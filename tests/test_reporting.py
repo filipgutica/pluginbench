@@ -7,6 +7,7 @@ from pluginbench.reporting import build_report, render_markdown
 from pluginbench.results import (
     ArmName,
     ArmResult,
+    StartingPatchResult,
     TaskResult,
     Usage,
     canonical_fingerprint,
@@ -87,6 +88,29 @@ def test_pass_rate_threshold_alone_configures_the_decision() -> None:
 
     assert report["decision"]["status"] == "justified"
     assert report["decision"]["gates"]["minimum_pass_rate_lift_pp"]
+
+
+def test_report_summarizes_starting_patch_outcomes() -> None:
+    baseline = _arm("baseline", {"a": 0}, cost=0.01)
+    treatment = _arm("treatment", {"a": 1}, cost=0.02)
+    baseline.tasks["a"].starting_patch = StartingPatchResult(
+        digest="sha256:seed",
+        expected_score=0,
+        unchanged_failure_attempts=1,
+    )
+    treatment.tasks["a"].starting_patch = StartingPatchResult(
+        digest="sha256:seed",
+        expected_score=0,
+        repaired_attempts=1,
+    )
+
+    report = build_report(baseline, treatment)
+    markdown = render_markdown(report)
+
+    assert report["baseline"]["starting_patch"]["repair_rate"] == 0
+    assert report["treatment"]["starting_patch"]["repair_rate"] == 1
+    assert report["comparison"]["repair_rate_lift_pp"] == 100
+    assert "Repair rate lift (pp)" in markdown
 
 
 def test_comparison_rejects_tampered_compatibility_payload() -> None:

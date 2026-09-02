@@ -30,6 +30,11 @@ class SWEbenchHarnessConfig(StrictModel):
         return self
 
 
+class StartingPatchConfig(StrictModel):
+    path: Path
+    expected_score: Literal[0, 1]
+
+
 class DatasetConfig(StrictModel):
     adapter: Literal["local", "swe-bench", "live-swe-bench"] = "local"
     name: str = Field(min_length=1)
@@ -37,6 +42,7 @@ class DatasetConfig(StrictModel):
     source: Path | str
     task_ids: list[str] = Field(min_length=1)
     harness: SWEbenchHarnessConfig | None = None
+    starting_patches: dict[str, StartingPatchConfig] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_dataset(self) -> DatasetConfig:
@@ -54,6 +60,13 @@ class DatasetConfig(StrictModel):
             self.source = str(self.source)
             if self.harness is not None:
                 raise ValueError("dataset.harness is only valid for swe-bench")
+        if self.starting_patches and self.adapter != "swe-bench":
+            raise ValueError("dataset.starting_patches is only valid for swe-bench")
+        unselected = sorted(self.starting_patches.keys() - set(self.task_ids))
+        if unselected:
+            raise ValueError(
+                "dataset.starting_patches contains an unselected task: " + ", ".join(unselected)
+            )
         if self.version.lower() in {"latest", "head", "main", "master"}:
             raise ValueError("dataset.version must be an immutable release or revision")
         if any(not task_id.strip() for task_id in self.task_ids):
@@ -218,6 +231,11 @@ def _resolve_config_paths(data: dict[str, Any], base: Path) -> None:
         harness = dataset.get("harness")
         if isinstance(harness, dict) and "executable" in harness:
             _resolve_mapping_path(harness, "executable", base)
+        starting_patches = dataset.get("starting_patches")
+        if isinstance(starting_patches, dict):
+            for starting_patch in starting_patches.values():
+                if isinstance(starting_patch, dict):
+                    _resolve_mapping_path(starting_patch, "path", base)
     skill = data.get("skill")
     if isinstance(skill, dict):
         _resolve_mapping_path(skill, "path", base)

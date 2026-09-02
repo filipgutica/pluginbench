@@ -51,6 +51,20 @@ def test_swebench_dry_run_shows_official_grader_command(tmp_path: Path) -> None:
     ]
 
 
+def test_swebench_dry_run_identifies_starting_patch(tmp_path: Path) -> None:
+    patch = tmp_path / "candidate.patch"
+    patch.write_text("diff --git a/a b/a\n")
+    config = load_config(write_swebench_config(tmp_path / "eval.yaml", starting_patch=patch))
+    bundle = inspect_skill_bundle(config.skill.path)
+    tasks = load_tasks(config.dataset)
+
+    plan = build_dry_run(config, bundle, tasks, Path("/tools/promptfoo"), "0.122.2")
+
+    seeded = plan["starting_patches"]["sympy__sympy-20590"]
+    assert seeded["digest"].startswith("sha256:")
+    assert seeded["expected_score"] == 0
+
+
 def test_container_dry_run_uses_one_command_per_attempt(tmp_path: Path) -> None:
     config = load_config(write_swebench_config(tmp_path / "eval.yaml"))
     config = config.model_copy(
@@ -149,6 +163,52 @@ def test_marks_result_past_agent_timeout_as_infrastructure_error(tmp_path: Path)
     assert result.score is None
     assert result.passed is False
     assert result.infrastructure_errors == ["promptfoo_reported_timeout_exceeded"]
+
+
+def test_classifies_passing_starting_patch_as_preserved_or_regressed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    patch = tmp_path / "candidate.patch"
+    patch.write_text("diff --git a/a b/a\n")
+    config = load_config(
+        write_swebench_config(
+            tmp_path / "eval.yaml",
+            starting_patch=patch,
+            expected_starting_score=1,
+        )
+    )
+    task = load_tasks(config.dataset)[0]
+    trials = [
+        Trial(
+            trial_id=f"{task.task_id}--attempt-{attempt:02d}",
+            task=task,
+            attempt=attempt,
+            workspace=tmp_path / f"workspace-{attempt}",
+            codex_home=tmp_path / f"codex-home-{attempt}",
+            isolated_home=tmp_path / f"home-{attempt}",
+        )
+        for attempt in (1, 2)
+    ]
+    parsed = {
+        trial.trial_id: PromptfooTrialResult(
+            trial_id=trial.trial_id,
+            task_id=task.task_id,
+            provider_succeeded=True,
+            duration_seconds=1,
+            usage=Usage(),
+            error=None,
+            skill_calls=(),
+        )
+        for trial in trials
+    }
+    scores = iter(((1.0, 1.0, None), (0.0, 1.0, None)))
+    monkeypatch.setattr("pluginbench.experiment._run_verifier", lambda _trial: next(scores))
+
+    result = _task_results(trials, parsed)[task.task_id]
+
+    assert result.starting_patch is not None
+    assert result.starting_patch.preserved_attempts == 1
+    assert result.starting_patch.regressed_attempts == 1
 
 
 def test_rejects_unexpected_promptfoo_result(tmp_path: Path) -> None:

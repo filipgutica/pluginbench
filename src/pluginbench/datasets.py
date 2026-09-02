@@ -13,6 +13,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from pluginbench.config import DatasetConfig
 
 
+STARTING_PATCH_INSTRUCTION = (
+    "A proposed implementation is already applied and staged in the workspace. "
+    "Review it against the issue, preserve correct work, fix any defects, and verify "
+    "the final result. Do not assume the proposed implementation is correct."
+)
+
+
 class CatalogModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -56,6 +63,13 @@ class SWEbenchSpec:
 
 
 @dataclass(frozen=True)
+class StartingPatchSpec:
+    path: Path
+    digest: str
+    expected_score: Literal[0, 1]
+
+
+@dataclass(frozen=True)
 class TaskSpec:
     task_id: str
     prompt: str
@@ -63,6 +77,7 @@ class TaskSpec:
     verifier: VerifierSpec | None
     digest: str
     swebench: SWEbenchSpec | None = None
+    starting_patch: StartingPatchSpec | None = None
 
 
 def _fixture_entries(root: Path) -> tuple[list[Path], list[Path]]:
@@ -193,6 +208,22 @@ def _swebench_digest(row: dict[str, Any]) -> str:
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def _load_starting_patch(config: DatasetConfig, task_id: str) -> StartingPatchSpec | None:
+    configured = config.starting_patches.get(task_id)
+    if configured is None:
+        return None
+    if not configured.path.is_file():
+        raise ValueError(f"starting patch does not exist for {task_id}: {configured.path}")
+    content = configured.path.read_bytes()
+    if not content:
+        raise ValueError(f"starting patch is empty for {task_id}: {configured.path}")
+    return StartingPatchSpec(
+        path=configured.path,
+        digest=f"sha256:{hashlib.sha256(content).hexdigest()}",
+        expected_score=configured.expected_score,
+    )
+
+
 def _load_swebench_tasks(config: DatasetConfig) -> list[TaskSpec]:
     assert isinstance(config.source, Path)
     assert config.harness is not None
@@ -210,13 +241,26 @@ def _load_swebench_tasks(config: DatasetConfig) -> list[TaskSpec]:
     for task_id in config.task_ids:
         row = by_id[task_id]
         serialized = row.model_dump(mode="json")
+        starting_patch = _load_starting_patch(config, task_id)
+        prompt = row.problem_statement
+        digest_input = serialized
+        if starting_patch is not None:
+            prompt = f"{prompt}\n\n{STARTING_PATCH_INSTRUCTION}"
+            digest_input = {
+                "row": serialized,
+                "prompt": prompt,
+                "starting_patch": {
+                    "digest": starting_patch.digest,
+                    "expected_score": starting_patch.expected_score,
+                },
+            }
         tasks.append(
             TaskSpec(
                 task_id=task_id,
-                prompt=row.problem_statement,
+                prompt=prompt,
                 fixture=None,
                 verifier=None,
-                digest=_swebench_digest(serialized),
+                digest=_swebench_digest(digest_input),
                 swebench=SWEbenchSpec(
                     repo=row.repo,
                     base_commit=row.base_commit,
@@ -228,6 +272,7 @@ def _load_swebench_tasks(config: DatasetConfig) -> list[TaskSpec]:
                     image_platform=config.harness.image_platform,
                     row=serialized,
                 ),
+                starting_patch=starting_patch,
             )
         )
     return tasks

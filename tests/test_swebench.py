@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from pluginbench.swebench import (
+    apply_starting_patch,
     build_clone_argv,
     build_eval_argv,
     capture_patch,
@@ -129,6 +130,96 @@ def test_patch_capture_uses_the_original_base_after_agent_commit(tmp_path: Path)
     assert "+after" in patch
 
 
+def test_applies_starting_patch_and_captures_only_later_agent_changes(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    subprocess.run(["git", "init", str(repository)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(repository), "config", "user.name", "Test"], check=True)
+    source = repository / "source.py"
+    source.write_text("before\n")
+    subprocess.run(["git", "-C", str(repository), "add", "source.py"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "commit.gpgsign=false",
+            "-C",
+            str(repository),
+            "commit",
+            "-m",
+            "base",
+        ],
+        check=True,
+    )
+    starting_patch = tmp_path / "starting.patch"
+    starting_patch.write_text(
+        "diff --git a/source.py b/source.py\n"
+        "--- a/source.py\n"
+        "+++ b/source.py\n"
+        "@@ -1 +1 @@\n"
+        "-before\n"
+        "+candidate\n"
+    )
+
+    starting_tree = apply_starting_patch(repository, starting_patch)
+
+    assert source.read_text() == "candidate\n"
+    assert len(starting_tree) == 40
+    source.write_text("final\n")
+    agent_patch = capture_patch(repository, starting_tree)
+    assert "-candidate" in agent_patch
+    assert "+final" in agent_patch
+    assert "-before" not in agent_patch
+
+
+def test_rejects_starting_patch_that_does_not_apply(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    patch = tmp_path / "invalid.patch"
+    patch.write_text("not a patch\n")
+
+    with pytest.raises(ValueError, match="cannot apply starting patch"):
+        apply_starting_patch(tmp_path, patch)
+
+
+def test_rejects_starting_patch_that_changes_agent_skills(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"], check=True
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True)
+    readme = tmp_path / "README.md"
+    readme.write_text("fixture\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "README.md"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "commit.gpgsign=false",
+            "-C",
+            str(tmp_path),
+            "commit",
+            "-m",
+            "base",
+        ],
+        check=True,
+    )
+    patch = tmp_path / "skills.patch"
+    patch.write_text(
+        "diff --git a/.agents/skills/injected/SKILL.md b/.agents/skills/injected/SKILL.md\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/.agents/skills/injected/SKILL.md\n"
+        "@@ -0,0 +1 @@\n"
+        "+injected\n"
+    )
+
+    with pytest.raises(ValueError, match="must not modify .agents"):
+        apply_starting_patch(tmp_path, patch)
+
+
 def test_failed_evaluator_process_is_an_infrastructure_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -139,8 +230,8 @@ def test_failed_evaluator_process_is_an_infrastructure_error(
     workspace.mkdir()
     artifact_dir = tmp_path / "artifacts"
 
-    def fake_capture_patch(*args: object, **kwargs: object) -> str:
-        return "patch\n"
+    def fake_capture_patch(_workspace: Path, base: str) -> str:
+        return f"patch from {base}\n"
 
     monkeypatch.setattr("pluginbench.swebench.capture_patch", fake_capture_patch)
 
@@ -162,6 +253,11 @@ def test_failed_evaluator_process_is_an_infrastructure_error(
         run_id="task-a--attempt-01",
         model_name="model",
         timeout_seconds=30,
+        starting_tree="starting-tree",
     )
 
     assert result == (None, "swebench_evaluator_failed")
+    assert (artifact_dir / "patch.diff").read_text() == (
+        "patch from cffd4e0f86fefd4802349a9f9b19ed70934ea354\n"
+    )
+    assert (artifact_dir / "agent-change.diff").read_text() == "patch from starting-tree\n"

@@ -13,6 +13,30 @@ def _divide(numerator: float | int | None, denominator: float | int) -> float | 
     return float(numerator) / denominator
 
 
+def _starting_patch_summary(arm: ArmResult) -> dict[str, Any] | None:
+    results = [
+        task.starting_patch for task in arm.tasks.values() if task.starting_patch is not None
+    ]
+    if not results:
+        return None
+    fields = (
+        "repaired_attempts",
+        "preserved_attempts",
+        "regressed_attempts",
+        "unchanged_failure_attempts",
+        "unscored_attempts",
+    )
+    counts = {field: sum(getattr(result, field) for result in results) for field in fields}
+    repair_total = counts["repaired_attempts"] + counts["unchanged_failure_attempts"]
+    preservation_total = counts["preserved_attempts"] + counts["regressed_attempts"]
+    return {
+        "seeded_tasks": len(results),
+        **counts,
+        "repair_rate": _divide(counts["repaired_attempts"], repair_total),
+        "preservation_rate": _divide(counts["preserved_attempts"], preservation_total),
+    }
+
+
 def _arm_summary(arm: ArmResult) -> dict[str, Any]:
     scoreable = sum(task.score is not None for task in arm.tasks.values())
     task_failures = sum(not task.passed and task.score is not None for task in arm.tasks.values())
@@ -46,6 +70,7 @@ def _arm_summary(arm: ArmResult) -> dict[str, Any]:
         "duration_per_task_seconds": _divide(duration_total, arm.tasks_attempted),
         "infrastructure_errors": arm.infrastructure_errors,
         "tasks": {key: value.model_dump(mode="json") for key, value in sorted(arm.tasks.items())},
+        "starting_patch": _starting_patch_summary(arm),
     }
 
 
@@ -111,7 +136,7 @@ def _paired_comparison(baseline: ArmResult, treatment: ArmResult) -> dict[str, A
         else None
     )
     additional_successes = treatment_paired_passes - baseline_paired_passes
-    return {
+    comparison = {
         "paired_tasks": len(scoreable),
         "unpaired_or_unscoreable_tasks": sorted(set(common) - set(scoreable)),
         "baseline_wins": baseline_wins,
@@ -128,6 +153,18 @@ def _paired_comparison(baseline: ArmResult, treatment: ArmResult) -> dict[str, A
             else None
         ),
     }
+    baseline_starting = _starting_patch_summary(baseline)
+    treatment_starting = _starting_patch_summary(treatment)
+    if baseline_starting is not None and treatment_starting is not None:
+        for metric in ("repair_rate", "preservation_rate"):
+            baseline_rate = baseline_starting[metric]
+            treatment_rate = treatment_starting[metric]
+            comparison[f"{metric}_lift_pp"] = (
+                (treatment_rate - baseline_rate) * 100
+                if baseline_rate is not None and treatment_rate is not None
+                else None
+            )
+    return comparison
 
 
 def _decision(
@@ -271,6 +308,27 @@ def render_markdown(report: dict[str, Any]) -> str:
                 "",
             ]
         )
+        starting_patch = arm.get("starting_patch")
+        if isinstance(starting_patch, dict):
+            lines.extend(
+                [
+                    "### Starting patch outcomes",
+                    "",
+                    "| Metric | Value |",
+                    "| --- | ---: |",
+                    f"| Seeded tasks | {_display(starting_patch['seeded_tasks'])} |",
+                    f"| Repaired attempts | {_display(starting_patch['repaired_attempts'])} |",
+                    f"| Preserved attempts | {_display(starting_patch['preserved_attempts'])} |",
+                    f"| Regressed attempts | {_display(starting_patch['regressed_attempts'])} |",
+                    "| Unchanged-failure attempts | "
+                    f"{_display(starting_patch['unchanged_failure_attempts'])} |",
+                    f"| Unscored attempts | {_display(starting_patch['unscored_attempts'])} |",
+                    f"| Repair rate | {_display(starting_patch['repair_rate'], percent=True)} |",
+                    "| Preservation rate | "
+                    f"{_display(starting_patch['preservation_rate'], percent=True)} |",
+                    "",
+                ]
+            )
     comparison = report.get("comparison")
     if isinstance(comparison, dict):
         comparison_lines = [
@@ -293,6 +351,16 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"{_display(comparison['incremental_cost_per_additional_success_usd'])} |",
             "",
         ]
+        if "repair_rate_lift_pp" in comparison:
+            comparison_lines.insert(
+                -1,
+                f"| Repair rate lift (pp) | {_display(comparison['repair_rate_lift_pp'])} |",
+            )
+            comparison_lines.insert(
+                -1,
+                "| Preservation rate lift (pp) | "
+                f"{_display(comparison['preservation_rate_lift_pp'])} |",
+            )
         decision = report.get("decision")
         if isinstance(decision, dict):
             comparison_lines.extend([f"Decision: **{decision['status']}**", ""])

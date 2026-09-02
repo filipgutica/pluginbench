@@ -9,6 +9,36 @@ from pathlib import Path
 from pluginbench.datasets import SWEbenchSpec
 
 
+def _run_git(workspace: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ("git", *arguments),
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        shell=False,
+        check=False,
+        timeout=60,
+    )
+
+
+def apply_starting_patch(workspace: Path, patch: Path) -> str:
+    applied = _run_git(workspace, "apply", "--index", "--whitespace=nowarn", str(patch))
+    if applied.returncode != 0:
+        detail = applied.stderr.strip() or applied.stdout.strip() or "git apply failed"
+        raise ValueError(f"cannot apply starting patch {patch}: {detail}")
+    changed = _run_git(workspace, "diff", "--cached", "--name-only", "-z")
+    if changed.returncode != 0:
+        raise ValueError(f"cannot inspect starting patch {patch}: {changed.stderr.strip()}")
+    paths = [item for item in changed.stdout.split("\0") if item]
+    if any(path == ".agents" or path.startswith(".agents/") for path in paths):
+        raise ValueError("starting patch must not modify .agents")
+    tree = _run_git(workspace, "write-tree")
+    tree_id = tree.stdout.strip()
+    if tree.returncode != 0 or re.fullmatch(r"[0-9a-f]{40}", tree_id) is None:
+        raise ValueError(f"cannot snapshot starting patch tree: {tree.stderr.strip()}")
+    return tree_id
+
+
 def build_clone_argv(
     *, repo: str, base_commit: str, destination: Path
 ) -> tuple[tuple[str, ...], ...]:
@@ -199,12 +229,15 @@ def run_official_evaluation(
     run_id: str,
     model_name: str,
     timeout_seconds: int,
+    starting_tree: str | None = None,
 ) -> tuple[float | None, str | None]:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     dataset_path = artifact_dir / "dataset.json"
     predictions_path = artifact_dir / "predictions.jsonl"
     patch_path = artifact_dir / "patch.diff"
     patch = capture_patch(workspace, spec.base_commit)
+    if starting_tree is not None:
+        (artifact_dir / "agent-change.diff").write_text(capture_patch(workspace, starting_tree))
     dataset_path.write_text(json.dumps([spec.row], indent=2) + "\n")
     patch_path.write_text(patch)
     predictions_path.write_text(

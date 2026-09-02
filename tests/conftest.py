@@ -190,7 +190,12 @@ def load_evaluation_config(
     return load_config(write_evaluation_config(tmp_path / "eval.yaml"), overrides)
 
 
-def write_swebench_config(path: Path) -> Path:
+def write_swebench_config(
+    path: Path,
+    *,
+    starting_patch: Path | None = None,
+    expected_starting_score: int = 0,
+) -> Path:
     skill_dir = path.parent / "skills" / "review"
     skill_dir.mkdir(parents=True, exist_ok=True)
     (skill_dir / "SKILL.md").write_text(
@@ -227,8 +232,16 @@ def write_swebench_config(path: Path) -> Path:
     harness = path.parent / "bin" / "swebench"
     harness.parent.mkdir()
     harness.write_text("")
+    starting_patch_block = ""
+    if starting_patch is not None:
+        starting_patch_block = (
+            "  starting_patches:\n"
+            "    sympy__sympy-20590:\n"
+            f"      path: {json.dumps(str(starting_patch))}\n"
+            f"      expected_score: {expected_starting_score}\n"
+        )
     path.write_text(
-        """
+        f"""
 schema_version: 1
 experiment:
   name: swebench-smoke
@@ -238,7 +251,7 @@ dataset:
   version: 78f471bf655a3137b2e8a75af1501690ec009ec3
   source: swebench.json
   task_ids: [sympy__sympy-20590]
-  harness:
+{starting_patch_block}  harness:
     executable: bin/swebench
     version: 5.0.2
     image_platform: linux/amd64

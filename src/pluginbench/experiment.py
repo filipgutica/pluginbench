@@ -36,6 +36,7 @@ from pluginbench.reporting import build_report, write_reports
 from pluginbench.results import (
     ArmName,
     ArmResult,
+    StartingPatchResult,
     TaskResult,
     Usage,
     canonical_fingerprint,
@@ -45,6 +46,7 @@ from pluginbench.results import (
 )
 from pluginbench.skills import SkillBundle, inspect_skill_bundle, stage_skill_bundle
 from pluginbench.swebench import (
+    apply_starting_patch,
     build_eval_argv as build_swebench_eval_argv,
     materialize_repository,
     prepare_image,
@@ -322,6 +324,14 @@ def build_dry_run(
         "runtime_container_image": config.tooling.container_image,
         "runtime_container_image_id": runtime_image_id,
         "tasks": [task.task_id for task in tasks],
+        "starting_patches": {
+            task.task_id: {
+                "digest": task.starting_patch.digest,
+                "expected_score": task.starting_patch.expected_score,
+            }
+            for task in tasks
+            if task.starting_patch is not None
+        },
         "treatments": arms,
         "baseline_mode": config.execution.baseline.mode,
         "reused_baseline": (
@@ -390,6 +400,7 @@ def _prepare_trial(
     model_name: str,
     agent_timeout_seconds: float,
     verifier_timeout_seconds: int,
+    starting_tree: str | None,
 ) -> Trial:
     workspace = run_dir / arm / "workspaces" / _slug(task.task_id) / f"attempt-{attempt:02d}"
     shutil.copytree(source, workspace)
@@ -426,6 +437,7 @@ def _prepare_trial(
         verifier_dir=(run_dir / arm / "verifiers" / _slug(task.task_id) / f"attempt-{attempt:02d}"),
         model_name=model_name,
         verifier_timeout_seconds=verifier_timeout_seconds,
+        starting_tree=starting_tree,
     )
 
 
@@ -448,6 +460,7 @@ def _run_verifier(trial: Trial) -> tuple[float | None, float | None, str | None]
                 run_id=trial.trial_id,
                 model_name=trial.model_name,
                 timeout_seconds=trial.verifier_timeout_seconds,
+                starting_tree=trial.starting_tree,
             )
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
             return None, time.monotonic() - started, f"swebench_verifier_error:{type(exc).__name__}"
@@ -522,6 +535,7 @@ def _task_results(
 
     results: dict[str, TaskResult] = {}
     for task_id, rows in attempts.items():
+        task = next(trial.task for trial in trials if trial.task.task_id == task_id)
         providers = [provider for provider, _, _, _ in rows if provider is not None]
         usages = [provider.usage if provider is not None else Usage() for provider, _, _, _ in rows]
         scores = [score for _, score, _, _ in rows if score is not None]
@@ -533,6 +547,23 @@ def _task_results(
             for provider, _, verifier_duration, _ in rows
         ]
         skill_calls = sorted({call for provider in providers for call in provider.skill_calls})
+        starting_patch: StartingPatchResult | None = None
+        if task.starting_patch is not None:
+            outcome_counts: defaultdict[str, int] = defaultdict(int)
+            for _, score, _, _ in rows:
+                if score is None:
+                    outcome_counts["unscored_attempts"] += 1
+                elif task.starting_patch.expected_score == 0:
+                    key = "repaired_attempts" if score >= 1 else "unchanged_failure_attempts"
+                    outcome_counts[key] += 1
+                else:
+                    key = "preserved_attempts" if score >= 1 else "regressed_attempts"
+                    outcome_counts[key] += 1
+            starting_patch = StartingPatchResult(
+                digest=task.starting_patch.digest,
+                expected_score=task.starting_patch.expected_score,
+                **outcome_counts,
+            )
         results[task_id] = TaskResult(
             task_id=task_id,
             attempts=len(rows),
@@ -547,13 +578,14 @@ def _task_results(
                 output_tokens=_sum_complete_int([usage.output_tokens for usage in usages]),
                 cost_usd=_sum_complete_float([usage.cost_usd for usage in usages]),
             ),
+            starting_patch=starting_patch,
         )
     return results
 
 
 def _snapshot_task_inputs(
     config: PluginbenchConfig, tasks: list[TaskSpec], inputs_dir: Path
-) -> tuple[dict[str, Path], dict[str, Path]]:
+) -> tuple[dict[str, Path], dict[str, Path], dict[str, str]]:
     if config.dataset.adapter == "local":
         shutil.copy2(Path(config.dataset.source), inputs_dir / "task-catalog.yaml")
     else:
@@ -565,6 +597,7 @@ def _snapshot_task_inputs(
     tasks_dir.mkdir()
     sources: dict[str, Path] = {}
     verifiers: dict[str, Path] = {}
+    starting_trees: dict[str, str] = {}
     for task in tasks:
         task_dir = tasks_dir / _slug(task.task_id)
         task_dir.mkdir()
@@ -587,6 +620,22 @@ def _snapshot_task_inputs(
                     "image_platform": task.swebench.image_platform,
                 },
             }
+            if task.starting_patch is not None:
+                snapshotted_patch = task_dir / "starting.patch"
+                shutil.copy2(task.starting_patch.path, snapshotted_patch)
+                snapshot_digest = (
+                    f"sha256:{hashlib.sha256(snapshotted_patch.read_bytes()).hexdigest()}"
+                )
+                if snapshot_digest != task.starting_patch.digest:
+                    raise ValueError(f"starting patch changed while snapshotting {task.task_id}")
+                starting_tree = apply_starting_patch(repository, snapshotted_patch)
+                starting_trees[task.task_id] = starting_tree
+                metadata["starting_patch"] = {
+                    "path": snapshotted_patch.name,
+                    "digest": task.starting_patch.digest,
+                    "expected_score": task.starting_patch.expected_score,
+                    "tree": starting_tree,
+                }
             (task_dir / "task.json").write_text(json.dumps(metadata, indent=2) + "\n")
             continue
         assert task.fixture is not None
@@ -607,7 +656,7 @@ def _snapshot_task_inputs(
             },
         }
         (task_dir / "task.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    return sources, verifiers
+    return sources, verifiers, starting_trees
 
 
 def _execute_batch(
@@ -622,6 +671,7 @@ def _execute_batch(
     batch_number: int,
     task_sources: dict[str, Path],
     verifier_sources: dict[str, Path],
+    starting_trees: dict[str, str],
     execution_image: str | None,
 ) -> dict[str, TaskResult]:
     trials = [
@@ -638,6 +688,7 @@ def _execute_batch(
             model_name=config.agent.model,
             agent_timeout_seconds=config.execution.timeout_seconds,
             verifier_timeout_seconds=int(config.execution.timeout_seconds),
+            starting_tree=starting_trees.get(task.task_id),
         )
         for task in tasks
         for attempt in range(1, config.execution.attempts + 1)
@@ -810,7 +861,9 @@ def run_evaluation(
         or inspect_skill_bundle(bundle.source_path).digest != bundle.digest
     ):
         raise ValueError("skill bundle changed while run inputs were being snapshotted")
-    task_sources, verifier_sources = _snapshot_task_inputs(config, tasks, destination / "inputs")
+    task_sources, verifier_sources, starting_trees = _snapshot_task_inputs(
+        config, tasks, destination / "inputs"
+    )
     refreshed_tasks = load_tasks(config.dataset)
     if {task.task_id: task.digest for task in refreshed_tasks} != {
         task.task_id: task.digest for task in tasks
@@ -840,6 +893,7 @@ def run_evaluation(
                         batch_number=batch_number,
                         task_sources=task_sources,
                         verifier_sources=verifier_sources,
+                        starting_trees=starting_trees,
                         execution_image=runtime_image_id,
                     )
                 )

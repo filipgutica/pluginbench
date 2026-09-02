@@ -23,6 +23,34 @@ class Usage(ResultModel):
     cost_usd: float | None = None
 
 
+class StartingPatchResult(ResultModel):
+    digest: str
+    expected_score: Literal[0, 1]
+    repaired_attempts: int = Field(default=0, ge=0)
+    preserved_attempts: int = Field(default=0, ge=0)
+    regressed_attempts: int = Field(default=0, ge=0)
+    unchanged_failure_attempts: int = Field(default=0, ge=0)
+    unscored_attempts: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_outcome_kinds(self) -> StartingPatchResult:
+        if self.expected_score == 0 and (self.preserved_attempts or self.regressed_attempts):
+            raise ValueError("failing starting patches cannot have preservation outcomes")
+        if self.expected_score == 1 and (self.repaired_attempts or self.unchanged_failure_attempts):
+            raise ValueError("passing starting patches cannot have repair outcomes")
+        return self
+
+    @property
+    def attempts(self) -> int:
+        return (
+            self.repaired_attempts
+            + self.preserved_attempts
+            + self.regressed_attempts
+            + self.unchanged_failure_attempts
+            + self.unscored_attempts
+        )
+
+
 class TaskResult(ResultModel):
     task_id: str
     attempts: int
@@ -32,6 +60,13 @@ class TaskResult(ResultModel):
     infrastructure_errors: list[str] = Field(default_factory=list)
     skill_calls: list[str] = Field(default_factory=list)
     usage: Usage = Field(default_factory=Usage)
+    starting_patch: StartingPatchResult | None = None
+
+    @model_validator(mode="after")
+    def validate_starting_patch_attempts(self) -> TaskResult:
+        if self.starting_patch is not None and self.starting_patch.attempts != self.attempts:
+            raise ValueError("starting patch outcome counts do not match task attempts")
+        return self
 
 
 def _sum_complete_int(values: list[int | None]) -> int | None:

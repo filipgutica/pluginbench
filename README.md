@@ -137,6 +137,32 @@ Track native ARM64 support in [SWE-bench issue 520](https://github.com/SWE-bench
 One task proves the benchmark path, but it cannot estimate general skill lift.
 Use more fixed task IDs and repeated attempts for a decision-quality result.
 
+### Start from an existing patch
+
+Use a starting patch to test whether a workflow repairs a known failing implementation or
+preserves a known passing implementation. Add the patch to the selected SWE-bench task:
+
+```yaml
+dataset:
+  adapter: swe-bench
+  # Other pinned SWE-bench fields...
+  task_ids: [sympy__sympy-20590]
+  starting_patches:
+    sympy__sympy-20590:
+      path: patches/sympy__sympy-20590.patch
+      expected_score: 0
+```
+
+Set `expected_score` to `0` for a patch already confirmed to fail the official grader.
+Set it to `1` for a confirmed passing control. Pluginbench snapshots and checksums the
+patch, applies it identically to both arms, and tells each agent to review, preserve, fix,
+and verify the proposed implementation. Starting patches cannot change `.agents/`.
+
+The official grader still receives the complete patch relative to the SWE-bench base
+commit. Each verifier directory also contains `agent-change.diff`, which isolates work
+performed after the starting patch. Reports classify attempts as repaired, unchanged
+failures, preserved, or regressed and compare repair and preservation rates between arms.
+
 ## Run the harder SWE-bench sample
 
 The hard sample pins eight official SWE-bench Verified tasks across eight repositories.

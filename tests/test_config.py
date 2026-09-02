@@ -63,6 +63,50 @@ def test_resolves_swebench_snapshot_and_harness_paths(tmp_path: Path) -> None:
     assert config.dataset.harness.version == "5.0.2"
 
 
+def test_resolves_swebench_starting_patch_paths(tmp_path: Path) -> None:
+    patch = tmp_path / "candidate.patch"
+    patch.write_text("diff --git a/a b/a\n")
+    config_path = write_swebench_config(tmp_path / "eval.yaml", starting_patch=patch)
+
+    config = load_config(config_path)
+
+    configured = config.dataset.starting_patches["sympy__sympy-20590"]
+    assert configured.path == patch.resolve()
+    assert configured.expected_score == 0
+
+
+def test_rejects_starting_patches_for_local_tasks(tmp_path: Path) -> None:
+    config_path = write_evaluation_config(tmp_path / "eval.yaml")
+    config_path.write_text(
+        config_path.read_text().replace(
+            "  task_ids: [task-a, task-b]\n",
+            "  task_ids: [task-a, task-b]\n"
+            "  starting_patches:\n"
+            "    task-a:\n"
+            "      path: candidate.patch\n"
+            "      expected_score: 0\n",
+        )
+    )
+
+    with pytest.raises(ValueError, match="only valid for swe-bench"):
+        load_config(config_path)
+
+
+def test_rejects_starting_patch_for_unselected_task(tmp_path: Path) -> None:
+    patch = tmp_path / "candidate.patch"
+    patch.write_text("diff --git a/a b/a\n")
+    config_path = write_swebench_config(tmp_path / "eval.yaml", starting_patch=patch)
+    config_path.write_text(
+        config_path.read_text().replace(
+            "    sympy__sympy-20590:\n",
+            "    other__task-1:\n",
+        )
+    )
+
+    with pytest.raises(ValueError, match="unselected task"):
+        load_config(config_path)
+
+
 def test_swebench_requires_a_native_harness(tmp_path: Path) -> None:
     config_path = write_swebench_config(tmp_path / "eval.yaml")
     config_path.write_text(

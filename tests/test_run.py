@@ -1,4 +1,5 @@
 import json
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -266,3 +267,105 @@ def test_swebench_run_uses_pinned_checkout_and_official_grader_without_model_cal
     report = json.loads((tmp_path / "swe-run" / "report.json").read_text())
     assert report["comparison"]["treatment_wins"] == 1
     assert (tmp_path / "swe-run" / "inputs" / "swebench-dataset.json").is_file()
+
+
+def test_swebench_run_applies_starting_patch_to_both_arms_and_reports_repairs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    starting_patch = tmp_path / "candidate.patch"
+    starting_patch.write_text(
+        "diff --git a/seeded.py b/seeded.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/seeded.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+BROKEN = True\n"
+    )
+    config = load_config(
+        write_swebench_config(tmp_path / "eval.yaml", starting_patch=starting_patch)
+    )
+    config = config.model_copy(
+        update={"execution": config.execution.model_copy(update={"attempts": 2})}
+    )
+    bundle = inspect_skill_bundle(config.skill.path)
+    seeded_workspaces: list[Path] = []
+
+    class StartingPatchRunner(FakePromptfooRunner):
+        def execute(
+            self,
+            config_path: Path,
+            output_path: Path,
+            *,
+            concurrency: int,
+            timeout_seconds: float,
+            container_image: str | None = None,
+        ) -> CommandResult:
+            loaded = yaml.safe_load(config_path.read_text())
+            workspace = Path(loaded["tests"][0]["vars"]["workspace_dir"])
+            assert (workspace / "seeded.py").read_text() == "BROKEN = True\n"
+            staged = subprocess.run(
+                ["git", "-C", str(workspace), "diff", "--cached", "--name-only"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            assert staged.stdout == "seeded.py\n"
+            seeded_workspaces.append(workspace)
+            return super().execute(
+                config_path,
+                output_path,
+                concurrency=concurrency,
+                timeout_seconds=timeout_seconds,
+                container_image=container_image,
+            )
+
+    def fake_materialize(_spec: SWEbenchSpec, destination: Path) -> None:
+        subprocess.run(["git", "init", str(destination)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(destination), "config", "user.email", "test@example.com"],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(destination), "config", "user.name", "Test"], check=True)
+        (destination / "README.md").write_text("fixture\n")
+        subprocess.run(["git", "-C", str(destination), "add", "README.md"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "commit.gpgsign=false",
+                "-C",
+                str(destination),
+                "commit",
+                "-m",
+                "base",
+            ],
+            check=True,
+        )
+
+    def fake_official(*, workspace: Path, **kwargs: Any) -> tuple[float, None]:
+        return (1.0, None) if (workspace / ".agents" / "skills").is_dir() else (0.0, None)
+
+    monkeypatch.setattr("pluginbench.experiment.materialize_repository", fake_materialize)
+    monkeypatch.setattr("pluginbench.experiment.validate_harness", lambda spec: None)
+    monkeypatch.setattr("pluginbench.experiment.prepare_image", lambda spec: None)
+    monkeypatch.setattr("pluginbench.experiment.run_official_evaluation", fake_official)
+
+    run_dir = tmp_path / "repair-run"
+    run_evaluation(config, bundle, StartingPatchRunner(), run_dir=run_dir)
+
+    assert len(seeded_workspaces) == 4
+    baseline = load_arm(run_dir / "baseline")
+    treatment = load_arm(run_dir / "treatment")
+    assert baseline.tasks["sympy__sympy-20590"].starting_patch is not None
+    assert baseline.tasks["sympy__sympy-20590"].starting_patch.unchanged_failure_attempts == 2
+    assert treatment.tasks["sympy__sympy-20590"].starting_patch is not None
+    assert treatment.tasks["sympy__sympy-20590"].starting_patch.repaired_attempts == 2
+    report = json.loads((run_dir / "report.json").read_text())
+    assert report["baseline"]["starting_patch"]["repair_rate"] == 0
+    assert report["treatment"]["starting_patch"]["repair_rate"] == 1
+    assert report["comparison"]["repair_rate_lift_pp"] == 100
+    task_input = json.loads((run_dir / "inputs/tasks/sympy__sympy-20590/task.json").read_text())
+    assert task_input["starting_patch"]["expected_score"] == 0
+    assert (run_dir / "inputs/tasks/sympy__sympy-20590/starting.patch").read_text() == (
+        starting_patch.read_text()
+    )

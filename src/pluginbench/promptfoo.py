@@ -53,6 +53,7 @@ class Trial:
     verifier_dir: Path | None = None
     model_name: str = "pluginbench"
     verifier_timeout_seconds: int = 1800
+    starting_tree: str | None = None
 
 
 @dataclass(frozen=True)

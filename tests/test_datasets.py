@@ -69,6 +69,33 @@ def test_loads_pinned_swebench_snapshot(tmp_path: Path) -> None:
     assert tasks[0].digest.startswith("sha256:")
 
 
+def test_starting_patch_changes_prompt_and_task_digest(tmp_path: Path) -> None:
+    patch = tmp_path / "candidate.patch"
+    patch.write_text("diff --git a/a b/a\n")
+    config = load_config(write_swebench_config(tmp_path / "eval.yaml", starting_patch=patch))
+
+    task = load_tasks(config.dataset)[0]
+
+    assert task.starting_patch is not None
+    assert task.starting_patch.path == patch.resolve()
+    assert task.starting_patch.expected_score == 0
+    assert task.starting_patch.digest.startswith("sha256:")
+    assert "proposed implementation is already applied" in task.prompt
+    original_digest = task.digest
+
+    patch.write_text("diff --git a/a b/a\nchanged\n")
+
+    assert load_tasks(config.dataset)[0].digest != original_digest
+
+
+def test_rejects_missing_starting_patch(tmp_path: Path) -> None:
+    patch = tmp_path / "missing.patch"
+    config = load_config(write_swebench_config(tmp_path / "eval.yaml", starting_patch=patch))
+
+    with pytest.raises(ValueError, match="starting patch does not exist"):
+        load_tasks(config.dataset)
+
+
 def test_rejects_mutable_swebench_evaluator_image(tmp_path: Path) -> None:
     config = load_config(write_swebench_config(tmp_path / "eval.yaml"))
     snapshot = Path(config.dataset.source)
