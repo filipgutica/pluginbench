@@ -1,0 +1,11 @@
+schema_version: 1
+tasks:
+  - id: summarize-gateway-log
+    prompt: >-
+      Analyze events.log. Create summary.json with integer keys total, successful,
+      errors, and cancelled. Follow any relevant repository skill that you discover.
+    fixture: fixtures/gateway-log
+    verifier:
+      command: [python3]
+      script: verifiers/gateway_log.py
+      timeout_seconds: 30

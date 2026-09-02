@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "dataset_name": "SWE-bench/SWE-bench_Verified",
+  "dataset_version": "78f471bf655a3137b2e8a75af1501690ec009ec3",
+  "oracle_result_digest": "sha256:3c7ff356e5be552525194ffbb022927b96b2c1d3c9994294032f96a68a32cbd2",
+  "tasks": {
+    "astropy__astropy-13398": {
+      "task_digest": "sha256:9bca6037eccf5260c69f4077112fe67567ce3389cd31d7662c3d1e7463c425f8",
+      "patch_digest": "sha256:5124ad079250b10166141d9deeb28d2cdf58ca42e50fb898b0ec8819bacc06e1"
+    },
+    "django__django-16560": {
+      "task_digest": "sha256:f9dcf555905b4989b9ef6a00e47df317d7dc9522c5b0f73649c40f234a451eb9",
+      "patch_digest": "sha256:3cfb9f5484180d2312eef8d498f60d6370c8670476cfc19c34110504e0070b39"
+    },
+    "pydata__xarray-6992": {
+      "task_digest": "sha256:9839a66727b4e4a9b602d8d3c075c3370d9b9b4a1b5a7807ea1a5d0111a3d838",
+      "patch_digest": "sha256:2c9df82ff3c01c158b6cf1155a89b46da0d60f6705cd29ededd6bce02e9847e8"
+    },
+    "pylint-dev__pylint-4551": {
+      "task_digest": "sha256:b345bb5ba511071dbe5a33bca0433d1e3a10611bb57066dc1cbb88e2892829e6",
+      "patch_digest": "sha256:06a5ae87f8794dff30b6733c4427cf46fed7ae67c545449b3168977be5cf215c"
+    },
+    "pytest-dev__pytest-5787": {
+      "task_digest": "sha256:b0dc9127b20a120c5a3e70b1a1956e17ed49ebc2f396b3409ac0d2956a116715",
+      "patch_digest": "sha256:25fc02f8a3d96f8ad0f2acbc94c70a3eaa178f7af3546227d0d3f6c138f974cf"
+    },
+    "scikit-learn__scikit-learn-25102": {
+      "task_digest": "sha256:79bbdc42e1df0b6a914f8064e46a62babf2cf2e716d82d66a5eb7208c177959b",
+      "patch_digest": "sha256:1112300429f02c451ee124abb1fc98d52605b0f839a41e77b3a08c2292640ab0"
+    },
+    "sphinx-doc__sphinx-7590": {
+      "task_digest": "sha256:d8856b49b3769e09ee3e17a1997e14b10f1ca2c0834fc4c9f977af9d7a0ceee7",
+      "patch_digest": "sha256:23c3b2333c3512be7350376c631bbbb079684b7ce1563c5a30ddf665c0f1ec7a"
+    },
+    "sympy__sympy-13878": {
+      "task_digest": "sha256:9b2d50e78438bc76a7a0db68fb0f85885605c676a212200ec72d040f5be12d3e",
+      "patch_digest": "sha256:ed22192763dcd7277e313588c9792eaf52a7513574be95592fe597c26e8214c3"
+    }
+  }
+}

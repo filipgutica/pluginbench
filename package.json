@@ -1,0 +1,13 @@
+{
+  "name": "pluginbench-runtime",
+  "private": true,
+  "version": "0.2.0",
+  "description": "Pinned Promptfoo runtime for pluginbench",
+  "engines": {
+    "node": ">=22.22.0"
+  },
+  "dependencies": {
+    "@openai/codex-sdk": "0.151.0",
+    "promptfoo": "0.122.2"
+  }
+}

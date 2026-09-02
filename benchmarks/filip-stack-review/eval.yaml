@@ -1,0 +1,42 @@
+schema_version: 1
+study:
+  name: filip-stack-swe-bench-review
+  randomization_seed: filip-stack-review-v1
+sources:
+  baseline:
+    arm: ../../runs/20260831T215323Z-filip-stack-swe-bench-verified-hard/baseline/arm.json
+  full:
+    arm: ../../runs/20260831T215323Z-filip-stack-swe-bench-verified-hard/treatment/arm.json
+  core:
+    arm: ../../runs/20260901T003052Z-filip-stack-core-ablation/treatment/arm.json
+  compatibility_fingerprint: sha256:4b8f0913f819ca2cd077ed558999bb319cf2566fede36836776c470e00ea7ca0
+dataset:
+  name: SWE-bench/SWE-bench_Verified
+  version: 78f471bf655a3137b2e8a75af1501690ec009ec3
+  source: ../swe-bench-verified-hard/tasks.json
+reviewer:
+  provider: openai:codex-sdk
+  codex_sdk_version: 0.151.0
+  model: gpt-5.6-luna
+  reasoning: high
+  attempts: 2
+  timeout_seconds: 900
+  concurrency: 1
+  auth:
+    mode: subscription
+    codex_home: ~/.codex
+tooling:
+  promptfoo_version: 0.122.2
+  container_image: pluginbench-runtime:0.2.0
+calibration:
+  enabled: true
+  oracle_result: ../../runs/swebench-oracle-hard/gold.pluginbench-hard-gold.json
+  evidence_manifest: gold-calibration.json
+limits:
+  max_tokens: 4000000
+  max_cost_usd: 5.0
+estimates:
+  tokens_per_review: 50000
+  cost_per_review_usd: 0.08
+output:
+  runs_dir: ../../runs/reviews

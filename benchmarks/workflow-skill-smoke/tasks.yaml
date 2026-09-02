@@ -1,0 +1,31 @@
+schema_version: 1
+tasks:
+  - id: debug-profile-cache
+    prompt: >-
+      Users can receive the wrong cached profile when two user IDs differ only by case.
+      Diagnose the cause, fix the defect, and keep the change scoped. Run the relevant tests.
+      You have authority to edit this workspace, but do not change unrelated files.
+    fixture: fixtures/debug-profile-cache
+    verifier:
+      command: [python3]
+      script: verifiers/debug_profile_cache.py
+      timeout_seconds: 30
+  - id: triage-pricing-review
+    prompt: >-
+      Review all feedback in review-comments.md against the code, tests, and contract.
+      Apply only the valid corrections. Keep the public money type and exact arithmetic contract.
+      You have authority to edit this workspace. Run the relevant tests.
+    fixture: fixtures/triage-pricing-review
+    verifier:
+      command: [python3]
+      script: verifiers/triage_pricing_review.py
+      timeout_seconds: 30
+  - id: plan-order-idempotency
+    prompt: >-
+      Read REQUEST.md and the repository. Create an implementation-ready plan in PLAN.md.
+      Base the plan on repository evidence. Do not modify code, tests, or existing documents.
+    fixture: fixtures/plan-order-idempotency
+    verifier:
+      command: [python3]
+      script: verifiers/plan_order_idempotency.py
+      timeout_seconds: 30

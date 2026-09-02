@@ -1,0 +1,34 @@
+description: pluginbench generated-config schema fixture
+prompts:
+  - "{{prompt}}"
+providers:
+  - id: openai:codex-sdk
+    config:
+      model: gpt-5.6-luna
+      model_reasoning_effort: high
+      working_dir: "{{workspace_dir}}"
+      skip_git_repo_check: true
+      sandbox_mode: workspace-write
+      approval_policy: never
+      network_access_enabled: false
+      web_search_enabled: false
+      enable_streaming: true
+      inherit_process_env: false
+      cli_env:
+        CODEX_HOME: "{{codex_home}}"
+        HOME: "{{isolated_home}}"
+tests:
+  - description: fixture--attempt-01
+    vars:
+      trial_id: fixture--attempt-01
+      task_id: fixture
+      attempt: "1"
+      prompt: Inspect the fixture.
+      workspace_dir: /tmp/pluginbench-workspace
+      codex_home: /tmp/pluginbench-codex-home
+      isolated_home: /tmp/pluginbench-home
+    metadata:
+      pluginbench_task_id: fixture
+      pluginbench_attempt: 1
+    options:
+      bustCache: true

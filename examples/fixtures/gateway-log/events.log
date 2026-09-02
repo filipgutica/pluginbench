@@ -1,0 +1,4 @@
+2026-08-31T10:00:00Z service=gateway status=200 message=ok
+2026-08-31T10:00:01Z service=gateway status=000 message=upstream_closed
+2026-08-31T10:00:02Z service=gateway status=503 message=unavailable
+2026-08-31T10:00:03Z service=gateway status=204 message=ok

@@ -1,0 +1,46 @@
+schema_version: 1
+experiment:
+  name: workflow-skill-smoke
+dataset:
+  adapter: local
+  name: workflow-skill-smoke
+  version: "2026-08-31.2"
+  source: tasks.yaml
+  task_ids:
+    - debug-profile-cache
+    - triage-pricing-review
+    - plan-order-idempotency
+skill:
+  path: ../../../filip-stack/plugins/workflow/skills
+agent:
+  provider: openai:codex-sdk
+  codex_sdk_version: 0.151.0
+  model: gpt-5.6-luna
+  reasoning: high
+  sandbox_mode: workspace-write
+  approval_policy: never
+  network_access_enabled: false
+  web_search_enabled: false
+  auth_file: ~/.codex/auth.json
+tooling:
+  promptfoo_version: 0.122.2
+execution:
+  baseline:
+    mode: run
+  attempts: 1
+  concurrency: 1
+  batch_size: 1
+  max_tasks: 3
+  timeout_seconds: 600
+limits:
+  max_total_tokens: 2000000
+  max_total_cost_usd: 0.25
+estimates:
+  tokens_per_trial: 450000
+  cost_per_trial_usd: 0.06
+decision:
+  minimum_pass_rate_lift_pp: 0
+  maximum_cost_overhead_pct: null
+  maximum_incremental_cost_per_additional_success_usd: null
+output:
+  runs_dir: ../../runs

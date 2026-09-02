@@ -1,0 +1,31 @@
+{
+  "evalId": "fixture-eval",
+  "results": {
+    "version": 3,
+    "timestamp": "2026-08-31T10:00:00Z",
+    "results": [
+      {
+        "id": "fixture-result",
+        "vars": {
+          "trial_id": "task-a--1",
+          "task_id": "task-a"
+        },
+        "success": true,
+        "score": 1,
+        "latencyMs": 500,
+        "response": {
+          "output": "done",
+          "tokenUsage": {
+            "prompt": 12,
+            "cached": 3,
+            "completion": 4
+          }
+        }
+      }
+    ],
+    "prompts": [],
+    "stats": {}
+  },
+  "config": {},
+  "shareableUrl": null
+}

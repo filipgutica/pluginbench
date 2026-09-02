@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pluginbench"
+version = "0.2.0"
+description = "Evaluate local Codex skills with paired Promptfoo runs."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "Filip Gutica" }]
+dependencies = [
+  "pydantic>=2.11,<3",
+  "PyYAML>=6.0.2,<7",
+  "typer>=0.16,<1",
+]
+
+[project.optional-dependencies]
+benchmark = [
+  "swebench==5.0.2",
+]
+dev = [
+  "build>=1.3,<2",
+  "mypy>=1.17,<2",
+  "pytest>=8.4,<9",
+  "ruff>=0.15,<0.16",
+  "types-PyYAML>=6.0.12,<7",
+]
+
+[project.scripts]
+pluginbench = "pluginbench.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/filipgutica/pluginbench"
+Repository = "https://github.com/filipgutica/pluginbench"
+Issues = "https://github.com/filipgutica/pluginbench/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pluginbench"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["pluginbench"]
