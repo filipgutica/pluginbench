@@ -15,6 +15,7 @@ from pluginbench.config import ConfigOverrides, PluginbenchConfig, load_config
 from pluginbench.datasets import load_tasks
 from pluginbench.experiment import build_dry_run, run_evaluation
 from pluginbench.promptfoo import PromptfooRunner
+from pluginbench.quality import build_quality_report, write_quality_reports
 from pluginbench.reporting import build_report, write_reports
 from pluginbench.review import (
     build_gold_calibration_dry_run,
@@ -452,6 +453,21 @@ def compare(
         write_reports(output, report_data)
         typer.echo(f"Reports: {output}")
     except (OSError, ValueError) as exc:
+        _show_error(exc)
+
+
+@app.command()
+def quality(
+    baseline_result: Path = typer.Argument(..., help="Baseline arm.json, arm, or run directory."),
+    treatment_result: Path = typer.Argument(..., help="Treatment arm.json, arm, or run directory."),
+    output: Path = typer.Option(Path("quality-report"), "--output"),
+) -> None:
+    """Compare the structure of compatible resolved SWE-bench patches."""
+    try:
+        generated = build_quality_report(baseline_result, treatment_result)
+        write_quality_reports(output, generated)
+        typer.echo(f"Reports: {output}")
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
         _show_error(exc)
 
 

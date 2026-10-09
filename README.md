@@ -424,6 +424,32 @@ The SWE-bench adapter keeps Promptfoo for Codex execution.
 It uses the official SWE-bench CLI for grading.
 The LiveSWEBench adapter remains deferred because its current harness needs manual log inspection.
 
+## Compare successful-patch quality
+
+Generate a read-only comparison from compatible completed SWE-bench arms or run directories:
+
+```bash
+.venv/bin/pluginbench quality runs/<baseline-run> runs/<treatment-run> \
+  --output quality-report
+```
+
+The command reconciles saved verifier artifacts with each arm's declared attempts, aligns
+artifacts by task ID and ordinal attempt number, and analyzes code only when both official
+SWE-bench summaries say `resolved`. Alignment is correctness and artifact bookkeeping; it
+does not imply shared randomness or support a paired-effect estimate. Seeded tasks use
+`agent-change.diff`; other tasks use `patch.diff`. JSON and Markdown reports keep line,
+file, dependency-manifest, Python AST, and reuse metrics separate—there is no composite
+quality score. Use the normal PluginBench reports for token, cost, and latency measurements.
+
+Python decision points count conditionals, loops, exception handlers, match cases,
+boolean branches, and comprehension filters. Existing-local-symbol calls refer to
+functions or classes already present in the same changed module. New top-level public
+symbols count newly introduced function and class definitions whose names do not start
+with `_`; they do not interpret `__all__` or dynamic exports. New-helper call counts match
+syntactic calls by function name in the same final changed module. These are transparent
+proxies, not maintainability judgments. Correction turns, human review time, and later
+maintenance are not measured.
+
 ## Artifacts
 
 ```text
