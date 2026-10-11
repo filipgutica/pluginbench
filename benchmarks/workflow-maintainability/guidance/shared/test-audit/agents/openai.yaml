@@ -1,0 +1,7 @@
+interface:
+  display_name: "Test Audit"
+  short_description: "Audit substantial or uncertain test coverage"
+  default_prompt: "Use $workflow:test-audit to inspect test value and coverage preservation in the requested scope."
+
+policy:
+  allow_implicit_invocation: true

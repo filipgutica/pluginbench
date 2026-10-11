@@ -1,0 +1,7 @@
+interface:
+  display_name: "Engineering"
+  short_description: "Implement small verified code changes"
+  default_prompt: "Use $workflow:engineering to make the smallest correct change and verify it."
+
+policy:
+  allow_implicit_invocation: true

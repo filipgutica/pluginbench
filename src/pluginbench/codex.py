@@ -1,0 +1,509 @@
+"""Isolated native execution and evidence shared by study and legacy runners."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import signal
+import subprocess
+import time
+from pathlib import Path
+from typing import Any
+
+
+GUIDANCE_NAMES = {
+    "AGENTS.md",
+    "AGENTS.override.md",
+    "CLAUDE.md",
+    ".agents",
+    ".claude",
+    ".codex",
+    ".claude-plugin",
+}
+
+
+def reject_guidance(
+    workspace: Path, *, include_ancestors: bool = True, reject_git: bool = False
+) -> None:
+    """Reject custom instruction discovery surfaces before staging treatment text."""
+    root = workspace.resolve()
+    if not root.is_dir():
+        raise ValueError(f"workspace is not a directory: {workspace}")
+    contaminants = []
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        if ".git" in relative.parts and not reject_git:
+            continue
+        if path.is_symlink():
+            contaminants.append(str(path))
+        elif path.name in GUIDANCE_NAMES or (reject_git and path.name == ".git"):
+            contaminants.append(str(path))
+    if include_ancestors:
+        contaminants.extend(
+            str(parent / name)
+            for parent in root.parents
+            for name in GUIDANCE_NAMES
+            if (parent / name).exists()
+        )
+    if contaminants:
+        raise ValueError(
+            "custom guidance or unsupported fixture paths: " + ", ".join(sorted(contaminants))
+        )
+
+
+def preflight() -> dict[str, Any]:
+    """Check native runtime capabilities locally without invoking a model."""
+    outputs = {}
+    for key, arguments in (("version", ["--version"]), ("help", ["exec", "--help"])):
+        result = subprocess.run(
+            ["codex", *arguments], capture_output=True, text=True, timeout=15, check=False
+        )
+        if result.returncode:
+            raise ValueError(f"codex {key} check failed (exit {result.returncode})")
+        outputs[key] = result.stdout
+    required = (
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--json",
+        "--model",
+        "--config",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--skip-git-repo-check",
+        "--cd",
+    )
+    missing = [flag for flag in required if flag not in outputs["help"]]
+    if missing:
+        raise ValueError("native codex lacks required isolation flags: " + ", ".join(missing))
+    return {
+        "harness": "codex-cli",
+        "harness_version": outputs["version"].strip(),
+        "help": outputs["help"],
+        "required_flags": list(required),
+        "paid_calls": 0,
+    }
+
+
+def write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".new")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def credential_values(auth_file: Path) -> tuple[str, ...]:
+    """Collect credential scalars for redaction without exposing them in receipts."""
+    values: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for child in value.values():
+                collect(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect(child)
+        elif isinstance(value, str) and len(value) > 20:
+            values.append(value)
+
+    collect(json.loads(auth_file.read_text()))
+    return tuple(values)
+
+
+def scrub_artifacts(directory: Path, secrets: tuple[str, ...]) -> None:
+    for path in directory.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            original = path.read_bytes()
+            content = original
+            for secret in secrets:
+                content = content.replace(secret.encode(), b"<redacted-credential>")
+            if content != original:
+                path.write_bytes(content)
+
+
+def runtime_environment(
+    private: Path, host: str, *, auth_file: Path | None = None
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    if host == "claude":
+        from pluginbench import claude
+
+        return claude.runtime_environment(private, auth_file=auth_file)
+    private.mkdir(mode=0o700)
+    home = private / "home"
+    home.mkdir(mode=0o700)
+    temporary = private / "tmp"
+    temporary.mkdir(mode=0o700)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        in {
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "NODE_EXTRA_CA_CERTS",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+        }
+    }
+    env.update(
+        HOME=str(home), TMPDIR=str(temporary), XDG_CONFIG_HOME=str(home / ".config"), NO_COLOR="1"
+    )
+    secrets: list[str] = []
+    if host == "codex":
+        config = private / "codex"
+        config.mkdir(mode=0o700)
+        auth = auth_file if auth_file is not None else Path.home() / ".codex/auth.json"
+        shutil.copy2(auth, config / "auth.json")
+        (config / "auth.json").chmod(0o600)
+
+        secrets.extend(credential_values(auth))
+        env["CODEX_HOME"] = str(config)
+    else:
+        raise ValueError(f"unsupported native host: {host}")
+    return env, tuple(secrets)
+
+
+def command(
+    *,
+    host: str,
+    model: str,
+    workspace: Path,
+    plugin: Path | None,
+    effort: str = "medium",
+    read_only: bool = False,
+) -> list[str]:
+    if host == "claude":
+        from pluginbench import claude
+
+        return claude.command(
+            model=model, workspace=workspace, plugin=plugin, effort=effort, read_only=read_only
+        )
+    if host == "codex":
+        return [
+            "codex",
+            "exec",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--json",
+            "-m",
+            model,
+            "-c",
+            f"model_reasoning_effort={json.dumps(effort)}",
+            "-c",
+            'web_search="disabled"',
+            "-c",
+            "features.multi_agent=false",
+            *(
+                ["--sandbox", "read-only", "-c", 'approval_policy="never"']
+                if read_only
+                else ["--dangerously-bypass-approvals-and-sandbox"]
+            ),
+            "--skip-git-repo-check",
+            "-C",
+            str(workspace),
+            "-",
+        ]
+    raise ValueError(f"unsupported native host: {host}")
+
+
+def observed_cli_version(startup: object, *, host: str = "codex") -> str | None:
+    """Return the exact agreed version from native session metadata, or unknown."""
+    if not isinstance(startup, list):
+        return None
+    if host == "claude":
+        from pluginbench import claude
+
+        return claude.observed_cli_version(startup)
+    versions: set[str] = set()
+    for event in startup:
+        if not isinstance(event, dict) or event.get("type") != "session_meta":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        version = payload.get("cli_version")
+        if not isinstance(version, str) or not version.strip():
+            return None
+        versions.add(version)
+    return next(iter(versions)) if len(versions) == 1 else None
+
+
+def parse_events(
+    stdout: str, traces: list[str], host: str, *, requested_effort: str = "medium"
+) -> dict[str, Any]:
+    if host == "claude":
+        from pluginbench import claude
+
+        return claude.parse_events(stdout, traces, requested_effort=requested_effort)
+    if host != "codex":
+        raise ValueError(f"unsupported native host: {host}")
+    commands: list[dict[str, Any]] = []
+    models = set()
+    usage = None
+    startup = []
+    errors: list[Any] = []
+    tools = []
+    final = []
+    successful_completion = False
+    turn_usage: list[dict[str, int]] = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            errors.append("malformed stdout JSONL")
+            continue
+        if not isinstance(event, dict):
+            errors.append("stdout JSONL event is not an object")
+            continue
+        item = event.get("item", {})
+        if not isinstance(item, dict):
+            errors.append("stdout item is not an object")
+            continue
+        if event.get("type") == "item.completed" and item.get("type") == "command_execution":
+            commands.append(item)
+        if item.get("type") == "agent_message" and event.get("type") == "item.completed":
+            message_text = item.get("text", "")
+            if isinstance(message_text, str):
+                final.append(message_text)
+            else:
+                errors.append("invalid agent message text")
+        if event.get("type") == "turn.completed":
+            reported = event.get("usage")
+            if isinstance(reported, dict) and all(
+                isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                for value in reported.values()
+            ):
+                turn_usage.append(reported)
+            else:
+                errors.append("invalid turn usage")
+            successful_completion = True
+        if event.get("type") in {"error", "turn.failed"}:
+            errors.append(event)
+        if item.get("type") not in {None, "command_execution", "agent_message", "reasoning"}:
+            tools.append(item)
+    effort = set()
+    partial_usage = []
+    for trace in traces:
+        last_observed_usage = None
+        for line in trace.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                errors.append("malformed trace JSONL")
+                continue
+            if not isinstance(event, dict):
+                errors.append("trace JSONL event is not an object")
+                continue
+            if event.get("type") == "event_msg":
+                payload = event.get("payload", {})
+                info = payload.get("info") if isinstance(payload, dict) else None
+                observed = info.get("total_token_usage") if isinstance(info, dict) else None
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("type") == "token_count"
+                    and isinstance(observed, dict)
+                ):
+                    if observed and all(
+                        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                        for value in observed.values()
+                    ):
+                        last_observed_usage = observed
+            if event.get("type") in {"session_meta", "turn_context"}:
+                payload = event.get("payload", {})
+                startup.append({"type": event["type"], "payload": payload})
+                if not isinstance(payload, dict):
+                    errors.append("trace payload is not an object")
+                    continue
+                if event["type"] == "turn_context":
+                    if isinstance(payload.get("model"), str):
+                        models.add(payload["model"])
+                    elif payload.get("model") is not None:
+                        errors.append("invalid trace model")
+                    if isinstance(payload.get("effort"), str):
+                        effort.add(payload["effort"])
+                    elif payload.get("effort") is not None:
+                        errors.append("invalid trace effort")
+        if last_observed_usage is not None:
+            partial_usage.append(
+                {
+                    "trace_sha256": "sha256:" + hashlib.sha256(trace.encode()).hexdigest(),
+                    "tokens": last_observed_usage,
+                    "status": "last observed session total; incomplete usage lower bound",
+                }
+            )
+    if turn_usage:
+        # Missing usage fields stay unknown instead of being silently undercounted.
+        common_keys = set.intersection(*(set(turn) for turn in turn_usage))
+        usage = {key: sum(turn[key] for turn in turn_usage) for key in sorted(common_keys)}
+    return {
+        "command_items": commands,
+        "actual_primary_models": sorted(models),
+        "usage": usage,
+        "partial_usage": partial_usage if usage is None else [],
+        "native_dollars": None,
+        "dollars_status": "unknown",
+        "requested_effort": requested_effort,
+        "runtime_effort_evidence": sorted(effort),
+        "startup": startup,
+        "observed_cli_version": observed_cli_version(startup),
+        "other_tools": tools,
+        "stream_errors": errors,
+        "final": final[-1] if final else "",
+        "agent_messages": final,
+        "successful_native_completion": successful_completion and not errors,
+    }
+
+
+def validated_claude_launch(execution: dict[str, Any], model: str, effort: str) -> bool:
+    """Bind a requested effort to an isolated launch without claiming effective effort."""
+    launch = execution.get("launch")
+    if not isinstance(launch, dict) or execution.get("actual_primary_models") != [model]:
+        return False
+    argv = launch.get("argv")
+    return (
+        bool(
+            launch.get("harness") == "claude-cli"
+            and launch.get("requested_model") == model
+            and launch.get("requested_effort") == effort
+            and launch.get("harness_version")
+            and isinstance(argv, list)
+            and ["--model", model] == argv[argv.index("--model") : argv.index("--model") + 2]
+            and ["--effort", effort] == argv[argv.index("--effort") : argv.index("--effort") + 2]
+            and "--safe-mode" in argv
+            and execution.get("runtime_effort_evidence") in ([], [effort])
+        )
+        if isinstance(argv, list) and "--model" in argv and "--effort" in argv
+        else False
+    )
+
+
+def invoke(
+    *,
+    area: Path,
+    entry: dict[str, Any],
+    protocol: dict[str, Any],
+    prompt: str,
+    timeout: int,
+    read_only: bool = False,
+    output_schema: Path | None = None,
+) -> dict[str, Any]:
+    artifacts = area / "artifacts"
+    artifacts.mkdir(exist_ok=True)
+    if any((artifacts / name).exists() for name in ("invocation.json", "execution.json")):
+        raise ValueError("native invocation artifacts already exist; use a fresh trial area")
+    private = area / "private"
+    effort = protocol.get("reasoning", "medium")
+    if not isinstance(effort, str) or not effort:
+        raise ValueError("reasoning must be a nonempty effort string")
+    argv = command(
+        host=entry["host"],
+        model=protocol["models"][entry["host"]],
+        workspace=area / "workspace",
+        plugin=None,
+        effort=effort,
+        read_only=read_only,
+    )
+    if output_schema is not None:
+        if entry["host"] == "claude":
+            argv.extend(["--json-schema", json.dumps(json.loads(output_schema.read_text()))])
+        else:
+            argv[-1:-1] = ["--output-schema", str(output_schema)]
+    launch = {
+        "harness": entry["host"] + "-cli",
+        "requested_model": protocol["models"][entry["host"]],
+        "requested_effort": effort,
+        "argv": argv,
+    }
+    if entry["host"] == "claude":
+        from pluginbench import claude
+
+        launch["harness_version"] = claude.preflight()["harness_version"]
+    write_json(
+        artifacts / "invocation.json",
+        {**launch, "timeout_seconds": timeout},
+    )
+    (artifacts / "prompt.txt").write_text(prompt)
+    secrets: tuple[str, ...] = ()
+    started = time.monotonic()
+    timed_out = False
+    proc = None
+    traces = []
+    try:
+        auth_file = protocol.get("auth_file")
+        env, secrets = runtime_environment(
+            private,
+            entry["host"],
+            **({"auth_file": Path(auth_file).expanduser()} if auth_file is not None else {}),
+        )
+        write_json(
+            artifacts / "runtime-isolation.json",
+            {
+                "environment_keys": sorted(env),
+                "private_startup_files": sorted(
+                    str(p.relative_to(private)) for p in private.rglob("*") if p.is_file()
+                ),
+                "fresh_home": not any((private / "home").iterdir())
+                if (private / "home").is_dir()
+                else None,
+                "configuration_source": "private auth only; user/project setting sources disabled",
+                "native_builtin_instructions": "retained",
+            },
+        )
+        with (
+            (artifacts / "stdout.jsonl").open("w") as stdout,
+            (artifacts / "stderr.log").open("w") as stderr,
+        ):
+            proc = subprocess.Popen(
+                argv,
+                cwd=area / "workspace",
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=stdout,
+                stderr=stderr,
+                text=True,
+                start_new_session=True,
+            )
+            try:
+                proc.communicate(prompt, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                os.killpg(proc.pid, signal.SIGTERM)
+                try:
+                    proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.communicate()
+    finally:
+        if proc is not None and proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+        for path in sorted((private / "codex/sessions").rglob("*.jsonl")):
+            traces.append(path.read_text())
+        for index, trace in enumerate(traces):
+            (artifacts / f"host-trace-{index}.jsonl").write_text(trace)
+        if private.exists():
+            shutil.rmtree(private)
+        scrub_artifacts(artifacts, secrets)
+        write_json(
+            artifacts / "execution.json",
+            {
+                "exit_code": proc.returncode if proc is not None else None,
+                "timed_out": timed_out,
+                "elapsed_seconds": time.monotonic() - started,
+                "private_runtime_removed": not private.exists(),
+            },
+        )
+    traces = [p.read_text() for p in sorted(artifacts.glob("host-trace-*.jsonl"))]
+    parsed = parse_events(
+        (artifacts / "stdout.jsonl").read_text(), traces, entry["host"], requested_effort=effort
+    )
+    if timed_out or proc is None or proc.returncode != 0:
+        parsed["successful_native_completion"] = False
+    parsed["launch"] = launch
+    parsed["launch_harness_version"] = launch.get("harness_version")
+    write_json(artifacts / "host-evidence.json", parsed)
+    return {**json.loads((artifacts / "execution.json").read_text()), **parsed}

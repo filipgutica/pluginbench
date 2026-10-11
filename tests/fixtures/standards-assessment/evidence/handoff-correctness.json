@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "snapshot_digest": "sha256:e4278ffd925aa416535e1bd4e2f5640b98f54eccbee2bed9811ef577c0a462e4",
+  "checks": {
+    "behavior": false
+  },
+  "command": [
+    "python3",
+    "-c",
+    "namespace = {}; exec(open('src/answer.py').read(), namespace); assert namespace['answer']() == 42"
+  ],
+  "tool": "Python deterministic demo oracle",
+  "tool_version": "3.14.7"
+}

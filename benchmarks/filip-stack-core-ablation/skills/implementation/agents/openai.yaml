@@ -1,9 +1,0 @@
-interface:
-  display_name: "Implementation"
-  short_description: "Implement the smallest tested behavior change"
-  default_prompt: >-
-    Use $workflow:implementation to implement only the active slice with focused
-    test-driven evidence. Stop when the work crosses its stated boundary.
-
-policy:
-  allow_implicit_invocation: true

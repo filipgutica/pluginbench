@@ -2,33 +2,19 @@
 
 ## Supported version
 
-PluginBench is an experimental proof of concept. Only the current `main` branch is supported.
+PluginBench is experimental. The latest release and current `main` branch are supported.
 
 ## Execution boundary
 
-PluginBench executes model-generated commands against local task workspaces. Use only trusted task catalogs, skill bundles, and repository snapshots.
+PluginBench executes model-generated commands against local task workspaces. Use only trusted task catalogs, text guidance, and repository snapshots.
 
-The SWE-bench runtime uses a privileged outer Docker container. It grants `SYS_ADMIN` and disables the outer AppArmor and seccomp profiles.
+Implementation runs use a local Codex or Claude process with write-capable tools, disabled user configuration, and fresh runtime homes. Reviews use read-only mode or restricted tools. This isolates supplied instructions; it is not operating-system containment. Use disposable tasks on a trusted machine. This execution path is not suitable for shared hosting.
 
-The inner Codex sandbox applies the configured file and network restrictions. This design is not suitable for a shared or hosted service.
+PluginBench copies only Codex authentication into a temporary private home. Claude uses a single selected credential with private settings and a restricted reviewer tool set. The primary runner removes that home after each bounded invocation, including failures and timeouts.
 
-PluginBench copies the configured Codex `auth.json` into a temporary isolated home. It removes that home after each bounded execution batch.
+DeepSWE tasks are adapted to local source snapshots with separate hidden verification. Hidden tests and reference solutions are excluded from the supplied workspace; local execution does not prevent a model from accessing the host filesystem.
 
 Never commit `auth.json`, API keys, run directories, or model traces that contain secrets.
-
-## Known dependency advisories
-
-The pinned `promptfoo@0.122.2` release currently reports high-severity advisories in optional or transitive dependencies.
-
-The current upstream release does not remove all reported advisories. PluginBench keeps the tested pin and does not suppress the audit result.
-
-Run this command before each release:
-
-```bash
-npm audit --omit=dev
-```
-
-Review each advisory against the local execution path. Update Promptfoo when upstream publishes a compatible fix.
 
 ## Reporting a vulnerability
 

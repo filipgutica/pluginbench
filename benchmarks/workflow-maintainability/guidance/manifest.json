@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "files": {
+    "candidate/SKILL.md": "f1ab30c51c30ab365c6ac4d1d164a37dc901260652c988921569467207667c84",
+    "old/SKILL.md": "a9372fca5749f0d3767f446df5d275cb12098239553a8e2bffdecded009fe21d",
+    "shared/engineering/agents/openai.yaml": "09c5cf46717b5d2deb99c4ff33722e3317b59c73cc840a20ce7061648100ff57",
+    "shared/engineering/references/commit-and-pr-hygiene.md": "3ea25d411c5c18ac411dc8628bbdaf6b59b87ab7f17d27f0b58c967c23220db1",
+    "shared/engineering/references/delegation-and-review.md": "232ebbda791bbc74e5e5c87358aa2b26dc743884d9927094497f6fd7d07a70f9",
+    "shared/engineering/references/testing-and-debugging.md": "3bf606714a3c33a72ec49ad9a823d317211a322313038a302af4369b7195859b",
+    "shared/engineering/references/verification-tools.md": "29a79465072fc57c7442d46dfac37ae2405f6ce9c7c0683072b0abc2854b7f71",
+    "shared/technical-writing/SKILL.md": "bef9067556c3fc3fda614f4c069ab561fa0bc6396f903d3b375e51a030f02938",
+    "shared/technical-writing/agents/openai.yaml": "99f30ba0651e95598b0fce4c67efab6f5f771753f0bc9302e45c9f8f4ae844be",
+    "shared/technical-writing/references/technical-prose.md": "57dbbc5883dac1468b08340379080c7a364230651b8ef3cf5256f48fbaff40e3",
+    "shared/test-audit/SKILL.md": "dcfb483fcdea43d4db09eace1dd7b8f88fbe7bbfcfd28915623e73d4d1880426",
+    "shared/test-audit/agents/openai.yaml": "d62013da8eb0fe199b5fc5ad1428504ed407e63cb39ab8a09fe8870fb187a44d",
+    "shared/test-audit/references/campaign.md": "fb7d2fa14065a2caacb75047da037a026859fe8a98b199e4df0cdd3213ca3535",
+    "shared/test-audit/references/value-criteria.md": "58bc9f8a93cba81bb7f62e97f927399340fae9fd0fb8daf3949bf81fd6617b78",
+    "stripped/SKILL.md": "2638fd86889de3373ce69dc46f56eb2f93a745bcc78cfbc2c45be947561e7d7f"
+  },
+  "candidate_sha256": "f1ab30c51c30ab365c6ac4d1d164a37dc901260652c988921569467207667c84",
+  "words": {
+    "old": 701,
+    "candidate": 703,
+    "stripped": 282
+  }
+}

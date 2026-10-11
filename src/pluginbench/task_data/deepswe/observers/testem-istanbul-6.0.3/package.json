@@ -1,0 +1,8 @@
+{
+  "name": "testem-istanbul-6.0.3",
+  "private": true,
+  "dependencies": {
+    "istanbul-lib-coverage": "3.2.2",
+    "istanbul-lib-instrument": "6.0.3"
+  }
+}

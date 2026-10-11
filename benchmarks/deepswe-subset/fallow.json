@@ -1,0 +1,19 @@
+{
+  "entry": [
+    "src/index.*"
+  ],
+  "production": true,
+  "ignorePatterns": [
+    "test/**",
+    "tests/**",
+    "examples/**",
+    "benchmark/**",
+    "benchmarks/**",
+    "media/**"
+  ],
+  "health": {
+    "maxCognitive": 0,
+    "maxCyclomatic": 0,
+    "maxUnitSize": 0
+  }
+}

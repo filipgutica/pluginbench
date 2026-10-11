@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "stage_digests": {
+    "handoff": "sha256:e4278ffd925aa416535e1bd4e2f5640b98f54eccbee2bed9811ef577c0a462e4",
+    "final": "sha256:f7b7a2e1362af3da9b041b7779ba012bc3fdf1a3d27d1b3f14807b84c756dda7"
+  },
+  "corrections": [
+    {
+      "issue_id": "answer-42",
+      "round": 1,
+      "from_stage": "handoff",
+      "to_stage": "final",
+      "category": "correctness",
+      "external_verification": {
+        "path": "evidence/issue-answer.json",
+        "sha256": "sha256:45f7d4d2926e34eab0cac5de453191227e7342ef60eb6b078a5c6185c84a0f12"
+      }
+    }
+  ],
+  "self_cleanup": [],
+  "completeness": {
+    "path": "evidence/ledger-completeness.json",
+    "sha256": "sha256:f1370b42dbb404776ccf6763b257282d709d73610b88e776239d66e8a70deacd"
+  }
+}

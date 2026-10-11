@@ -1,0 +1,42 @@
+--- a/src/concurrency.ts
++++ b/src/concurrency.ts
+@@ -1,19 +1,32 @@
+-/** Run tasks with a bounded number in flight, preserving input order in the result. */
++/** Run tasks with bounded concurrency, ordered results, and drained failure. */
+ export const mapLimit = async <T, R>(
+   items: readonly T[],
+   limit: number,
+   fn: (item: T, index: number) => Promise<R>,
+ ): Promise<R[]> => {
++  if (!Number.isInteger(limit) || limit < 1) {
++    throw new RangeError('concurrency must be a positive finite integer');
++  }
+   const results = new Array<R>(items.length);
+-  let next = 0;
++  const entries = items.entries();
++  let failed = false;
++  let failure: unknown;
+   const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+-    for (;;) {
+-      const index = next++;
+-      const item = items[index];
+-      if (index >= items.length || item === undefined) return;
+-      results[index] = await fn(item, index);
++    while (!failed) {
++      const entry = entries.next();
++      if (entry.done) return;
++      const [index, item] = entry.value;
++      try {
++        results[index] = await fn(item, index);
++      } catch (error) {
++        if (!failed) {
++          failed = true;
++          failure = error;
++        }
++      }
+     }
+   });
+   await Promise.all(workers);
++  if (failed) throw failure;
+   return results;
+ };

@@ -1,7 +1,0 @@
-interface:
-  display_name: "Systematic Debugging"
-  short_description: "Find and verify a root cause before fixing"
-  default_prompt: "Use $workflow:systematic-debugging to investigate this failure from reproduction to root cause."
-
-policy:
-  allow_implicit_invocation: true

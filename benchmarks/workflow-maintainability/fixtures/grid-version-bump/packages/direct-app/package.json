@@ -1,0 +1,6 @@
+{
+  "name": "@fixture/direct-app",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {"@fixture/grid-widget": "1.0.0", "@kong-ui-public/table-data-grid": "1.4.0"}
+}
