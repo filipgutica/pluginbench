@@ -13,13 +13,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from pluginbench.config import DatasetConfig
 
 
-STARTING_PATCH_INSTRUCTION = (
-    "A proposed implementation is already applied and staged in the workspace. "
-    "Review it against the issue, preserve correct work, fix any defects, and verify "
-    "the final result. Do not assume the proposed implementation is correct."
-)
-
-
 class CatalogModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -35,6 +28,7 @@ class TaskEntry(CatalogModel):
     prompt: str = Field(min_length=1)
     fixture: Path
     verifier: VerifierEntry
+    provenance: dict[str, str] | None = None
 
 
 class TaskCatalog(CatalogModel):
@@ -50,34 +44,13 @@ class VerifierSpec:
 
 
 @dataclass(frozen=True)
-class SWEbenchSpec:
-    repo: str
-    base_commit: str
-    image: str
-    dataset_name: str
-    dataset_version: str
-    harness_executable: Path
-    harness_version: str
-    image_platform: str | None
-    row: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class StartingPatchSpec:
-    path: Path
-    digest: str
-    expected_score: Literal[0, 1]
-
-
-@dataclass(frozen=True)
 class TaskSpec:
     task_id: str
     prompt: str
     fixture: Path | None
     verifier: VerifierSpec | None
     digest: str
-    swebench: SWEbenchSpec | None = None
-    starting_patch: StartingPatchSpec | None = None
+    provenance: dict[str, str] | None = None
 
 
 def _fixture_entries(root: Path) -> tuple[list[Path], list[Path]]:
@@ -113,6 +86,8 @@ def _task_digest(entry: TaskEntry, fixture: Path, verifier_script: Path) -> str:
         "prompt": entry.prompt,
         "verifier": entry.verifier.model_dump(mode="json"),
     }
+    if entry.provenance is not None:
+        contract["provenance"] = entry.provenance
     digest.update(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode())
     directories, files = _fixture_entries(fixture)
     for path in directories:
@@ -130,7 +105,7 @@ def _task_digest(entry: TaskEntry, fixture: Path, verifier_script: Path) -> str:
     return f"sha256:{digest.hexdigest()}"
 
 
-def _load_local_tasks(config: DatasetConfig) -> list[TaskSpec]:
+def load_tasks(config: DatasetConfig) -> list[TaskSpec]:
     source = Path(config.source)
     try:
         loaded = yaml.safe_load(source.read_text())
@@ -169,121 +144,7 @@ def _load_local_tasks(config: DatasetConfig) -> list[TaskSpec]:
                     timeout_seconds=entry.verifier.timeout_seconds,
                 ),
                 digest=_task_digest(entry, fixture, verifier_script),
+                provenance=entry.provenance,
             )
         )
     return tasks
-
-
-class SWEbenchRow(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    instance_id: str = Field(min_length=1)
-    repo: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-    base_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
-    problem_statement: str = Field(min_length=1)
-    version: str = Field(min_length=1)
-    image: str = Field(pattern=r"^[A-Za-z0-9._/-]+@sha256:[0-9a-f]{64}$")
-    eval_script: str = Field(min_length=1)
-    log_parser: str = Field(min_length=1)
-    eval_type: str = Field(min_length=1)
-    FAIL_TO_PASS: list[str] | str
-    PASS_TO_PASS: list[str] | str
-
-
-def _read_swebench_rows(source: Path) -> list[dict[str, Any]]:
-    try:
-        if source.suffix == ".jsonl":
-            loaded = [json.loads(line) for line in source.read_text().splitlines() if line.strip()]
-        else:
-            loaded = json.loads(source.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"cannot read SWE-bench snapshot {source}: {exc}") from exc
-    if not isinstance(loaded, list) or not all(isinstance(row, dict) for row in loaded):
-        raise ValueError("SWE-bench snapshot must contain a JSON list of task objects")
-    return loaded
-
-
-def _swebench_digest(row: dict[str, Any]) -> str:
-    encoded = json.dumps(row, sort_keys=True, separators=(",", ":")).encode()
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
-
-
-def _load_starting_patch(config: DatasetConfig, task_id: str) -> StartingPatchSpec | None:
-    configured = config.starting_patches.get(task_id)
-    if configured is None:
-        return None
-    if not configured.path.is_file():
-        raise ValueError(f"starting patch does not exist for {task_id}: {configured.path}")
-    content = configured.path.read_bytes()
-    if not content:
-        raise ValueError(f"starting patch is empty for {task_id}: {configured.path}")
-    return StartingPatchSpec(
-        path=configured.path,
-        digest=f"sha256:{hashlib.sha256(content).hexdigest()}",
-        expected_score=configured.expected_score,
-    )
-
-
-def _load_swebench_tasks(config: DatasetConfig) -> list[TaskSpec]:
-    assert isinstance(config.source, Path)
-    assert config.harness is not None
-    rows = [SWEbenchRow.model_validate(row) for row in _read_swebench_rows(config.source)]
-    by_id = {row.instance_id: row for row in rows}
-    if len(by_id) != len(rows):
-        raise ValueError("SWE-bench snapshot contains duplicate task IDs")
-    missing = [task_id for task_id in config.task_ids if task_id not in by_id]
-    if missing:
-        raise ValueError(
-            "selected task IDs are missing from SWE-bench snapshot: " + ", ".join(missing)
-        )
-
-    tasks: list[TaskSpec] = []
-    for task_id in config.task_ids:
-        row = by_id[task_id]
-        serialized = row.model_dump(mode="json")
-        starting_patch = _load_starting_patch(config, task_id)
-        prompt = row.problem_statement
-        digest_input = serialized
-        if starting_patch is not None:
-            prompt = f"{prompt}\n\n{STARTING_PATCH_INSTRUCTION}"
-            digest_input = {
-                "row": serialized,
-                "prompt": prompt,
-                "starting_patch": {
-                    "digest": starting_patch.digest,
-                    "expected_score": starting_patch.expected_score,
-                },
-            }
-        tasks.append(
-            TaskSpec(
-                task_id=task_id,
-                prompt=prompt,
-                fixture=None,
-                verifier=None,
-                digest=_swebench_digest(digest_input),
-                swebench=SWEbenchSpec(
-                    repo=row.repo,
-                    base_commit=row.base_commit,
-                    image=row.image,
-                    dataset_name=config.name,
-                    dataset_version=config.version,
-                    harness_executable=config.harness.executable,
-                    harness_version=config.harness.version,
-                    image_platform=config.harness.image_platform,
-                    row=serialized,
-                ),
-                starting_patch=starting_patch,
-            )
-        )
-    return tasks
-
-
-def load_tasks(config: DatasetConfig) -> list[TaskSpec]:
-    if config.adapter == "local":
-        return _load_local_tasks(config)
-    if config.adapter == "swe-bench":
-        return _load_swebench_tasks(config)
-    raise ValueError(
-        f"dataset adapter {config.adapter!r} requires its native benchmark harness; "
-        "the Promptfoo POC currently executes local fixture catalogs only"
-    )

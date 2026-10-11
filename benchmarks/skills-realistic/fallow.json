@@ -1,0 +1,6 @@
+{
+  "entry": ["src/query.ts", "src/catalog.ts"],
+  "production": true,
+  "ignorePatterns": ["test/**"],
+  "health": {"maxCognitive": 0, "maxCyclomatic": 0, "maxUnitSize": 0}
+}

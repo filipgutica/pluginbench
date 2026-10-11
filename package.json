@@ -1,13 +1,16 @@
 {
-  "name": "pluginbench-runtime",
+  "name": "pluginbench-charts",
   "private": true,
-  "version": "0.2.0",
-  "description": "Pinned Promptfoo runtime for pluginbench",
+  "version": "0.3.0",
+  "description": "Build the vendored ECharts report bundle",
   "engines": {
-    "node": ">=22.22.0"
+    "node": ">=22.20.0"
   },
-  "dependencies": {
-    "@openai/codex-sdk": "0.151.0",
-    "promptfoo": "0.122.2"
+  "devDependencies": {
+    "echarts": "6.1.0",
+    "esbuild": "0.28.2"
+  },
+  "scripts": {
+    "build:charts": "node scripts/build-charts.mjs"
   }
 }

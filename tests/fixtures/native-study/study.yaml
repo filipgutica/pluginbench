@@ -1,0 +1,8 @@
+schema_version: 1
+name: Log summary smoke test
+tasks: tasks.yaml
+guidance:
+  example-skill: [skills/example]
+model: gpt-6.1-sol
+reasoning: medium
+repeats: 1

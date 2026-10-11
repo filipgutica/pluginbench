@@ -1,0 +1,6 @@
+{
+  "name": "selection-count-fixture",
+  "private": true,
+  "type": "module",
+  "scripts": {"test": "node --experimental-strip-types --test test/*.test.ts"}
+}

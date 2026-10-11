@@ -1,0 +1,7 @@
+interface:
+  display_name: "Technical Writing"
+  short_description: "Write concise evidence-based technical prose"
+  default_prompt: "Use $workflow:technical-writing to rewrite this technical artifact clearly and concisely."
+
+policy:
+  allow_implicit_invocation: true

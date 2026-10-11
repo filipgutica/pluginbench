@@ -1,0 +1,28 @@
+name: Workflow versus Superpowers
+runner:
+  harness: codex                # codex or claude
+  model: gpt-6.1-sol
+  reasoning: medium
+
+guidance:
+  workflow: [/path/to/workflow/skills]
+  superpowers: [/path/to/superpowers/skills]
+  # Each named package can combine skills and global instruction files.
+  # Vanilla is included automatically.
+
+tasks:
+  source: /tmp/deep-swe/tasks
+  ids:
+    - ofetch-per-origin-circuit-breaker
+    - testem-per-launcher-reports
+    - happy-dom-abort-pending-body-reads
+
+measurements: [tokens, lines, cyclomatic, cognitive, dead_code, coverage, test_overlap, review]
+reviewer:
+  harness: codex
+  model: gpt-6-astra
+  reasoning: high
+  guidance: [/path/to/fixed-review-standards.md]  # Same criteria for all outputs.
+
+repeats: 3
+# jobs: 2  # Optional override; default is up to four CPU cores.

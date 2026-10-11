@@ -1,0 +1,1 @@
+{"test_globs": ["test/*.test.ts", "test/**/*.test.ts"]}

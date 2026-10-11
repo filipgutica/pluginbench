@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/filipgutica/wtree",
+  "commit": "fbf9a5e2fbdb865d539db64738eb82facd8255ea",
+  "license": {
+    "status": "no upstream license declared",
+    "evidence": "No LICENSE file and no package.json license field at source commit. Repository owner is the benchmark user. No permission for public redistribution is inferred."
+  },
+  "production_source": {
+    "src/filter.ts": {
+      "sha256": "1ff1db69a4e2ba7e9099be19cc6123e11a9be40a26b74ac0d0886064f87418d0"
+    },
+    "src/types.ts": {
+      "sha256": "980b02127a80557bb7cd1572e40c8a98a0a4cf6f58bbfbe61513d4be329f4d5c"
+    },
+    "src/exec.ts": {
+      "sha256": "e1d243f71c58ebae8153fc708396b7e81446e6b72fb43857e25d1f235a1c98a3"
+    },
+    "src/cli.ts": {
+      "sha256": "c4e6a6ab3bc44fc02f426c8b8e6aaeee679b4578f4dd34a808a720ec88741ffb"
+    },
+    "src/enrich.ts": {
+      "sha256": "53c2c6dc630d5f3f33fb0a9f649c30a2660cb716f20f2f354f620eb2a2bb1729"
+    },
+    "test/filter.test.ts": {
+      "sha256": "803f362111ddb2c024974193dcf7f4847113ce424dce98f725127f1a6d63c4d6"
+    },
+    "test/helpers.ts": {
+      "sha256": "4308b7248948c0d7bde74963be30e608e36525ce0ef835799f41476bccf6c7dd"
+    }
+  },
+  "adaptations": {
+    "both/src/filter.ts": "Complete production module; relative import extensions mechanically changed from .js to .ts.",
+    "both/src/types.ts": "Complete production types module, unchanged.",
+    "both/test/filter.test.ts": "Complete production test module; import extensions mechanically changed from .js to .ts.",
+    "both/test/helpers.ts": "Production fixture helper; import extension mechanically changed from .js to .ts.",
+    "both/src/options.ts": "Adapted FilterOptions, normalizeDone and buildFilters from src/cli.ts; exported them and changed buildFilters to a parameter object. Commander registration and destructive-command guards excluded.",
+    "both/src/query.ts": "New benchmark caller modeling list option normalization, filtering and sorting from src/cli.ts. Does not execute commands.",
+    "bounded-collection/src/concurrency.ts": "Exact mapLimit excerpt from src/exec.ts. Invalid-limit and undefined-element behavior exists in source; stop-and-drain failure semantics are a benchmark-requested contract extension, not a claim of a production incident.",
+    "bounded-collection/src/collect.ts": "Adapted src/enrich.ts collect orchestration, using a typed in-memory CollectionSource in place of Git, filesystem, disk usage and GitHub adapters. Inputs are already normalized paths. PR merge and main/current flags retained as scenario responsibilities.",
+    "bounded-collection/src/catalog.ts": "New benchmark list/refresh caller composing collection and query.",
+    "both/test/query.test.ts and bounded-collection/test/collect.test.ts": "New scenario tests for preserved boundaries; no network or destructive filesystem operations.",
+    "both/package.json, tsconfig.json, notes.md": "New dependency-free scenario packaging; Node native type stripping for tests and strict compiler config for source checks.",
+    "references/*.patch": "New benchmark reference implementations outside model workspaces; no upstream production fix is claimed."
+  },
+  "fixtures": {
+    "branch-exclusions": {
+      "files_sha256": {
+        "notes.md": "72430fffde8987cc42a73b0a8e317aa8e0cdec1dfc4c632392fe077683e394d1",
+        "package.json": "281bf06fe5c094590276634ae2d7e5c6feeef3029b74bd03b63d1b70fe15fdbe",
+        "src/filter.ts": "621231958215532578bd36b4a4bf8b6b30eb539ce19ee3aebb31efd3d5fb195f",
+        "src/options.ts": "5b7bf83374d884e7cded1e7375f1ee0072277c2555f0103ae0765aab70aae637",
+        "src/query.ts": "fa7842d28314672a9e940a125621816a74a04d683c0c28dd6c2fd76c942768fa",
+        "src/types.ts": "980b02127a80557bb7cd1572e40c8a98a0a4cf6f58bbfbe61513d4be329f4d5c",
+        "test/filter.test.ts": "b87bd486c2f8bc28070ce6becc65405b0d07aef9480535c2ef88ed9bf9c383f9",
+        "test/helpers.ts": "38013790059add8b6a67fc8e7aea2dc9c664e3c0dade5dd864a92678b768c240",
+        "test/query.test.ts": "57adac2f1a42fcb02a8bdb23dcc1a91a7398ccb3b1b88a3fbee8800fbac87653",
+        "tsconfig.json": "415d82d67d0576347a64b70d2a2ffe4d7c5b9f7f36387af6da2f98e5b7fb4c52"
+      },
+      "source_files": 4,
+      "source_physical_lines": 300,
+      "seed_existing_tests_pass": true,
+      "seed_new_contract_pass": false,
+      "reference_all_contracts_pass": true,
+      "reference_patch_sha256": "18a11ee181c28e7bce46fe12917a737d4665aded9450218184a2c9af07433c26"
+    },
+    "bounded-collection": {
+      "files_sha256": {
+        "notes.md": "72430fffde8987cc42a73b0a8e317aa8e0cdec1dfc4c632392fe077683e394d1",
+        "package.json": "69da0a9c367e3e821874352dec182e7f6e6b0800bab85beadf8be4b95c140e7d",
+        "src/catalog.ts": "30f5a500efe56587be2d06bb39d33fb4def0c01501c9706dc17f47ec278285ae",
+        "src/collect.ts": "22eee954888f72987c06740916c4f2ba5db1946cd707a710a12cca9d18f48269",
+        "src/concurrency.ts": "7a9dd4f04829bef919dc6dbaefc92348017949efe0019dcb52dca6df43556561",
+        "src/filter.ts": "621231958215532578bd36b4a4bf8b6b30eb539ce19ee3aebb31efd3d5fb195f",
+        "src/options.ts": "5b7bf83374d884e7cded1e7375f1ee0072277c2555f0103ae0765aab70aae637",
+        "src/query.ts": "fa7842d28314672a9e940a125621816a74a04d683c0c28dd6c2fd76c942768fa",
+        "src/types.ts": "980b02127a80557bb7cd1572e40c8a98a0a4cf6f58bbfbe61513d4be329f4d5c",
+        "test/collect.test.ts": "a1062ab8af673dccd26b3135d09ada097344aa90ba3f295e84ce7dc5e5517f2d",
+        "test/filter.test.ts": "b87bd486c2f8bc28070ce6becc65405b0d07aef9480535c2ef88ed9bf9c383f9",
+        "test/helpers.ts": "38013790059add8b6a67fc8e7aea2dc9c664e3c0dade5dd864a92678b768c240",
+        "test/query.test.ts": "57adac2f1a42fcb02a8bdb23dcc1a91a7398ccb3b1b88a3fbee8800fbac87653",
+        "tsconfig.json": "415d82d67d0576347a64b70d2a2ffe4d7c5b9f7f36387af6da2f98e5b7fb4c52"
+      },
+      "source_files": 7,
+      "source_physical_lines": 388,
+      "seed_existing_tests_pass": true,
+      "seed_new_contract_pass": false,
+      "reference_all_contracts_pass": true,
+      "reference_patch_sha256": "3539404be1c1576755e4cebc64b2bf4d600e94218f7fa5a0a078c67a6c048893"
+    }
+  }
+}
