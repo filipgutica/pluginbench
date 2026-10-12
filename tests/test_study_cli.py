@@ -14,7 +14,7 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
-from pluginbench import claude, cli, codex, collectors, evaluation
+from pluginbench import claude, cli, codex, collectors, evaluation, harbor_backend
 from pluginbench.remeasure import propose_remeasurement
 from pluginbench.study_review import recover_review_citations
 
@@ -25,7 +25,10 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> evaluation.Evalua
     task = suite / "tasks" / evaluation.SUPPORTED_TASKS[0]
     for name in ("environment", "tests", "solution"):
         (task / name).mkdir(parents=True)
-    (task / "task.toml").write_text("version='1.0'\n")
+    (task / "task.toml").write_text(
+        "version='1.0'\n[agent]\ntimeout_sec=10800.0\n"
+        "[environment]\ncpus=2\nmemory_mb=8192\nbuild_timeout_sec=1800.0\n"
+    )
     (task / "instruction.md").write_text("Implement the task.\n")
     (tmp_path / "a.md").write_text("Use existing helpers.\n")
     (tmp_path / "b.md").write_text("Keep state minimal.\n")
@@ -36,6 +39,7 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> evaluation.Evalua
     )
     return evaluation.resolve_evaluation(
         {
+            "backend": "local",
             "runner": {"harness": "codex", "model": "gpt-6.1-sol", "reasoning": "medium"},
             "guidance": {"workflow": ["a.md"], "superpowers": ["b.md"]},
             "tasks": {"source": "deep-swe/tasks", "ids": [evaluation.SUPPORTED_TASKS[0]]},
@@ -81,6 +85,8 @@ def test_flags_match_single_package_config(
         cli.app,
         [
             "run",
+            "--backend",
+            "local",
             "--harness",
             "codex",
             "--model",
@@ -106,6 +112,161 @@ def test_flags_match_single_package_config(
     )
     assert result.exit_code == 0, result.stderr
     assert json.loads(result.stdout) == evaluation.plan_evaluation(expected)
+
+
+@pytest.mark.parametrize("version", ["codex-cli 0.162.0-alpha.1", "codex-cli 0.162.0+build.4"])
+def test_harbor_rejects_cli_versions_it_cannot_pin_exactly(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    selected = config.model_copy(update={"backend": "harbor"})
+    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 1)
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: {"offline": True})
+    monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {})
+    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": version})
+    monkeypatch.setattr(codex, "invoke", lambda **kwargs: pytest.fail("cannot launch"))
+    root = tmp_path / "results"
+    with pytest.raises(ValueError, match="cannot pin codex CLI version"):
+        evaluation.run_evaluation(selected, root)
+    assert not root.exists()
+
+
+def test_harbor_plan_uses_task_resources_and_labels_the_shorter_agent_budget(
+    config: evaluation.Evaluation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected = config.model_copy(update={"backend": "harbor"})
+    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 1)
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: kwargs)
+    plan = evaluation.plan_evaluation(selected)
+    assert plan["container_limits"] == {"cpus": 2, "memory_mb": 8192}
+    comparison = plan["comparison_identity"]
+    assert isinstance(comparison, dict)
+    assert comparison["isolation"] == plan["container_limits"]
+    assert comparison["task_limits"][selected.tasks.ids[0]] == {
+        "declared": {
+            "cpus": 2,
+            "memory_mb": 8192,
+            "agent_timeout_seconds": 10800,
+            "build_timeout_seconds": 1800,
+        },
+        "effective": {
+            "cpus": 2,
+            "memory_mb": 8192,
+            "agent_timeout_seconds": 1800,
+            "build_timeout_seconds": 1800,
+        },
+        "adapted_agent_budget": True,
+    }
+
+
+@pytest.mark.parametrize("override", [{"container_cpus": 1}, {"container_memory_mb": 2048}])
+def test_task_resource_reduction_stops_before_setup_or_model_calls(
+    config: evaluation.Evaluation,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    override: dict[str, int],
+) -> None:
+    selected = config.model_copy(update={"backend": "harbor", **override})
+    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 1)
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: {})
+    monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {})
+    monkeypatch.setattr(codex, "preflight", lambda: pytest.fail("must reject before harness setup"))
+    root = tmp_path / "results"
+    with pytest.raises(ValueError, match="below.*task"):
+        evaluation.run_evaluation(selected, root)
+    assert not root.exists()
+
+
+def test_task_resources_that_do_not_fit_docker_stop_before_setup(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected = config.model_copy(update={"backend": "harbor"})
+    monkeypatch.setattr(
+        harbor_backend, "_engine", lambda: ({"NCPU": 2, "MemTotal": 6 * 1024**3}, "unix:///docker")
+    )
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: {})
+    monkeypatch.setattr(
+        harbor_backend, "preflight", lambda **kwargs: pytest.fail("must reject in planning")
+    )
+    with pytest.raises(ValueError, match="does not fit"):
+        evaluation.run_evaluation(selected, tmp_path / "results")
+    assert not (tmp_path / "results").exists()
+
+
+def test_mixed_task_resources_require_an_explicit_common_budget(
+    config: evaluation.Evaluation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected = config.model_copy(deep=True, update={"backend": "harbor"})
+    task = selected.tasks.source / evaluation.SUPPORTED_TASKS[1]
+    for name in ("environment", "tests", "solution"):
+        (task / name).mkdir(parents=True)
+    (task / "instruction.md").write_text("Implement another task.\n")
+    (task / "task.toml").write_text(
+        "[agent]\ntimeout_sec=10800\n[environment]\ncpus=2\nmemory_mb=4096\nbuild_timeout_sec=1800\n"
+    )
+    selected.tasks.ids.append(task.name)
+    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 1)
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: kwargs)
+    with pytest.raises(ValueError, match="common container_memory_mb"):
+        evaluation.plan_evaluation(selected)
+    selected.container_memory_mb = 8192
+    assert evaluation.plan_evaluation(selected)["container_limits"] == {
+        "cpus": 2,
+        "memory_mb": 8192,
+    }
+
+
+def test_failed_native_preparation_stops_before_coding_or_grading(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected = config.model_copy(update={"backend": "harbor"})
+    definition = selected.tasks.source / selected.tasks.ids[0] / "task.toml"
+    definition.write_text(definition.read_text() + "docker_image='fixture:fixed'\n")
+    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 1)
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: kwargs)
+    monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {})
+    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.162.0"})
+    monkeypatch.setattr(codex, "runtime_environment", lambda *args, **kwargs: ({}, ()))
+    monkeypatch.setattr(harbor_backend, "resolve_image", lambda image: {"image": image})
+    monkeypatch.setattr(
+        harbor_backend, "prepare_toolchain", lambda *args, **kwargs: {"fixed": True}
+    )
+    monkeypatch.setattr(codex, "invoke", lambda **kwargs: pytest.fail("no coding call"))
+    monkeypatch.setattr(harbor_backend, "invoke", lambda **kwargs: pytest.fail("no native call"))
+
+    def prepare(argv: list[str], **kwargs: Any) -> None:
+        assert str(evaluation.ADAPTER / "prepare.py") in argv
+        assert "--prepared-dependencies" in argv
+        destination = Path(argv[argv.index("--output") + 1])
+        (destination / "fixture").mkdir(parents=True)
+        (destination / "fixture/source.ts").write_text("export const value = 1;\n")
+        (destination / "native-environment.json").write_text("{}")
+        (destination / "tasks.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "tasks": [
+                        {
+                            "id": selected.tasks.ids[0],
+                            "fixture": "fixture",
+                            "prompt": "Implement the change.",
+                            "verifier": {"command": [sys.executable], "script": "verify.py"},
+                        }
+                    ],
+                }
+            )
+        )
+
+    def reject(**kwargs: Any) -> None:
+        assert kwargs["fixture"].is_dir()
+        assert kwargs["cpus"] == 2 and kwargs["memory_mb"] == 8192
+        raise ValueError("native visible checks failed")
+
+    monkeypatch.setattr(subprocess, "run", prepare)
+    monkeypatch.setattr(harbor_backend, "prepare_task_image", reject)
+    root = tmp_path / "evaluation"
+    with pytest.raises(ValueError, match="native visible checks failed"):
+        evaluation.run_evaluation(selected, root)
+    assert not (root / "evidence/attempts").exists()
 
 
 @pytest.mark.parametrize(
@@ -360,7 +521,7 @@ def test_integrated_evaluation_and_report_regeneration(
         monkeypatch.setattr(
             collectors,
             "_execute",
-            lambda argv, cwd, timeout: subprocess.CompletedProcess(
+            lambda argv, cwd, timeout, *, output=None, config=None: subprocess.CompletedProcess(
                 argv, 2, stdout="", stderr="inner integrity rejected"
             ),
         )
@@ -394,7 +555,7 @@ def test_integrated_evaluation_and_report_regeneration(
         monkeypatch.setattr(
             collectors,
             "_execute",
-            lambda argv, cwd, timeout: subprocess.CompletedProcess(
+            lambda argv, cwd, timeout, *, output=None, config=None: subprocess.CompletedProcess(
                 argv, 3, stdout="", stderr="observer unavailable"
             ),
         )
@@ -467,7 +628,7 @@ def test_integrated_evaluation_and_report_regeneration(
             monkeypatch.setattr(
                 collectors,
                 "_execute",
-                lambda argv, cwd, timeout: subprocess.CompletedProcess(
+                lambda argv, cwd, timeout, *, output=None, config=None: subprocess.CompletedProcess(
                     argv, 3, stdout="", stderr="coverage unavailable"
                 ),
             )
@@ -532,6 +693,46 @@ def test_integrated_evaluation_and_report_regeneration(
             json.loads((root / "evaluation.json").read_text())["review_revision"]
             == "review-citations"
         )
+    if not any((unavailable, recover, collection_unavailable)):
+        saved = evaluation._load_selection(root)
+        protected = {
+            path: path.read_bytes()
+            for path in (
+                root / "evaluation.json",
+                root / "evaluation-binding.json",
+                root / "report/results.json",
+                root / "report/results.csv",
+                root / "report/report.html",
+            )
+        }
+        native_counts = (len(calls), len(judge_calls))
+        revision = "review" if citation_error else str(saved["review_revision"])
+        projected_path = evaluation.regenerate_report(root, review_revision=revision)
+        assert (
+            projected_path
+            == root / f"evidence/review-revisions/{revision}/evaluation-report/results.json"
+        )
+        projected = json.loads(projected_path.read_text())
+        if citation_error:
+            assert all(
+                row["value"] is None
+                for row in projected["observations"]
+                if row["metric"] == "Total review findings"
+            )
+        else:
+            assert projected["observations"] == data["observations"]
+        assert projected["review_projection"]["native_invocations_in_these_revisions"] == 9
+        assert (len(calls), len(judge_calls)) == native_counts
+        assert all(path.read_bytes() == content for path, content in protected.items())
+        with monkeypatch.context() as changed:
+            changed.setattr(
+                evaluation,
+                "_load_selection",
+                lambda _: {**saved, "timeout_seconds": config.timeout_seconds + 1},
+            )
+            with pytest.raises(ValueError, match="fixed comparison settings"):
+                evaluation.regenerate_report(root, review_revision=revision)
+        assert all(path.read_bytes() == content for path, content in protected.items())
     original = (root / "report/results.json").read_bytes()
     monkeypatch.setattr(
         codex, "invoke", lambda **kwargs: pytest.fail("report cannot invoke models")

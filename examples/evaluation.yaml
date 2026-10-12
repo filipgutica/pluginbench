@@ -1,4 +1,5 @@
 name: Workflow versus Superpowers
+# Harbor containers are the default coding backend.
 runner:
   harness: codex                # codex or claude
   model: gpt-6.1-sol
@@ -17,7 +18,8 @@ tasks:
     - testem-per-launcher-reports
     - happy-dom-abort-pending-body-reads
 
-measurements: [tokens, lines, cyclomatic, cognitive, dead_code, coverage, test_overlap, review]
+measurements: [tokens, lines, cyclomatic, cognitive, dead_code, coverage, review]
+# Add test_overlap only when needed; it reruns tests and can take hours.
 reviewer:
   harness: codex
   model: gpt-6-astra
@@ -25,4 +27,8 @@ reviewer:
   guidance: [/path/to/fixed-review-standards.md]  # Same criteria for all outputs.
 
 repeats: 3
-# jobs: 2  # Optional override; default is up to four CPU cores.
+# jobs: 2  # Optional request; capped by Docker CPU and memory capacity.
+# CPU and memory default to task.toml; Docker must fit them before any model call.
+# container_cpus: 2
+# container_memory_mb: 8192
+# timeout_seconds: 1800  # Separate agent budget; shorter than these tasks declare.

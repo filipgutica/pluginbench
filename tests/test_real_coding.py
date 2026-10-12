@@ -382,6 +382,7 @@ fs.writeFileSync(output, JSON.stringify({ tests: [test], passes: [test], pending
         "source_scope": ["lib/**"],
         "test_scope": ["tests/*_tests.js"],
         "observer": {"path": str(observer), "sha256": "digest"},
+        "measure_test_overlap": True,
     }
     if controlled:
         config["clock"] = module.CLOCK_POLICY

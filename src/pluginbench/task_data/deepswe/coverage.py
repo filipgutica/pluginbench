@@ -992,11 +992,16 @@ def collect(
                     raise ValueError(
                         "measured source/test bytes changed during visible test execution"
                     )
-                if excluded and (
-                    not exclusion_receipt.is_file()
-                    or json.loads(exclusion_receipt.read_text()) != excluded
-                ):
-                    raise ValueError("native case exclusion receipt missing or mismatched")
+                if excluded:
+                    if exclusion_receipt.is_symlink() or exclusion_receipt.exists():
+                        if (
+                            exclusion_receipt.is_symlink()
+                            or not exclusion_receipt.is_file()
+                            or json.loads(exclusion_receipt.read_text()) != excluded
+                        ):
+                            raise ValueError("native case exclusion receipt missing or mismatched")
+                    elif not timed_out:
+                        raise ValueError("native case exclusion receipt missing or mismatched")
                 if execution.returncode:
                     failures = failure_summary(
                         json.loads(test_report.read_text()) if test_report.is_file() else {},
@@ -1039,7 +1044,7 @@ def collect(
                 raise ValueError("coverage file population differs from declared source inventory")
             repeat = run_once("reference-repeat")
             validate_repeat(reference, repeat)
-            if config.get("measure_test_overlap", True):
+            if config.get("measure_test_overlap", False):
                 candidates = [
                     row
                     for row in reference["tests"]

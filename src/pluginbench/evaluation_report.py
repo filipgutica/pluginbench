@@ -405,6 +405,7 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         }
         observations.append(row)
     attempts = []
+    origins = _map(report.get("baseline_origin"))
     for attempt in _rows(report.get("attempts")):
         stage = next(
             row for row in _rows(attempt.get("stages")) if row.get("id") == attempt.get("handoff")
@@ -416,6 +417,12 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
                 "repeat": attempt.get("attempt"),
                 "task": attempt.get("task_id"),
                 "guidance": attempt.get("arm"),
+                "baseline_origin": {
+                    key: _map(origins.get(str(attempt.get("id")))).get(key)
+                    for key in ("cache_key", "origin_run", "origin_attempt", "evidence")
+                }
+                if str(attempt.get("id")) in origins
+                else None,
                 "correctness": _map(stage.get("correctness")).get("status", "unknown"),
                 "actual_model": attempt.get("model"),
                 "runtime": {
@@ -440,9 +447,13 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
             }
         )
     limitations = [
-        "Each guidance set is compared with this evaluation's vanilla runs. Separate evaluations have separate baseline samples.",
+        "Each guidance set is compared with the same vanilla cohort. Compare separate evaluations through compatible baseline deltas.",
         "Deltas are differences in observed medians, not a winner or composite quality score. A negative delta is not automatically better.",
     ]
+    if origins:
+        limitations.append(
+            f"{len(origins)} vanilla attempts were reused from earlier evaluations. Their tokens and time are original observations, not fresh independent samples. Grading, measurements, and reviews run again."
+        )
     if {"cyclomatic", "cognitive"}.intersection(selected):
         limitations.append(
             "Complexity covers functions touched by changed lines and functions in new files, as separate populations. Empty populations have no maximum."
@@ -454,6 +465,10 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
     if "review" in selected:
         limitations.append(
             "AI review findings are judgments, not deterministic defect counts. The reviewer is not calibrated against human judgments; recorded reviews do not measure human review churn."
+        )
+    if config.get("review_projection") is not None:
+        limitations.append(
+            "This report selects a separate review revision. Judge charts show that revision's usage; bound prior review receipts retain earlier calls, failures, and usage."
         )
     data = {
         "schema_version": 1,
@@ -468,6 +483,8 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         "measurements": selected,
         "measurement_collection": config.get("measurement_collection"),
         "assigned": len(attempts),
+        "coding_invocations": _map(report.get("study_progress")).get("native_invocations"),
+        "reused_baseline_attempts": len(origins),
         "attempts": attempts,
         "observations": observations,
         "observation_fields": list(OBSERVATION_FIELDS),
@@ -496,6 +513,8 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
     data["measurement_completeness"] = _selected_completeness(
         data=data, projection=projection, selected=selected
     )
+    if config.get("review_projection") is not None:
+        data["review_projection"] = config["review_projection"]
     return data
 
 

@@ -52,6 +52,9 @@ def run(
         None, "--config", help="Evaluation YAML or JSON; relative paths use its directory."
     ),
     harness: str | None = typer.Option(None, "--harness", help="codex or claude."),
+    backend: str | None = typer.Option(
+        None, "--backend", help="harbor (default) or legacy local execution."
+    ),
     model: str | None = typer.Option(None, "--model"),
     reasoning: str | None = typer.Option(None, "--reasoning"),
     guidance: list[Path] | None = typer.Option(
@@ -85,7 +88,7 @@ def run(
         "--jobs",
         min=1,
         max=16,
-        help="Maximum independent jobs per phase (default: up to 4 CPU cores); also works with --config.",
+        help="Maximum jobs per phase; Harbor coding is bounded by Docker CPU/memory capacity (up to 4).",
     ),
     dry_run: bool = typer.Option(
         False,
@@ -98,6 +101,7 @@ def run(
     """Run fresh vanilla and guidance attempts, selected measurements, and fixed reviews."""
     try:
         overrides = [
+            backend,
             harness,
             model,
             reasoning,
@@ -143,6 +147,8 @@ def run(
                 "tasks": {"source": tasks, "ids": task or []},
                 "measurements": measure or [],
             }
+            if backend is not None:
+                raw["backend"] = backend
             if any(
                 value is not None
                 for value in (review_harness, review_model, review_reasoning, review_guidance)
@@ -169,7 +175,7 @@ def run(
             return
         typer.echo(
             f"{plan['coding_calls']} coding calls + {plan['review_calls']} review calls; "
-            + ("saved submissions reused." if resume else "fresh vanilla included.")
+            + ("saved submissions reused." if resume else "vanilla reused when compatible.")
         )
         if not yes and not typer.confirm("Start evaluation?"):
             raise typer.Exit()

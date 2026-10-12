@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 from typing import Literal
 from collections.abc import Callable
@@ -17,7 +18,7 @@ from collections.abc import Callable
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
-from pluginbench import claude, codex
+from pluginbench import claude, codex, isolation, harbor_backend
 from pluginbench.assessment_metrics import scoped_code_size, scoped_test_size
 from pluginbench.datasets import TaskCatalog, TaskEntry
 from pluginbench.collectors import Collector
@@ -101,6 +102,7 @@ class Tasks(BaseModel):
 class Evaluation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(default="evaluation", min_length=1)
+    backend: Literal["harbor", "local"] = "harbor"
     runner: Runner
     guidance: dict[str, list[Path]] = Field(min_length=1)
     tasks: Tasks
@@ -110,9 +112,13 @@ class Evaluation(BaseModel):
     seed: int = Field(default=42, strict=True)
     timeout_seconds: int = Field(default=1800, strict=True, ge=1)
     jobs: int = Field(default_factory=lambda: min(4, os.cpu_count() or 1), strict=True, ge=1, le=16)
+    container_cpus: int | None = Field(default=None, strict=True, ge=1)
+    container_memory_mb: int | None = Field(default=None, strict=True, ge=256)
 
     @model_validator(mode="after")
     def coherent(self) -> Evaluation:
+        if self.backend == "harbor" and self.runner.reasoning == "ultra":
+            raise ValueError("Harbor does not support ultra reasoning; select a supported effort")
         if len(set(self.measurements)) != len(self.measurements):
             raise ValueError("measurements must be unique")
         if ("review" in self.measurements) != (self.reviewer is not None):
@@ -165,6 +171,50 @@ def _tree_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _task_limits(path: Path) -> dict[str, int]:
+    definition = tomllib.loads((path / "task.toml").read_text())
+    fields = {
+        "cpus": ("environment", "cpus"),
+        "memory_mb": ("environment", "memory_mb"),
+        "build_timeout_seconds": ("environment", "build_timeout_sec"),
+        "agent_timeout_seconds": ("agent", "timeout_sec"),
+    }
+    limits = {}
+    for name, (section, key) in fields.items():
+        value = definition.get(section, {}).get(key)
+        if (
+            type(value) not in (int, float)
+            or value <= 0
+            or (isinstance(value, float) and not value.is_integer())
+        ):
+            raise ValueError(f"{path.name}: {section}.{key} must be a positive whole number")
+        limits[name] = int(value)
+    return limits
+
+
+def _container_limits(config: Evaluation, declared: dict[str, dict[str, int]]) -> dict[str, int]:
+    limits = {}
+    for key, field, fallback in (
+        ("cpus", "container_cpus", 1),
+        ("memory_mb", "container_memory_mb", 2048),
+    ):
+        value = getattr(config, field)
+        requested = {row[key] for row in declared.values()}
+        if value is None:
+            if len(requested) > 1:
+                raise ValueError(
+                    f"Selected tasks declare different {key}; provide an explicit common {field}"
+                )
+            value = next(iter(requested), fallback)
+        for task, row in declared.items():
+            if value < row[key]:
+                raise ValueError(
+                    f"{field}={value} is below {row[key]} requested by task {task}; reduced resources require native fitness validation and are currently unsupported"
+                )
+        limits[key] = value
+    return limits
+
+
 def plan_evaluation(config: Evaluation) -> dict[str, object]:
     source = config.tasks.source
     suite = source.parent if source.name == "tasks" else source
@@ -172,6 +222,7 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
     if revision != SUITE_SHA:
         raise ValueError(f"DeepSWE tasks must be checked out at {SUITE_SHA}; found {revision}")
     identities = {}
+    declared = {}
     for task in config.tasks.ids:
         path = suite / "tasks" / task
         for required in ("task.toml", "instruction.md", "environment", "tests", "solution"):
@@ -183,6 +234,14 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
         if dirty:
             raise ValueError(f"selected DeepSWE task has uncommitted changes: {task}")
         identities[task] = _tree_hash(path)
+        if config.backend == "harbor":
+            declared[task] = _task_limits(path)
+    limits = _container_limits(config, declared)
+    jobs = (
+        min(config.jobs, harbor_backend.capacity_jobs(**limits))
+        if config.backend == "harbor"
+        else config.jobs
+    )
     preset = json.loads((ADAPTER / "measurement-presets.json").read_text())
     methods = {task: preset[task] for task in config.tasks.ids}
     criteria = (
@@ -201,7 +260,21 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
         if config.reviewer
         else None,
         "review_criteria_sha256": _criteria_digest(criteria) if criteria else None,
-        "jobs": config.jobs,
+        "jobs": jobs,
+        "backend": config.backend,
+        "task_limits": {
+            task: {
+                "declared": row,
+                "effective": {**row, **limits, "agent_timeout_seconds": config.timeout_seconds},
+                "adapted_agent_budget": config.timeout_seconds != row["agent_timeout_seconds"],
+            }
+            for task, row in declared.items()
+        },
+        "isolation": (
+            harbor_backend.runtime_identity(**limits)
+            if config.backend == "harbor"
+            else isolation.runtime_identity()
+        ),
     }
     coding = len(config.tasks.ids) * (1 + len(config.guidance)) * config.repeats
     return {
@@ -213,8 +286,10 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
         "tasks": config.tasks.ids,
         "measurements": config.measurements,
         "repeats": config.repeats,
-        "jobs": config.jobs,
-        "baseline": "fresh vanilla attempts, no supplied text guidance; native built-in instructions remain",
+        "jobs": jobs,
+        "container_limits": limits,
+        "baseline": "reuse a verified isolated vanilla cohort when available; otherwise fresh vanilla attempts; native built-in instructions remain",
+        "call_estimate": "maximum new calls; baseline hits are resolved after preparation, before coding",
         "comparison_identity": comparison,
     }
 
@@ -227,15 +302,31 @@ def run_evaluation(
     config: Evaluation, output: Path, *, progress: Callable[[str], None] | None = None
 ) -> Path:
     plan = plan_evaluation(config)
+    limits = TypeAdapter(dict[str, int]).validate_python(plan["container_limits"])
+    config = config.model_copy(
+        update={
+            "jobs": plan["jobs"],
+            "container_cpus": limits["cpus"],
+            "container_memory_mb": limits["memory_mb"],
+        }
+    )
     comparison = plan["comparison_identity"]
     if not isinstance(comparison, dict):
         raise ValueError("evaluation comparison identity is malformed")
     root = output.expanduser().absolute()
     if root.exists():
         raise ValueError(f"output must be a new directory: {root}")
+    if config.backend == "harbor":
+        harbor_backend.preflight(jobs=config.jobs, **limits)
     # Both runtimes are checked before any task calls; preparation validates selected observers too.
+    harness_versions = {}
     for harness in {config.runner.harness, *([config.reviewer.harness] if config.reviewer else [])}:
-        (claude.preflight if harness == "claude" else codex.preflight)()
+        native = (claude.preflight if harness == "claude" else codex.preflight)()
+        version = str(native.get("harness_version", ""))
+        match = re.search(r"(?<![\w.+-])\d+\.\d+\.\d+(?![\w.+-])", version)
+        if config.backend == "harbor" and match is None:
+            raise ValueError(f"cannot pin {harness} CLI version: {version}")
+        harness_versions[harness] = match.group() if match else None
         with tempfile.TemporaryDirectory(prefix="pluginbench-auth-check-") as temporary:
             codex.runtime_environment(Path(temporary) / "private", harness)
     root.mkdir(parents=True)
@@ -250,6 +341,13 @@ def run_evaluation(
         if progress:
             progress(f"Preparing and calibrating {task}")
         destination = prepared / task
+        task_limits = (
+            TypeAdapter(dict[str, int]).validate_python(
+                _object(_object(comparison["task_limits"])[task])["effective"]
+            )
+            if config.backend == "harbor"
+            else {}
+        )
         subprocess.run(
             [
                 sys.executable,
@@ -260,6 +358,7 @@ def run_evaluation(
                 task,
                 "--output",
                 str(destination),
+                *(["--prepared-dependencies"] if config.backend == "harbor" else []),
                 *[
                     arg
                     for measurement in config.measurements
@@ -269,9 +368,51 @@ def run_evaluation(
             check=True,
         )
         task_catalog = TaskCatalog.model_validate_json((destination / "tasks.json").read_text())
+        suite = (
+            config.tasks.source.parent
+            if config.tasks.source.name == "tasks"
+            else config.tasks.source
+        )
+        image = (
+            tomllib.loads((suite / "tasks" / task / "task.toml").read_text())["environment"][
+                "docker_image"
+            ]
+            if config.backend == "harbor"
+            else None
+        )
+        image_identity = harbor_backend.resolve_image(image) if image is not None else None
+        toolchain_identity = (
+            harbor_backend.prepare_toolchain(
+                image_identity,
+                harness=config.runner.harness,
+                version=harness_versions[config.runner.harness] or "",
+            )
+            if image_identity is not None
+            else None
+        )
+        if toolchain_identity is not None:
+            native_recipe = json.loads((destination / "native-environment.json").read_text())
+            toolchain_identity = harbor_backend.prepare_task_image(
+                fixture=destination / task_catalog.tasks[0].fixture,
+                toolchain=toolchain_identity,
+                recipe=native_recipe,
+                artifacts=destination / "native-preparation",
+                cache=root.parent / ".prepared-images",
+                cpus=limits["cpus"],
+                memory_mb=limits["memory_mb"],
+                timeout=task_limits["build_timeout_seconds"],
+            )
         for item in task_catalog.tasks:
             item.fixture = Path(task) / item.fixture
             item.verifier.script = Path(task) / item.verifier.script
+            if image is not None:
+                item.provenance = {
+                    **(item.provenance or {}),
+                    "agent_image": image_identity["image"] if image_identity else image,
+                    "image_identity": json.dumps(image_identity, sort_keys=True),
+                    "toolchain_identity": json.dumps(toolchain_identity, sort_keys=True),
+                    "build_timeout_seconds": str(task_limits["build_timeout_seconds"]),
+                }
             entries.append(item)
         profiles.update(load_profiles(destination / "measurements.json"))
         suite = (
@@ -308,6 +449,12 @@ def run_evaluation(
                 "instruction_sha256",
             )
         }
+        if image_identity is not None:
+            task_environment[task]["image_identity"] = image_identity
+            task_environment[task]["toolchain_identity"] = toolchain_identity
+            task_environment[task]["build_timeout_seconds"] = str(
+                task_limits["build_timeout_seconds"]
+            )
     _write(
         prepared / "tasks.json",
         TaskCatalog(schema_version=1, tasks=entries).model_dump(mode="json"),
@@ -328,6 +475,10 @@ def run_evaluation(
             raise ValueError("fixed review guidance changed during preparation")
     recipe = {
         "schema_version": 1,
+        "backend": config.backend,
+        "harness_version": harness_versions[config.runner.harness],
+        "container_cpus": config.container_cpus,
+        "container_memory_mb": config.container_memory_mb,
         "name": config.name,
         "harness": config.runner.harness,
         "tasks": str(prepared / "tasks.json"),
@@ -351,8 +502,39 @@ def run_evaluation(
         "review_revision": None,
     }
     comparison["task_environment"] = task_environment
+    comparison["harness_version"] = harness_versions[config.runner.harness]
     _save_selection(root, selection)
-    run_study(load_study(prepared / "study.json"), evidence, progress=progress)
+    coding_identity = {
+        "task_assets": comparison["tasks"],
+        "task_environment": task_environment,
+        "runner": comparison["runner"],
+        "harness_version": harness_versions[config.runner.harness],
+        "isolation": comparison["isolation"],
+        "timeout_seconds": config.timeout_seconds,
+        "jobs": config.jobs,
+        "seed": config.seed,
+        "repair_rounds": 0,
+        "preparation_sha256": {
+            name: hashlib.sha256((ADAPTER / name).read_bytes()).hexdigest()
+            for name in ("prepare.py", "verify.py")
+        },
+        "launcher_sha256": {
+            name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
+            for name in (
+                "codex.py",
+                *(["harbor_backend.py"] if config.backend == "harbor" else []),
+                "processes.py",
+                *(["claude.py"] if config.runner.harness == "claude" else []),
+            )
+        },
+    }
+    run_study(
+        load_study(prepared / "study.json"),
+        evidence,
+        progress=progress,
+        baseline_cache=root.parent / ".baseline-cache",
+        baseline_identity=coding_identity,
+    )
     selected_profiles = {task: collectors for task, collectors in profiles.items() if collectors}
     return _finish_evaluation(
         root,
@@ -367,8 +549,9 @@ def _saved_evaluation(selection: dict[str, object]) -> Evaluation:
     # Runs created before jobs existed used sequential execution.
     return Evaluation.model_validate(
         {
-            key: selection.get(key, 1) if key == "jobs" else selection[key]
-            for key in Evaluation.model_fields
+            "backend": "local",
+            "jobs": 1,
+            **{key: selection[key] for key in Evaluation.model_fields if key in selection},
         }
     )
 
@@ -532,17 +715,6 @@ def _resume_inputs(
             if study._inventory(directory / "profiles") != state["profile_inventory"]:
                 raise ValueError("frozen observer profiles changed")
             profiles = load_profiles(study._bound_path(evidence, state["frozen_profiles"]))
-            # The calibrated coverage adapter is the only script refreshed on recovery.
-            # Its exact bytes are frozen and recorded in the new observer revision.
-            for collectors in profiles.values():
-                for collector in collectors:
-                    if (
-                        collector.kind == "coverage"
-                        and collector.command
-                        and "--before" in collector.command
-                    ):
-                        collector.command[1] = str(ADAPTER / "coverage.py")
-                        collector.failure_protocol = "coverage-exit-v1"
         else:
             raise ValueError("observer collection is still marked active; cannot replay it")
     guidance = []
@@ -660,7 +832,7 @@ def _measurement_collection(root: Path, selection: dict[str, object]) -> dict[st
     }
 
 
-def regenerate_report(root: Path) -> Path:
+def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path:
     root = root.expanduser().absolute()
     config = _load_selection(root)
     config.setdefault("jobs", 1)
@@ -668,6 +840,46 @@ def regenerate_report(root: Path) -> Path:
     comparison.setdefault("jobs", config["jobs"])
     config["comparison_identity"] = comparison
     evidence = root / "evidence"
+    output = root / "report"
+    if review_revision is not None:
+        review_path = validate_review_revision(evidence, review_revision)
+        state = study._bound_document(evidence, study._reference(evidence, review_path))
+        protocol = study._bound_document(evidence, state["protocol"])
+        reviewer = _object(config["reviewer"])
+        expected = {
+            "harness": reviewer["harness"],
+            "model": reviewer["model"],
+            "effort": reviewer["reasoning"],
+            "criteria_sha256": comparison["review_criteria_sha256"],
+            "seed": config["seed"],
+            "jobs": config["jobs"],
+            "timeout_seconds": config["timeout_seconds"],
+            "stage": "handoff",
+        }
+        if any(protocol.get(key) != value for key, value in expected.items()):
+            raise ValueError("review projection differs from the fixed comparison settings")
+        original_revision = _selected_revision(config, "review_revision")
+        previous_path = (
+            validate_review_revision(evidence, original_revision) if original_revision else None
+        )
+        states = {review_path}
+        if previous_path is not None:
+            states.add(previous_path)
+        starts = {
+            study._bound_path(evidence, row["native_start"]).resolve()
+            for path in states
+            for row in study._bound_document(evidence, study._reference(evidence, path))["records"]
+            if row.get("native_start") is not None
+        }
+        config["review_projection"] = {
+            "original_revision": original_revision,
+            "selected_revision": review_revision,
+            "revision_receipts": [study._reference(evidence, path) for path in sorted(states)],
+            "native_invocations_in_these_revisions": len(starts),
+            "usage_accounting": "Charts show the selected revision; bound prior revision receipts retain failed calls and their usage.",
+        }
+        config["review_revision"] = review_revision
+        output = review_path.parent / "evaluation-report"
     report_path, _ = report_study(
         evidence,
         measurement_revision=_selected_revision(config, "measurement_revision"),
@@ -766,4 +978,4 @@ def regenerate_report(root: Path) -> Path:
                 change=stage["change"],
             )
     config["measurement_collection"] = _measurement_collection(root, config)
-    return write_evaluation_report(report, config, root / "report")
+    return write_evaluation_report(report, config, output)

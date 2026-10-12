@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import json
 import sys
+import tarfile
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
 
-from pluginbench import codex, study
+from pluginbench import codex, study, isolation, harbor_backend
+from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.datasets import TaskSpec
 
 
@@ -134,6 +136,157 @@ def test_full_study_keeps_all_twelve_attempts_and_reports_failure(
         else:
             assert "Reuse the existing helper.\nKeep the change small.\n" in call["prompt"]
     assert not (root / "frozen/auth.json").exists()
+
+
+def test_harbor_submissions_use_trusted_grading_and_keep_missing_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _recipe(tmp_path)
+    document = yaml.safe_load(path.read_text())
+    document.update(backend="harbor", harness_version="1.2.3", repeats=1)
+    document["guidance"]["second-package"] = ["guidance.md"]
+    path.write_text(yaml.safe_dump(document))
+    catalog_path = tmp_path / "suite/tasks.yaml"
+    catalog = yaml.safe_load(catalog_path.read_text())
+    for task in catalog["tasks"]:
+        task["provenance"] = {"agent_image": "example@sha256:" + "a" * 64}
+    catalog_path.write_text(yaml.safe_dump(catalog))
+    runtime = {"protocol": "offline-harbor-fixture"}
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: runtime)
+    monkeypatch.setattr(harbor_backend, "assert_runtime", lambda expected: None)
+    monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
+    monkeypatch.setattr(codex, "invoke", lambda **kwargs: pytest.fail("coding must use Harbor"))
+    calls = []
+
+    def invoke(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        assert kwargs["protocol"]["harness_version"] == "1.2.3"
+        workspace = kwargs["area"] / "workspace"
+        assert (workspace / "src/answer.py").read_text() == "answer = 0\n"
+        if len(calls) != 1:
+            (workspace / "src/answer.py").write_text("answer = 1\n")
+        execution: dict[str, Any] = {
+            "submission_collected": len(calls) != 1,
+            "successful_native_completion": len(calls) > 2,
+            "usage": None,
+            "actual_primary_models": ["gpt-6.1-sol"],
+            "runtime_effort_evidence": ["medium"],
+            "launch_harness_version": "1.2.3",
+        }
+        if len(calls) == 3:
+            execution.update(
+                submission_collected=False,
+                submission_export_digest=inspect_snapshot(workspace)["digest"],
+            )
+            codex.write_json(kwargs["area"] / "artifacts/execution.json", execution)
+            raise ValueError("stopped export completed but cleanup failed")
+        return execution
+
+    monkeypatch.setattr(harbor_backend, "invoke", invoke)
+    root = study.run_study(study.load_study(path), tmp_path / "results")
+    report = json.loads((root / "report/assessment-report.json").read_text())
+    stages = [attempt["stages"][0] for attempt in report["attempts"]]
+    assert len(calls) == len(stages) == 6
+    assert stages[0]["snapshot_digest"] is None
+    assert stages[0]["correctness"]["status"] == "unknown"
+    assert stages[1]["correctness"]["status"] == "fail"
+    assert stages[2]["snapshot_digest"] is None
+    assert stages[2]["correctness"]["status"] == "unknown"
+    ungraded = list(root.glob("attempts/*/handoff/ungraded-submission/src/answer.py"))
+    assert len(ungraded) == 1 and ungraded[0].read_text() == "answer = 1\n"
+    assert all(stage["correctness"]["status"] == "pass" for stage in stages[3:])
+    assert all(stage["work"]["tokens"] is None for stage in stages)
+    assert (root / "report/assessment-charts.html").is_file()
+    assert json.loads((root / "run.json").read_text())["actual_calls"] == 6
+
+
+@pytest.mark.parametrize("backend", ["local", "harbor"])
+def test_runtime_drift_stops_new_calls_and_preserves_completed_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    path = _recipe(tmp_path)
+    if backend == "harbor":
+        document = yaml.safe_load(path.read_text())
+        document.update(backend="harbor", harness_version="1.2.3")
+        path.write_text(yaml.safe_dump(document))
+        catalog_path = tmp_path / "suite/tasks.yaml"
+        catalog = yaml.safe_load(catalog_path.read_text())
+        for task in catalog["tasks"]:
+            task["provenance"] = {"agent_image": "example@sha256:" + "a" * 64}
+        catalog_path.write_text(yaml.safe_dump(catalog))
+        monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
+    recipe = study.load_study(path)
+    calls = _fake_runtime(monkeypatch)
+    native = codex.invoke
+    runtime = harbor_backend if backend == "harbor" else isolation
+    identity = (
+        {"resources": {"cpus": 1, "memory_mb": 2048}, "offline": True}
+        if backend == "harbor"
+        else isolation.runtime_identity()
+    )
+    monkeypatch.setattr(runtime, "runtime_identity", lambda **kwargs: identity)
+
+    def changed_runtime(**kwargs: Any) -> dict[str, Any]:
+        result = native(**kwargs)
+        result["submission_collected"] = True
+        monkeypatch.setattr(
+            runtime, "runtime_identity", lambda **kwargs: {**identity, "os_release": "changed"}
+        )
+        return result
+
+    monkeypatch.setattr(runtime if backend == "harbor" else codex, "invoke", changed_runtime)
+    root = tmp_path / "results"
+    with pytest.raises(isolation.RuntimeDriftError, match="runtime changed"):
+        study.run_study(recipe, root)
+    run = json.loads((root / "run.json").read_text())
+    assert len(calls) == run["actual_calls"] == 1
+    assert run["status"] == "interrupted"
+    assert list(root.glob("attempts/*/handoff/snapshot/src/answer.py"))
+    manifest = json.loads((root / "assessment-input.json").read_text())
+    assert len(manifest["records"]) == 12
+    assert (root / "report/assessment-report.json").is_file()
+
+
+@pytest.mark.parametrize("directory_link", [False, True])
+def test_artifact_links_are_retained_without_reading_external_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, directory_link: bool
+) -> None:
+    path = _recipe(tmp_path)
+    document = yaml.safe_load(path.read_text())
+    document["repeats"] = 1
+    path.write_text(yaml.safe_dump(document))
+    private = tmp_path / "operator-private"
+    private.mkdir()
+    secret = private / "private.txt"
+    secret.write_text("operator content must never enter submission evidence")
+    calls = _fake_runtime(monkeypatch)
+    native = codex.invoke
+
+    def linked_artifacts(**kwargs: Any) -> dict[str, Any]:
+        execution = native(**kwargs)
+        logs = kwargs["area"] / "artifacts/harbor/trial/agent"
+        logs.mkdir(parents=True)
+        (logs / "not-native-log").symlink_to(private if directory_link else secret)
+        return execution
+
+    monkeypatch.setattr(codex, "invoke", linked_artifacts)
+    root = study.run_study(study.load_study(path), tmp_path / "results")
+    assert len(calls) == 4
+    for file in root.rglob("*"):
+        if file.is_file() and not file.is_symlink():
+            assert secret.read_bytes() not in file.read_bytes()
+    archives = list(root.glob("attempts/*/handoff/artifacts/unsupported-artifacts.tar"))
+    assert len(archives) == 4
+    with tarfile.open(archives[0]) as archive:
+        link = archive.getmember("artifacts/harbor/trial/agent/not-native-log")
+        assert link.issym()
+        assert link.linkname == str(private if directory_link else secret)
+    report = json.loads((root / "report/assessment-report.json").read_text())
+    assert all(
+        attempt["stages"][0]["snapshot_digest"] is None
+        and attempt["stages"][0]["correctness"]["status"] == "unknown"
+        for attempt in report["attempts"]
+    )
 
 
 def test_plan_is_fixed_balanced_and_counts_maximum_repair_calls(tmp_path: Path) -> None:

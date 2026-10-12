@@ -721,9 +721,16 @@ def test_partial_coverage_failure_preserves_matching_fallow_and_later_inputs(
     profiles["task"].insert(0, Collector(kind="fallow", config=cfg, scope=["*.js"]))
     original = collectors._execute
 
-    def execute(argv: list[str], cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:
+    def execute(
+        argv: list[str],
+        cwd: Path,
+        timeout: int,
+        *,
+        output: Path | None = None,
+        config: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         if argv[0] != "fallow":
-            return original(argv, cwd, timeout)
+            return original(argv, cwd, timeout, output=output, config=config)
         report: dict[str, object] = {
             "kind": "combined",
             "version": "3.18.0",

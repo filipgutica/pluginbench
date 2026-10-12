@@ -6,11 +6,15 @@ import hashlib
 import json
 import os
 import shutil
-import signal
+import stat
 import subprocess
+import tarfile
 import time
 from pathlib import Path
 from typing import Any
+
+from pluginbench import isolation
+from pluginbench.processes import terminate_process_group
 
 
 GUIDANCE_NAMES = {
@@ -110,15 +114,70 @@ def credential_values(auth_file: Path) -> tuple[str, ...]:
     return tuple(values)
 
 
+def validate_artifacts(directory: Path) -> None:
+    """Accept only ordinary directories and files before reading native evidence."""
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("native artifact root must be an ordinary directory")
+
+    def failed(error: OSError) -> None:
+        raise error
+
+    for root, names, files in os.walk(directory, followlinks=False, onerror=failed):
+        for name in [*names, *files]:
+            path = Path(root) / name
+            mode = path.lstat().st_mode
+            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                raise ValueError(f"unsupported native artifact: {path.relative_to(directory)}")
+
+
+def copy_artifacts(source: Path, target: Path) -> str | None:
+    """Preserve unsupported evidence as an inert archive, without following links."""
+    try:
+        validate_artifacts(source)
+    except (OSError, ValueError) as error:
+        target.mkdir(parents=True)
+        with tarfile.open(target / "unsupported-artifacts.tar", "w", dereference=False) as archive:
+            archive.add(source, arcname="artifacts")
+        write_json(target / "unsupported-artifacts.json", {"error": str(error)})
+        return str(error)
+    shutil.copytree(source, target, symlinks=True)
+    return None
+
+
 def scrub_artifacts(directory: Path, secrets: tuple[str, ...]) -> None:
-    for path in directory.rglob("*"):
-        if path.is_file() and not path.is_symlink():
+    if directory.is_symlink() or not directory.is_dir():
+        return
+    for root, names, files in os.walk(directory, followlinks=False):
+        names[:] = [name for name in names if not (Path(root) / name).is_symlink()]
+        for name in files:
+            path = Path(root) / name
+            if not stat.S_ISREG(path.lstat().st_mode):
+                continue
             original = path.read_bytes()
             content = original
             for secret in secrets:
                 content = content.replace(secret.encode(), b"<redacted-credential>")
             if content != original:
                 path.write_bytes(content)
+
+
+def _native_traces(private: Path, artifacts: Path, secrets: tuple[str, ...]) -> list[str]:
+    sessions = private / "codex/sessions"
+    for path in (private, private / "codex", sessions):
+        if path.is_symlink():
+            copy_artifacts(path, artifacts / "unsupported-native-traces")
+            raise ValueError("unsupported native session ancestor link")
+        if path.exists() and not path.is_dir():
+            raise ValueError("native session ancestors must be ordinary directories")
+    if not sessions.exists():
+        return []
+    try:
+        validate_artifacts(sessions)
+    except (OSError, ValueError):
+        scrub_artifacts(sessions, secrets)
+        copy_artifacts(sessions, artifacts / "unsupported-native-traces")
+        raise
+    return [path.read_text() for path in sorted(sessions.rglob("*.jsonl"))]
 
 
 def runtime_environment(
@@ -405,7 +464,8 @@ def invoke(
         workspace=area / "workspace",
         plugin=None,
         effort=effort,
-        read_only=read_only,
+        # The mandatory OS wrapper owns Codex's read-only scope. Nested Seatbelt fails.
+        read_only=read_only and entry["host"] != "codex",
     )
     if output_schema is not None:
         if entry["host"] == "claude":
@@ -432,12 +492,19 @@ def invoke(
     timed_out = False
     proc = None
     traces = []
+    failure: BaseException | None = None
     try:
         auth_file = protocol.get("auth_file")
         env, secrets = runtime_environment(
             private,
             entry["host"],
             **({"auth_file": Path(auth_file).expanduser()} if auth_file is not None else {}),
+        )
+        argv, filesystem = isolation.command(
+            argv,
+            writable=[private, *([] if read_only else [area / "workspace"])],
+            readable=[area / "workspace", *([output_schema] if output_schema else [])],
+            expected=protocol.get("isolation"),
         )
         write_json(
             artifacts / "runtime-isolation.json",
@@ -451,6 +518,7 @@ def invoke(
                 else None,
                 "configuration_source": "private auth only; user/project setting sources disabled",
                 "native_builtin_instructions": "retained",
+                "filesystem": filesystem,
             },
         )
         with (
@@ -471,32 +539,58 @@ def invoke(
                 proc.communicate(prompt, timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                os.killpg(proc.pid, signal.SIGTERM)
-                try:
-                    proc.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    proc.communicate()
+    except BaseException as error:
+        failure = error
+        raise
     finally:
-        if proc is not None and proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.communicate()
-        for path in sorted((private / "codex/sessions").rglob("*.jsonl")):
-            traces.append(path.read_text())
-        for index, trace in enumerate(traces):
-            (artifacts / f"host-trace-{index}.jsonl").write_text(trace)
-        if private.exists():
-            shutil.rmtree(private)
-        scrub_artifacts(artifacts, secrets)
-        write_json(
-            artifacts / "execution.json",
-            {
-                "exit_code": proc.returncode if proc is not None else None,
-                "timed_out": timed_out,
-                "elapsed_seconds": time.monotonic() - started,
-                "private_runtime_removed": not private.exists(),
-            },
-        )
+        cleanup_error: OSError | subprocess.TimeoutExpired | None = None
+        trace_error: OSError | ValueError | None = None
+        try:
+            if proc is not None:
+                terminate_process_group(proc)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            cleanup_error = error
+            if failure is not None:
+                failure.add_note(f"Process-group cleanup failed: {error}")
+        try:
+            traces = _native_traces(private, artifacts, secrets)
+            for index, trace in enumerate(traces):
+                (artifacts / f"host-trace-{index}.jsonl").write_text(trace)
+        except (OSError, ValueError) as error:
+            trace_error = error
+            if failure is not None:
+                failure.add_note(f"Native session evidence rejected: {error}")
+        finally:
+            try:
+                if private.is_symlink():
+                    private.unlink()
+                elif private.exists():
+                    shutil.rmtree(private)
+            finally:
+                try:
+                    scrub_artifacts(artifacts, secrets)
+                finally:
+                    write_json(
+                        artifacts / "execution.json",
+                        {
+                            "exit_code": proc.returncode if proc is not None else None,
+                            "timed_out": timed_out,
+                            "elapsed_seconds": time.monotonic() - started,
+                            "private_runtime_removed": not private.exists(),
+                            "cleanup_error": str(cleanup_error)
+                            if cleanup_error is not None
+                            else None,
+                            "trace_error": str(trace_error) if trace_error is not None else None,
+                            "successful_native_completion": False
+                            if trace_error is not None
+                            else not timed_out and proc is not None and proc.returncode == 0,
+                        },
+                    )
+        if cleanup_error is not None and failure is None:
+            raise cleanup_error
+        if trace_error is not None and failure is None:
+            raise trace_error
+    validate_artifacts(artifacts)
     traces = [p.read_text() for p in sorted(artifacts.glob("host-trace-*.jsonl"))]
     parsed = parse_events(
         (artifacts / "stdout.jsonl").read_text(), traces, entry["host"], requested_effort=effort

@@ -240,6 +240,11 @@ def test_incomplete_or_unstable_fresh_runs_are_refused(fault: str) -> None:
         "timeout_mutation",
         "exclusion_receipt",
         "exclusion_unavailable",
+        "exclusion_timeout",
+        "exclusion_timeout_mismatch",
+        "exclusion_timeout_receipt_directory",
+        "exclusion_timeout_receipt_symlink",
+        "exclusion_timeout_mutation",
         None,
     ],
 )
@@ -277,7 +282,7 @@ def test_reference_repeat_validation_and_coverage_only_avoid_candidate_exclusion
     def run(command: list[str], *, cwd: Path, **kwargs: object) -> subprocess.CompletedProcess[str]:
         exclusion = command[-1].endswith("exclusion-options.json")
         if exclusion:
-            assert fault in {"exclusion_receipt", "exclusion_unavailable"}
+            assert fault and fault.startswith("exclusion_")
             options = json.loads(Path(command[-1]).read_text())["options"]
             report = Path(options["outputFile"])
         else:
@@ -354,9 +359,16 @@ def test_reference_repeat_validation_and_coverage_only_avoid_candidate_exclusion
             shutil.copyfile(
                 report.parent / "excluded-case.json", report.parent / "exclusion-receipt.json"
             )
+        if exclusion and fault == "exclusion_timeout_mismatch":
+            (report.parent / "exclusion-receipt.json").write_text("{}")
+        if exclusion and fault == "exclusion_timeout_receipt_directory":
+            (report.parent / "exclusion-receipt.json").mkdir()
+        if exclusion and fault == "exclusion_timeout_receipt_symlink":
+            (report.parent / "exclusion-receipt.json").symlink_to(report.parent / "missing-receipt")
         mutation = {
             "inner_mutation": workspace / "src/choose.js",
             "timeout_mutation": workspace / "src/choose.js",
+            "exclusion_timeout_mutation": workspace / "src/choose.js" if exclusion else None,
             "submitted_mutation": after / "src/choose.js",
             "before_mutation": before / "src/choose.js",
             "dependency_mutation": dependencies / "mutation-marker",
@@ -364,7 +376,9 @@ def test_reference_repeat_validation_and_coverage_only_avoid_candidate_exclusion
         }.get(fault or "")
         if mutation is not None:
             mutation.write_text("mutated during native execution")
-        if fault in {"native_timeout", "timeout_mutation"}:
+        if fault in {"native_timeout", "timeout_mutation"} or (
+            exclusion and fault and fault.startswith("exclusion_timeout")
+        ):
             raise subprocess.TimeoutExpired(command, 1, output=b"partial output", stderr=b"timeout")
         return subprocess.CompletedProcess(
             command,
@@ -392,7 +406,7 @@ def test_reference_repeat_validation_and_coverage_only_avoid_candidate_exclusion
                 "test_scope": ["test/*.test.ts"],
                 "provider": f"vitest/{provider}",
                 "version": "4.0.5",
-                "measure_test_overlap": fault is not None,
+                **({"measure_test_overlap": True} if fault is not None else {}),
                 "disable_coverage_thresholds": disable_thresholds,
                 "disable_typechecking": disable_thresholds,
                 "observer": {"path": str(observer), "sha256": "bound"},
@@ -435,24 +449,37 @@ def test_reference_repeat_validation_and_coverage_only_avoid_candidate_exclusion
         assert (saved / "native-errors.json").is_file()
         assert calls == ["reference"]
         return
-    elif fault in {"exclusion_receipt", "exclusion_unavailable"}:
-        expected = module.MeasurementUnavailable if fault == "exclusion_unavailable" else ValueError
+    elif fault in {
+        "exclusion_receipt",
+        "exclusion_unavailable",
+        "exclusion_timeout",
+        "exclusion_timeout_mismatch",
+        "exclusion_timeout_receipt_directory",
+        "exclusion_timeout_receipt_symlink",
+    }:
+        unavailable = fault in {"exclusion_unavailable", "exclusion_timeout"}
+        expected = module.MeasurementUnavailable if unavailable else ValueError
         message = (
-            "visible coverage run remove-0 failed"
-            if fault == "exclusion_unavailable"
+            f"visible coverage run remove-0 {'timed out' if fault == 'exclusion_timeout' else 'failed'}"
+            if unavailable
             else "native case exclusion receipt missing or mismatched"
         )
         with pytest.raises(expected, match=message) as error:
             collect()
-        assert isinstance(error.value, module.MeasurementUnavailable) is (
-            fault == "exclusion_unavailable"
-        )
+        assert isinstance(error.value, module.MeasurementUnavailable) is unavailable
+        if fault == "exclusion_timeout":
+            saved = tmp_path / "native-diagnostics/remove-0"
+            execution = json.loads((saved / "execution.json").read_text())
+            assert execution["timed_out"] is True
+            assert execution["exit_code"] == 124
+            assert execution["stdout"] == "partial output"
+            assert not (saved / "exclusion-receipt.json").exists()
         assert calls == ["reference", "reference-repeat", "remove-0"]
         return
     elif fault and fault.endswith("mutation"):
         message = (
             "measured source/test bytes changed"
-            if fault in {"inner_mutation", "timeout_mutation"}
+            if fault in {"inner_mutation", "timeout_mutation", "exclusion_timeout_mutation"}
             else "source changed during coverage collection"
             if fault in {"submitted_mutation", "before_mutation"}
             else "dependency cache changed during collection"
@@ -460,7 +487,11 @@ def test_reference_repeat_validation_and_coverage_only_avoid_candidate_exclusion
         with pytest.raises(ValueError, match=message) as error:
             collect()
         assert not isinstance(error.value, module.MeasurementUnavailable)
-        assert calls == ["reference"]
+        assert calls == (
+            ["reference", "reference-repeat", "remove-0"]
+            if fault == "exclusion_timeout_mutation"
+            else ["reference"]
+        )
         return
     else:
         with pytest.raises(ValueError, match="not repeatable|population differs") as error:

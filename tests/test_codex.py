@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from pluginbench import codex
+from pluginbench import codex, processes, isolation
 
 
 def test_codex_final_message_excludes_earlier_progress_for_structured_review() -> None:
@@ -259,6 +260,174 @@ def test_missing_auth_removes_private_runtime(tmp_path: Path) -> None:
         )
     assert not (area / "private").exists()
     assert json.loads((area / "artifacts/execution.json").read_text())["private_runtime_removed"]
+
+
+@pytest.mark.parametrize("link_kind", ["file", "sessions", "codex"])
+def test_native_session_links_never_copy_host_data_and_still_remove_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_kind: str
+) -> None:
+    area = tmp_path / "trial"
+    (area / "workspace").mkdir(parents=True)
+    outside = tmp_path / "operator-private"
+    (outside / "sessions").mkdir(parents=True)
+    secret = outside / "sessions/private.jsonl"
+    secret.write_text("outside-job-secret must not be read by the host launcher")
+    token = "fake-token-that-must-not-be-archived"
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({"token": token}))
+    setup = {
+        "file": f"sessions.mkdir(); (sessions/'trace.jsonl').symlink_to({str(secret)!r})",
+        "sessions": f"sessions.symlink_to({str(outside / 'sessions')!r})",
+        "codex": f"shutil.rmtree(home); home.symlink_to({str(outside)!r})",
+    }[link_kind]
+    script = (
+        "import os,pathlib,shutil; "
+        "home=pathlib.Path(os.environ['CODEX_HOME']); sessions=home/'sessions'; " + setup
+    )
+    monkeypatch.setattr(codex, "command", lambda **kwargs: [sys.executable, "-c", script])
+    with pytest.raises(ValueError, match="artifact|session"):
+        codex.invoke(
+            area=area,
+            entry={"host": "codex", "arm": "baseline"},
+            protocol={"models": {"codex": "test"}, "auth_file": str(auth)},
+            prompt="task",
+            timeout=5,
+        )
+    assert not (area / "private").exists()
+    assert secret.read_text() == "outside-job-secret must not be read by the host launcher"
+    receipt = json.loads((area / "artifacts/execution.json").read_text())
+    assert receipt["private_runtime_removed"]
+    for artifact in (area / "artifacts").rglob("*"):
+        if artifact.is_file() and not artifact.is_symlink():
+            assert secret.read_bytes() not in artifact.read_bytes()
+            assert token.encode() not in artifact.read_bytes()
+
+
+@pytest.mark.parametrize("native_failure", [False, True])
+def test_cleanup_failure_still_removes_auth_scrubs_evidence_and_preserves_original_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native_failure: bool
+) -> None:
+    area = tmp_path / "trial"
+    (area / "workspace").mkdir(parents=True)
+    token = "fake-credential-on-cleanup-error"
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({"token": token}))
+    script = "import os; from pathlib import Path; print(Path(os.environ['CODEX_HOME'], 'auth.json').read_text())"
+    monkeypatch.setattr(codex, "command", lambda **kwargs: [sys.executable, "-c", script])
+    cleanup = processes.terminate_process_group
+
+    def failed_cleanup(proc: subprocess.Popen[str]) -> None:
+        cleanup(proc)
+        raise PermissionError("cleanup probe")
+
+    monkeypatch.setattr(codex, "terminate_process_group", failed_cleanup)
+    if native_failure:
+        communicate = subprocess.Popen.communicate
+
+        def failed_native(
+            proc: subprocess.Popen[str], input: str | None = None, timeout: float | None = None
+        ) -> tuple[str, str]:
+            communicate(proc, input, timeout)
+            raise OSError("native probe")
+
+        monkeypatch.setattr(subprocess.Popen, "communicate", failed_native)
+    expected = "native probe" if native_failure else "cleanup probe"
+    with pytest.raises(OSError, match=expected) as failure:
+        codex.invoke(
+            area=area,
+            entry={"host": "codex", "arm": "baseline"},
+            protocol={"models": {"codex": "test"}, "auth_file": str(auth)},
+            prompt="task",
+            timeout=5,
+        )
+    if native_failure:
+        assert any("Process-group cleanup failed" in note for note in failure.value.__notes__)
+    receipt = json.loads((area / "artifacts/execution.json").read_text())
+    assert receipt["cleanup_error"] == "cleanup probe"
+    assert receipt["private_runtime_removed"] and not (area / "private").exists()
+    assert auth.is_file()
+    assert all(token not in path.read_text() for path in (area / "artifacts").iterdir())
+
+
+def test_changed_runtime_is_fatal_before_native_process_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    area = tmp_path / "trial"
+    (area / "workspace").mkdir(parents=True)
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"token":"fake-auth"}')
+    expected = {**isolation.runtime_identity(), "os_release": "different-runtime"}
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: pytest.fail("cannot launch"))
+    with pytest.raises(isolation.RuntimeDriftError, match="runtime changed"):
+        codex.invoke(
+            area=area,
+            entry={"host": "codex", "arm": "candidate"},
+            protocol={"models": {"codex": "test"}, "auth_file": str(auth), "isolation": expected},
+            prompt="task",
+            timeout=5,
+        )
+    assert not (area / "private").exists()
+    assert json.loads((area / "artifacts/execution.json").read_text())["exit_code"] is None
+
+
+@pytest.mark.skipif(shutil.which("codex") is None, reason="native Codex sandbox probe requires CLI")
+def test_readonly_invocation_uses_one_sandbox_and_cannot_escape_packet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    area = tmp_path / "trial"
+    packet = area / "workspace"
+    packet.mkdir(parents=True)
+    source = packet / "packet.txt"
+    source.write_text("bounded packet")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside packet")
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"token":"fake-auth"}')
+    script = f"""import json, os
+from pathlib import Path
+p = Path({str(source)!r}); assert p.read_text() == 'bounded packet'
+for path, operation in ((p, 'write'), (Path({str(outside)!r}), 'read'), (Path({str(outside)!r}), 'write')):
+    try:
+        path.read_text() if operation == 'read' else path.write_text('changed')
+    except OSError:
+        continue
+    raise AssertionError('escaped packet boundary')
+Path(os.environ['TMPDIR'], 'scratch.txt').write_text('private storage allowed')
+print(json.dumps({{'type':'turn.completed','usage':{{'input_tokens':0,'output_tokens':0}}}}))
+"""
+    native_command = codex.command
+
+    def probe(**kwargs: object) -> list[str]:
+        # Exercise the CLI's actual sandbox entry without invoking any model.
+        profile = ":read-only" if kwargs["read_only"] else ":danger-full-access"
+        return [
+            "codex",
+            "sandbox",
+            "-P",
+            profile,
+            "-C",
+            str(packet),
+            "--",
+            sys.executable,
+            "-c",
+            script,
+        ]
+
+    monkeypatch.setattr(codex, "command", probe)
+    result = codex.invoke(
+        area=area,
+        entry={"host": "codex", "arm": "baseline"},
+        protocol={"models": {"codex": "setup-only"}, "auth_file": str(auth)},
+        prompt="No model calls: sandbox boundary probe only.",
+        timeout=15,
+        read_only=True,
+    )
+    assert result["exit_code"] == 0, (area / "artifacts/stderr.log").read_text()
+    assert source.read_text() == "bounded packet"
+    assert outside.read_text() == "outside packet"
+    assert result["private_runtime_removed"] and not (area / "private").exists()
+    argv = native_command(host="codex", model="test", workspace=packet, plugin=None, read_only=True)
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
 
 
 def test_invocation_cannot_overwrite_existing_execution_evidence(tmp_path: Path) -> None:

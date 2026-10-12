@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -22,7 +23,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from pluginbench import claude, codex, pier_backend
+from pluginbench import claude, codex, pier_backend, isolation, harbor_backend
+from pluginbench.baselines import BaselineCache
 from pluginbench.parallel import run_jobs, validate_jobs
 from pluginbench.assessment import build_assessment, write_assessment
 from pluginbench.assessment_metrics import EXCLUDED_NAMES, inspect_snapshot
@@ -47,10 +49,13 @@ class StudyRecipe(BaseModel):
 
     schema_version: Literal[1]
     name: str = Field(min_length=1)
-    backend: Literal["local", "pier"] = "local"
+    backend: Literal["local", "pier", "harbor"] = "local"
     harness: Literal["codex", "claude"] = "codex"
     tasks: Path
     codex_version: str = Field(default="0.162.0", pattern=r"^\d+\.\d+\.\d+$")
+    harness_version: str | None = None
+    container_cpus: int = Field(default=1, strict=True, ge=1)
+    container_memory_mb: int = Field(default=2048, strict=True, ge=256)
     pier_python: Path = Path(sys.executable)
     guidance: dict[str, list[Path]] = Field(min_length=1)
     model: str = Field(default="gpt-6.1-sol", min_length=1)
@@ -82,6 +87,8 @@ class StudyRecipe(BaseModel):
 
     @model_validator(mode="after")
     def supported_repairs(self) -> StudyRecipe:
+        if self.backend == "harbor" and (self.max_repairs or self.reasoning == "ultra"):
+            raise ValueError("Harbor supports no repair rounds and does not support ultra effort")
         if self.backend == "pier" and self.max_repairs:
             raise ValueError("Pier studies currently support max_repairs: 0 only")
         if self.backend == "pier" and self.harness != "codex":
@@ -214,6 +221,10 @@ def _load_local_tasks(recipe: StudyRecipe) -> tuple[TaskSpec, ...]:
     for task in tasks:
         assert task.fixture is not None
         codex.reject_guidance(task.fixture, include_ancestors=False, reject_git=True)
+        if recipe.backend == "harbor":
+            image = (task.provenance or {}).get("agent_image", "")
+            if not re.fullmatch(r"[^\s]+@sha256:[a-f0-9]{64}", image):
+                raise ValueError("Harbor tasks require a pinned agent_image in provenance")
     return tuple(tasks)
 
 
@@ -344,7 +355,7 @@ def _freeze(study: ResolvedStudy, root: Path) -> ResolvedStudy:
     public_recipe = recipe.model_dump(mode="json", exclude={"auth_file"})
     _write(frozen / "resolved-recipe.json", public_recipe)
     _write(root / "frozen-inventory.json", _inventory(frozen))
-    if recipe.backend == "local":
+    if recipe.backend != "pier":
         tasks = _load_local_tasks(recipe)
     return ResolvedStudy(
         recipe,
@@ -406,15 +417,15 @@ def _grade(snapshot: Path, task: TaskSpec, directory: Path) -> dict[str, Any]:
     workspace = directory / "workspace"
     shutil.copytree(snapshot, workspace)
     before = inspect_snapshot(workspace)["digest"]
+    receipt = directory / "runtime-isolation.json"
     try:
-        result = subprocess.run(
-            task.verifier.command,
+        result = isolation.run(
+            list(task.verifier.command),
             cwd=workspace,
-            capture_output=True,
-            text=True,
             timeout=task.verifier.timeout_seconds,
-            check=False,
             env={"PATH": os.environ["PATH"], "PLUGINBENCH_TASK_ID": task.task_id},
+            readable=isolation.verifier_paths(task.verifier.script),
+            receipt=receipt,
         )
         try:
             report = json.loads(result.stdout)
@@ -433,9 +444,14 @@ def _grade(snapshot: Path, task: TaskSpec, directory: Path) -> dict[str, Any]:
             "stdout": result.stdout,
             "stderr": result.stderr,
             "grader_immutable": immutable,
+            "filesystem": json.loads(receipt.read_text()),
         }
     except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
-        return {"pass": None, "error": str(exc)}
+        return {
+            "pass": None,
+            "error": str(exc),
+            "filesystem": json.loads(receipt.read_text()) if receipt.is_file() else None,
+        }
 
 
 def _collect(
@@ -493,6 +509,7 @@ def _execute_stage(
     stage_id: str,
     prompt: str,
     on_native_start: Callable[[], None] | None = None,
+    expected_runtime: dict[str, object] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     _assert_frozen(root)
     interrupted: KeyboardInterrupt | None = None
@@ -500,12 +517,35 @@ def _execute_stage(
         codex.reject_guidance(area / "workspace", include_ancestors=True, reject_git=False)
         if on_native_start:
             on_native_start()
-        execution = codex.invoke(
+        invoke = harbor_backend.invoke if study.recipe.backend == "harbor" else codex.invoke
+        execution = invoke(
             area=area,
             entry={**entry, "host": study.recipe.harness},
             protocol={
                 "models": {study.recipe.harness: study.recipe.model},
                 "reasoning": study.recipe.reasoning,
+                "isolation": expected_runtime,
+                **(
+                    {
+                        "agent_image": (task.provenance or {})["agent_image"],
+                        "image_identity": json.loads((task.provenance or {})["image_identity"])
+                        if (task.provenance or {}).get("image_identity")
+                        else None,
+                        "toolchain_identity": json.loads(
+                            (task.provenance or {})["toolchain_identity"]
+                        )
+                        if (task.provenance or {}).get("toolchain_identity")
+                        else None,
+                        "harness_version": study.recipe.harness_version,
+                        "container_cpus": study.recipe.container_cpus,
+                        "container_memory_mb": study.recipe.container_memory_mb,
+                        "build_timeout_seconds": int(
+                            (task.provenance or {}).get("build_timeout_seconds", "300")
+                        ),
+                    }
+                    if study.recipe.backend == "harbor"
+                    else {}
+                ),
                 **(
                     {"auth_file": str(study.recipe.auth_file)}
                     if study.recipe.harness == "codex"
@@ -517,25 +557,49 @@ def _execute_stage(
         )
     except (OSError, ValueError, KeyboardInterrupt) as exc:
         artifacts = area / "artifacts"
-        stdout = artifacts / "stdout.jsonl"
-        traces = [path.read_text() for path in sorted(artifacts.glob("host-trace-*.jsonl"))]
         execution = codex.parse_events(
-            stdout.read_text() if stdout.is_file() else "",
-            traces,
+            "",
+            [],
             study.recipe.harness,
             requested_effort=study.recipe.reasoning,
         )
-        runtime_receipt = artifacts / "execution.json"
-        if runtime_receipt.is_file():
-            execution.update(json.loads(runtime_receipt.read_text()))
+        try:
+            codex.validate_artifacts(artifacts)
+        except (OSError, ValueError):
+            pass
+        else:
+            stdout = artifacts / "stdout.jsonl"
+            execution.update(
+                codex.parse_events(
+                    stdout.read_text() if stdout.is_file() else "",
+                    [path.read_text() for path in sorted(artifacts.glob("host-trace-*.jsonl"))],
+                    study.recipe.harness,
+                    requested_effort=study.recipe.reasoning,
+                )
+            )
+            runtime_receipt = artifacts / "execution.json"
+            if runtime_receipt.is_file():
+                execution.update(json.loads(runtime_receipt.read_text()))
         execution.update(successful_native_completion=False, error=f"{type(exc).__name__}: {exc}")
         if isinstance(exc, KeyboardInterrupt):
             interrupted = exc
     target = root / "attempts" / entry["id"] / stage_id
     target.mkdir(parents=True)
-    if (area / "artifacts").exists():
-        shutil.copytree(area / "artifacts", target / "artifacts")
-        shutil.rmtree(area / "artifacts")
+    artifacts = area / "artifacts"
+    artifact_error = None
+    if artifacts.exists() or artifacts.is_symlink():
+        artifact_error = codex.copy_artifacts(artifacts, target / "artifacts")
+        if artifacts.is_symlink():
+            artifacts.unlink()
+        else:
+            shutil.rmtree(artifacts)
+    if artifact_error:
+        execution = {
+            **codex.parse_events("", [], study.recipe.harness),
+            "successful_native_completion": False,
+            "submission_collected": False,
+            "error": artifact_error,
+        }
     _write(target / "execution.json", execution)
     if interrupted is not None:
         shutil.copytree(
@@ -549,6 +613,46 @@ def _execute_stage(
             {"status": "unsubmitted interrupted workspace; not graded"},
         )
         raise interrupted
+    if artifact_error or (
+        study.recipe.backend == "harbor" and execution.get("submission_collected") is not True
+    ):
+        exported_digest = execution.get("submission_export_digest")
+        if not artifact_error and isinstance(exported_digest, str):
+            try:
+                exported = inspect_snapshot(area / "workspace")
+                if exported["digest"] != exported_digest:
+                    raise ValueError("stopped export changed before failure evidence was frozen")
+                shutil.copytree(
+                    area / "workspace",
+                    target / "ungraded-submission",
+                    symlinks=True,
+                    ignore=shutil.ignore_patterns(*EXCLUDED_NAMES),
+                )
+                _write(
+                    target / "ungraded-submission.json",
+                    {
+                        "status": "stopped export; cleanup proof incomplete; not graded",
+                        "digest": exported_digest,
+                    },
+                )
+            except ValueError as error:
+                execution["error"] = str(error)
+                _write(target / "execution.json", execution)
+        _write(
+            target / "unsupported-submission.json",
+            {"error": execution.get("error", "Harbor did not freeze a complete submission")},
+        )
+        return (
+            {
+                "id": stage_id,
+                "snapshot": None,
+                "correctness": None,
+                "evidence": None,
+                "work": _work(execution),
+            },
+            execution,
+            {"pass": None, "error": "unavailable submitted snapshot"},
+        )
     try:
         inspect_snapshot(area / "workspace")
     except ValueError as exc:
@@ -576,6 +680,28 @@ def _execute_stage(
     shutil.copytree(
         area / "workspace", snapshot, symlinks=True, ignore=shutil.ignore_patterns(*EXCLUDED_NAMES)
     )
+    stage, result = _verify_snapshot(
+        root=root,
+        snapshot=snapshot,
+        task=task,
+        study=study,
+        target=target,
+        stage_id=stage_id,
+        execution=execution,
+    )
+    return stage, execution, result
+
+
+def _verify_snapshot(
+    *,
+    root: Path,
+    snapshot: Path,
+    task: TaskSpec,
+    study: ResolvedStudy,
+    target: Path,
+    stage_id: str,
+    execution: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     snapshot_ref = _reference(root, snapshot, snapshot=True)
     with tempfile.TemporaryDirectory(prefix="pluginbench-grade-") as grader:
         result = _grade(snapshot, task, Path(grader))
@@ -616,7 +742,6 @@ def _execute_stage(
             "evidence": evidence or None,
             "work": _work(execution),
         },
-        execution,
         result,
     )
 
@@ -710,15 +835,33 @@ def _checkpoint(
             "executions": executions,
             "verifier_results": verifier_results,
             "submission_errors": submission_errors,
+            "baseline_origin": {
+                path.parent.name: {
+                    **json.loads(path.read_text()),
+                    "evidence": _reference(root, path),
+                }
+                for path in sorted((root / "baseline-evidence").glob("*/origin.json"))
+            },
             "correction_burden": "unknown: deterministic verifier repair stages are not independent review",
         },
     )
 
 
 def run_study(
-    study: ResolvedStudy, output: Path, *, progress: Callable[[str], None] | None = None
+    study: ResolvedStudy,
+    output: Path,
+    *,
+    progress: Callable[[str], None] | None = None,
+    baseline_cache: Path | None = None,
+    baseline_identity: dict[str, object] | None = None,
 ) -> Path:
     validate_jobs(study.recipe.jobs)
+    if study.recipe.backend == "pier":
+        raise ValueError(
+            "Pier execution is retired; saved Pier runs remain readable. Use Harbor for new evaluations."
+        )
+    if baseline_cache is not None and not baseline_identity:
+        raise ValueError("baseline reuse requires a fixed coding identity")
     root = output.resolve()
     if root.exists():
         raise ValueError(f"study output must be a new directory: {root}")
@@ -747,31 +890,74 @@ def run_study(
     }
     _checkpoint(root, frozen, manifest, states, status="preflight")
     tasks = {task.task_id: task for task in frozen.tasks}
+    cache = None
     try:
+        expected_runtime = (
+            harbor_backend.runtime_identity(
+                cpus=frozen.recipe.container_cpus, memory_mb=frozen.recipe.container_memory_mb
+            )
+            if frozen.recipe.backend == "harbor"
+            else isolation.runtime_identity()
+        )
+        if baseline_identity is not None:
+            requested_runtime = baseline_identity.get("isolation")
+            if not isinstance(requested_runtime, dict):
+                raise ValueError("baseline reuse requires a fixed filesystem isolation identity")
+            (
+                harbor_backend.assert_runtime
+                if frozen.recipe.backend == "harbor"
+                else isolation.assert_runtime
+            )(requested_runtime)
+            expected_runtime = requested_runtime
+        if baseline_cache is not None:
+            assert baseline_identity is not None
+            cache = BaselineCache(
+                path=baseline_cache,
+                root=root,
+                tasks=tuple(task for task in frozen.tasks if isinstance(task, TaskSpec)),
+                entries=plan["entries"],
+                identity={
+                    **baseline_identity,
+                    "study": {
+                        key: getattr(frozen.recipe, key)
+                        for key in (
+                            "harness",
+                            "model",
+                            "reasoning",
+                            "jobs",
+                            "timeout_seconds",
+                            "seed",
+                            "max_repairs",
+                        )
+                    },
+                },
+            ).reserve()
+            plan["baseline_cache"] = cache.decisions()
+            _write(root / "plan.json", plan)
+            _checkpoint(root, frozen, manifest, states, status="preflight")
         preflight = (
-            pier_backend.preflight(frozen.recipe.pier_python)
-            if frozen.recipe.backend == "pier"
+            harbor_backend.preflight(
+                jobs=frozen.recipe.jobs,
+                cpus=frozen.recipe.container_cpus,
+                memory_mb=frozen.recipe.container_memory_mb,
+            )
+            if frozen.recipe.backend == "harbor"
             else claude.preflight()
             if frozen.recipe.harness == "claude"
             else codex.preflight()
         )
+        if expected_runtime is not None:
+            preflight["filesystem_isolation"] = expected_runtime
+        if frozen.recipe.backend == "harbor":
+            preflight["harness_version"] = frozen.recipe.harness_version
         _write(root / "runtime-preflight.json", preflight)
         _checkpoint(
             root,
             frozen,
             manifest,
             states,
-            status="calibration" if frozen.recipe.backend == "pier" else "running",
+            status="running",
         )
-        if frozen.recipe.backend == "pier":
-            pier_tasks = tuple(
-                task for task in frozen.tasks if isinstance(task, pier_backend.PierTask)
-            )
-            calibration = pier_backend.calibrate(
-                pier_tasks, root / "calibration", frozen.recipe.pier_python
-            )
-            _assert_frozen(root)
-            _write(root / "calibration.json", calibration)
 
         def commit(index: int, record: dict[str, Any], status: str) -> None:
             records[index] = record
@@ -799,6 +985,12 @@ def run_study(
             def started() -> None:
                 if cancelled.is_set():
                     raise CancelledError("attempt cancelled before its next native invocation")
+                if expected_runtime is not None:
+                    (
+                        harbor_backend.assert_runtime
+                        if frozen.recipe.backend == "harbor"
+                        else isolation.assert_runtime
+                    )(expected_runtime)
                 receipt = root / "invocations" / entry["id"] / f"{stage_id}.json"
                 _write(
                     receipt,
@@ -811,79 +1003,96 @@ def run_study(
                 emit(partial(commit, index, copy.deepcopy(record), "running"))
 
             try:
-                if isinstance(task, pier_backend.PierTask):
-                    record = _run_pier_attempt(
-                        root=root, entry=entry, task=task, study=frozen, on_native_start=started
-                    )
-                else:
-                    assert task.fixture is not None
-                    attempt_dir = root / "attempts" / entry["id"]
-                    before = _reference(root, task.fixture, snapshot=True)
-                    before_evidence = _collect(
-                        root,
-                        task.fixture,
-                        attempt_dir / "before-evidence",
-                        frozen.recipe.collectors,
-                        before=task.fixture,
-                    )
-                    record.update(before=before, before_evidence=before_evidence or None)
-                    stages: list[dict[str, Any]] = []
-                    executions: list[dict[str, Any]] = []
-                    with tempfile.TemporaryDirectory(prefix="pluginbench-study-") as temporary:
-                        previous_snapshot = task.fixture
-                        guidance = frozen.guidance.get(entry["arm"], ())
-                        prompt = _prompt(task, guidance)
-                        for round_number in range(frozen.recipe.max_repairs + 1):
-                            if cancelled.is_set():
-                                break
-                            stage_id = "handoff" if round_number == 0 else f"repair-{round_number}"
-                            area = Path(temporary) / stage_id
-                            shutil.copytree(previous_snapshot, area / "workspace")
-                            stages.append({"id": stage_id, "snapshot": None, "work": None})
-                            record["stages"] = list(stages)
-                            record["model"] = None
-                            _assert_frozen(root)
-                            codex.reject_guidance(
-                                area / "workspace", include_ancestors=True, reject_git=False
-                            )
-                            emit(partial(commit, index, copy.deepcopy(record), "running"))
-                            stage, execution, result = _execute_stage(
+                assert isinstance(task, TaskSpec)
+                assert task.fixture is not None
+                attempt_dir = root / "attempts" / entry["id"]
+                imported = cache.import_attempt(entry) if cache is not None else None
+                if imported is not None:
+                    record = imported
+                before = _reference(root, task.fixture, snapshot=True)
+                before_evidence = _collect(
+                    root,
+                    task.fixture,
+                    attempt_dir / "before-evidence",
+                    frozen.recipe.collectors,
+                    before=task.fixture,
+                )
+                record.update(before=before, before_evidence=before_evidence or None)
+                if imported is not None:
+                    for stage in record["stages"]:
+                        target = attempt_dir / stage["id"]
+                        execution = json.loads((target / "execution.json").read_text())
+                        if stage["snapshot"] is not None:
+                            verified, _ = _verify_snapshot(
                                 root=root,
-                                area=area,
-                                entry=entry,
+                                snapshot=root / stage["snapshot"]["path"],
                                 task=task,
                                 study=frozen,
-                                stage_id=stage_id,
-                                prompt=prompt,
-                                on_native_start=started,
+                                target=target,
+                                stage_id=stage["id"],
+                                execution=execution,
                             )
-                            stages[-1] = stage
-                            executions.append(execution)
-                            record.update(
-                                stages=list(stages),
-                                model=_consistent_observation(executions, "actual_primary_models"),
-                                runtime={
-                                    "harness": f"{study.recipe.harness}-cli",
-                                    "harness_version": _observed_harness_version(executions),
-                                    "requested_reasoning_effort": study.recipe.reasoning,
-                                    "reasoning_effort": _consistent_observation(
-                                        executions, "runtime_effort_evidence"
-                                    ),
-                                },
-                            )
-                            emit(partial(commit, index, copy.deepcopy(record), "running"))
-                            if stage["snapshot"] is not None:
-                                previous_snapshot = root / stage["snapshot"]["path"]
-                            if (
-                                result["pass"] is not False
-                                or execution.get("successful_native_completion") is not True
-                            ):
-                                break
-                            prompt = _prompt(task, guidance) + (
-                                "\n\nThe external verifier rejected your previous submission. "
-                                "Fix its failures in the current workspace and verify the result.\n"
-                                + json.dumps(result, sort_keys=True)
-                            )
+                            stage.update(verified)
+                    completed = True
+                    return
+                stages: list[dict[str, Any]] = []
+                executions: list[dict[str, Any]] = []
+                with tempfile.TemporaryDirectory(prefix="pluginbench-study-") as temporary:
+                    previous_snapshot = task.fixture
+                    guidance = frozen.guidance.get(entry["arm"], ())
+                    prompt = _prompt(task, guidance)
+                    for round_number in range(frozen.recipe.max_repairs + 1):
+                        if cancelled.is_set():
+                            break
+                        stage_id = "handoff" if round_number == 0 else f"repair-{round_number}"
+                        area = Path(temporary) / stage_id
+                        shutil.copytree(previous_snapshot, area / "workspace")
+                        stages.append({"id": stage_id, "snapshot": None, "work": None})
+                        record["stages"] = list(stages)
+                        record["model"] = None
+                        _assert_frozen(root)
+                        codex.reject_guidance(
+                            area / "workspace", include_ancestors=True, reject_git=False
+                        )
+                        emit(partial(commit, index, copy.deepcopy(record), "running"))
+                        stage, execution, result = _execute_stage(
+                            root=root,
+                            area=area,
+                            entry=entry,
+                            task=task,
+                            study=frozen,
+                            stage_id=stage_id,
+                            prompt=prompt,
+                            on_native_start=started,
+                            expected_runtime=expected_runtime,
+                        )
+                        stages[-1] = stage
+                        executions.append(execution)
+                        record.update(
+                            stages=list(stages),
+                            model=_consistent_observation(executions, "actual_primary_models"),
+                            runtime={
+                                "harness": f"{study.recipe.harness}-cli",
+                                "harness_version": _observed_harness_version(executions),
+                                "requested_reasoning_effort": study.recipe.reasoning,
+                                "reasoning_effort": _consistent_observation(
+                                    executions, "runtime_effort_evidence"
+                                ),
+                            },
+                        )
+                        emit(partial(commit, index, copy.deepcopy(record), "running"))
+                        if stage["snapshot"] is not None:
+                            previous_snapshot = root / stage["snapshot"]["path"]
+                        if (
+                            result["pass"] is not False
+                            or execution.get("successful_native_completion") is not True
+                        ):
+                            break
+                        prompt = _prompt(task, guidance) + (
+                            "\n\nThe external verifier rejected your previous submission. "
+                            "Fix its failures in the current workspace and verify the result.\n"
+                            + json.dumps(result, sort_keys=True)
+                        )
                 completed = True
             finally:
                 emit(
@@ -901,6 +1110,11 @@ def run_study(
             operation=attempt,
             on_submit=submitted,
         )
+        _checkpoint(root, frozen, manifest, states, status="complete")
+        if cache is not None:
+            cache.publish(
+                records, tuple(task for task in frozen.tasks if isinstance(task, TaskSpec))
+            )
     except BaseException as exc:
         for attempt_id, state in states.items():
             if state == "running":
@@ -923,102 +1137,11 @@ def run_study(
         )
         report_study(root)
         raise
-    _checkpoint(root, frozen, manifest, states, status="complete")
+    finally:
+        if cache is not None:
+            cache.close()
     report_study(root)
     return root
-
-
-def _run_pier_attempt(
-    *,
-    root: Path,
-    entry: dict[str, Any],
-    task: pier_backend.PierTask,
-    study: ResolvedStudy,
-    on_native_start: Callable[[], None] | None = None,
-) -> dict[str, Any]:
-    _assert_frozen(root)
-    target = root / "attempts" / entry["id"] / "handoff"
-    if on_native_start:
-        on_native_start()
-    result = pier_backend.invoke(
-        target=target,
-        task=task,
-        prompt=_prompt(task, study.guidance.get(entry["arm"], ())),
-        model=study.recipe.model,
-        reasoning=study.recipe.reasoning,
-        auth_file=study.recipe.auth_file,
-        codex_version=study.recipe.codex_version,
-        python=study.recipe.pier_python,
-        timeout=study.recipe.timeout_seconds,
-    )
-    execution = result["execution"]
-    _write(target / "execution.json", execution)
-    _write(target / "verifier-result.json", result)
-    before = Path(result["before"]) if result.get("before") else None
-    handoff = Path(result["handoff"]) if result.get("handoff") else None
-    correctness = None
-    if handoff is not None:
-        snapshot = _reference(root, handoff, snapshot=True)
-        receipt = CorrectnessReceipt(
-            schema_version=1,
-            snapshot_digest=snapshot["sha256"],
-            checks={
-                **result["checks"],
-                "native_completion": execution.get("successful_native_completion") is True,
-            },
-            command=["pier", "trial", str(task.directory)],
-            tool="DeepSWE separate verifier",
-            tool_version=pier_backend.PIER_VERSION,
-        )
-        _write(target / "correctness.json", receipt.model_dump(mode="json"))
-        correctness = _reference(root, target / "correctness.json")
-    else:
-        _write(
-            target / "unsupported-submission.json",
-            {
-                "error": "Pier did not export a bindable graded submission",
-                "checks": result.get("checks"),
-                "execution_error": execution.get("error"),
-            },
-        )
-    before_ref = _reference(root, before, snapshot=True) if before else None
-    before_evidence = (
-        _collect(
-            root, before, target.parent / "before-evidence", study.recipe.collectors, before=before
-        )
-        if before
-        else None
-    )
-    evidence = (
-        _collect(root, handoff, target / "evidence", study.recipe.collectors, before=before)
-        if handoff
-        else None
-    )
-    _assert_frozen(root)
-    return {
-        "id": entry["id"],
-        "task_id": task.task_id,
-        "attempt": entry["attempt"],
-        "arm": entry["arm"],
-        "model": _consistent_observation([execution], "actual_primary_models"),
-        "runtime": {
-            "harness": "codex-cli",
-            "harness_version": _observed_harness_version([execution]),
-            "requested_reasoning_effort": study.recipe.reasoning,
-            "reasoning_effort": _consistent_observation([execution], "runtime_effort_evidence"),
-        },
-        "before": before_ref,
-        "before_evidence": before_evidence or None,
-        "stages": [
-            {
-                "id": "handoff",
-                "snapshot": _reference(root, handoff, snapshot=True) if handoff else None,
-                "correctness": correctness,
-                "evidence": evidence or None,
-                "work": _work(execution),
-            }
-        ],
-    }
 
 
 def _bound_path(root: Path, reference: object) -> Path:
@@ -1147,6 +1270,14 @@ def report_study(
         "native_invocations": run["actual_calls"],
         "error": run.get("error"),
     }
+    report["baseline_origin"] = run.get("baseline_origin", {})
+    for origin in report["baseline_origin"].values():
+        if _bound_document(root, origin["evidence"]) != {
+            key: value for key, value in origin.items() if key != "evidence"
+        }:
+            raise ValueError("baseline origin differs from its bound evidence")
+        for reference in origin["historical_evidence"]:
+            _bound_path(root, reference)
     if review_path is not None:
         review = json.loads(review_path.read_text())
         recovery = None

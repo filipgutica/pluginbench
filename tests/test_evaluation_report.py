@@ -107,6 +107,27 @@ def test_each_guidance_set_has_its_own_delta_against_the_same_evaluation_baselin
     assert "winner" not in data and "score" not in data
 
 
+def test_reused_baseline_is_disclosed_without_recounting_original_calls() -> None:
+    report = _token_report()
+    report["baseline_origin"] = {
+        "baseline-0": {"cache_key": "key", "origin_run": "earlier", "origin_attempt": "old"}
+    }
+    report["study_progress"] = {"native_invocations": 8}
+    data = evaluation_data(report, _config())
+    assert data["coding_invocations"] == 8
+    assert data["reused_baseline_attempts"] == 1
+    limitations = data["limitations"]
+    assert isinstance(limitations, list)
+    assert "reused" in " ".join(str(row) for row in limitations)
+    row = next(row for row in _rows(data, "attempts") if row["id"] == "baseline-0")
+    assert row["baseline_origin"] == {
+        "cache_key": "key",
+        "origin_run": "earlier",
+        "origin_attempt": "old",
+        "evidence": None,
+    }
+
+
 def test_report_records_jobs_without_changing_attempts_or_metric_values() -> None:
     config = _config()
     serial = evaluation_data(_token_report(), config)

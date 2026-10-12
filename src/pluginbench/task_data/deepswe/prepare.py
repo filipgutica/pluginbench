@@ -14,7 +14,10 @@ import subprocess
 import tarfile
 import tomllib
 
-from pluginbench.task_data.deepswe.verify import dependency_digest
+from pluginbench.task_data.deepswe.verify import (
+    dependency_digest,
+    test_command as native_test_command,
+)
 from pluginbench.task_data.deepswe.measurements import (
     MEASUREMENT_NAMES,
     measurement_metadata,
@@ -82,6 +85,11 @@ def main() -> None:
         help="collect only these measurements; repeat to select more",
     )
     parser.add_argument("--observer-cache", type=Path, help="observer cache outside task fixtures")
+    parser.add_argument(
+        "--prepared-dependencies",
+        action="store_true",
+        help="prepare a Harbor prompt whose dependencies are installed before coding",
+    )
     args = parser.parse_args()
     observed_node = command(["node", "--version"]).decode().strip()
     if observed_node != NODE_VERSION:
@@ -271,16 +279,38 @@ def main() -> None:
     verifier = generated / ("verify-ofetch.py" if task == TASK else f"verify-{task}.py")
     template = (ROOT / "verify.py").read_text()
     verifier.write_text(template.replace("PAYLOAD = {}", "PAYLOAD = " + repr(payload)))
+    framework = payload["framework"]
+    report = Path(f"/tmp/pluginbench-visible-check.{'json' if framework == 'mocha' else 'xml'}")
+    visible_check = native_test_command(
+        workspace=fixture, framework=framework, arguments=runs[0][1], report=report
+    )
+    visible_check[1] = str(Path("/workspace") / Path(visible_check[1]).relative_to(fixture))
+    (generated / "native-environment.json").write_text(
+        json.dumps(
+            {
+                "package_manager": manager,
+                "install_arguments": install,
+                "visible_check": visible_check,
+                "test_cwd": test_cwd,
+                "lock_file": lock,
+                "framework": framework,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
     original = (task_source / "instruction.md").read_text()
     commit_instruction = "IMPORTANT: Please work on this in a new branch from main and commit everything when you are done."
     if original.count(commit_instruction) != 1:
         raise ValueError("upstream delivery instruction changed")
-    prompt = original.replace(
-        commit_instruction,
-        "Work in the supplied source snapshot; do not create branches or commits. "
-        f"Install locked dependencies with corepack {manager} {' '.join(install)}. "
-        f"Run existing tests with {test_command}.",
+    delivery = "Work in the supplied source snapshot; do not create branches or commits. "
+    delivery += (
+        "Dependencies are already installed. Choose verification appropriate to your change."
+        if args.prepared_dependencies
+        else f"Install locked dependencies with corepack {manager} {' '.join(install)}. "
+        f"Run existing tests with {test_command}."
     )
+    prompt = original.replace(commit_instruction, delivery)
     prompt += (
         "\n\nExecution contract: work as a single implementation agent. "
         "Independent review happens externally after source handoff. "
@@ -305,9 +335,13 @@ def main() -> None:
         ).hexdigest(),
         "instruction_sha256": hashlib.sha256(original.encode()).hexdigest(),
         "dependency_sha256": payload["dependency_sha256"],
-        "prompt_adaptation": "replace branch/commit instruction with source-snapshot delivery and original package commands; append identical single-agent execution contract with external post-handoff review and no claims of unavailable delegation/pre-edit critique",
+        "prompt_adaptation": "replace branch/commit instruction with source-snapshot delivery and prepared dependencies; agent chooses verification; append identical single-agent execution contract with external post-handoff review and no claims of unavailable delegation/pre-edit critique"
+        if args.prepared_dependencies
+        else "replace branch/commit instruction with source-snapshot delivery and original package commands; append identical single-agent execution contract with external post-handoff review and no claims of unavailable delegation/pre-edit critique",
         "stripped_guidance": json.dumps(stripped),
-        "backend_difference": "native macOS; no enforced network isolation; locked ignore-scripts dependency setup",
+        "backend_difference": "isolated Linux coding with prepared locked ignore-scripts dependencies; trusted host grading is an adapted verifier environment"
+        if args.prepared_dependencies
+        else "native macOS; no enforced network isolation; locked ignore-scripts dependency setup",
         "derived_lock_adaptation": "generated package-lock.json with npm10.9.2 --package-lock=true; added to both fixtures with original code bytes unchanged"
         if derived_lock
         else "none; original lock retained",

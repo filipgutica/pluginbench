@@ -8,6 +8,7 @@ from typing import Literal
 import pytest
 
 from pluginbench.assessment_metrics import evaluate_evidence, inspect_snapshot
+from pluginbench import isolation
 from pluginbench.collectors import Collector, _execute, collect_measurements, freeze_collectors
 from pluginbench.task_data.deepswe.measurements import ROOT, observer_cache_root
 
@@ -23,6 +24,187 @@ def config(root: Path, value: object) -> Path:
     path = root / "config.json"
     path.write_text(json.dumps(value))
     return path
+
+
+@pytest.mark.parametrize(
+    ("operator_owned", "selected"), [(False, True), (True, False), (True, True)]
+)
+def test_only_operator_json_can_grant_selected_read_paths(
+    tmp_path: Path, operator_owned: bool, selected: bool
+) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    secret = tmp_path / "private.txt"
+    secret.write_text("private")
+    settings = (tmp_path if operator_owned else job) / "settings.json"
+    settings.write_text(json.dumps({"asset": str(secret)}))
+    script = job / "probe.py"
+    script.write_text("""import json, sys
+from pathlib import Path
+asset = Path(json.loads(Path(sys.argv[1]).read_text())['asset'])
+try:
+    asset.read_text()
+    allowed = True
+except OSError:
+    allowed = False
+assert allowed == (sys.argv[2] == 'True')
+""")
+    execution = _execute(
+        [sys.executable, str(script), str(settings), str(operator_owned and selected)],
+        job,
+        10,
+        config=settings if selected else None,
+    )
+    assert execution.returncode == 0, execution.stderr
+
+
+def test_frozen_verifier_dependencies_are_read_only_and_exact(tmp_path: Path) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    dependencies = tmp_path / "dependencies"
+    dependencies.mkdir()
+    asset = dependencies / "value.txt"
+    asset.write_text("42")
+    neighbor = tmp_path / "private.txt"
+    neighbor.write_text("private")
+    script = tmp_path / "verifier.py"
+    script.write_text(
+        "import json\nfrom pathlib import Path\n"
+        f"PAYLOAD = { {'dependencies': str(dependencies)}!r}\n"
+        "asset = Path(PAYLOAD['dependencies']) / 'value.txt'\n"
+        "result = {}\n"
+        "try:\n    result['read'] = asset.read_text()\n"
+        "except OSError:\n    result['read'] = None\n"
+        "try:\n    asset.write_text('changed')\n    result['write'] = True\n"
+        "except OSError:\n    result['write'] = False\n"
+        f"try:\n    Path({str(neighbor)!r}).read_text()\n    result['neighbor'] = True\n"
+        "except OSError:\n    result['neighbor'] = False\n"
+        "print(json.dumps(result))\n"
+    )
+    collector = Collector(
+        kind="mutation",
+        config=config(tmp_path, {}),
+        command=[sys.executable, str(script)],
+        tool_version="test",
+    )
+    frozen = freeze_collectors([collector], tmp_path / "frozen")[0]
+    assert frozen.command is not None
+    result = _execute(frozen.command, job, 10, config=frozen.config)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"read": "42", "write": False, "neighbor": False}
+    assert asset.read_text() == "42"
+
+
+@pytest.mark.parametrize("kind", ["python", "json"])
+@pytest.mark.parametrize(
+    "route",
+    [
+        "submitted",
+        "submitted-link",
+        "outside-link",
+        "round-trip",
+        "declared-submitted-link",
+        "declared-round-trip",
+    ],
+)
+def test_submitted_metadata_and_aliases_cannot_grant_reads(
+    tmp_path: Path, kind: str, route: str
+) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    operator = tmp_path / "operator"
+    operator.mkdir()
+    secret = tmp_path / "private.txt"
+    secret.write_text("private")
+    asset = secret
+    if route == "declared-submitted-link":
+        asset = job / "asset-link"
+        asset.symlink_to(secret)
+    elif route == "declared-round-trip":
+        (tmp_path / "bridge").symlink_to(job / "back", target_is_directory=True)
+        (job / "back").symlink_to(tmp_path, target_is_directory=True)
+        asset = tmp_path / "bridge" / secret.name
+    metadata = operator / ("verifier.py" if kind == "python" else "settings.json")
+    if kind == "python":
+        metadata.write_text(
+            "from pathlib import Path\n"
+            f"PAYLOAD = { {'asset': str(asset)}!r}\n"
+            "try:\n    Path(PAYLOAD['asset']).read_text()\n    allowed = True\n"
+            "except OSError:\n    allowed = False\n"
+            "print(allowed)\n"
+        )
+    else:
+        metadata.write_text(json.dumps({"asset": str(asset)}))
+    if route == "submitted":
+        selected = job / metadata.name
+        shutil.copy2(metadata, selected)
+    elif route == "submitted-link":
+        selected = job / metadata.name
+        selected.symlink_to(metadata)
+    elif route == "outside-link":
+        selected = tmp_path / metadata.name
+        selected.symlink_to(metadata)
+    elif route == "round-trip":
+        (tmp_path / "bridge").symlink_to(job / "back", target_is_directory=True)
+        (job / "back").symlink_to(operator, target_is_directory=True)
+        selected = tmp_path / "bridge" / metadata.name
+    else:
+        selected = metadata
+    if kind == "python":
+        argv = [sys.executable, str(selected)]
+        settings = None
+    else:
+        script = job / "probe.py"
+        script.write_text(
+            "import json, sys\nfrom pathlib import Path\n"
+            "asset = Path(json.loads(Path(sys.argv[1]).read_text())['asset'])\n"
+            "try:\n    asset.read_text()\n    allowed = True\n"
+            "except OSError:\n    allowed = False\n"
+            "print(allowed)\n"
+        )
+        argv = [sys.executable, str(script), str(selected)]
+        settings = selected
+    result = _execute(argv, job, 10, config=settings)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False"
+
+
+def test_canonical_preparation_preserves_trusted_alias_reads(tmp_path: Path) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    operator = tmp_path / "operator"
+    operator.mkdir()
+    alias = tmp_path / "trusted-alias"
+    alias.symlink_to(operator, target_is_directory=True)
+    asset = operator / "value.txt"
+    asset.write_text("42")
+    script = operator / "verifier.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        f"PAYLOAD = { {'asset': str((alias / asset.name).resolve())}!r}\n"
+        "print(Path(PAYLOAD['asset']).read_text())\n"
+    )
+    result = _execute([sys.executable, str((alias / script.name).resolve())], job, 10)
+    assert result.returncode == 0 and result.stdout.strip() == "42", result.stderr
+
+
+def test_dynamic_payload_runs_once_without_granting_reads(tmp_path: Path) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    secret = tmp_path / "private.txt"
+    secret.write_text("private")
+    script = tmp_path / "verifier.py"
+    script.write_text(
+        "import json\nfrom pathlib import Path\n"
+        f"PAYLOAD = json.loads({json.dumps({'asset': str(secret)})!r})\n"
+        "with Path('executions.txt').open('a') as log:\n    log.write('executed\\n')\n"
+        "try:\n    Path(PAYLOAD['asset']).read_text()\n    allowed = True\n"
+        "except OSError:\n    allowed = False\n"
+        "print(allowed)\n"
+    )
+    result = _execute([sys.executable, str(script)], job, 10)
+    assert result.returncode == 0 and result.stdout.strip() == "False", result.stderr
+    assert (job / "executions.txt").read_text() == "executed\n"
 
 
 def _syntax_command() -> list[str]:
@@ -278,7 +460,14 @@ def test_fallow_syntax_validator_is_frozen_and_keeps_builtin_producer(
     assert Path(frozen.syntax_command[1]).read_text() == "original validator"
     calls = []
 
-    def execute(argv: list[str], root: Path, timeout: int) -> subprocess.CompletedProcess[str]:
+    def execute(
+        argv: list[str],
+        root: Path,
+        timeout: int,
+        *,
+        output: Path | None = None,
+        config: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
         if argv[0] == "node":
             assert json.loads(Path(argv[-2]).read_text()) == {
@@ -341,7 +530,24 @@ def test_pinned_oxc_observer_reports_parse_and_utf8_errors(
 
 
 @pytest.mark.parametrize("target", ["snapshot", "before"])
-def test_nonzero_collector_source_mutation_is_fatal(tmp_path: Path, target: str) -> None:
+def test_nonzero_collector_source_mutation_is_fatal(
+    tmp_path: Path,
+    target: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pluginbench.processes import run_command
+
+    # Keep integrity validation independent of the new OS prevention boundary.
+    monkeypatch.setattr(
+        isolation,
+        "run",
+        lambda argv, **kw: run_command(
+            argv,
+            cwd=kw["cwd"],
+            env=kw["env"],
+            timeout=kw["timeout"],
+        ),
+    )
     snapshot = source(tmp_path)
     before = tmp_path / "before"
     shutil.copytree(snapshot, before)
@@ -380,7 +586,22 @@ def test_successful_invalid_collector_report_is_fatal(tmp_path: Path) -> None:
         collect_measurements(snapshot, tmp_path / "evidence", [collector])
 
 
-def test_nonzero_collector_profile_mutation_is_fatal(tmp_path: Path) -> None:
+def test_nonzero_collector_profile_mutation_is_fatal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pluginbench.processes import run_command
+
+    monkeypatch.setattr(
+        isolation,
+        "run",
+        lambda argv, **kw: run_command(
+            argv,
+            cwd=kw["cwd"],
+            env=kw["env"],
+            timeout=kw["timeout"],
+        ),
+    )
     snapshot = source(tmp_path)
     cfg = config(tmp_path, {})
     collector = Collector(
@@ -410,7 +631,14 @@ def test_timeout_preserves_bound_execution_diagnostics(
         kind="coverage", config=config(tmp_path, {}), command=["coverage-tool"], tool_version="test"
     )
 
-    def timeout(argv: list[str], root: Path, seconds: int) -> subprocess.CompletedProcess[str]:
+    def timeout(
+        argv: list[str],
+        root: Path,
+        seconds: int,
+        *,
+        output: Path | None = None,
+        config: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         raise subprocess.TimeoutExpired(
             argv, seconds, output="partial output", stderr="native error"
         )
@@ -477,7 +705,14 @@ def test_trusted_adapter_outer_timeout_is_unclassified_and_fatal(
         failure_protocol="coverage-exit-v1",
     )
 
-    def timeout(argv: list[str], root: Path, seconds: int) -> subprocess.CompletedProcess[str]:
+    def timeout(
+        argv: list[str],
+        root: Path,
+        seconds: int,
+        *,
+        output: Path | None = None,
+        config: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         raise subprocess.TimeoutExpired(argv, seconds)
 
     monkeypatch.setattr(collectors, "_execute", timeout)

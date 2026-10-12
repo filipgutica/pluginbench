@@ -20,6 +20,7 @@ from pluginbench.assessment_metrics import (
     evaluate_evidence,
     inspect_snapshot,
 )
+from pluginbench import isolation
 
 
 class Collector(BaseModel):
@@ -98,11 +99,51 @@ def freeze_collectors(collectors: list[Collector], frozen_dir: Path) -> list[Col
     return result
 
 
-def _execute(argv: list[str], root: Path, timeout: int) -> subprocess.CompletedProcess[str]:
+def _outside_job(path: Path, root: Path) -> bool:
+    """Only canonical frozen paths can declare reads outside a submitted job."""
+    try:
+        canonical = path.resolve(strict=True)
+        return path.absolute() == canonical and not any(
+            canonical.is_relative_to(job) for job in (root.absolute(), root.resolve(strict=True))
+        )
+    except (OSError, RuntimeError):
+        return False
+
+
+def _execute(
+    argv: list[str],
+    root: Path,
+    timeout: int,
+    *,
+    output: Path | None = None,
+    config: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = {key: value for key, value in os.environ.items() if key in {"PATH", "LANG", "LC_ALL"}}
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    return subprocess.run(
-        argv, cwd=root, env=env, capture_output=True, text=True, timeout=timeout, check=False
+    readable: list[Path] = []
+    if config is not None and config.is_file() and _outside_job(config, root):
+        readable.extend(isolation.referenced_paths(json.loads(config.read_text())))
+    for argument in argv[1:]:
+        script = Path(argument)
+        if (
+            script.is_absolute()
+            and script.suffix == ".py"
+            and script.is_file()
+            and _outside_job(script, root)
+        ):
+            try:
+                readable.extend(isolation.verifier_paths(script))
+            except (OSError, ValueError):
+                # Dynamic PAYLOAD declarations grant nothing; execution still records their result.
+                pass
+    return isolation.run(
+        argv,
+        cwd=root,
+        env=env,
+        timeout=timeout,
+        readable=[path for path in readable if _outside_job(path, root)],
+        writable=[output] if output else [],
+        receipt=output / "runtime-isolation.json" if output else None,
     )
 
 
@@ -136,9 +177,12 @@ def _recorded_execute(
     timeout: int,
     destination: Path,
     receipts: list[dict[str, object]],
+    *,
+    config: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    filesystem_receipt = destination / "runtime-isolation.json"
     try:
-        result = _execute(argv, root, timeout)
+        result = _execute(argv, root, timeout, output=destination, config=config)
     except (OSError, subprocess.TimeoutExpired) as exc:
         receipts.append(
             {
@@ -147,6 +191,9 @@ def _recorded_execute(
                 "error": str(exc),
                 "stdout": str(getattr(exc, "stdout", "") or ""),
                 "stderr": str(getattr(exc, "stderr", "") or ""),
+                "filesystem": json.loads(filesystem_receipt.read_text())
+                if filesystem_receipt.is_file()
+                else None,
             }
         )
         _json(destination / "execution.json", receipts)
@@ -157,6 +204,9 @@ def _recorded_execute(
             "exit_code": result.returncode,
             "stdout": result.stdout,
             "stderr": result.stderr,
+            "filesystem": json.loads(filesystem_receipt.read_text())
+            if filesystem_receipt.is_file()
+            else None,
         }
     )
     _json(destination / "execution.json", receipts)
@@ -182,7 +232,12 @@ def _fallow(
     outputs = []
     for suffix in ([], ["list", "--files"]):
         execution = _recorded_execute(
-            argv + suffix, root, collector.timeout_seconds, destination, receipts
+            argv + suffix,
+            root,
+            collector.timeout_seconds,
+            destination,
+            receipts,
+            config=collector.config,
         )
         if execution.returncode not in (0, 1):
             raise CollectorUnavailable(f"Fallow exited {execution.returncode}: {execution.stderr}")
@@ -206,7 +261,12 @@ def _fallow(
             for argument in collector.syntax_command
         ]
         execution = _recorded_execute(
-            syntax_argv, root, collector.timeout_seconds, destination, receipts
+            syntax_argv,
+            root,
+            collector.timeout_seconds,
+            destination,
+            receipts,
+            config=collector.config,
         )
         receipt = receipts[-1]
         if execution.returncode:
@@ -333,7 +393,12 @@ def collect_measurements(
                         receipts = []
                         try:
                             execution = _recorded_execute(
-                                argv, root, collector.timeout_seconds, destination, receipts
+                                argv,
+                                root,
+                                collector.timeout_seconds,
+                                destination,
+                                receipts,
+                                config=collector.config,
                             )
                         except CollectorUnavailable as exc:
                             if collector.failure_protocol is not None:

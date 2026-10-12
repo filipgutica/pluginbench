@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
-import subprocess
 import tempfile
 
 from pluginbench.task_data.deepswe.prepare import TASK, command, suite_root, validate_suite
+from pluginbench import isolation
 
 
 def source_digest(root: Path) -> str:
@@ -163,12 +164,14 @@ def main() -> None:
                     )
                 source.write_text(content.replace(needle, replacement))
             before = source_digest(workspace)
-            execution = subprocess.run(
+            isolation_receipt = Path(temporary) / "runtime-isolation.json"
+            execution = isolation.run(
                 ["python3", str(verifier)],
                 cwd=workspace,
-                capture_output=True,
-                text=True,
+                env={"PATH": os.environ["PATH"]},
                 timeout=600,
+                readable=isolation.verifier_paths(verifier),
+                receipt=isolation_receipt,
             )
             report = json.loads(execution.stdout)
             after = source_digest(workspace)
@@ -181,6 +184,7 @@ def main() -> None:
                 "report": report,
                 "stderr": execution.stderr,
                 "mutation": mutation,
+                "filesystem": json.loads(isolation_receipt.read_text()),
             }
             receipts[name] = receipt
             (generated / "calibration.json").write_text(json.dumps(receipts, indent=2) + "\n")

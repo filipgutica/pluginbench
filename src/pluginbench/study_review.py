@@ -833,8 +833,16 @@ def review_study(
                     if isinstance(exc, KeyboardInterrupt):
                         call_interrupted = exc
                 finally:
-                    if (area / "artifacts").is_dir():
-                        shutil.copytree(area / "artifacts", observed / "artifacts")
+                    artifacts = area / "artifacts"
+                    if artifacts.exists() or artifacts.is_symlink():
+                        artifact_error = codex.copy_artifacts(artifacts, observed / "artifacts")
+                        if artifact_error:
+                            row.update(status="unknown", reason=artifact_error)
+                            response = None
+                            execution = codex.parse_events("", [], harness, requested_effort=effort)
+                            execution.update(
+                                successful_native_completion=False, error=artifact_error
+                            )
                     if not execution:
                         execution.update(
                             _captured_execution(observed / "artifacts", effort, harness)

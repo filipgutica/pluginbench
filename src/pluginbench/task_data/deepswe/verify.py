@@ -51,6 +51,39 @@ def run(command: list[str], cwd: Path, env: dict[str, str]) -> subprocess.Comple
     return subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, timeout=180)
 
 
+def test_command(
+    *, workspace: Path, framework: str, arguments: list[str], report: Path
+) -> list[str]:
+    """Use the same visible test command for native fitness and trusted grading."""
+    if framework == "mocha":
+        expanded: list[str] = []
+        for argument in arguments:
+            if "*" in argument:
+                expanded.extend(
+                    Path(path).relative_to(workspace).as_posix()
+                    for path in sorted(glob.glob(str(workspace / argument)))
+                )
+            else:
+                expanded.append(argument)
+        return [
+            "node",
+            str(workspace / "node_modules/mocha/bin/mocha.js"),
+            *expanded,
+            "--reporter=json",
+            f"--reporter-option=output={report}",
+        ]
+    if framework != "vitest":
+        raise ValueError(f"unsupported framework: {framework}")
+    return [
+        "node",
+        str(workspace / "node_modules/vitest/vitest.mjs"),
+        "run",
+        *arguments,
+        "--reporter=junit",
+        f"--outputFile={report}",
+    ]
+
+
 def reported_tests(
     report: Path, framework: str
 ) -> list[tuple[str, bool, dict[str, object] | None]]:
@@ -142,32 +175,9 @@ def verify() -> dict[str, object]:
             ],
         ):
             report = Path(temporary) / f"{name}.{'json' if framework == 'mocha' else 'xml'}"
-            if framework == "mocha":
-                expanded: list[str] = []
-                for argument in arguments:
-                    if "*" in argument:
-                        expanded.extend(
-                            Path(path).relative_to(workspace).as_posix()
-                            for path in sorted(glob.glob(str(workspace / argument)))
-                        )
-                    else:
-                        expanded.append(argument)
-                command = [
-                    "node",
-                    str(workspace / "node_modules/mocha/bin/mocha.js"),
-                    *expanded,
-                    "--reporter=json",
-                    f"--reporter-option=output={report}",
-                ]
-            else:
-                command = [
-                    "node",
-                    str(workspace / "node_modules/vitest/vitest.mjs"),
-                    "run",
-                    *arguments,
-                    "--reporter=junit",
-                    f"--outputFile={report}",
-                ]
+            command = test_command(
+                workspace=workspace, framework=framework, arguments=arguments, report=report
+            )
             execution = run(
                 command,
                 workspace / PAYLOAD.get("test_cwd", "."),

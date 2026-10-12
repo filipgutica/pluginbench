@@ -195,6 +195,7 @@ def test_generation_preserves_calibrated_corpus_and_emits_measurement_profile(
     assert fallow["production"] is True
     assert fallow["health"] == {"maxCognitive": 0, "maxCyclomatic": 0, "maxUnitSize": 0}
     assert coverage["run_timeout_seconds"] == 600
+    assert coverage["measure_test_overlap"] is False
     assert all(collector.timeout_seconds == 7200 for collector in collectors)
     assert observers == [
         "oxc-parser-0.126.0",
@@ -696,6 +697,7 @@ def test_leave_one_out_preserves_duplicate_titles_and_native_occurrences(
         "provider": provider,
         "version": version,
         "framework_version": native_version,
+        "measure_test_overlap": True,
     }
     if observer is not None:
         config["observer"] = {

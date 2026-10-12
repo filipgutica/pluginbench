@@ -326,6 +326,33 @@ def test_review_binds_ledgers_and_preserves_source_run_and_implementation_cost(
     assert len(calls) == 2
 
 
+def test_unsupported_review_artifacts_cannot_leak_host_data_or_count_findings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _existing_study(tmp_path, monkeypatch)
+    secret = tmp_path / "operator-private.txt"
+    secret.write_text("private operator content must never enter review evidence")
+    calls = _judge(monkeypatch, root)
+    native = codex.invoke
+
+    def linked_review(*, area: Path, **kwargs: Unpack[NativeInvocationKwargs]) -> dict[str, object]:
+        execution = native(area=area, **kwargs)
+        (area / "artifacts/other-log").symlink_to(secret)
+        return execution
+
+    monkeypatch.setattr(codex, "invoke", linked_review)
+    state = json.loads(study_review.review_study(root).read_text())
+    assert len(calls) == 2 and state["status"] == "incomplete"
+    for row in state["records"]:
+        observation = study._bound_document(root, row["observation"])
+        assert row["status"] == "unknown"
+        assert observation["response"] is None
+        assert observation["execution"]["usage"] is None
+    for artifact in (root / "review").rglob("*"):
+        if artifact.is_file() and not artifact.is_symlink():
+            assert secret.read_bytes() not in artifact.read_bytes()
+
+
 @pytest.mark.parametrize(
     "behavior",
     [

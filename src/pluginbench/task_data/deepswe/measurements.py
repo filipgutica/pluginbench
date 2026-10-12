@@ -127,7 +127,7 @@ def validate_task_dependencies(
 
 
 def selected_measurements(selection: Iterable[str] | None) -> frozenset[str]:
-    selected = MEASUREMENT_NAMES if selection is None else frozenset(selection)
+    selected = MEASUREMENT_NAMES - {"test_overlap"} if selection is None else frozenset(selection)
     unknown = selected - MEASUREMENT_NAMES
     if unknown:
         raise ValueError("unsupported measurements: " + ", ".join(sorted(unknown)))

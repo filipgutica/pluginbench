@@ -17,6 +17,8 @@ from pluginbench.assessment_metrics import (
 )
 from pluginbench.assessment_models import Attempt, Snapshot, Stage
 from pluginbench.collectors import Collector, collect_measurements
+from pluginbench import isolation
+from pluginbench.processes import run_command
 
 
 def _receipt() -> dict[str, object]:
@@ -309,7 +311,7 @@ def test_incomplete_or_unbound_contribution_is_not_zero(fault: str) -> None:
 
 @pytest.mark.parametrize("mutate_before", [False, True])
 def test_collector_receives_disposable_bound_before_context(
-    tmp_path: Path, mutate_before: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutate_before: bool
 ) -> None:
     before, after = tmp_path / "before", tmp_path / "after"
     for root, text in ((before, "before"), (after, "after")):
@@ -333,6 +335,15 @@ def test_collector_receives_disposable_bound_before_context(
     )
     evidence = tmp_path / "evidence"
     if mutate_before:
+        # Simulate a trusted adapter outside the OS boundary to exercise the
+        # independent post-execution integrity guard; the real boundary denies this write.
+        monkeypatch.setattr(
+            isolation,
+            "run",
+            lambda argv, **kwargs: run_command(
+                argv, **{key: kwargs[key] for key in ("cwd", "env", "timeout")}
+            ),
+        )
         with pytest.raises(ValueError, match="^collector modified its before snapshot$"):
             collect_measurements(after, evidence, [collector], before=before)
         assert (evidence / "coverage/execution.json").is_file()
