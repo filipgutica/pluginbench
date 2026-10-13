@@ -52,9 +52,6 @@ def run(
         None, "--config", help="Evaluation YAML or JSON; relative paths use its directory."
     ),
     harness: str | None = typer.Option(None, "--harness", help="codex or claude."),
-    backend: str | None = typer.Option(
-        None, "--backend", help="harbor (default) or legacy local execution."
-    ),
     model: str | None = typer.Option(None, "--model"),
     reasoning: str | None = typer.Option(None, "--reasoning"),
     guidance: list[Path] | None = typer.Option(
@@ -98,10 +95,9 @@ def run(
     output: Path | None = typer.Option(None, "--output", help="New run directory."),
     yes: bool = typer.Option(False, "--yes", help="Start without confirmation."),
 ) -> None:
-    """Run fresh vanilla and guidance attempts, selected measurements, and fixed reviews."""
+    """Run vanilla and guidance attempts, selected measurements, and fixed reviews."""
     try:
         overrides = [
-            backend,
             harness,
             model,
             reasoning,
@@ -147,8 +143,6 @@ def run(
                 "tasks": {"source": tasks, "ids": task or []},
                 "measurements": measure or [],
             }
-            if backend is not None:
-                raw["backend"] = backend
             if any(
                 value is not None
                 for value in (review_harness, review_model, review_reasoning, review_guidance)

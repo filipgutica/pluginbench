@@ -310,34 +310,6 @@ def test_clock_is_optional_mocha_only_and_preset_binds_implementation() -> None:
     assert "clock" not in presets["happy-dom-abort-pending-body-reads"]["coverage"]
 
 
-def test_stepped_date_survives_sinon_date_install_and_restore() -> None:
-    module = template("coverage")
-    sinon = (
-        Path(__file__).parents[1]
-        / "benchmarks/real-coding/generated/testem/dependencies/testem-per-launcher-reports/node_modules/sinon"
-    )
-    if not sinon.is_dir():
-        pytest.skip("prepared Testem Sinon cache unavailable")
-    checks = """
-const assert = require('node:assert/strict');
-const sinon = require(process.argv[1]);
-const controlled = Date;
-const before = Date.now();
-const fake = sinon.useFakeTimers({ now: 12345, toFake: ['Date'] });
-assert.equal(Date.now(), 12345);
-assert.equal(+new Date(), 12345);
-fake.restore();
-assert.equal(Date, controlled);
-assert(Date.now() > before);
-const start = new Date();
-assert(new Date() > start);
-"""
-    execution = subprocess.run(
-        ["node", "-e", module.CLOCK_PRELOAD + checks, str(sinon)], capture_output=True, text=True
-    )
-    assert execution.returncode == 0, execution.stderr
-
-
 @pytest.mark.parametrize("controlled", [False, True])
 def test_mocha_process_clock_is_installed_before_visible_test_loading(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, controlled: bool

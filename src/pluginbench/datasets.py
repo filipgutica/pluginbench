@@ -10,8 +10,6 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from pluginbench.config import DatasetConfig
-
 
 class CatalogModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -105,23 +103,35 @@ def _task_digest(entry: TaskEntry, fixture: Path, verifier_script: Path) -> str:
     return f"sha256:{digest.hexdigest()}"
 
 
-def load_tasks(config: DatasetConfig) -> list[TaskSpec]:
-    source = Path(config.source)
+def load_tasks(source: Path, task_ids: list[str] | None = None) -> list[TaskSpec]:
     try:
         loaded = yaml.safe_load(source.read_text())
     except (OSError, yaml.YAMLError) as exc:
-        raise ValueError(f"cannot read local task catalog {source}: {exc}") from exc
+        raise ValueError(f"cannot read task catalog {source}: {exc}") from exc
     catalog = TaskCatalog.model_validate(loaded)
     by_id = {entry.id: entry for entry in catalog.tasks}
     if len(by_id) != len(catalog.tasks):
-        raise ValueError("local task catalog contains duplicate task IDs")
-    missing = [task_id for task_id in config.task_ids if task_id not in by_id]
+        raise ValueError("task catalog contains duplicate task IDs")
+    selected = list(by_id) if task_ids is None else task_ids
+    if not selected or any(not task_id.strip() for task_id in selected):
+        raise ValueError("selected task IDs must be nonempty")
+    if len(set(selected)) != len(selected):
+        raise ValueError("selected task IDs must be unique")
+    missing = [task_id for task_id in selected if task_id not in by_id]
     if missing:
-        raise ValueError("selected task IDs are missing from local catalog: " + ", ".join(missing))
+        raise ValueError("selected task IDs are missing from catalog: " + ", ".join(missing))
 
     tasks: list[TaskSpec] = []
-    for task_id in config.task_ids:
+    for task_id in selected:
         entry = by_id[task_id]
+        for item in (entry.fixture, entry.verifier.script):
+            if item.is_absolute() or ".." in item.parts:
+                raise ValueError(
+                    "task fixtures and verifier scripts must be relative to their catalog"
+                )
+            raw_path = source.parent / item
+            if any(candidate.is_symlink() for candidate in (raw_path, *raw_path.parents)):
+                raise ValueError(f"task input must not be a symlink: {raw_path}")
         fixture = (source.parent / entry.fixture).resolve()
         if not fixture.is_dir():
             raise ValueError(f"task fixture is not a directory for {task_id}: {fixture}")

@@ -12,7 +12,7 @@ New coding evaluations use Harbor 0.24.0 and a fresh Docker container for each t
 
 Harbor's verifier is disabled. PluginBench exports code only after Docker confirms the coding container has stopped. It validates and freezes the submission before trusted grading, measurement, or review. Hidden tests and reference solutions are not supplied to the coding container.
 
-Grading, collectors, reviews, and the explicit legacy `backend: local` use an OS filesystem boundary: macOS Seatbelt or Linux Bubblewrap. They can access only their job copy, private runtime, selected trusted assets, and read-only toolchain paths. Reviews receive read-only code; trusted scripts and dependencies stay read-only. A missing boundary stops execution.
+Grading, collectors, and reviews use an OS filesystem boundary: macOS Seatbelt or Linux Bubblewrap. They can access only their job copy, private runtime, selected trusted assets, and read-only toolchain paths. Reviews receive read-only code; trusted scripts and dependencies stay read-only. A missing boundary stops execution.
 
 The OS wrapper enforces Codex reviewers' read-only access. Codex's inner sandbox is disabled inside that wrapper because nested Seatbelt prevents command startup. Packet writes and reads outside the allowed roots remain blocked.
 

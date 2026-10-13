@@ -1,8 +1,0 @@
-{
-  "name": "@fixture/grid-widget",
-  "version": "1.0.0",
-  "type": "module",
-  "exports": "./src/grid.ts",
-  "peerDependencies": {"@kong-ui-public/table-data-grid": "^1.4.0"},
-  "devDependencies": {"@kong-ui-public/table-data-grid": "1.4.0"}
-}

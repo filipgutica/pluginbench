@@ -552,42 +552,6 @@ def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> d
     }
 
 
-def _mutation(report: dict[str, object], files: set[str], scope: list[str]) -> dict[str, object]:
-    mutant_rows = _object(report.get("mutants"), "mutants")
-    mutants: dict[str, object] = {}
-    source_identity: dict[str, str] = {}
-    for identifier, value in mutant_rows.items():
-        row = _object(value, f"mutant {identifier}")
-        if set(row) != {"status", "path"} or not isinstance(row["path"], str):
-            raise ValueError("mutants require status and path")
-        _source_path(row["path"], files, scope)
-        mutants[identifier] = row["status"]
-        source_identity[identifier] = row["path"]
-    allowed = {"killed", "survived", "no_coverage", "timeout", "compile_error", "runtime_error"}
-    if any(not isinstance(status, str) or status not in allowed for status in mutants.values()):
-        raise ValueError("mutation report contains an unsupported mutant status")
-    detected = {key for key, status in mutants.items() if status in {"killed", "timeout"}}
-    undetected = {key for key, status in mutants.items() if status in {"survived", "no_coverage"}}
-    killed = {key for key, status in mutants.items() if status == "killed"}
-    return {
-        "mutant_total": len(mutants),
-        "detected": len(detected),
-        "undetected": len(undetected),
-        "invalid": len(mutants) - len(detected) - len(undetected),
-        "score_percent": _percent(len(detected), len(detected) + len(undetected)),
-        "mutant_set_digest": _digest(json.dumps(sorted(mutants)).encode()),
-        "eligible_mutant_set_digest": _digest(json.dumps(sorted(detected | undetected)).encode()),
-        "mutant_source_digest": _digest(
-            json.dumps(source_identity, sort_keys=True, separators=(",", ":")).encode()
-        ),
-        "per_test_detection": "unique contribution among supplied tests only; not proof of redundancy",
-        "per_test_count": len(_object(report["per_test"], "per_test"))
-        if report.get("per_test") is not None
-        else None,
-        "zero_unique_mutant_kill_tests": _marginal(report.get("per_test"), killed, "per_test"),
-    }
-
-
 _DEAD_FIELDS = (
     "unused_files",
     "unused_exports",
@@ -965,98 +929,27 @@ def _fallow(
     }
 
 
-_THRESHOLDS = {
-    "fallow": {
-        "max_cognitive": "cognitive",
-        "max_cyclomatic": "cyclomatic",
-        "max_unit_size": "line_count",
-        "max_dead_code": "dead_code",
-        "max_clone_groups": "clone_groups",
-        "max_cycles": "cycles",
-        "max_boundary_violations": "boundary_violations",
-    },
-    "coverage": {
-        "min_branch_percent": "branch_percent",
-        "min_function_percent": "function_percent",
-    },
-    "mutation": {"min_score_percent": "score_percent"},
-}
-
-
-def _validate_thresholds(kind: str, standards: dict[str, object]) -> None:
-    for key, limit in standards.items():
-        if key not in _THRESHOLDS[kind]:
-            raise ValueError(f"unsupported {kind} threshold: {key}")
-        threshold = _number(limit, key)
-        if threshold < 0 or (key.startswith("min_") and threshold > 100):
-            raise ValueError(f"invalid threshold: {key}")
-        if kind == "fallow":
-            _integer(limit, key)
-            if key in {"max_cyclomatic", "max_unit_size"} and threshold < 1:
-                raise ValueError(f"invalid threshold: {key}")
-
-
-def _violations(
-    kind: str, metrics: dict[str, object], standards: dict[str, object]
-) -> tuple[list[str], list[str]]:
-    violations: list[str] = []
-    unknown: list[str] = []
-    for key, limit in standards.items():
-        threshold = _number(limit, key)
-        metric = _THRESHOLDS[kind][key]
-        if kind == "fallow" and metric in {"cognitive", "cyclomatic", "line_count"}:
-            rows = metrics["functions"]
-            assert isinstance(rows, list)
-            exceeded = any(
-                _number(_object(row, "function")[metric], metric) > threshold for row in rows
-            )
-            if exceeded:
-                violations.append(key)
-            elif not metrics.get("complexity_complete_for_declared_scope"):
-                unknown.append(key)
-        else:
-            value = metrics[metric]
-            if value is None:
-                unknown.append(key)
-            elif (
-                _number(value, metric) < threshold
-                if key.startswith("min_")
-                else _number(value, metric) > threshold
-            ):
-                violations.append(key)
-            elif kind == "fallow" and (
-                metrics.get("unresolved_imports") != 0
-                or not metrics.get(f"{metric}_complete_for_declared_scope")
-            ):
-                unknown.append(key)
-            elif kind == "coverage" and not metrics.get("population_complete_for_declared_scope"):
-                unknown.append(key)
-    return violations, unknown
+_EVIDENCE_KINDS = ("fallow", "coverage")
 
 
 def evaluate_evidence(
     snapshot_root: Path,
     evidence_refs: dict[str, str] | None,
-    standards: dict[str, object],
     base_dir: Path,
 ) -> dict[str, object]:
     """Import bound reports, without running analyzers or mutating submitted source."""
     snapshot = inspect_snapshot(snapshot_root)
     refs = evidence_refs or {}
     files = set(_object(snapshot["files"], "snapshot files"))
-    if set(refs) - set(_THRESHOLDS) or set(standards) - set(_THRESHOLDS):
+    if set(refs) - set(_EVIDENCE_KINDS):
         raise ValueError("unsupported evidence kind")
     result: dict[str, object] = {"snapshot_digest": snapshot["digest"]}
-    for kind in _THRESHOLDS:
-        limits = _object(standards.get(kind, {}), f"standards.{kind}")
-        _validate_thresholds(kind, limits)
+    for kind in _EVIDENCE_KINDS:
         if kind not in refs:
             result[kind] = {
                 "status": "unavailable",
                 "reason": "no source-bound report",
                 "metrics": None,
-                "violations": [],
-                "unknown_standards": sorted(limits),
             }
             continue
         envelope_path = base_dir / refs[kind]
@@ -1158,9 +1051,6 @@ def evaluate_evidence(
                             "coverage reference selection differs from its bound configuration"
                         )
             metrics = _coverage(report, files, scope)
-        else:
-            metrics = _mutation(report, files, scope)
-        violations, unknown = _violations(kind, metrics, limits)
         provenance = {
             key: envelope[key] for key in ("tool", "tool_version", "config_digest", "scope")
         }
@@ -1179,11 +1069,9 @@ def evaluate_evidence(
                 )
             }
         result[kind] = {
-            "status": "incomplete" if unknown else "available",
+            "status": "available",
             "provenance": provenance,
             "metrics": metrics,
-            "violations": violations,
-            "unknown_standards": unknown,
             "evidence_basis": "externally supplied source-bound report; execution not independently attested",
         }
     return result
@@ -1425,7 +1313,7 @@ def compare_evidence(
 ) -> dict[str, object]:
     """Compare measurements only with compatible collection and denominator provenance."""
     result: dict[str, object] = {}
-    for kind in _THRESHOLDS:
+    for kind in _EVIDENCE_KINDS:
         left = _object(before.get(kind, {}), f"before.{kind}")
         right = _object(after.get(kind, {}), f"after.{kind}")
         if not isinstance(left.get("metrics"), dict) or not isinstance(right.get("metrics"), dict):
@@ -1449,8 +1337,6 @@ def compare_evidence(
         denominator_keys = (
             ("branch_denominator_digest", "function_denominator_digest")
             if kind == "coverage"
-            else ("mutant_set_digest", "eligible_mutant_set_digest", "mutant_source_digest")
-            if kind == "mutation"
             else ()
         )
         if any(
@@ -1461,7 +1347,7 @@ def compare_evidence(
         ):
             result[kind] = {
                 "status": "incomplete",
-                "reason": "fixed denominator or mutant source identity differs or is unbound",
+                "reason": "fixed denominator differs or is unbound",
                 "deltas": None,
             }
             continue

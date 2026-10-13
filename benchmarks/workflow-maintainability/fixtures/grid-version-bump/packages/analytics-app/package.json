@@ -1,6 +1,0 @@
-{
-  "name": "@fixture/analytics-app",
-  "version": "1.0.0",
-  "type": "module",
-  "dependencies": {"@fixture/grid-widget": "1.0.0"}
-}

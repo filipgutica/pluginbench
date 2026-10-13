@@ -18,7 +18,7 @@ from collections.abc import Callable
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
-from pluginbench import claude, codex, isolation, harbor_backend
+from pluginbench import claude, codex, harbor_backend
 from pluginbench.assessment_metrics import scoped_code_size, scoped_test_size
 from pluginbench.datasets import TaskCatalog, TaskEntry
 from pluginbench.collectors import Collector
@@ -102,7 +102,6 @@ class Tasks(BaseModel):
 class Evaluation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(default="evaluation", min_length=1)
-    backend: Literal["harbor", "local"] = "harbor"
     runner: Runner
     guidance: dict[str, list[Path]] = Field(min_length=1)
     tasks: Tasks
@@ -117,7 +116,7 @@ class Evaluation(BaseModel):
 
     @model_validator(mode="after")
     def coherent(self) -> Evaluation:
-        if self.backend == "harbor" and self.runner.reasoning == "ultra":
+        if self.runner.reasoning == "ultra":
             raise ValueError("Harbor does not support ultra reasoning; select a supported effort")
         if len(set(self.measurements)) != len(self.measurements):
             raise ValueError("measurements must be unique")
@@ -234,18 +233,13 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
         if dirty:
             raise ValueError(f"selected DeepSWE task has uncommitted changes: {task}")
         identities[task] = _tree_hash(path)
-        if config.backend == "harbor":
-            declared[task] = _task_limits(path)
+        declared[task] = _task_limits(path)
     limits = _container_limits(config, declared)
-    jobs = (
-        min(config.jobs, harbor_backend.capacity_jobs(**limits))
-        if config.backend == "harbor"
-        else config.jobs
-    )
+    jobs = min(config.jobs, harbor_backend.capacity_jobs(**limits))
     preset = json.loads((ADAPTER / "measurement-presets.json").read_text())
     methods = {task: preset[task] for task in config.tasks.ids}
     criteria = (
-        _fixed_criteria([file.read_text() for file in config.reviewer.guidance], "handoff")
+        _fixed_criteria([file.read_text() for file in config.reviewer.guidance])
         if config.reviewer
         else None
     )
@@ -261,7 +255,7 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
         else None,
         "review_criteria_sha256": _criteria_digest(criteria) if criteria else None,
         "jobs": jobs,
-        "backend": config.backend,
+        "backend": "harbor",
         "task_limits": {
             task: {
                 "declared": row,
@@ -270,11 +264,7 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
             }
             for task, row in declared.items()
         },
-        "isolation": (
-            harbor_backend.runtime_identity(**limits)
-            if config.backend == "harbor"
-            else isolation.runtime_identity()
-        ),
+        "isolation": harbor_backend.runtime_identity(**limits),
     }
     coding = len(config.tasks.ids) * (1 + len(config.guidance)) * config.repeats
     return {
@@ -316,17 +306,17 @@ def run_evaluation(
     root = output.expanduser().absolute()
     if root.exists():
         raise ValueError(f"output must be a new directory: {root}")
-    if config.backend == "harbor":
-        harbor_backend.preflight(jobs=config.jobs, **limits)
+    harbor_backend.preflight(jobs=config.jobs, **limits)
     # Both runtimes are checked before any task calls; preparation validates selected observers too.
     harness_versions = {}
     for harness in {config.runner.harness, *([config.reviewer.harness] if config.reviewer else [])}:
         native = (claude.preflight if harness == "claude" else codex.preflight)()
         version = str(native.get("harness_version", ""))
         match = re.search(r"(?<![\w.+-])\d+\.\d+\.\d+(?![\w.+-])", version)
-        if config.backend == "harbor" and match is None:
+        if match is None:
             raise ValueError(f"cannot pin {harness} CLI version: {version}")
-        harness_versions[harness] = match.group() if match else None
+        assert match is not None
+        harness_versions[harness] = match.group()
         with tempfile.TemporaryDirectory(prefix="pluginbench-auth-check-") as temporary:
             codex.runtime_environment(Path(temporary) / "private", harness)
     root.mkdir(parents=True)
@@ -341,12 +331,8 @@ def run_evaluation(
         if progress:
             progress(f"Preparing and calibrating {task}")
         destination = prepared / task
-        task_limits = (
-            TypeAdapter(dict[str, int]).validate_python(
-                _object(_object(comparison["task_limits"])[task])["effective"]
-            )
-            if config.backend == "harbor"
-            else {}
+        task_limits = TypeAdapter(dict[str, int]).validate_python(
+            _object(_object(comparison["task_limits"])[task])["effective"]
         )
         subprocess.run(
             [
@@ -358,7 +344,7 @@ def run_evaluation(
                 task,
                 "--output",
                 str(destination),
-                *(["--prepared-dependencies"] if config.backend == "harbor" else []),
+                "--prepared-dependencies",
                 *[
                     arg
                     for measurement in config.measurements
@@ -373,46 +359,36 @@ def run_evaluation(
             if config.tasks.source.name == "tasks"
             else config.tasks.source
         )
-        image = (
-            tomllib.loads((suite / "tasks" / task / "task.toml").read_text())["environment"][
-                "docker_image"
-            ]
-            if config.backend == "harbor"
-            else None
+        image = tomllib.loads((suite / "tasks" / task / "task.toml").read_text())["environment"][
+            "docker_image"
+        ]
+        image_identity = harbor_backend.resolve_image(image)
+        toolchain_identity = harbor_backend.prepare_toolchain(
+            image_identity,
+            harness=config.runner.harness,
+            version=harness_versions[config.runner.harness],
         )
-        image_identity = harbor_backend.resolve_image(image) if image is not None else None
-        toolchain_identity = (
-            harbor_backend.prepare_toolchain(
-                image_identity,
-                harness=config.runner.harness,
-                version=harness_versions[config.runner.harness] or "",
-            )
-            if image_identity is not None
-            else None
+        native_recipe = json.loads((destination / "native-environment.json").read_text())
+        toolchain_identity = harbor_backend.prepare_task_image(
+            fixture=destination / task_catalog.tasks[0].fixture,
+            toolchain=toolchain_identity,
+            recipe=native_recipe,
+            artifacts=destination / "native-preparation",
+            cache=root.parent / ".prepared-images",
+            cpus=limits["cpus"],
+            memory_mb=limits["memory_mb"],
+            timeout=task_limits["build_timeout_seconds"],
         )
-        if toolchain_identity is not None:
-            native_recipe = json.loads((destination / "native-environment.json").read_text())
-            toolchain_identity = harbor_backend.prepare_task_image(
-                fixture=destination / task_catalog.tasks[0].fixture,
-                toolchain=toolchain_identity,
-                recipe=native_recipe,
-                artifacts=destination / "native-preparation",
-                cache=root.parent / ".prepared-images",
-                cpus=limits["cpus"],
-                memory_mb=limits["memory_mb"],
-                timeout=task_limits["build_timeout_seconds"],
-            )
         for item in task_catalog.tasks:
             item.fixture = Path(task) / item.fixture
             item.verifier.script = Path(task) / item.verifier.script
-            if image is not None:
-                item.provenance = {
-                    **(item.provenance or {}),
-                    "agent_image": image_identity["image"] if image_identity else image,
-                    "image_identity": json.dumps(image_identity, sort_keys=True),
-                    "toolchain_identity": json.dumps(toolchain_identity, sort_keys=True),
-                    "build_timeout_seconds": str(task_limits["build_timeout_seconds"]),
-                }
+            item.provenance = {
+                **(item.provenance or {}),
+                "agent_image": image_identity["image"],
+                "image_identity": json.dumps(image_identity, sort_keys=True),
+                "toolchain_identity": json.dumps(toolchain_identity, sort_keys=True),
+                "build_timeout_seconds": str(task_limits["build_timeout_seconds"]),
+            }
             entries.append(item)
         profiles.update(load_profiles(destination / "measurements.json"))
         suite = (
@@ -449,12 +425,9 @@ def run_evaluation(
                 "instruction_sha256",
             )
         }
-        if image_identity is not None:
-            task_environment[task]["image_identity"] = image_identity
-            task_environment[task]["toolchain_identity"] = toolchain_identity
-            task_environment[task]["build_timeout_seconds"] = str(
-                task_limits["build_timeout_seconds"]
-            )
+        task_environment[task]["image_identity"] = image_identity
+        task_environment[task]["toolchain_identity"] = toolchain_identity
+        task_environment[task]["build_timeout_seconds"] = str(task_limits["build_timeout_seconds"])
     _write(
         prepared / "tasks.json",
         TaskCatalog(schema_version=1, tasks=entries).model_dump(mode="json"),
@@ -467,15 +440,13 @@ def run_evaluation(
             shutil.copy2(source, target)
             fixed_guidance.append(target)
         if (
-            _criteria_digest(
-                _fixed_criteria([file.read_text() for file in fixed_guidance], "handoff")
-            )
+            _criteria_digest(_fixed_criteria([file.read_text() for file in fixed_guidance]))
             != comparison["review_criteria_sha256"]
         ):
             raise ValueError("fixed review guidance changed during preparation")
     recipe = {
         "schema_version": 1,
-        "backend": config.backend,
+        "backend": "harbor",
         "harness_version": harness_versions[config.runner.harness],
         "container_cpus": config.container_cpus,
         "container_memory_mb": config.container_memory_mb,
@@ -513,7 +484,6 @@ def run_evaluation(
         "timeout_seconds": config.timeout_seconds,
         "jobs": config.jobs,
         "seed": config.seed,
-        "repair_rounds": 0,
         "preparation_sha256": {
             name: hashlib.sha256((ADAPTER / name).read_bytes()).hexdigest()
             for name in ("prepare.py", "verify.py")
@@ -522,7 +492,7 @@ def run_evaluation(
             name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
             for name in (
                 "codex.py",
-                *(["harbor_backend.py"] if config.backend == "harbor" else []),
+                "harbor_backend.py",
                 "processes.py",
                 *(["claude.py"] if config.runner.harness == "claude" else []),
             )
@@ -546,13 +516,8 @@ def run_evaluation(
 
 
 def _saved_evaluation(selection: dict[str, object]) -> Evaluation:
-    # Runs created before jobs existed used sequential execution.
     return Evaluation.model_validate(
-        {
-            "backend": "local",
-            "jobs": 1,
-            **{key: selection[key] for key in Evaluation.model_fields if key in selection},
-        }
+        {key: selection[key] for key in Evaluation.model_fields if key in selection}
     )
 
 
@@ -581,7 +546,6 @@ def _finish_evaluation(
             profiles=profiles,
             revision=revision,
             progress=progress,
-            allow_partial=True,
             jobs=config.jobs,
         )
         _adopt_measurement_revision(root, selection, revision)
@@ -729,7 +693,7 @@ def _resume_inputs(
                 root / "inputs" / f"review-{index}.md"
                 for index in range(len(config.reviewer.guidance))
             ]
-            criteria = _fixed_criteria([file.read_text() for file in guidance], "handoff")
+            criteria = _fixed_criteria([file.read_text() for file in guidance])
             if (
                 _criteria_digest(criteria)
                 != _object(selection["comparison_identity"])["review_criteria_sha256"]
@@ -746,7 +710,7 @@ def plan_resume(root: Path) -> dict[str, object]:
         "coding_calls": 0,
         "review_calls": calls,
         "collect_measurements": bool(profiles),
-        "jobs": selection.get("jobs", 1),
+        "jobs": selection["jobs"],
         "baseline": "reuse immutable saved submissions; no coding replay",
     }
 
@@ -785,10 +749,7 @@ def _measurement_collection(root: Path, selection: dict[str, object]) -> dict[st
     available = 0
     failures = []
     for observation in state["observations"]:
-        outcomes = observation.get("outcomes")
-        if outcomes is None:  # Validated v1 revisions require every family to match.
-            available += len(observation["repeats"][0])
-            continue
+        outcomes = observation["outcomes"]
         for family, outcome in outcomes.items():
             if outcome["status"] == "available":
                 available += 1
@@ -835,9 +796,7 @@ def _measurement_collection(root: Path, selection: dict[str, object]) -> dict[st
 def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path:
     root = root.expanduser().absolute()
     config = _load_selection(root)
-    config.setdefault("jobs", 1)
     comparison = _object(config["comparison_identity"])
-    comparison.setdefault("jobs", config["jobs"])
     config["comparison_identity"] = comparison
     evidence = root / "evidence"
     output = root / "report"
@@ -880,7 +839,7 @@ def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path
         }
         config["review_revision"] = review_revision
         output = review_path.parent / "evaluation-report"
-    report_path, _ = report_study(
+    report_path = report_study(
         evidence,
         measurement_revision=_selected_revision(config, "measurement_revision"),
         review_revision=_selected_revision(config, "review_revision"),

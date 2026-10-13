@@ -1,16 +1,14 @@
-import hashlib
 import json
 import shutil
 import sys
 from pathlib import Path
-from typing import Literal
 
 import pytest
 
 from pluginbench.assessment_metrics import evaluate_evidence, inspect_snapshot
 from pluginbench import isolation
 from pluginbench.collectors import Collector, _execute, collect_measurements, freeze_collectors
-from pluginbench.task_data.deepswe.measurements import ROOT, observer_cache_root
+from pluginbench.task_data.deepswe.measurements import prepare_observer
 
 
 def source(root: Path) -> Path:
@@ -82,7 +80,7 @@ def test_frozen_verifier_dependencies_are_read_only_and_exact(tmp_path: Path) ->
         "print(json.dumps(result))\n"
     )
     collector = Collector(
-        kind="mutation",
+        kind="coverage",
         config=config(tmp_path, {}),
         command=[sys.executable, str(script)],
         tool_version="test",
@@ -207,16 +205,13 @@ def test_dynamic_payload_runs_once_without_granting_reads(tmp_path: Path) -> Non
     assert (job / "executions.txt").read_text() == "executed\n"
 
 
-def _syntax_command() -> list[str]:
-    name = "oxc-parser-0.126.0"
-    lock_digest = hashlib.sha256((ROOT / "observers" / name / "package-lock.json").read_bytes())
-    cache = observer_cache_root() / name / lock_digest.hexdigest()
-    if not (cache / "node_modules/oxc-parser").is_dir():
-        pytest.skip("pinned Oxc observer cache unavailable")
+def _syntax_command(cache: Path) -> list[str]:
+    observer = prepare_observer("oxc-parser-0.126.0", cache)
+    prepared = Path(observer["path"]).parent
     return [
         "node",
         str(Path(__file__).parents[1] / "src/pluginbench/fallow_parse.mjs"),
-        str(cache),
+        str(prepared),
         "{snapshot}",
         "{inputs}",
         "{output}",
@@ -256,7 +251,7 @@ def test_collector_scripts_and_configs_are_frozen(tmp_path: Path) -> None:
     script = tmp_path / "script.py"
     script.write_text("original")
     collector = Collector(
-        kind="mutation",
+        kind="coverage",
         config=config(tmp_path, {}),
         command=[sys.executable, str(script)],
         tool_version="test",
@@ -282,7 +277,7 @@ def test_python_collector_import_does_not_mutate_frozen_scripts(tmp_path: Path) 
         "print(module.value)\n"
     )
     collector = Collector(
-        kind="mutation",
+        kind="coverage",
         config=config(tmp_path, {}),
         command=[sys.executable, str(script), str(helper)],
         tool_version="test",
@@ -305,38 +300,6 @@ def test_python_collector_import_does_not_mutate_frozen_scripts(tmp_path: Path) 
     assert after == before
 
 
-@pytest.mark.skipif(shutil.which("node") is None, reason="Node unavailable")
-def test_node_coverage_keeps_unimported_source_unknown(tmp_path: Path) -> None:
-    snapshot = source(tmp_path)
-    (snapshot / "src/unloaded.ts").write_text("export const neverLoaded = () => false;\n")
-    (snapshot / "package.json").write_text('{"type":"module"}')
-    (snapshot / "test").mkdir()
-    (snapshot / "test/value.test.ts").write_text(
-        "import {test} from 'node:test';\nimport {strict as assert} from 'node:assert';\nimport {value} from '../src/used.ts';\ntest('value', () => assert.equal(value(), 42));\n"
-    )
-    collector = Collector(
-        kind="coverage", config=config(tmp_path, {"test_globs": ["test/*.test.ts"]})
-    )
-    result = collect_measurements(snapshot, tmp_path / "evidence", [collector])
-    assert "coverage" in result, (
-        (tmp_path / "evidence/coverage/failure.json").read_text() if not result else ""
-    )
-    evidence = evaluate_evidence(
-        snapshot,
-        {"coverage": str(result["coverage"])},
-        {"coverage": {"min_function_percent": 90}},
-        tmp_path,
-    )
-    coverage = evidence["coverage"]
-    assert isinstance(coverage, dict)
-    assert coverage["unknown_standards"] == ["min_function_percent"]
-    metrics = coverage["metrics"]
-    assert isinstance(metrics, dict)
-    assert metrics["function_percent"] == 100
-    assert metrics["unmeasured_source_files"] == ["src/unloaded.ts"]
-    assert metrics["population_complete_for_declared_scope"] is False
-
-
 @pytest.mark.skipif(shutil.which("fallow") is None, reason="Fallow unavailable")
 @pytest.mark.parametrize("with_syntax", [False, True])
 def test_fallow_calibration_counts_planted_dead_code_and_type_only_files(
@@ -349,7 +312,7 @@ def test_fallow_calibration_counts_planted_dead_code_and_type_only_files(
     )
     collector = Collector(
         kind="fallow",
-        syntax_command=_syntax_command() if with_syntax else None,
+        syntax_command=_syntax_command(tmp_path / "parser-cache") if with_syntax else None,
         config=config(
             tmp_path,
             {
@@ -361,7 +324,7 @@ def test_fallow_calibration_counts_planted_dead_code_and_type_only_files(
     )
     result = collect_measurements(snapshot, tmp_path / "evidence", [collector])
     assert "fallow" in result
-    evidence = evaluate_evidence(snapshot, {"fallow": str(result["fallow"])}, {}, tmp_path)
+    evidence = evaluate_evidence(snapshot, {"fallow": str(result["fallow"])}, tmp_path)
     fallow = evidence["fallow"]
     assert isinstance(fallow, dict)
     metrics = fallow["metrics"]
@@ -372,7 +335,7 @@ def test_fallow_calibration_counts_planted_dead_code_and_type_only_files(
     assert metrics["dead_code"] == 0
     (snapshot / "src/dead.ts").write_text("export const unused = () => 9;\n")
     result = collect_measurements(snapshot, tmp_path / "dead-evidence", [collector])
-    evidence = evaluate_evidence(snapshot, {"fallow": str(result["fallow"])}, {}, tmp_path)
+    evidence = evaluate_evidence(snapshot, {"fallow": str(result["fallow"])}, tmp_path)
     fallow = evidence["fallow"]
     assert isinstance(fallow, dict) and isinstance(fallow["metrics"], dict)
     assert fallow["metrics"]["dead_code"] > 0
@@ -389,7 +352,7 @@ def test_fallow_zero_entry_graph_does_not_prove_clean_scope(tmp_path: Path) -> N
         ),
     )
     result = collect_measurements(snapshot, tmp_path / "evidence", [collector])
-    evidence = evaluate_evidence(snapshot, {"fallow": str(result["fallow"])}, {}, tmp_path)
+    evidence = evaluate_evidence(snapshot, {"fallow": str(result["fallow"])}, tmp_path)
     fallow = evidence["fallow"]
     assert isinstance(fallow, dict) and isinstance(fallow["metrics"], dict)
     assert fallow["metrics"]["dead_code_complete_for_declared_scope"] is False
@@ -406,7 +369,7 @@ def test_same_line_anonymous_functions_have_distinct_column_identities(
     )
     collector = Collector(
         kind="fallow",
-        syntax_command=_syntax_command() if with_syntax else None,
+        syntax_command=_syntax_command(tmp_path / "parser-cache") if with_syntax else None,
         config=config(
             tmp_path,
             {
@@ -417,22 +380,19 @@ def test_same_line_anonymous_functions_have_distinct_column_identities(
         ),
     )
     result = collect_measurements(snapshot, tmp_path / "evidence", [collector])
-    evidence = evaluate_evidence(snapshot, {"fallow": str(result["fallow"])}, {}, tmp_path)
+    evidence = evaluate_evidence(snapshot, {"fallow": str(result["fallow"])}, tmp_path)
     fallow = evidence["fallow"]
     assert isinstance(fallow, dict) and isinstance(fallow["metrics"], dict)
     assert fallow["metrics"]["function_count_reported"] == 3
     assert fallow["metrics"]["complexity_complete_for_declared_scope"] is with_syntax
 
 
-@pytest.mark.parametrize("kind", ["coverage", "mutation"])
-def test_syntax_command_is_only_for_fallow(
-    tmp_path: Path, kind: Literal["coverage", "mutation"]
-) -> None:
+def test_syntax_command_is_only_for_fallow(tmp_path: Path) -> None:
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError, match="optional Fallow parser"):
         Collector(
-            kind=kind,
+            kind="coverage",
             config=config(tmp_path, {}),
             command=["tool"],
             tool_version="1",
@@ -516,7 +476,7 @@ def test_pinned_oxc_observer_reports_parse_and_utf8_errors(
             arg.replace("{snapshot}", str(snapshot))
             .replace("{inputs}", str(inputs))
             .replace("{output}", str(output))
-            for arg in _syntax_command()
+            for arg in _syntax_command(tmp_path / "parser-cache")
         ],
         tmp_path,
         30,

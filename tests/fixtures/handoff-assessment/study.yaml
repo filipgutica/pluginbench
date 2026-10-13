@@ -1,6 +1,5 @@
 schema_version: 1
-name: Deterministic answer correction
-standards: standards.yaml
+name: Immutable handoff assessment
 records:
 - id: answer-demo
   task_id: answer-42
@@ -16,13 +15,3 @@ records:
     correctness:
       path: evidence/handoff-correctness.json
       sha256: sha256:421a1cc1058fd4aebf1ee494db3eff9bd8c4b71852cd45de70a5203fdd4e14f1
-  - id: final
-    snapshot:
-      path: snapshots/final
-      sha256: sha256:f7b7a2e1362af3da9b041b7779ba012bc3fdf1a3d27d1b3f14807b84c756dda7
-    correctness:
-      path: evidence/final-correctness.json
-      sha256: sha256:747c4e9760656b3a62483080cb8af338db1628c3772cff72f0e7fad59ff340b6
-  correction_ledger:
-    path: ledger.json
-    sha256: sha256:f24913ef8f63fb03617812d3ab4353ee18e16aca45cba0eab231f8677fdac454

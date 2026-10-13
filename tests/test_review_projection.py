@@ -8,7 +8,7 @@ import pytest
 
 from pluginbench import codex, remeasure, study, study_review
 from pluginbench.collectors import Collector
-from test_study_review import _existing_study, _judge
+from test_study_review import _existing_study
 
 
 def _rated_judge(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -47,12 +47,10 @@ def _rated_judge(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("measurement_name", ["metrics", "original"])
-def test_fixed_review_projection_preserves_completed_measurements_and_old_review(
+def test_fixed_review_projection_preserves_completed_measurements(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, measurement_name: str
 ) -> None:
     root = _existing_study(tmp_path, monkeypatch)
-    _judge(monkeypatch, root)
-    study_review.review_study(root)
     config = tmp_path / "coverage-config.json"
     config.write_text(json.dumps({"test_scope": ["tests/**"]}))
     adapter = tmp_path / "coverage.py"
@@ -78,21 +76,19 @@ def test_fixed_review_projection_preserves_completed_measurements_and_old_review
         },
         revision=measurement_name,
     )
-    old_report, _ = study.report_study(root, measurement_revision=measurement_name)
+    old_report = study.report_study(root, measurement_revision=measurement_name)
     original = json.loads(old_report.read_text())
     protected = study._inventory(root)
     guidance = tmp_path / "review-guidance.md"
     guidance.write_text("Keep the code maintainable.\n")
     _rated_judge(monkeypatch)
     study_review.review_study(root, revision="fixed", guidance=[guidance])
-    path, _ = study.report_study(
-        root, measurement_revision=measurement_name, review_revision="fixed"
-    )
+    path = study.report_study(root, measurement_revision=measurement_name, review_revision="fixed")
     assert (
         path.parent == root / "review-revisions/fixed/report-native/measurements" / measurement_name
     )
     preserved_projection = path.read_bytes()
-    native_path, _ = study.report_study(root, review_revision="fixed")
+    native_path = study.report_study(root, review_revision="fixed")
     assert native_path.parent == root / "review-revisions/fixed/report-native/original"
     assert path.read_bytes() == preserved_projection
     after = study._inventory(root)
@@ -115,17 +111,3 @@ def test_fixed_review_projection_preserves_completed_measurements_and_old_review
         }
         assert review["issues"][0]["evidence"] == "answer = 1"
         assert review["criteria_sha256"] == projected["independent_review"]["criteria_sha256"]
-
-
-def test_legacy_review_has_categories_without_invented_severities(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    root = _existing_study(tmp_path, monkeypatch)
-    _judge(monkeypatch, root)
-    study_review.review_study(root)
-    report = json.loads((root / "report/assessment-report.json").read_text())
-    for attempt in report["attempts"]:
-        review = attempt["independent_review"]
-        assert review["category_counts"]["maintainability"] == 1
-        assert review["severity_counts"] is None
-        assert review["criteria_sha256"] is None

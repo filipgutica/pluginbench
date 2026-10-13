@@ -236,15 +236,15 @@ def test_complete_all_function_scan_does_not_capture_missing_selected_changed_po
         metrics = _stage(report, index)["metrics"]
         assert isinstance(metrics, dict)
         metrics["fallow"]["metrics"]["function_count_reported"] = 3
-    legacy = chart_data(report)["measurement_completeness"]
-    assert isinstance(legacy, list)
-    assert all(row["counts"]["Complexity population"] for row in legacy)
+    measured = chart_data(report)["measurement_completeness"]
+    assert isinstance(measured, list)
+    assert all(row["counts"]["Complexity population"] for row in measured)
     data = evaluation_data(report, _config(family))
     assert all(
         row["counts"] == {"Complexity population": False} and not row["complete"]
         for row in _rows(data, "measurement_completeness")
     )
-    assert chart_data(report)["measurement_completeness"] == legacy
+    assert chart_data(report)["measurement_completeness"] == measured
 
 
 def test_selected_token_completeness_preserves_missing_output_counts() -> None:

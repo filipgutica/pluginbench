@@ -188,8 +188,19 @@ def _selected_completeness(
     return results
 
 
+def _assigned_counts(
+    observations: list[dict[str, object]],
+) -> dict[tuple[object, object, object], int]:
+    attempts: dict[tuple[object, object, object], set[object]] = {}
+    for row in observations:
+        key = (row.get("task"), row.get("metric"), row.get("arm"))
+        attempts.setdefault(key, set()).add(row["attempt_id"])
+    return {key: len(ids) for key, ids in attempts.items()}
+
+
 def _comparison_rows(data: dict[str, object]) -> list[dict[str, object]]:
     observations = _rows(data["observations"])
+    assigned_counts = _assigned_counts(observations)
     medians = _rows(data["medians"])
     lookup = {
         (row.get("task"), row.get("metric"), row.get("compatibility"), row.get("arm")): row
@@ -221,16 +232,7 @@ def _comparison_rows(data: dict[str, object]) -> list[dict[str, object]]:
             else None
         )
         assigned = {
-            group: len(
-                {
-                    row["attempt_id"]
-                    for row in observations
-                    if row.get("task") == task
-                    and row.get("metric") == metric
-                    and row.get("arm") == group
-                }
-            )
-            for group in ("baseline", arm)
+            group: assigned_counts.get((task, metric, group), 0) for group in ("baseline", arm)
         }
         baseline_measured, guided_measured = baseline.get("measured", 0), guided.get("measured", 0)
         complete = baseline_measured == assigned["baseline"] and guided_measured == assigned[arm]
@@ -266,9 +268,22 @@ def _comparison_rows(data: dict[str, object]) -> list[dict[str, object]]:
 def _aggregate_rows(data: dict[str, object]) -> list[dict[str, object]]:
     """Give each assigned task one median, independent of its repeat count."""
     observations = _rows(data["observations"])
+    assigned_counts = _assigned_counts(observations)
     medians = _rows(data["medians"])
     raw_medians = _rows(data["raw_medians"])
     comparisons = _rows(data["comparisons"])
+    median_rows: dict[tuple[object, object, object], list[dict[str, object]]] = {}
+    raw_rows: dict[tuple[object, object, object], list[dict[str, object]]] = {}
+    comparison_rows: dict[tuple[object, object, object], list[dict[str, object]]] = {}
+    for row in medians:
+        median_rows.setdefault((row["task"], row["metric"], row["arm"]), []).append(row)
+    for row in raw_medians:
+        raw_rows.setdefault((row["task"], row["metric"], row["arm"]), []).append(row)
+    for row in comparisons:
+        if row["absolute_delta_vs_vanilla"] is not None:
+            comparison_rows.setdefault((row["task"], row["metric"], row["guidance"]), []).append(
+                row
+            )
     tasks = sorted({str(row["task"]) for row in _rows(data["attempts"])})
     arms = sorted(
         {str(row["arm"]) for row in observations}, key=lambda arm: (arm != "baseline", arm)
@@ -276,44 +291,20 @@ def _aggregate_rows(data: dict[str, object]) -> list[dict[str, object]]:
     metrics = sorted({str(row["metric"]) for row in observations})
     results = []
     for metric in metrics:
-        baseline_values = {
-            task: [
-                row
-                for row in medians
-                if row["task"] == task and row["metric"] == metric and row["arm"] == "baseline"
-            ]
-            for task in tasks
-        }
+        baseline_values = {task: median_rows.get((task, metric, "baseline"), []) for task in tasks}
         for arm in arms:
             task_values = []
             task_statuses = []
             comparison_statuses = []
             matching_baselines = []
             for task in tasks:
-                rows = [
-                    row
-                    for row in raw_medians
-                    if row["task"] == task and row["metric"] == metric and row["arm"] == arm
-                ]
+                rows = raw_rows.get((task, metric, arm), [])
                 value = rows[0].get("value") if len(rows) == 1 else None
                 task_values.append({"task": task, "value": value})
-                matches = [
-                    row
-                    for row in comparisons
-                    if row["task"] == task
-                    and row["metric"] == metric
-                    and row["guidance"] == arm
-                    and row["absolute_delta_vs_vanilla"] is not None
-                ]
+                matches = comparison_rows.get((task, metric, arm), [])
                 baseline = baseline_values[task]
                 measured = rows[0].get("measured", 0) if len(rows) == 1 else 0
-                assigned = len(
-                    {
-                        row["attempt_id"]
-                        for row in observations
-                        if row["task"] == task and row["metric"] == metric and row["arm"] == arm
-                    }
-                )
+                assigned = assigned_counts.get((task, metric, arm), 0)
                 raw_status = "complete" if value is not None and measured == assigned else "partial"
                 task_statuses.append(raw_status)
                 if arm == "baseline":
@@ -393,7 +384,7 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
     guide = _map(projection["metric_guide"])
     observations = []
     for source in _rows(projection["observations"]):
-        if source.get("role") != "handoff" or source.get("metric") not in families:
+        if source.get("metric") not in families:
             continue
         metric = str(source["metric"])
         row = {field: source.get(field) for field in OBSERVATION_FIELDS}
@@ -488,23 +479,15 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         "attempts": attempts,
         "observations": observations,
         "observation_fields": list(OBSERVATION_FIELDS),
-        "medians": [
-            row
-            for row in _rows(projection["medians"])
-            if row.get("role") == "handoff" and row.get("metric") in families
-        ],
+        "medians": [row for row in _rows(projection["medians"]) if row.get("metric") in families],
         "raw_medians": [
-            row
-            for row in _rows(projection["raw_medians"])
-            if row.get("role") == "handoff" and row.get("metric") in families
+            row for row in _rows(projection["raw_medians"]) if row.get("metric") in families
         ],
         "metric_guide": {metric: guide[metric] for metric in families},
         "independent_review": projection.get("independent_review")
         if "review" in selected
         else None,
         "review_findings": projection.get("review_findings") if "review" in selected else [],
-        "distinct_final": False,
-        "single_stage_attempts": [row["id"] for row in attempts],
         "download_csv": "results.csv",
         "limitations": limitations,
     }

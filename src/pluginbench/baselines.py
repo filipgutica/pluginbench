@@ -108,8 +108,6 @@ def _docker_executable(value: object) -> dict[str, object] | None:
 
 
 def _matches_docker_client(artifacts: Path, expected: dict[str, object]) -> bool:
-    if not any(key in expected for key in ("docker_cli", "docker_plugins")):
-        return True  # Historical Harbor runtimes did not bind client executables.
     try:
         actual = json.loads((artifacts / "docker-client.json").read_text())
     except (OSError, ValueError):
@@ -151,10 +149,8 @@ def _matches_settings(
     ):
         return False
     harness = settings["harness"] + "-cli"
-    isolation = coding.get("isolation")
-    harbor = isinstance(isolation, dict) and isolation.get("protocol") == "harbor-docker-v1"
-    version = coding.get("harness_version") if harbor else None
-    if harbor and (
+    version = coding.get("harness_version")
+    if (
         not isinstance(version, str)
         or not version
         or image is None
@@ -163,20 +159,18 @@ def _matches_settings(
         or toolchain.get("harness_version") != version
     ):
         return False
-    budgets = {}
-    if harbor and isinstance(isolation, dict) and isolation.get("submission_receipt_version") == 2:
-        environment = coding.get("task_environment")
-        build = environment.get("build_timeout_seconds") if isinstance(environment, dict) else None
-        agent = coding.get("timeout_seconds")
-        if (
-            type(agent) is not int
-            or agent <= 0
-            or not isinstance(build, str)
-            or not build.isdecimal()
-            or int(build) <= 0
-        ):
-            return False
-        budgets = {"timeout_seconds": agent, "build_timeout_seconds": int(build)}
+    environment = coding.get("task_environment")
+    build = environment.get("build_timeout_seconds") if isinstance(environment, dict) else None
+    agent = coding.get("timeout_seconds")
+    if (
+        type(agent) is not int
+        or agent <= 0
+        or not isinstance(build, str)
+        or not build.isdecimal()
+        or int(build) <= 0
+    ):
+        return False
+    budgets = {"timeout_seconds": agent, "build_timeout_seconds": int(build)}
     runtime = record.get("runtime") or {}
     observations = [
         (record.get("model"), settings["model"]),
@@ -187,31 +181,30 @@ def _matches_settings(
         observations.append((runtime.get("harness_version"), version))
     for stage in record["stages"]:
         execution = json.loads((attempt / stage["id"] / "execution.json").read_text())
-        if harbor:
-            invocation_path = attempt / stage["id"] / "artifacts/invocation.json"
-            if not invocation_path.is_file():
-                return False
-            invocation = json.loads(invocation_path.read_text())
-            if (
-                not isinstance(invocation, dict)
-                or _immutable_image(invocation.get("image_identity")) != image
-                or _immutable_toolchain(invocation.get("toolchain_identity")) != toolchain
-                or any(
-                    type(invocation.get(key)) is not int or invocation[key] != expected
-                    for key, expected in budgets.items()
+        invocation_path = attempt / stage["id"] / "artifacts/invocation.json"
+        if not invocation_path.is_file():
+            return False
+        invocation = json.loads(invocation_path.read_text())
+        if (
+            not isinstance(invocation, dict)
+            or _immutable_image(invocation.get("image_identity")) != image
+            or _immutable_toolchain(invocation.get("toolchain_identity")) != toolchain
+            or any(
+                type(invocation.get(key)) is not int or invocation[key] != expected
+                for key, expected in budgets.items()
+            )
+            or any(
+                invocation.get(key) != expected
+                for key, expected in (
+                    ("backend", "harbor-docker-v1"),
+                    ("harness", harness),
+                    ("harness_version", version),
+                    ("requested_model", settings["model"]),
+                    ("requested_effort", settings["reasoning"]),
                 )
-                or any(
-                    invocation.get(key) != expected
-                    for key, expected in (
-                        ("backend", "harbor-docker-v1"),
-                        ("harness", harness),
-                        ("harness_version", version),
-                        ("requested_model", settings["model"]),
-                        ("requested_effort", settings["reasoning"]),
-                    )
-                )
-            ):
-                return False
+            )
+        ):
+            return False
         if isinstance(version, str) and version:
             observations.append((execution.get("launch_harness_version"), version))
             startup = execution.get("startup")
@@ -256,7 +249,9 @@ def _matches_harbor_runtime(
     engine = expected.get("docker_engine")
     resources = expected.get("resources")
     if (
-        not isinstance(expected.get("harbor_version"), str)
+        type(expected.get("submission_receipt_version")) is not int
+        or expected["submission_receipt_version"] != 2
+        or not isinstance(expected.get("harbor_version"), str)
         or not expected["harbor_version"]
         or not isinstance(expected.get("implementation_sha256"), str)
         or not re.fullmatch(r"[a-f0-9]{64}", expected["implementation_sha256"])
@@ -300,32 +295,26 @@ def _matches_harbor_runtime(
             or cleanup.get("residuals") != {"containers": [], "networks": [], "images": []}
         ):
             return False
-        if expected.get("submission_receipt_version") is not None:
-            if (
-                type(expected["submission_receipt_version"]) is not int
-                or expected["submission_receipt_version"] != 2
-            ):
+        try:
+            proof = json.loads((artifacts / "container-state.json").read_text())
+            if not isinstance(proof, dict):
                 return False
-            try:
-                proof = json.loads((artifacts / "container-state.json").read_text())
-                if not isinstance(proof, dict):
-                    return False
-                harbor_backend.stopped_container_state(proof.get("state"))
-                worker = json.loads((artifacts / "worker.json").read_text())
-            except (OSError, ValueError):
-                return False
-            owner, container_id = proof.get("owner"), proof.get("container_id")
-            if (
-                proof.get("resources") != export["resources"]
-                or proof.get("derived_image_id") != export["derived_image_id"]
-                or not isinstance(owner, str)
-                or re.fullmatch(r"[0-9a-f]{32}", owner) is None
-                or not isinstance(container_id, str)
-                or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
-                or not isinstance(worker, dict)
-                or worker.get("session_id") != f"pluginbench-{owner}__env"
-            ):
-                return False
+            harbor_backend.stopped_container_state(proof.get("state"))
+            worker = json.loads((artifacts / "worker.json").read_text())
+        except (OSError, ValueError):
+            return False
+        owner, container_id = proof.get("owner"), proof.get("container_id")
+        if (
+            proof.get("resources") != export["resources"]
+            or proof.get("derived_image_id") != export["derived_image_id"]
+            or not isinstance(owner, str)
+            or re.fullmatch(r"[0-9a-f]{32}", owner) is None
+            or not isinstance(container_id, str)
+            or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+            or not isinstance(worker, dict)
+            or worker.get("session_id") != f"pluginbench-{owner}__env"
+        ):
+            return False
     return True
 
 
@@ -353,42 +342,7 @@ def _eligible(attempt: Path, record: dict[str, Any], coding: object) -> bool:
         return _matches_harbor_runtime(
             attempt, record, expected, image=image, toolchain=toolchain
         ) and _matches_settings(attempt, record, coding, image=image, toolchain=toolchain)
-    required = {
-        "protocol",
-        "implementation_sha256",
-        "backend",
-        "backend_sha256",
-        "os",
-        "os_release",
-        "system_read_roots",
-        "tool_read_roots",
-        "tools",
-        "filesystem",
-        "network",
-        "process_limit",
-    }
-    if (
-        not isinstance(expected, dict)
-        or not required.issubset(expected)
-        or expected.get("protocol") != "local-filesystem-v1"
-    ):
-        return False
-    for stage in record["stages"]:
-        receipt = attempt / stage["id"] / "artifacts/runtime-isolation.json"
-        if not receipt.is_file():
-            return False
-        filesystem = json.loads(receipt.read_text()).get("filesystem", {})
-        if (
-            not isinstance(filesystem, dict)
-            or {
-                key: value
-                for key, value in filesystem.items()
-                if key not in {"readable", "writable", "policy_sha256"}
-            }
-            != expected
-        ):
-            return False
-    return _matches_settings(attempt, record, coding)
+    return False
 
 
 class BaselineCache:

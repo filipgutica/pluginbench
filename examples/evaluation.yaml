@@ -1,5 +1,4 @@
 name: Workflow versus Superpowers
-# Harbor containers are the default coding backend.
 runner:
   harness: codex                # codex or claude
   model: gpt-6.1-sol

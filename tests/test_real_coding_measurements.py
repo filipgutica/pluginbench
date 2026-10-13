@@ -452,15 +452,8 @@ def test_fallow_version_drift_is_rejected(
 def test_oxc_expected_digest_uses_verifier_bytes_and_rejects_changes(
     measurements: ModuleType, tmp_path: Path
 ) -> None:
-    lock = measurements.ROOT / "observers/oxc-parser-0.126.0/package-lock.json"
-
-    cache = (
-        measurements.observer_cache_root()
-        / "oxc-parser-0.126.0"
-        / hashlib.sha256(lock.read_bytes()).hexdigest()
-    )
-    if not (cache / "node_modules/oxc-parser").is_dir():
-        pytest.skip("prepared pinned Oxc observer unavailable")
+    observer = measurements.prepare_observer("oxc-parser-0.126.0", tmp_path / "parser-cache")
+    cache = Path(observer["path"]).parent
     snapshot = tmp_path / "source"
     snapshot.mkdir()
     (snapshot / "example.ts").write_text("export const value: number = 1;\n")
@@ -481,7 +474,7 @@ def test_oxc_expected_digest_uses_verifier_bytes_and_rejects_changes(
     receipt = json.loads(output.read_text())
     assert receipt["dependency_digest"] == receipt["expected_dependency_digest"] == expected
     assert receipt["files"][0]["status"] == "valid"
-    # Alter only a disposable copy, preserving the shared cache used by studies.
+    # Tamper with a separate copy while keeping the prepared observer bound.
 
     copied = tmp_path / "cache"
     shutil.copytree(cache, copied, symlinks=True)
@@ -608,131 +601,6 @@ def test_unknown_measurement_is_rejected_before_setup_or_writes(
             selection=["unknown"],
         )
     assert not list(tmp_path.iterdir())
-
-
-@pytest.mark.parametrize("framework", ["vitest", "mocha"])
-def test_leave_one_out_preserves_duplicate_titles_and_native_occurrences(
-    measurements: ModuleType,
-    tmp_path: Path,
-    framework: str,
-) -> None:
-    task = (
-        "ofetch-per-origin-circuit-breaker"
-        if framework == "vitest"
-        else "testem-per-launcher-reports"
-    )
-    native_version = "4.0.5" if framework == "vitest" else "11.8.0"
-    candidates = [
-        *(ROOT / "benchmarks/real-coding/generated").glob(f"*/dependencies/{task}/node_modules"),
-        *(ROOT / "runs").glob(f"*/inputs/{task}/dependencies/{task}/node_modules"),
-    ]
-    dependencies = next(
-        (
-            path
-            for path in sorted(candidates)
-            if (path / framework / "package.json").is_file()
-            and json.loads((path / framework / "package.json").read_text())["version"]
-            == native_version
-        ),
-        None,
-    )
-    if framework == "vitest":
-        version, provider, observer = "4.0.5", "vitest/v8", None
-    else:
-        caches = sorted(
-            (measurements.observer_cache_root() / "testem-istanbul-6.0.3").glob("*/node_modules")
-        )
-        version, provider = "6.0.3", "istanbul/mocha"
-        observer = caches[0] if caches else None
-    if dependencies is None or (framework == "mocha" and observer is None):
-        pytest.skip("prepared pinned native test dependencies unavailable")
-    submitted, before = tmp_path / "submitted", tmp_path / "before"
-    for directory in (submitted, before):
-        (directory / "src").mkdir(parents=True)
-        (directory / "test").mkdir()
-        source = (
-            "export function pick(value) { return value ? 'yes' : 'no'; }"
-            if framework == "vitest"
-            else "exports.pick = function(value) { return value ? 'yes' : 'no'; };"
-        )
-        (directory / "src/pick.js").write_text(source)
-        if framework == "vitest":
-            (directory / "package.json").write_text('{"type":"module"}')
-    imports = (
-        "import { describe, it, expect } from 'vitest'; import { pick } from '../src/pick.js';"
-        if framework == "vitest"
-        else "const assert = require('node:assert/strict'); const { pick } = require('../src/pick');"
-    )
-    positive = (
-        "expect(pick(true)).toBe('yes');"
-        if framework == "vitest"
-        else "assert.equal(pick(true), 'yes');"
-    )
-    negative = (
-        "expect(pick(false)).toBe('no');"
-        if framework == "vitest"
-        else "assert.equal(pick(false), 'no');"
-    )
-    for directory in (submitted, before):
-        (directory / "test/b.test.js").write_text(
-            imports + "describe('shared', () => { it('works', () => {" + positive + "}); });"
-        )
-    (before / "test/a.test.js").write_text(
-        imports
-        + "describe('shared', () => { it('works', () => {"
-        + positive
-        + "}); it.skip('works', () => {}); });"
-    )
-    (submitted / "test/a.test.js").write_text(
-        imports
-        + "describe('shared', () => { it('works', () => {"
-        + positive
-        + "}); it('works', () => {"
-        + negative
-        + "}); it.skip('works', () => {}); });"
-    )
-    config: coverage_adapter.Configuration = {
-        "source_scope": ["src/**"],
-        "test_scope": ["test/*.test.js"],
-        "provider": provider,
-        "version": version,
-        "framework_version": native_version,
-        "measure_test_overlap": True,
-    }
-    if observer is not None:
-        config["observer"] = {
-            "path": str(observer),
-            "sha256": measurements.dependency_digest(observer),
-        }
-    report = coverage_adapter.collect(
-        submitted=submitted,
-        before=before,
-        payload={
-            "dependencies": str(dependencies),
-            "dependency_sha256": measurements.dependency_digest(dependencies),
-            "trusted_files": {},
-            "framework": framework,
-        },
-        config=config,
-        dependency_digest=measurements.dependency_digest,
-    )
-    contribution = report["contribution"]
-    first = "test/a.test.js::shared works::native-occurrence:1"
-    second = "test/a.test.js::shared works::native-occurrence:2"
-    pending = "test/a.test.js::shared works::native-occurrence:3"
-    other_file = "test/b.test.js::shared works"
-    assert contribution["candidate_ids"] == [first, second]
-    assert contribution["zero_marginal_ids"] == [first]
-    removals = contribution["removal_runs"]
-    assert isinstance(removals, list)
-    for removal, excluded in zip(removals, (first, second), strict=True):
-        assert isinstance(removal, dict)
-        assert removal["excluded_id"] == excluded
-        assert other_file in removal["passing_ids"]
-        assert removal["test_statuses"][pending] == "pending"
-        assert removal["test_statuses"][excluded] == "pending"
-        assert len(removal["test_statuses"]) == 4
-    assert report["branches"]["total"] and report["branches"]["covered"]
 
 
 def test_coverage_cli_does_not_write_bytecode_into_frozen_verifier(

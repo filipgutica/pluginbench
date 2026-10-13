@@ -251,19 +251,17 @@ def test_changed_candidate_files_are_checked_against_the_bound_diff(
         "fixture",
         Snapshot(before, baseline),
         (stage,),
-        None,
-        tmp_path,
         {},
     )
     if declared == ["test/new.test.ts"]:
-        metrics = _stage(attempt, stage, None, tmp_path, {})["metrics"]
+        metrics = _stage(attempt, stage, tmp_path, {})["metrics"]
         assert isinstance(metrics, dict) and isinstance(metrics["coverage"], dict)
         coverage = metrics["coverage"]["metrics"]
         assert isinstance(coverage, dict) and isinstance(coverage["test_contribution"], dict)
         assert coverage["test_contribution"]["candidate_count"] == 2
     else:
         with pytest.raises(ValueError, match="changed-file selection differs"):
-            _stage(attempt, stage, None, tmp_path, {})
+            _stage(attempt, stage, tmp_path, {})
 
 
 @pytest.mark.parametrize(

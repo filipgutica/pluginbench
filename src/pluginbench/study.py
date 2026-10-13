@@ -10,9 +10,8 @@ import random
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from functools import partial
 from threading import Event
 from concurrent.futures import CancelledError
@@ -23,7 +22,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from pluginbench import claude, codex, pier_backend, isolation, harbor_backend
+from pluginbench import codex, isolation, harbor_backend
 from pluginbench.baselines import BaselineCache
 from pluginbench.parallel import run_jobs, validate_jobs
 from pluginbench.assessment import build_assessment, write_assessment
@@ -32,7 +31,6 @@ from pluginbench.assessment_models import (
     ArtifactRef,
     AssessmentInput,
     CorrectnessReceipt,
-    Standards,
 )
 from pluginbench.collectors import (
     Collector,
@@ -40,7 +38,6 @@ from pluginbench.collectors import (
     freeze_collectors,
     resolve_collector_command,
 )
-from pluginbench.config import DatasetConfig
 from pluginbench.datasets import TaskCatalog, TaskSpec, load_tasks
 
 
@@ -49,14 +46,12 @@ class StudyRecipe(BaseModel):
 
     schema_version: Literal[1]
     name: str = Field(min_length=1)
-    backend: Literal["local", "pier", "harbor"] = "local"
+    backend: Literal["harbor"] = "harbor"
     harness: Literal["codex", "claude"] = "codex"
     tasks: Path
-    codex_version: str = Field(default="0.162.0", pattern=r"^\d+\.\d+\.\d+$")
     harness_version: str | None = None
     container_cpus: int = Field(default=1, strict=True, ge=1)
     container_memory_mb: int = Field(default=2048, strict=True, ge=256)
-    pier_python: Path = Path(sys.executable)
     guidance: dict[str, list[Path]] = Field(min_length=1)
     model: str = Field(default="gpt-6.1-sol", min_length=1)
     reasoning: Literal["minimal", "low", "medium", "high", "xhigh", "max", "ultra"] = "medium"
@@ -64,9 +59,7 @@ class StudyRecipe(BaseModel):
     jobs: int = Field(default=1, strict=True, ge=1, le=16)
     timeout_seconds: int = Field(default=600, strict=True, ge=1)
     seed: int = Field(default=42, strict=True)
-    max_repairs: int = Field(default=0, strict=True, ge=0, le=3)
     auth_file: Path = Path("~/.codex/auth.json")
-    standards: Path | None = None
     collectors: list[Collector] = Field(default_factory=list)
 
     @field_validator("guidance")
@@ -86,13 +79,9 @@ class StudyRecipe(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def supported_repairs(self) -> StudyRecipe:
-        if self.backend == "harbor" and (self.max_repairs or self.reasoning == "ultra"):
-            raise ValueError("Harbor supports no repair rounds and does not support ultra effort")
-        if self.backend == "pier" and self.max_repairs:
-            raise ValueError("Pier studies currently support max_repairs: 0 only")
-        if self.backend == "pier" and self.harness != "codex":
-            raise ValueError("Pier execution currently supports Codex only")
+    def supported_effort(self) -> StudyRecipe:
+        if self.reasoning == "ultra":
+            raise ValueError("Harbor does not support ultra effort")
         if self.harness == "claude" and self.reasoning not in {
             "low",
             "medium",
@@ -107,7 +96,7 @@ class StudyRecipe(BaseModel):
 @dataclass(frozen=True)
 class ResolvedStudy:
     recipe: StudyRecipe
-    tasks: tuple[TaskSpec | pier_backend.PierTask, ...]
+    tasks: tuple[TaskSpec, ...]
     guidance: dict[str, tuple[Path, ...]]
     source: Path
     guidance_selection: dict[str, dict[str, list[str]]] = field(default_factory=dict)
@@ -154,17 +143,7 @@ def load_study(path: Path) -> ResolvedStudy:
     base = source.parent
     recipe.tasks = _resolve(base, recipe.tasks)
     recipe.auth_file = _resolve(base, recipe.auth_file)
-    # Resolving a venv's Python symlink selects the base interpreter and loses its packages.
-    python = recipe.pier_python.expanduser()
-    recipe.pier_python = python.absolute() if python.is_absolute() else (base / python).absolute()
-    recipe.standards = _resolve(base, recipe.standards) if recipe.standards else None
-    if recipe.standards:
-        Standards.model_validate(yaml.safe_load(recipe.standards.read_text()))
-    tasks: tuple[TaskSpec | pier_backend.PierTask, ...] = (
-        pier_backend.load_tasks(recipe.tasks)
-        if recipe.backend == "pier"
-        else _load_local_tasks(recipe)
-    )
+    tasks = _load_tasks(recipe)
     guidance = {}
     selection = {}
     for name, paths in recipe.guidance.items():
@@ -199,32 +178,14 @@ def load_study(path: Path) -> ResolvedStudy:
     return ResolvedStudy(recipe, tasks, guidance, source, selection)
 
 
-def _load_local_tasks(recipe: StudyRecipe) -> tuple[TaskSpec, ...]:
-    catalog = TaskCatalog.model_validate(yaml.safe_load(recipe.tasks.read_text()))
-    for entry in catalog.tasks:
-        for item in (entry.fixture, entry.verifier.script):
-            if item.is_absolute() or ".." in item.parts:
-                raise ValueError(
-                    "task fixtures and verifier scripts must be relative to their catalog"
-                )
-            raw_path = recipe.tasks.parent / item
-            if any(candidate.is_symlink() for candidate in (raw_path, *raw_path.parents)):
-                raise ValueError(f"task input must not be a symlink: {raw_path}")
-    tasks = load_tasks(
-        DatasetConfig(
-            name=recipe.name,
-            version="1",
-            source=recipe.tasks,
-            task_ids=[task.id for task in catalog.tasks],
-        )
-    )
+def _load_tasks(recipe: StudyRecipe) -> tuple[TaskSpec, ...]:
+    tasks = load_tasks(recipe.tasks)
     for task in tasks:
         assert task.fixture is not None
         codex.reject_guidance(task.fixture, include_ancestors=False, reject_git=True)
-        if recipe.backend == "harbor":
-            image = (task.provenance or {}).get("agent_image", "")
-            if not re.fullmatch(r"[^\s]+@sha256:[a-f0-9]{64}", image):
-                raise ValueError("Harbor tasks require a pinned agent_image in provenance")
+        image = (task.provenance or {}).get("agent_image", "")
+        if not re.fullmatch(r"[^\s]+@sha256:[a-f0-9]{64}", image):
+            raise ValueError("Harbor tasks require a pinned agent_image in provenance")
     return tuple(tasks)
 
 
@@ -245,7 +206,6 @@ def plan_study(study: ResolvedStudy) -> dict[str, Any]:
         "name": recipe.name,
         "host": recipe.harness,
         "backend": recipe.backend,
-        "codex_version": recipe.codex_version if recipe.backend == "pier" else None,
         "model": recipe.model,
         "requested_reasoning_effort": recipe.reasoning,
         "delivery": "forced text in task prompt; automatic activation is not measured",
@@ -254,8 +214,6 @@ def plan_study(study: ResolvedStudy) -> dict[str, Any]:
         "seed": recipe.seed,
         "jobs": recipe.jobs,
         "initial_calls": len(entries),
-        "maximum_calls": len(entries) * (1 + recipe.max_repairs),
-        "repair_policy": "same external verifier feedback, bounded repairs; not independent review",
         "entries": entries,
     }
 
@@ -299,28 +257,7 @@ def _freeze(study: ResolvedStudy, root: Path) -> ResolvedStudy:
     frozen = root / "frozen"
     frozen.mkdir()
     shutil.copyfile(study.source, frozen / "source-recipe.yaml")
-    tasks: tuple[TaskSpec | pier_backend.PierTask, ...]
-    if study.recipe.backend == "pier":
-        tasks = pier_backend.freeze_tasks(
-            tuple(task for task in study.tasks if isinstance(task, pier_backend.PierTask)),
-            frozen / "suite",
-        )
-        source = yaml.safe_load(study.recipe.tasks.read_text())["source"]
-        _write(
-            frozen / "tasks.json",
-            {
-                "schema_version": 1,
-                "source": source,
-                "tasks": [
-                    {"id": task.task_id, "path": str(task.directory.relative_to(frozen))}
-                    for task in tasks
-                    if isinstance(task, pier_backend.PierTask)
-                ],
-            },
-        )
-    else:
-        _freeze_local_tasks(study, frozen)
-        tasks = ()
+    _freeze_tasks(study, frozen)
     runner = frozen / "runner"
     runner.mkdir()
     for source_file in sorted(Path(__file__).parent.glob("*.py")):
@@ -338,25 +275,10 @@ def _freeze(study: ResolvedStudy, root: Path) -> ResolvedStudy:
     recipe.tasks = frozen / "tasks.json"
     recipe.guidance = guidance
     recipe.collectors = freeze_collectors(recipe.collectors, frozen / "collectors")
-    standards = Standards(
-        schema_version=1, required_correctness_checks=["behavior", "native_completion"]
-    )
-    if recipe.standards:
-        shutil.copyfile(recipe.standards, frozen / "source-standards.yaml")
-        standards = Standards.model_validate(yaml.safe_load(recipe.standards.read_text()))
-        if "native_completion" not in standards.required_correctness_checks:
-            standards.required_correctness_checks.append("native_completion")
-    if recipe.backend == "pier":
-        for check in ("delivery_complete", "submission_collected"):
-            if check not in standards.required_correctness_checks:
-                standards.required_correctness_checks.append(check)
-    recipe.standards = frozen / "standards.yaml"
-    _write(recipe.standards, standards.model_dump(mode="json"))
     public_recipe = recipe.model_dump(mode="json", exclude={"auth_file"})
     _write(frozen / "resolved-recipe.json", public_recipe)
     _write(root / "frozen-inventory.json", _inventory(frozen))
-    if recipe.backend != "pier":
-        tasks = _load_local_tasks(recipe)
+    tasks = _load_tasks(recipe)
     return ResolvedStudy(
         recipe,
         tasks,
@@ -366,12 +288,11 @@ def _freeze(study: ResolvedStudy, root: Path) -> ResolvedStudy:
     )
 
 
-def _freeze_local_tasks(study: ResolvedStudy, frozen: Path) -> None:
+def _freeze_tasks(study: ResolvedStudy, frozen: Path) -> None:
     entries = []
     catalog = TaskCatalog.model_validate(yaml.safe_load(study.recipe.tasks.read_text()))
     declared = {entry.id: entry for entry in catalog.tasks}
     for task in study.tasks:
-        assert isinstance(task, TaskSpec)
         assert task.fixture is not None and task.verifier is not None
         entry = declared[task.task_id]
         fixture = frozen / "suite" / entry.fixture
@@ -397,7 +318,7 @@ def _freeze_local_tasks(study: ResolvedStudy, frozen: Path) -> None:
     _write(frozen / "tasks.json", {"schema_version": 1, "tasks": entries})
 
 
-def _prompt(task: TaskSpec | pier_backend.PierTask, guidance: tuple[Path, ...]) -> str:
+def _prompt(task: TaskSpec, guidance: tuple[Path, ...]) -> str:
     if not guidance:
         return task.prompt
     text = "\n\n".join(
@@ -508,43 +429,33 @@ def _execute_stage(
     study: ResolvedStudy,
     stage_id: str,
     prompt: str,
-    on_native_start: Callable[[], None] | None = None,
-    expected_runtime: dict[str, object] | None = None,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    on_native_start: Callable[[], None],
+    expected_runtime: dict[str, object],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     _assert_frozen(root)
     interrupted: KeyboardInterrupt | None = None
     try:
         codex.reject_guidance(area / "workspace", include_ancestors=True, reject_git=False)
-        if on_native_start:
-            on_native_start()
-        invoke = harbor_backend.invoke if study.recipe.backend == "harbor" else codex.invoke
-        execution = invoke(
+        on_native_start()
+        execution = harbor_backend.invoke(
             area=area,
             entry={**entry, "host": study.recipe.harness},
             protocol={
                 "models": {study.recipe.harness: study.recipe.model},
                 "reasoning": study.recipe.reasoning,
                 "isolation": expected_runtime,
-                **(
-                    {
-                        "agent_image": (task.provenance or {})["agent_image"],
-                        "image_identity": json.loads((task.provenance or {})["image_identity"])
-                        if (task.provenance or {}).get("image_identity")
-                        else None,
-                        "toolchain_identity": json.loads(
-                            (task.provenance or {})["toolchain_identity"]
-                        )
-                        if (task.provenance or {}).get("toolchain_identity")
-                        else None,
-                        "harness_version": study.recipe.harness_version,
-                        "container_cpus": study.recipe.container_cpus,
-                        "container_memory_mb": study.recipe.container_memory_mb,
-                        "build_timeout_seconds": int(
-                            (task.provenance or {}).get("build_timeout_seconds", "300")
-                        ),
-                    }
-                    if study.recipe.backend == "harbor"
-                    else {}
+                "agent_image": (task.provenance or {})["agent_image"],
+                "image_identity": json.loads((task.provenance or {})["image_identity"])
+                if (task.provenance or {}).get("image_identity")
+                else None,
+                "toolchain_identity": json.loads((task.provenance or {})["toolchain_identity"])
+                if (task.provenance or {}).get("toolchain_identity")
+                else None,
+                "harness_version": study.recipe.harness_version,
+                "container_cpus": study.recipe.container_cpus,
+                "container_memory_mb": study.recipe.container_memory_mb,
+                "build_timeout_seconds": int(
+                    (task.provenance or {}).get("build_timeout_seconds", "300")
                 ),
                 **(
                     {"auth_file": str(study.recipe.auth_file)}
@@ -613,9 +524,7 @@ def _execute_stage(
             {"status": "unsubmitted interrupted workspace; not graded"},
         )
         raise interrupted
-    if artifact_error or (
-        study.recipe.backend == "harbor" and execution.get("submission_collected") is not True
-    ):
+    if artifact_error or execution.get("submission_collected") is not True:
         exported_digest = execution.get("submission_export_digest")
         if not artifact_error and isinstance(exported_digest, str):
             try:
@@ -651,7 +560,6 @@ def _execute_stage(
                 "work": _work(execution),
             },
             execution,
-            {"pass": None, "error": "unavailable submitted snapshot"},
         )
     try:
         inspect_snapshot(area / "workspace")
@@ -674,13 +582,12 @@ def _execute_stage(
                 "work": _work(execution),
             },
             execution,
-            {"pass": None, "error": "unsupported submitted snapshot"},
         )
     snapshot = target / "snapshot"
     shutil.copytree(
         area / "workspace", snapshot, symlinks=True, ignore=shutil.ignore_patterns(*EXCLUDED_NAMES)
     )
-    stage, result = _verify_snapshot(
+    stage = _verify_snapshot(
         root=root,
         snapshot=snapshot,
         task=task,
@@ -689,7 +596,7 @@ def _execute_stage(
         stage_id=stage_id,
         execution=execution,
     )
-    return stage, execution, result
+    return stage, execution
 
 
 def _verify_snapshot(
@@ -701,7 +608,7 @@ def _verify_snapshot(
     target: Path,
     stage_id: str,
     execution: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> dict[str, Any]:
     snapshot_ref = _reference(root, snapshot, snapshot=True)
     with tempfile.TemporaryDirectory(prefix="pluginbench-grade-") as grader:
         result = _grade(snapshot, task, Path(grader))
@@ -734,16 +641,13 @@ def _verify_snapshot(
     if _reference(root, snapshot, snapshot=True) != snapshot_ref:
         raise ValueError("submitted snapshot changed during verification or collection")
     _assert_frozen(root)
-    return (
-        {
-            "id": stage_id,
-            "snapshot": snapshot_ref,
-            "correctness": _reference(root, target / "correctness.json"),
-            "evidence": evidence or None,
-            "work": _work(execution),
-        },
-        result,
-    )
+    return {
+        "id": stage_id,
+        "snapshot": snapshot_ref,
+        "correctness": _reference(root, target / "correctness.json"),
+        "evidence": evidence or None,
+        "work": _work(execution),
+    }
 
 
 def _versioned_artifact(path: Path) -> Path:
@@ -758,7 +662,6 @@ def _checkpoint(
     study: ResolvedStudy,
     manifest: dict[str, Any],
     states: dict[str, str],
-    calls: int = 0,
     *,
     status: str,
     error: str | None = None,
@@ -803,16 +706,11 @@ def _checkpoint(
         for path in sorted((root / "invocations").glob("*"))
         if path.is_dir()
     }
-    if (root / "invocations").is_dir():
-        calls = sum(len(starts) for starts in invocation_starts.values())
+    calls = sum(len(starts) for starts in invocation_starts.values())
     _write(
         root / "run.json",
         {
-            **{
-                key: existing[key]
-                for key in ("review", "observer_revision", "evidence_kind")
-                if key in existing
-            },
+            **{key: existing[key] for key in ("evidence_kind",) if key in existing},
             "schema_version": 1,
             "status": status,
             "error": error,
@@ -842,7 +740,6 @@ def _checkpoint(
                 }
                 for path in sorted((root / "baseline-evidence").glob("*/origin.json"))
             },
-            "correction_burden": "unknown: deterministic verifier repair stages are not independent review",
         },
     )
 
@@ -856,10 +753,6 @@ def run_study(
     baseline_identity: dict[str, object] | None = None,
 ) -> Path:
     validate_jobs(study.recipe.jobs)
-    if study.recipe.backend == "pier":
-        raise ValueError(
-            "Pier execution is retired; saved Pier runs remain readable. Use Harbor for new evaluations."
-        )
     if baseline_cache is not None and not baseline_identity:
         raise ValueError("baseline reuse requires a fixed coding identity")
     root = output.resolve()
@@ -884,37 +777,26 @@ def run_study(
         "schema_version": 1,
         "name": study.recipe.name,
         "records": records,
-        "standards": str(frozen.recipe.standards.relative_to(root))
-        if frozen.recipe.standards
-        else None,
     }
     _checkpoint(root, frozen, manifest, states, status="preflight")
     tasks = {task.task_id: task for task in frozen.tasks}
     cache = None
     try:
-        expected_runtime = (
-            harbor_backend.runtime_identity(
-                cpus=frozen.recipe.container_cpus, memory_mb=frozen.recipe.container_memory_mb
-            )
-            if frozen.recipe.backend == "harbor"
-            else isolation.runtime_identity()
+        expected_runtime = harbor_backend.runtime_identity(
+            cpus=frozen.recipe.container_cpus, memory_mb=frozen.recipe.container_memory_mb
         )
         if baseline_identity is not None:
             requested_runtime = baseline_identity.get("isolation")
             if not isinstance(requested_runtime, dict):
                 raise ValueError("baseline reuse requires a fixed filesystem isolation identity")
-            (
-                harbor_backend.assert_runtime
-                if frozen.recipe.backend == "harbor"
-                else isolation.assert_runtime
-            )(requested_runtime)
+            harbor_backend.assert_runtime(requested_runtime)
             expected_runtime = requested_runtime
         if baseline_cache is not None:
             assert baseline_identity is not None
             cache = BaselineCache(
                 path=baseline_cache,
                 root=root,
-                tasks=tuple(task for task in frozen.tasks if isinstance(task, TaskSpec)),
+                tasks=frozen.tasks,
                 entries=plan["entries"],
                 identity={
                     **baseline_identity,
@@ -927,7 +809,6 @@ def run_study(
                             "jobs",
                             "timeout_seconds",
                             "seed",
-                            "max_repairs",
                         )
                     },
                 },
@@ -935,21 +816,13 @@ def run_study(
             plan["baseline_cache"] = cache.decisions()
             _write(root / "plan.json", plan)
             _checkpoint(root, frozen, manifest, states, status="preflight")
-        preflight = (
-            harbor_backend.preflight(
-                jobs=frozen.recipe.jobs,
-                cpus=frozen.recipe.container_cpus,
-                memory_mb=frozen.recipe.container_memory_mb,
-            )
-            if frozen.recipe.backend == "harbor"
-            else claude.preflight()
-            if frozen.recipe.harness == "claude"
-            else codex.preflight()
+        preflight = harbor_backend.preflight(
+            jobs=frozen.recipe.jobs,
+            cpus=frozen.recipe.container_cpus,
+            memory_mb=frozen.recipe.container_memory_mb,
         )
-        if expected_runtime is not None:
-            preflight["filesystem_isolation"] = expected_runtime
-        if frozen.recipe.backend == "harbor":
-            preflight["harness_version"] = frozen.recipe.harness_version
+        preflight["filesystem_isolation"] = expected_runtime
+        preflight["harness_version"] = frozen.recipe.harness_version
         _write(root / "runtime-preflight.json", preflight)
         _checkpoint(
             root,
@@ -985,12 +858,7 @@ def run_study(
             def started() -> None:
                 if cancelled.is_set():
                     raise CancelledError("attempt cancelled before its next native invocation")
-                if expected_runtime is not None:
-                    (
-                        harbor_backend.assert_runtime
-                        if frozen.recipe.backend == "harbor"
-                        else isolation.assert_runtime
-                    )(expected_runtime)
+                harbor_backend.assert_runtime(expected_runtime)
                 receipt = root / "invocations" / entry["id"] / f"{stage_id}.json"
                 _write(
                     receipt,
@@ -1003,7 +871,6 @@ def run_study(
                 emit(partial(commit, index, copy.deepcopy(record), "running"))
 
             try:
-                assert isinstance(task, TaskSpec)
                 assert task.fixture is not None
                 attempt_dir = root / "attempts" / entry["id"]
                 imported = cache.import_attempt(entry) if cache is not None else None
@@ -1023,7 +890,7 @@ def run_study(
                         target = attempt_dir / stage["id"]
                         execution = json.loads((target / "execution.json").read_text())
                         if stage["snapshot"] is not None:
-                            verified, _ = _verify_snapshot(
+                            verified = _verify_snapshot(
                                 root=root,
                                 snapshot=root / stage["snapshot"]["path"],
                                 task=task,
@@ -1035,64 +902,34 @@ def run_study(
                             stage.update(verified)
                     completed = True
                     return
-                stages: list[dict[str, Any]] = []
-                executions: list[dict[str, Any]] = []
+                if cancelled.is_set():
+                    return
                 with tempfile.TemporaryDirectory(prefix="pluginbench-study-") as temporary:
-                    previous_snapshot = task.fixture
-                    guidance = frozen.guidance.get(entry["arm"], ())
-                    prompt = _prompt(task, guidance)
-                    for round_number in range(frozen.recipe.max_repairs + 1):
-                        if cancelled.is_set():
-                            break
-                        stage_id = "handoff" if round_number == 0 else f"repair-{round_number}"
-                        area = Path(temporary) / stage_id
-                        shutil.copytree(previous_snapshot, area / "workspace")
-                        stages.append({"id": stage_id, "snapshot": None, "work": None})
-                        record["stages"] = list(stages)
-                        record["model"] = None
-                        _assert_frozen(root)
-                        codex.reject_guidance(
-                            area / "workspace", include_ancestors=True, reject_git=False
-                        )
-                        emit(partial(commit, index, copy.deepcopy(record), "running"))
-                        stage, execution, result = _execute_stage(
-                            root=root,
-                            area=area,
-                            entry=entry,
-                            task=task,
-                            study=frozen,
-                            stage_id=stage_id,
-                            prompt=prompt,
-                            on_native_start=started,
-                            expected_runtime=expected_runtime,
-                        )
-                        stages[-1] = stage
-                        executions.append(execution)
-                        record.update(
-                            stages=list(stages),
-                            model=_consistent_observation(executions, "actual_primary_models"),
-                            runtime={
-                                "harness": f"{study.recipe.harness}-cli",
-                                "harness_version": _observed_harness_version(executions),
-                                "requested_reasoning_effort": study.recipe.reasoning,
-                                "reasoning_effort": _consistent_observation(
-                                    executions, "runtime_effort_evidence"
-                                ),
-                            },
-                        )
-                        emit(partial(commit, index, copy.deepcopy(record), "running"))
-                        if stage["snapshot"] is not None:
-                            previous_snapshot = root / stage["snapshot"]["path"]
-                        if (
-                            result["pass"] is not False
-                            or execution.get("successful_native_completion") is not True
-                        ):
-                            break
-                        prompt = _prompt(task, guidance) + (
-                            "\n\nThe external verifier rejected your previous submission. "
-                            "Fix its failures in the current workspace and verify the result.\n"
-                            + json.dumps(result, sort_keys=True)
-                        )
+                    area = Path(temporary) / "handoff"
+                    shutil.copytree(task.fixture, area / "workspace")
+                    stage, execution = _execute_stage(
+                        root=root,
+                        area=area,
+                        entry=entry,
+                        task=task,
+                        study=frozen,
+                        stage_id="handoff",
+                        prompt=_prompt(task, frozen.guidance.get(entry["arm"], ())),
+                        on_native_start=started,
+                        expected_runtime=expected_runtime,
+                    )
+                    record.update(
+                        stages=[stage],
+                        model=_consistent_observation([execution], "actual_primary_models"),
+                        runtime={
+                            "harness": f"{study.recipe.harness}-cli",
+                            "harness_version": _observed_harness_version([execution]),
+                            "requested_reasoning_effort": study.recipe.reasoning,
+                            "reasoning_effort": _consistent_observation(
+                                [execution], "runtime_effort_evidence"
+                            ),
+                        },
+                    )
                 completed = True
             finally:
                 emit(
@@ -1112,9 +949,7 @@ def run_study(
         )
         _checkpoint(root, frozen, manifest, states, status="complete")
         if cache is not None:
-            cache.publish(
-                records, tuple(task for task in frozen.tasks if isinstance(task, TaskSpec))
-            )
+            cache.publish(records, frozen.tasks)
     except BaseException as exc:
         for attempt_id, state in states.items():
             if state == "running":
@@ -1159,48 +994,19 @@ def _bound_document(root: Path, reference: object) -> dict[str, Any]:
     return document
 
 
-def _observer_tasks(
-    root: Path, tasks: dict[str, TaskSpec | pier_backend.PierTask]
-) -> dict[str, TaskSpec | pier_backend.PierTask]:
-    run = json.loads((root / "run.json").read_text())
-    if not run.get("observer_revision"):
-        return tasks
-    revision = _bound_document(root, run["observer_revision"])
-    result = dict(tasks)
-    for task_id, reference in revision.get("task_verifiers", {}).items():
-        task = tasks[task_id]
-        if not isinstance(task, TaskSpec) or task.verifier is None:
-            raise ValueError("revised observer requires a local task verifier")
-        path = _bound_path(root, reference)
-        result[task_id] = replace(
-            task,
-            verifier=replace(
-                task.verifier,
-                script=path,
-                command=tuple(
-                    str(path) if argument == str(task.verifier.script) else argument
-                    for argument in task.verifier.command
-                ),
-            ),
-        )
-    return result
-
-
 def report_study(
     root: Path,
     *,
     measurement_revision: str | None = None,
     review_revision: str | None = None,
-) -> tuple[Path, Path]:
+) -> Path:
     root = root.resolve()
     _assert_frozen(root)
     run = json.loads((root / "run.json").read_text())
     _bound_document(root, run["assessment_input"])
     plan = _bound_document(root, run["plan"])
     preflight = _bound_document(root, run["runtime_preflight"])
-    assigned_harness_version = (
-        plan["codex_version"] if plan.get("backend") == "pier" else preflight.get("harness_version")
-    )
+    assigned_harness_version = preflight.get("harness_version")
     if isinstance(assigned_harness_version, str):
         assigned_harness_version = assigned_harness_version.removeprefix("codex-cli ")
     if run.get("calibration"):
@@ -1215,7 +1021,7 @@ def report_study(
         manifest_path = validate_remeasurement(root, directory)
         output = directory / "report-native"
         measurement_state = json.loads((directory / "revision.json").read_text())
-    review_path = _bound_path(root, run["review"]) if run.get("review") else None
+    review_path = None
     if review_revision is not None:
         from pluginbench.study_review import validate_review_revision
 
@@ -1231,38 +1037,6 @@ def report_study(
     report = build_assessment(manifest_path)
     if measurement_state is not None:
         report["measurement_revision"] = measurement_state
-    if run.get("observer_revision"):
-        revision = _bound_document(root, run["observer_revision"])
-        _bound_document(root, revision["original_run"])
-        _bound_document(root, revision["original_assessment"])
-        for group in ("task_verifiers", "measurement_configs", "original_reports"):
-            for reference in revision.get(group, {}).values():
-                _bound_path(root, reference)
-        manifest = _bound_document(root, run["assessment_input"])
-        records = {record["id"]: record for record in manifest["records"]}
-        attempts = {attempt["id"]: attempt for attempt in report["attempts"]}
-        for observation in revision["observations"]:
-            attempt = attempts[observation["attempt_id"]]
-            stage = next(row for row in attempt["stages"] if row["id"] == observation["stage"])
-            if (
-                observation["snapshot_digest"] != stage["snapshot_digest"]
-                or observation["before_digest"] != attempt["before_digest"]
-            ):
-                raise ValueError("revised observer source differs from its original attempt")
-            input_stage = next(
-                row for row in records[attempt["id"]]["stages"] if row["id"] == stage["id"]
-            )
-            if observation.get("new_correctness_ref") != input_stage.get("correctness"):
-                raise ValueError("revised observer correctness differs from current assessment")
-            for key in ("old_correctness_ref", "new_correctness_ref", "result_ref"):
-                if observation.get(key):
-                    _bound_document(root, observation[key])
-            for key in ("before_evidence", "after_evidence"):
-                for reference in (observation.get(key) or {}).values():
-                    _bound_document(root, reference)
-            if observation.get("result_ref"):
-                stage["task_result"] = _bound_document(root, observation["result_ref"])
-        report["observer_revision"] = revision
     report["study_progress"] = {
         "status": run.get("status", "complete"),
         "completed_attempts": run["completed_attempts"],
@@ -1308,61 +1082,19 @@ def report_study(
         if _digest(root / adapter.path) != adapter.sha256:
             raise ValueError("review adapter changed after the review")
         observations = []
-        review_attempts = {attempt["id"]: attempt for attempt in report["attempts"]}
         for row in review["records"]:
             observation = (
                 _bound_document(root, row["observation"]) if row.get("observation") else None
             )
             if observation and observation.get("recovery"):
                 _bound_document(root, observation["recovery"]["original_observation"])
-            if row.get("packet"):
-                packet = _bound_document(root, row["packet"])
-                attempt = review_attempts[row["id"]]
-                selection = protocol.get("selections", {}).get(row["id"], {})
-                stage_id = packet.get("stage_id", "handoff")
-                selected = next(
-                    (stage for stage in attempt["stages"] if stage["id"] == stage_id), None
-                )
-                submission_digest = packet.get("submission_digest", packet.get("handoff_digest"))
-                if (
-                    packet["before_digest"] != attempt["before_digest"]
-                    or selected is None
-                    or submission_digest != selected["snapshot_digest"]
-                    or (
-                        selection
-                        and (
-                            selection["stage_id"] != stage_id
-                            or stage_id != attempt.get(protocol.get("stage", "handoff"))
-                            or selection["submission_digest"] != submission_digest
-                            or row.get("stage_id") != stage_id
-                            or row.get("submission_digest") != submission_digest
-                            or (
-                                observation
-                                and (
-                                    observation.get("stage_id") != stage_id
-                                    or observation.get("submission_digest") != submission_digest
-                                )
-                            )
-                        )
-                    )
-                ):
-                    raise ValueError("review packet source differs from its attempt")
-                packet_directory = _bound_path(root, row["packet"]).with_suffix("")
-                if _inventory(packet_directory) != packet["files"]:
-                    raise ValueError("archived review packet changed after review")
-                if observation and observation["packet"] != row["packet"]:
-                    raise ValueError("review observation differs from its bound packet")
             issues = None
             severity_counts = None
             category_counts = None
             if row["status"] == "reviewed" and observation and observation.get("response"):
-                from pluginbench.study_review import JudgeResponse, RatedJudgeResponse
+                from pluginbench.study_review import JudgeResponse
 
-                response = (
-                    RatedJudgeResponse.model_validate(observation["response"])
-                    if review_revision is not None
-                    else JudgeResponse.model_validate(observation["response"])
-                )
+                response = JudgeResponse.model_validate(observation["response"])
                 if (
                     response.status != "reviewed"
                     or response.outside_packet_access
@@ -1374,16 +1106,15 @@ def report_study(
                     category: sum(issue["category"] == category for issue in issues)
                     for category in ("correctness", "scope", "maintainability", "tests")
                 }
-                if review_revision is not None:
-                    severity_counts = {
-                        severity: sum(issue["severity"] == severity for issue in issues)
-                        for severity in ("P0", "P1", "P2", "P3")
-                    }
+                severity_counts = {
+                    severity: sum(issue["severity"] == severity for issue in issues)
+                    for severity in ("P0", "P1", "P2", "P3")
+                }
             observations.append(
                 {
                     "attempt_id": row["id"],
-                    "stage": protocol.get("stage", "handoff"),
-                    **protocol.get("selections", {}).get(row["id"], {}),
+                    "stage": protocol["stage"],
+                    **protocol["selections"][row["id"]],
                     "status": row["status"],
                     "finding_count": len(issues) if issues is not None else None,
                     "issues": issues,
@@ -1403,7 +1134,7 @@ def report_study(
             )
         report["independent_review"] = {
             "status": review["status"],
-            "stage": protocol.get("stage", "handoff"),
+            "stage": protocol["stage"],
             "assigned": review["assigned"],
             "native_invocation_requests": review["native_invocations"],
             "requested_model": protocol["model"],
@@ -1499,7 +1230,7 @@ def report_study(
                 "assigned_harness_version": assigned_harness_version,
                 "assigned_reasoning_effort": plan["requested_reasoning_effort"],
                 "study_seed": plan["seed"],
-                "execution_backend": plan.get("backend", "local"),
+                "execution_backend": "harbor",
                 "task": run.get("task_provenance", {}).get(attempt["task_id"]),
             }
         )

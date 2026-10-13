@@ -18,7 +18,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from pluginbench import codex
 from pluginbench import harbor_backend as harbor
 from pluginbench import isolation
 from pluginbench.assessment_metrics import inspect_snapshot
@@ -58,6 +57,7 @@ def runtime() -> dict[str, Any]:
     return {
         "protocol": harbor.PROTOCOL,
         "harbor_version": harbor.HARBOR_VERSION,
+        "codex_transport": {"version": "codex-stdout-stderr-v1", "harbor_run_sha256": "e" * 64},
         "implementation_sha256": "a" * 64,
         "docker_cli": {
             "path": "/frozen/docker",
@@ -120,6 +120,8 @@ def container(
                 "org.pluginbench.trial": "owner",
                 "org.pluginbench.base-image": base_image()["image"],
                 "org.pluginbench.base-image-id": base_image()["image_id"],
+                **harbor._toolchain_labels(toolchain()),
+                "org.pluginbench.toolchain-image-id": toolchain()["image_id"],
             }
         },
         "State": {
@@ -137,12 +139,10 @@ def container(
     }
 
 
-@pytest.mark.parametrize("native_toolchain", [None, toolchain()])
 @pytest.mark.parametrize("oom_killed", [False, True])
 def test_export_copies_stopped_container_and_hashes_every_source_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    native_toolchain: dict[str, Any] | None,
     oom_killed: bool,
 ) -> None:
     (tmp_path / "workspace").mkdir()
@@ -150,11 +150,6 @@ def test_export_copies_stopped_container_and_hashes_every_source_file(
     calls = []
     description = container()
     description["State"]["OOMKilled"] = oom_killed
-    if native_toolchain is not None:
-        description["Config"]["Labels"].update(harbor._toolchain_labels(native_toolchain))
-        description["Config"]["Labels"]["org.pluginbench.toolchain-image-id"] = native_toolchain[
-            "image_id"
-        ]
 
     def docker(*arguments: str, **kwargs: Any) -> str:
         if arguments[:2] == ("image", "inspect"):
@@ -181,7 +176,7 @@ def test_export_copies_stopped_container_and_hashes_every_source_file(
         owner="owner",
         expected_runtime=runtime(),
         base_image=base_image(),
-        toolchain=native_toolchain,
+        toolchain=toolchain(),
     )
     assert receipt == {
         "status": "complete",
@@ -190,7 +185,7 @@ def test_export_copies_stopped_container_and_hashes_every_source_file(
         "resources": {"cpus": 1, "memory_mb": 2048},
         "derived_image_id": "sha256:" + "b" * 64,
         "base_image_identity": base_image(),
-        **({"toolchain_identity": native_toolchain} if native_toolchain is not None else {}),
+        "toolchain_identity": toolchain(),
     }
     assert not (tmp_path / "workspace/old.py").exists()
     assert json.loads((tmp_path / "artifacts/container-state.json").read_text()) == {
@@ -231,6 +226,7 @@ def test_export_rejects_live_foreign_or_shared_workspace_before_copy(
             owner="owner",
             expected_runtime=runtime(),
             base_image=base_image(),
+            toolchain=toolchain(),
         )
     assert "cp" not in calls
 
@@ -261,6 +257,7 @@ def test_failed_copy_never_replaces_initial_workspace(
             owner="owner",
             expected_runtime=runtime(),
             base_image=base_image(),
+            toolchain=toolchain(),
         )
     assert original.read_text() == "initial"
     assert (tmp_path / "artifacts/container-submission/partial.py").exists()
@@ -294,6 +291,7 @@ def test_unsupported_export_retains_link_evidence_without_following(
             owner="owner",
             expected_runtime=runtime(),
             base_image=base_image(),
+            toolchain=toolchain(),
         )
     assert (tmp_path / "artifacts/unsupported-submission/external").is_symlink()
 
@@ -486,7 +484,10 @@ def test_missing_native_usage_stays_unknown(tmp_path: Path) -> None:
     agent = tmp_path / "artifacts/harbor/trial/agent"
     agent.mkdir(parents=True)
     (agent / "codex.txt").write_text('{"type":"turn.failed","error":"timeout"}\n')
-    result = harbor._native_evidence(area=tmp_path, host="codex", effort="high")
+    (agent / "codex.stderr.log").write_text("")
+    result = harbor._native_evidence(
+        area=tmp_path, host="codex", effort="high", transport="codex-stdout-stderr-v1"
+    )
     assert result["usage"] is None
     assert result["successful_native_completion"] is False
 
@@ -503,57 +504,6 @@ _CODEX_COMPLETED = (
     '{"type":"item.completed","item":{"type":"agent_message","text":"Updated."}}\n'
     '{"type":"turn.completed","usage":{"input_tokens":43035,"output_tokens":199}}\n'
 )
-
-
-def test_native_codex_separates_known_cli_prelude_without_changing_raw_output(
-    tmp_path: Path,
-) -> None:
-    agent = tmp_path / "artifacts/harbor/trial/agent"
-    agent.mkdir(parents=True)
-    raw = agent / "codex.txt"
-    output = _CODEX_PRELUDE + _CODEX_COMPLETED
-    raw.write_text(output)
-    assert codex.parse_events(output, [], "codex")["successful_native_completion"] is False
-
-    result = harbor._native_evidence(area=tmp_path, host="codex", effort="medium")
-
-    assert result["successful_native_completion"] is True
-    assert result["stream_errors"] == []
-    assert result["usage"] == {"input_tokens": 43035, "output_tokens": 199}
-    assert result["final"] == "Updated."
-    assert raw.read_text() == output
-    assert (tmp_path / "artifacts/stdout.jsonl").read_text() == _CODEX_COMPLETED
-    assert (tmp_path / "artifacts/codex-prelude.log").read_text() == _CODEX_PRELUDE
-
-
-@pytest.mark.parametrize(
-    "output,error",
-    [
-        ("Unexpected CLI failure\n" + _CODEX_COMPLETED, "malformed stdout JSONL"),
-        (_CODEX_COMPLETED + _CODEX_PRELUDE, "malformed stdout JSONL"),
-        (_CODEX_PRELUDE + '{"type":\n' + _CODEX_COMPLETED, "malformed stdout JSONL"),
-        (_CODEX_PRELUDE + "[]\n" + _CODEX_COMPLETED, "stdout JSONL event is not an object"),
-        (
-            _CODEX_PRELUDE + '{"type":"turn.failed","error":"timeout"}\n' + _CODEX_COMPLETED,
-            {"type": "turn.failed", "error": "timeout"},
-        ),
-        (
-            _CODEX_PRELUDE + '{"type":"error","message":"failed"}\n' + _CODEX_COMPLETED,
-            {"type": "error", "message": "failed"},
-        ),
-    ],
-)
-def test_native_codex_prelude_does_not_hide_protocol_errors(
-    tmp_path: Path, output: str, error: str | dict[str, str]
-) -> None:
-    agent = tmp_path / "artifacts/harbor/trial/agent"
-    agent.mkdir(parents=True)
-    (agent / "codex.txt").write_text(output)
-
-    result = harbor._native_evidence(area=tmp_path, host="codex", effort="medium")
-
-    assert result["successful_native_completion"] is False
-    assert error in result["stream_errors"]
 
 
 @pytest.mark.parametrize("failure_kind", ["native", "worker", "cleanup", "cleanup-drift"])
@@ -630,6 +580,7 @@ def test_invoke_preserves_failed_submission_and_never_replays(
         agent = Path(config["trials_dir"]) / config["trial_name"] / "agent"
         agent.mkdir(parents=True)
         (agent / "codex.txt").write_text('{"type":"turn.failed","error":"timeout"}\n')
+        (agent / "codex.stderr.log").write_text("")
         (agent / "sessions").mkdir()
         (agent / "sessions/rollout.jsonl").write_text(
             json.dumps(
@@ -729,7 +680,9 @@ def test_native_log_link_is_rejected_without_reading_external_file(
     link.parent.mkdir(parents=True, exist_ok=True)
     link.symlink_to(secret)
     with pytest.raises(ValueError, match="unsupported native artifact"):
-        harbor._native_evidence(area=tmp_path, host="codex", effort="high")
+        harbor._native_evidence(
+            area=tmp_path, host="codex", effort="high", transport="codex-stdout-stderr-v1"
+        )
     assert not (tmp_path / "artifacts/stdout.jsonl").exists()
 
 
@@ -755,6 +708,7 @@ def test_actual_limits_must_match_before_export(
             owner="owner",
             expected_runtime=runtime(),
             base_image=base_image(),
+            toolchain=toolchain(),
         )
 
 
@@ -781,6 +735,7 @@ def test_staged_task_has_empty_home_and_canonical_source_only(tmp_path: Path) ->
         prompt="the same task",
         owner="owned",
         timeout=60,
+        toolchain=toolchain(),
         image=base_image(),
         cpus=2,
         memory_mb=8192,
@@ -833,6 +788,7 @@ def test_context_switch_cannot_redirect_export_or_cleanup(
     monkeypatch.setattr(harbor, "run_command", command)
     exported = harbor.collect_submission(
         area=tmp_path,
+        toolchain=toolchain(),
         project="owned",
         owner="owner",
         expected_runtime=runtime(),
@@ -987,6 +943,7 @@ def test_changed_base_image_evidence_is_rejected_before_copy(
             owner="owner",
             expected_runtime=runtime(),
             base_image=base_image(),
+            toolchain=toolchain(),
         )
 
 
@@ -1776,8 +1733,10 @@ def test_codex_transport_delegates_to_sdk_pipefail_and_preserves_separate_stderr
     assert counter.read_text() == "called"
 
 
-@pytest.mark.parametrize("capture", ["missing", "empty", "prelude", "unknown"])
-def test_native_codex_capture_version_never_falls_back_to_legacy(
+@pytest.mark.parametrize(
+    "capture", ["missing", "empty", "prelude", "unknown", "unversioned", "merged"]
+)
+def test_native_codex_requires_current_transport_and_separate_streams(
     tmp_path: Path, capture: str
 ) -> None:
     agent = tmp_path / "artifacts/harbor/trial/agent"
@@ -1787,8 +1746,10 @@ def test_native_codex_capture_version_never_falls_back_to_legacy(
     )
     if capture != "missing":
         (agent / "codex.stderr.log").write_text("")
-    transport = "unknown" if capture == "unknown" else "codex-stdout-stderr-v1"
-    if capture in {"missing", "unknown"}:
+    transport = {"unknown": "unknown", "unversioned": None, "merged": "merged-stderr-v1"}.get(
+        capture, "codex-stdout-stderr-v1"
+    )
+    if capture in {"missing", "unknown", "unversioned", "merged"}:
         with pytest.raises(ValueError):
             harbor._native_evidence(
                 area=tmp_path, host="codex", effort="medium", transport=transport
@@ -1799,24 +1760,6 @@ def test_native_codex_capture_version_never_falls_back_to_legacy(
         )
         assert result["successful_native_completion"] is (capture == "empty")
         assert not (tmp_path / "artifacts/codex-prelude.log").exists()
-
-
-def test_legacy_codex_midstream_stderr_stays_a_failure_even_with_separate_file(
-    tmp_path: Path,
-) -> None:
-    agent = tmp_path / "artifacts/harbor/trial/agent"
-    agent.mkdir(parents=True)
-    output = _CODEX_COMPLETED.replace(
-        '{"type":"turn.completed"',
-        'ERROR codex_core::tools::router: exec command rejected\n{"type":"turn.completed"',
-    )
-    (agent / "codex.txt").write_text(output)
-    (agent / "codex.stderr.log").write_text("new filename does not upgrade old capture\n")
-    result = harbor._native_evidence(area=tmp_path, host="codex", effort="medium")
-    assert result["successful_native_completion"] is False
-    assert "malformed stdout JSONL" in result["stream_errors"]
-    assert (agent / "codex.txt").read_text() == output
-    assert not (tmp_path / "artifacts/codex.stderr.log").exists()
 
 
 def test_report_and_backend_import_without_optional_harbor_sdk(tmp_path: Path) -> None:

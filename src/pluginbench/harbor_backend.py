@@ -1172,11 +1172,10 @@ def _stage_task(
     cpus: int,
     memory_mb: int,
     build_timeout: int = 300,
-    toolchain: dict[str, Any] | None = None,
+    toolchain: dict[str, Any],
 ) -> Path:
-    prepared = toolchain is not None and "task_preparation" in toolchain
+    prepared = "task_preparation" in toolchain
     if prepared:
-        assert toolchain is not None
         preparation = _object(toolchain["task_preparation"], "task preparation")
         if inspect_snapshot(area / "workspace")["digest"] != preparation.get("fixture_digest"):
             raise ValueError("Prepared image fixture differs from the starting task fixture")
@@ -1191,12 +1190,8 @@ def _stage_task(
         if not prepared and workdir != "/workspace"
         else ""
     )
-    source = _toolchain_tag(toolchain["image_id"]) if toolchain is not None else image["image"]
-    toolchain_label = (
-        f"LABEL {_TOOLCHAIN_IMAGE_LABEL}={json.dumps(toolchain['image_id'])}\n"
-        if toolchain is not None
-        else ""
-    )
+    source = _toolchain_tag(toolchain["image_id"])
+    toolchain_label = f"LABEL {_TOOLCHAIN_IMAGE_LABEL}={json.dumps(toolchain['image_id'])}\n"
     guard = (
         "RUN "
         + json.dumps(
@@ -1207,8 +1202,6 @@ def _stage_task(
             ]
         )
         + "\n"
-        if toolchain is not None
-        else ""
     )
     source_reset = (
         ""
@@ -1247,7 +1240,7 @@ def _stage_task(
 async def run_trial(config: dict[str, Any]) -> dict[str, Any]:
     """Run one native trial, without queue retries or Harbor resume behavior."""
     # Harbor's wheel is untyped. Keep its dynamic API at this single boundary,
-    # without making old report readers import its execution dependencies.
+    # without making reporting import its execution dependencies.
     agent = _object(config.get("agent"), "native agent configuration")
     separate_codex = agent.get("name") == "codex"
     if separate_codex:
@@ -1337,7 +1330,7 @@ def collect_submission(
     owner: str,
     expected_runtime: dict[str, object],
     base_image: dict[str, str],
-    toolchain: dict[str, Any] | None = None,
+    toolchain: dict[str, Any],
 ) -> dict[str, object]:
     """Copy only from the one stopped main container; no live snapshot is accepted."""
     _assert_daemon(expected_runtime)
@@ -1374,9 +1367,8 @@ def collect_submission(
         _BASE_IMAGE_LABEL: base_image["image"],
         _BASE_IMAGE_ID_LABEL: base_image["image_id"],
     }
-    if toolchain is not None:
-        required_labels.update(_toolchain_labels(toolchain))
-        required_labels[_TOOLCHAIN_IMAGE_LABEL] = toolchain["image_id"]
+    required_labels.update(_toolchain_labels(toolchain))
+    required_labels[_TOOLCHAIN_IMAGE_LABEL] = toolchain["image_id"]
     if any(
         labels.get(key) != value or derived_labels.get(key) != value
         for key, value in required_labels.items()
@@ -1430,7 +1422,7 @@ def collect_submission(
         "resources": proof["resources"],
         "derived_image_id": proof["derived_image_id"],
         "base_image_identity": base_image,
-        **({"toolchain_identity": toolchain} if toolchain is not None else {}),
+        "toolchain_identity": toolchain,
     }
 
 
@@ -1486,28 +1478,13 @@ def _native_evidence(
     sessions = agent / "sessions"
     traces = [path.read_text(errors="replace") for path in sorted(sessions.rglob("*.jsonl"))]
     artifacts = area / "artifacts"
-    if host == "codex" and transport == _CODEX_TRANSPORT_VERSION:
+    if host == "codex":
+        if transport != _CODEX_TRANSPORT_VERSION:
+            raise ValueError("Unsupported frozen Codex transport version")
         stderr = agent / "codex.stderr.log"
         if not raw.is_file() or not stderr.is_file():
             raise ValueError("Native Codex separate stdout/stderr capture is incomplete")
         shutil.copyfile(stderr, artifacts / "codex.stderr.log")
-    elif host == "codex":
-        if transport not in {None, "merged-stderr-v1"}:
-            raise ValueError("Unsupported frozen Codex transport version")
-        # Legacy Harbor merges stderr into codex.txt. Separate only observed CLI prelude
-        # diagnostics; unexpected text and diagnostics inside JSONL still fail parsing.
-        diagnostics = {
-            "WARNING: proceeding, even though we could not create PATH aliases: Refusing to create "
-            'helper binaries under temporary dir "/tmp" '
-            '(codex_home: AbsolutePathBuf("/tmp/codex-home"))',
-            "Reading additional input from stdin...",
-        }
-        lines = stdout.splitlines(keepends=True)
-        prefix = 0
-        while prefix < len(lines) and lines[prefix].rstrip("\r\n") in diagnostics:
-            prefix += 1
-        (artifacts / "codex-prelude.log").write_text("".join(lines[:prefix]))
-        stdout = "".join(lines[prefix:])
     (artifacts / "stdout.jsonl").write_text(stdout)
     for index, trace in enumerate(traces):
         (artifacts / f"host-trace-{index}.jsonl").write_text(trace)
@@ -1702,7 +1679,7 @@ def invoke(
             if receipt["cleanup"]["status"] == "complete":
                 transport = (
                     _object(expected["codex_transport"], "frozen Codex transport")["version"]
-                    if "codex_transport" in expected
+                    if host == "codex"
                     else None
                 )
                 execution.update(

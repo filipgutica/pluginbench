@@ -1,4 +1,4 @@
-"""Isolated native execution and evidence shared by study and legacy runners."""
+"""Native CLI execution and evidence for isolated reviews and Harbor submissions."""
 
 from __future__ import annotations
 

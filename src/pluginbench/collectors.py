@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fnmatch
 import hashlib
 import json
 import os
@@ -26,7 +25,7 @@ from pluginbench import isolation
 class Collector(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["fallow", "coverage", "mutation"]
+    kind: Literal["fallow", "coverage"]
     config: Path
     scope: list[str] = Field(default_factory=lambda: ["src/**"], min_length=1)
     command: list[str] | None = None
@@ -37,12 +36,12 @@ class Collector(BaseModel):
 
     @model_validator(mode="after")
     def supported_command(self) -> Collector:
+        if self.kind == "coverage" and self.command is None:
+            raise ValueError("coverage requires an adapter command")
         if self.kind == "fallow" and self.command is not None:
             raise ValueError("Fallow uses the built-in collector, not a custom command")
         if self.syntax_command is not None and (self.kind != "fallow" or not self.syntax_command):
             raise ValueError("syntax_command is an optional Fallow parser validator")
-        if self.kind == "mutation" and self.command is None:
-            raise ValueError("mutation requires a command producing normalized JSON")
         if self.command is not None and (not self.command or not self.tool_version):
             raise ValueError("custom collectors require command and tool_version")
         if self.failure_protocol is not None and (self.kind != "coverage" or self.command is None):
@@ -213,9 +212,7 @@ def _recorded_execute(
     return result
 
 
-def _fallow(
-    root: Path, collector: Collector, destination: Path
-) -> tuple[dict[str, object], str, list[dict[str, object]]]:
+def _fallow(root: Path, collector: Collector, destination: Path) -> tuple[dict[str, object], str]:
     argv = [
         "fallow",
         "--root",
@@ -288,70 +285,7 @@ def _fallow(
             if Path(argument).is_file()
         }
         report["syntax_validation"] = validation
-    _json(destination / "execution.json", receipts)
-    return report, str(report["version"]), receipts
-
-
-_NODE_REPORTER = """export default async function* (source) {
-  for await (const event of source) {
-    if (event.type === 'test:coverage') yield JSON.stringify(event.data.summary);
-  }
-}
-"""
-
-
-def _node_coverage(
-    root: Path, collector: Collector, destination: Path
-) -> tuple[dict[str, object], str, list[dict[str, object]]]:
-    config = json.loads(collector.config.read_text())
-    patterns = config.get("test_globs", ["test/*.test.ts"])
-    if not isinstance(patterns, list) or not all(isinstance(item, str) for item in patterns):
-        raise ValueError("coverage test_globs must be a list of paths")
-    tests = sorted({path for pattern in patterns for path in root.glob(pattern) if path.is_file()})
-    if not tests:
-        raise CollectorUnavailable("coverage found no tests")
-    reporter = destination / "node-reporter.mjs"
-    reporter.write_text(_NODE_REPORTER)
-    node = str(config.get("node", "node"))
-    receipts: list[dict[str, object]] = []
-    version = _recorded_execute([node, "--version"], root, 10, destination, receipts)
-    if version.returncode:
-        raise CollectorUnavailable("Node version unavailable")
-    argv = [
-        node,
-        "--experimental-strip-types",
-        "--test",
-        "--experimental-test-coverage",
-        f"--test-reporter={reporter.resolve()}",
-        *map(str, tests),
-    ]
-    execution = _recorded_execute(argv, root, collector.timeout_seconds, destination, receipts)
-    (destination / "coverage-stdout.json").write_text(execution.stdout)
-    if execution.returncode:
-        raise CollectorUnavailable(f"coverage tests failed: {execution.stderr}")
-    summary = json.loads(execution.stdout)
-    measured = sorted(
-        Path(file["path"]).relative_to(root).as_posix()
-        for file in summary["files"]
-        if any(
-            fnmatch.fnmatchcase(Path(file["path"]).relative_to(root).as_posix(), pattern)
-            for pattern in collector.scope
-        )
-    )
-    report: dict[str, object] = {"files_measured": measured}
-    for category in ("branches", "functions"):
-        total, covered = [], []
-        for file in summary["files"]:
-            path = Path(file["path"]).relative_to(root).as_posix()
-            if not any(fnmatch.fnmatchcase(path, pattern) for pattern in collector.scope):
-                continue
-            for index, item in enumerate(file[category]):
-                coordinate = f"{path}:{item['line']}:{index}"
-                total.append(coordinate)
-                if item["count"] > 0:
-                    covered.append(coordinate)
-        report[category] = {"total": total, "covered": covered}
-    return report, version.stdout.strip(), receipts
+    return report, str(report["version"])
 
 
 def collect_measurements(
@@ -376,11 +310,8 @@ def collect_measurements(
                     shutil.copytree(before, baseline)
                 try:
                     if collector.kind == "fallow":
-                        report, version, receipts = _fallow(root, collector, destination)
+                        report, version = _fallow(root, collector, destination)
                         tool = "fallow"
-                    elif collector.kind == "coverage" and collector.command is None:
-                        report, version, receipts = _node_coverage(root, collector, destination)
-                        tool = "node-test-coverage"
                     else:
                         assert collector.command and collector.tool_version
                         output = destination / "report.json"
@@ -390,7 +321,7 @@ def collect_measurements(
                             .replace("{before}", str(baseline) if baseline is not None else "")
                             for argument in collector.command
                         ]
-                        receipts = []
+                        receipts: list[dict[str, object]] = []
                         try:
                             execution = _recorded_execute(
                                 argv,
@@ -431,7 +362,6 @@ def collect_measurements(
                         raise ValueError("collector modified archived before snapshot")
                     if collector_identity(collector) != identity:
                         raise ValueError("collector modified its frozen profile")
-            _json(destination / "execution.json", receipts)
             _json(destination / "report.json", report)
             shutil.copy2(collector.config, destination / "config.json")
             envelope = bind_evidence(
@@ -449,7 +379,6 @@ def collect_measurements(
             evaluate_evidence(
                 snapshot,
                 {collector.kind: str((destination / "envelope.json").resolve())},
-                {},
                 evidence_dir.resolve(),
             )
             results[collector.kind] = destination / "envelope.json"

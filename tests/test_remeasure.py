@@ -16,7 +16,7 @@ def _write(path: Path, value: object) -> None:
     path.write_text(json.dumps(value))
 
 
-def _native(root: Path, *, visible_tests: bool = False) -> Path:
+def _native(root: Path, *, visible_tests: bool = False, distinct_handoffs: bool = False) -> Path:
     before = root / "frozen/before"
     before.mkdir(parents=True)
     (before / "value.js").write_text("export const value = 0;\n")
@@ -28,9 +28,8 @@ def _native(root: Path, *, visible_tests: bool = False) -> Path:
     verifiers: dict[str, dict[str, dict[str, str]]] = {}
     for attempt_id, arm in (("a", "baseline"), ("b", "candidate")):
         stages: list[dict[str, object]] = []
-        stage_digests: dict[str, str] = {}
         executions[attempt_id], verifiers[attempt_id] = {}, {}
-        for stage_id, value in (("handoff", 1), ("repair-1", 2)):
+        for stage_id, value in (("handoff", 2 if distinct_handoffs and arm == "candidate" else 1),):
             directory = root / "attempts" / attempt_id / stage_id
             snapshot = directory / "snapshot"
             snapshot.mkdir(parents=True)
@@ -40,7 +39,6 @@ def _native(root: Path, *, visible_tests: bool = False) -> Path:
                 (snapshot / "tests/old_tests.js").write_text("old reference test\n")
                 (snapshot / "tests/new_tests.js").write_text("two added test cases\n")
             reference = study._reference(root, snapshot, snapshot=True)
-            stage_digests[stage_id] = reference["sha256"]
             _write(
                 directory / "correctness.json",
                 {
@@ -72,15 +70,6 @@ def _native(root: Path, *, visible_tests: bool = False) -> Path:
                     "work": {"tokens": {"input_tokens": 10, "output_tokens": 5}},
                 }
             )
-        ledger = root / "ledgers" / f"{attempt_id}.json"
-        _write(
-            ledger,
-            {
-                "schema_version": 1,
-                "stage_digests": stage_digests,
-                "corrections": [],
-            },
-        )
         records.append(
             {
                 "id": attempt_id,
@@ -91,7 +80,6 @@ def _native(root: Path, *, visible_tests: bool = False) -> Path:
                 "runtime": {"harness": "codex", "reasoning_effort": "medium"},
                 "before": study._reference(root, before, snapshot=True),
                 "stages": stages,
-                "correction_ledger": study._reference(root, ledger),
             }
         )
     _write(
@@ -108,26 +96,16 @@ def _native(root: Path, *, visible_tests: bool = False) -> Path:
         },
     )
     _write(root / "runtime-preflight.json", {"harness_version": "test"})
-    _write(root / "review/protocol.json", {"native_invocations": 2})
-    _write(
-        root / "review/review-state.json",
-        {
-            "schema_version": 1,
-            "status": "complete",
-            "protocol": study._reference(root, root / "review/protocol.json"),
-        },
-    )
     _write(
         root / "run.json",
         {
             "schema_version": 1,
             "status": "complete",
-            "actual_calls": 4,
+            "actual_calls": 2,
             "attempt_states": {"a": "complete", "b": "complete"},
             "assessment_input": study._reference(root, root / "assessment-input.json"),
             "plan": study._reference(root, root / "plan.json"),
             "runtime_preflight": study._reference(root, root / "runtime-preflight.json"),
-            "review": study._reference(root, root / "review/review-state.json"),
             "executions": executions,
             "verifier_results": verifiers,
         },
@@ -185,20 +163,16 @@ def test_remeasurement_deduplicates_repeats_and_preserves_native_fields(
     )
     protocol = json.loads(sidecar.read_text())
     assert protocol["status"] == "complete"
-    assert protocol["unique_inputs"] == 3 and len(calls) == 6
-    assert len(protocol["observations"]) == 6
+    assert protocol["unique_inputs"] == 2 and len(calls) == 4
+    assert len(protocol["observations"]) == 4
     proposed_path = root / protocol["proposed_assessment"]["path"]
     proposed = AssessmentInput.model_validate_json(proposed_path.read_text())
     original = AssessmentInput.model_validate_json((root / "assessment-input.json").read_text())
     for old, new in zip(original.records, proposed.records, strict=True):
         assert old.id == new.id and old.runtime == new.runtime and old.model == new.model
         assert old.before is not None and new.before is not None
-        assert old.correction_ledger is not None and new.correction_ledger is not None
         assert (root / old.before.path).resolve() == (
             proposed_path.parent / new.before.path
-        ).resolve()
-        assert (root / old.correction_ledger.path).resolve() == (
-            proposed_path.parent / new.correction_ledger.path
         ).resolve()
         for before_stage, after_stage in zip(old.stages, new.stages, strict=True):
             assert before_stage.id == after_stage.id and before_stage.work == after_stage.work
@@ -226,7 +200,7 @@ def test_remeasurement_deduplicates_repeats_and_preserves_native_fields(
 
 @pytest.mark.parametrize(
     "fault",
-    ["running", "pending", "frozen", "snapshot", "execution", "review", "staged", "review-proof"],
+    ["running", "pending", "frozen", "snapshot", "execution"],
 )
 def test_remeasurement_rejects_invalid_native_state_before_tools(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
@@ -243,13 +217,6 @@ def test_remeasurement_rejects_invalid_native_state_before_tools(
         (root / "attempts/a/handoff/snapshot/value.js").write_text("changed")
     elif fault == "execution":
         (root / "attempts/a/handoff/execution.json").write_text("{}")
-    elif fault == "review":
-        _write(root / "review/review-state.json", {"status": "running"})
-        run["review"] = study._reference(root, root / "review/review-state.json")
-    elif fault == "staged":
-        del run["review"]
-    elif fault == "review-proof":
-        _write(root / "review/protocol.json", {"tampered": True})
     _write(root / "run.json", run)
     monkeypatch.setattr(
         remeasure,
@@ -259,57 +226,6 @@ def test_remeasurement_rejects_invalid_native_state_before_tools(
     with pytest.raises(ValueError):
         remeasure.propose_remeasurement(root, profiles=_profile(tmp_path), revision="bad")
     assert not (root / "observer-revisions/bad").exists()
-
-
-def test_remeasurement_partial_collection_preserves_current_refs_and_diagnostics(
-    tmp_path: Path,
-) -> None:
-    root = _native(tmp_path / "run")
-    previous = (root / "run.json").read_bytes()
-    with pytest.raises(ValueError, match="partial observer"):
-        remeasure.propose_remeasurement(
-            root, profiles=_profile(tmp_path, broken=True), revision="partial"
-        )
-    directory = root / "observer-revisions/partial"
-    assert json.loads((directory / "revision.json").read_text())["status"] == "failed"
-    assert (directory / "measurements/0/0/coverage/failure.json").is_file()
-    assert not (directory / "assessment-input.json").exists()
-    assert (root / "run.json").read_bytes() == previous
-
-
-def test_remeasurement_detects_repeat_mismatch_without_promoting(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    root = _native(tmp_path / "run")
-    previous = (root / "run.json").read_bytes()
-    calls = 0
-
-    def changed(
-        snapshot_root: Path,
-        evidence_refs: dict[str, str] | None,
-        standards: dict[str, object],
-        base_dir: Path,
-    ) -> dict[str, object]:
-        nonlocal calls
-        calls += 1
-        observed = evaluate_evidence(snapshot_root, evidence_refs, standards, base_dir)
-        if calls == 2:
-            coverage = observed["coverage"]
-            assert isinstance(coverage, dict)
-            metrics = coverage["metrics"]
-            assert isinstance(metrics, dict)
-            metrics["branches_covered"] = 0
-        return observed
-
-    monkeypatch.setattr(remeasure, "evaluate_evidence", changed)
-    with pytest.raises(ValueError, match="not repeatable"):
-        remeasure.propose_remeasurement(root, profiles=_profile(tmp_path), revision="mismatch")
-    directory = root / "observer-revisions/mismatch"
-    assert (directory / "measurements/0/0/normalized.json").is_file()
-    assert (directory / "measurements/0/1/normalized.json").is_file()
-    assert json.loads((directory / "revision.json").read_text())["status"] == "failed"
-    assert not (directory / "assessment-input.json").exists()
-    assert (root / "run.json").read_bytes() == previous
 
 
 def test_metric_normalization_preserves_multiplicity_but_ignores_set_order() -> None:
@@ -416,7 +332,7 @@ def test_finished_validator_rejects_equal_counts_with_different_removal_coordina
         "collect_measurements",
         lambda *args, **kwargs: pytest.fail("validation must not collect"),
     )
-    with pytest.raises(ValueError, match="not repeatable"):
+    with pytest.raises(ValueError, match="recorded family outcome differs from bound repeats"):
         remeasure.validate_remeasurement(root, sidecar.parent)
     assert study._inventory(root) == previous
 
@@ -458,9 +374,9 @@ def test_coverage_clock_claim_is_bound_and_only_retained_when_declared(
     )
     if claim in {"different", "unconfigured", "missing"}:
         with pytest.raises(ValueError, match="clock differs"):
-            evaluate_evidence(snapshot, {"coverage": str(envelope_path)}, {}, tmp_path)
+            evaluate_evidence(snapshot, {"coverage": str(envelope_path)}, tmp_path)
     else:
-        result = evaluate_evidence(snapshot, {"coverage": str(envelope_path)}, {}, tmp_path)
+        result = evaluate_evidence(snapshot, {"coverage": str(envelope_path)}, tmp_path)
         coverage = result["coverage"]
         assert isinstance(coverage, dict) and isinstance(coverage["metrics"], dict)
         if claim == "matching":
@@ -631,7 +547,6 @@ def test_unavailable_submission_retains_assignment_and_does_not_block_other_meas
     unavailable = manifest.records[0].stages[0]
     unavailable.snapshot = None
     unavailable.correctness = None
-    manifest.records[0].correction_ledger = None
     _write(manifest_path, manifest.model_dump(mode="json"))
     run = json.loads((root / "run.json").read_text())
     run["assessment_input"] = study._reference(root, manifest_path)
@@ -641,7 +556,7 @@ def test_unavailable_submission_retains_assignment_and_does_not_block_other_meas
     )
     state = json.loads(sidecar.read_text())
     assert state["status"] == "complete"
-    assert len(state["observations"]) == 5
+    assert len(state["observations"]) == 3
     assert all(
         (row["attempt_id"], row["stage"]) != ("a", "handoff") for row in state["observations"]
     )
@@ -657,12 +572,12 @@ def test_unavailable_submission_retains_assignment_and_does_not_block_other_meas
 def test_partial_proposal_finishes_later_inputs_and_validates(tmp_path: Path) -> None:
     root = _native(tmp_path / "run")
     revision = remeasure.propose_remeasurement(
-        root, profiles=_profile(tmp_path, broken=True), revision="partial-ready", allow_partial=True
+        root, profiles=_profile(tmp_path, broken=True), revision="partial-ready"
     )
     state = json.loads(revision.read_text())
     assert state["status"] == "complete"
-    assert state["unique_inputs"] == 3
-    assert len(list(revision.parent.glob("measurements/*/*/coverage/failure.json"))) == 6
+    assert state["unique_inputs"] == 2
+    assert len(list(revision.parent.glob("measurements/*/*/coverage/failure.json"))) == 4
     assert all(
         row["outcomes"]["coverage"]["status"] == "unavailable" for row in state["observations"]
     )
@@ -690,9 +605,7 @@ def test_partial_repeat_disagreement_never_promotes_a_passing_repeat(
         " raise SystemExit(7)\n" if second == "failed" else " report['branches']['covered']=[]\n"
     )
     script.write_text(text.replace(before_write, condition + action + before_write))
-    revision = remeasure.propose_remeasurement(
-        root, profiles=profiles, revision="disagreement", allow_partial=True
-    )
+    revision = remeasure.propose_remeasurement(root, profiles=profiles, revision="disagreement")
     state = json.loads(revision.read_text())
     assert all(
         row["outcomes"]["coverage"]["status"] == "nonrepeatable" for row in state["observations"]
@@ -743,11 +656,9 @@ def test_partial_coverage_failure_preserves_matching_fallow_and_later_inputs(
         return subprocess.CompletedProcess(argv, 0, json.dumps(report), "")
 
     monkeypatch.setattr(collectors, "_execute", execute)
-    revision = remeasure.propose_remeasurement(
-        root, profiles=profiles, revision="families", allow_partial=True
-    )
+    revision = remeasure.propose_remeasurement(root, profiles=profiles, revision="families")
     state = json.loads(revision.read_text())
-    assert state["unique_inputs"] == 3
+    assert state["unique_inputs"] == 2
     assert all(row["outcomes"]["fallow"]["status"] == "available" for row in state["observations"])
     proposed = json.loads(remeasure.validate_remeasurement(root, revision.parent).read_text())
     assert all(set(record["before_evidence"]) == {"fallow"} for record in proposed["records"])
@@ -776,7 +687,7 @@ def test_partial_validator_rejects_resealed_failure_binding_tampering(
 ) -> None:
     root = _native(tmp_path / "run")
     revision = remeasure.propose_remeasurement(
-        root, profiles=_profile(tmp_path, broken=True), revision="tampered", allow_partial=True
+        root, profiles=_profile(tmp_path, broken=True), revision="tampered"
     )
     state = json.loads(revision.read_text())
     path = revision.parent / "measurements/0/0/coverage/failure.json"
@@ -826,9 +737,7 @@ def test_failed_replacement_removes_supplied_stale_success(tmp_path: Path) -> No
     run["assessment_input"] = study._reference(root, manifest_path)
     _write(root / "run.json", run)
     broken = _profile(tmp_path, broken=True)
-    revision = remeasure.propose_remeasurement(
-        root, profiles=broken, revision="replacement", allow_partial=True
-    )
+    revision = remeasure.propose_remeasurement(root, profiles=broken, revision="replacement")
     proposed = json.loads(remeasure.validate_remeasurement(root, revision.parent).read_text())
     assert all(
         not stage["evidence"] for record in proposed["records"] for stage in record["stages"]
@@ -846,9 +755,7 @@ def test_trusted_adapter_failure_validator_rejects_resealed_integrity_exit(tmp_p
     collector = profiles["task"][0]
     collector.failure_protocol = "coverage-exit-v1"
     collector.command = [sys.executable, "-c", "raise SystemExit(3)"]
-    revision = remeasure.propose_remeasurement(
-        root, profiles=profiles, revision="trusted", allow_partial=True
-    )
+    revision = remeasure.propose_remeasurement(root, profiles=profiles, revision="trusted")
     assert remeasure.validate_remeasurement(root, revision.parent).is_file()
     state = json.loads(revision.read_text())
     receipt = revision.parent / "measurements/0/0/coverage/execution.json"
@@ -876,9 +783,9 @@ def test_parallel_remeasurement_deduplicates_fixed_inputs_with_serial_repeats(
 
     root = _native(tmp_path / "run")
     previous = study._inventory(root)
-    gate, lock = Barrier(3), Lock()
-    released = [Event() for _ in range(3)]
-    released[2].set()
+    gate, lock = Barrier(2), Lock()
+    released = [Event() for _ in range(2)]
+    released[1].set()
     active: set[int] = set()
     maximum = 0
     calls: list[tuple[int, int]] = []
@@ -918,15 +825,15 @@ def test_parallel_remeasurement_deduplicates_fixed_inputs_with_serial_repeats(
         jobs=3,
     )
     state = json.loads(revision.read_text())
-    assert maximum == 3 and not active and finished == [2, 1, 0]
-    assert state["jobs"] == 3 and state["unique_inputs"] == 3
-    assert sorted(calls) == [(index, repeat) for index in range(3) for repeat in range(2)]
-    assert all([repeat for i, repeat in calls if i == index] == [0, 1] for index in range(3))
+    assert maximum == 2 and not active and finished == [1, 0]
+    assert state["jobs"] == 3 and state["unique_inputs"] == 2
+    assert sorted(calls) == [(index, repeat) for index in range(2) for repeat in range(2)]
+    assert all([repeat for i, repeat in calls if i == index] == [0, 1] for index in range(2))
     proposed = json.loads(remeasure.validate_remeasurement(root, revision.parent).read_text())
     assert [record["id"] for record in proposed["records"]] == ["a", "b"]
     for row in state["observations"]:
-        # Duplicate before/handoff/repair contexts retain the first seeded input index.
-        index = {"before": 0, "handoff": 1, "repair-1": 2}[row["stage"]]
+        # Duplicate before/handoff contexts retain the first seeded input index.
+        index = {"before": 0, "handoff": 1}[row["stage"]]
         assert [Path(repeat["coverage"]["path"]).parts[-4:-2] for repeat in row["repeats"]] == [
             (str(index), "0"),
             (str(index), "1"),
@@ -949,7 +856,7 @@ def test_parallel_partial_collection_finishes_other_inputs_without_promoting_fai
             "pathlib.Path(sys.argv[2]).write_text",
         )
     )
-    gate = Barrier(3)
+    gate = Barrier(2)
 
     def collecting(
         snapshot: Path,
@@ -967,11 +874,10 @@ def test_parallel_partial_collection_finishes_other_inputs_without_promoting_fai
         root,
         profiles=profiles,
         revision="partial-parallel",
-        allow_partial=True,
         jobs=3,
     )
     state = json.loads(revision.read_text())
-    assert state["status"] == "complete" and state["unique_inputs"] == 3
+    assert state["status"] == "complete" and state["unique_inputs"] == 2
     assert all(
         row["outcomes"]["coverage"]["status"]
         == ("unavailable" if row["stage"] == "handoff" else "available")
@@ -980,7 +886,6 @@ def test_parallel_partial_collection_finishes_other_inputs_without_promoting_fai
     proposed = json.loads(remeasure.validate_remeasurement(root, revision.parent).read_text())
     assert all(row["before_evidence"]["coverage"] for row in proposed["records"])
     assert all(not row["stages"][0]["evidence"] for row in proposed["records"])
-    assert all(row["stages"][1]["evidence"]["coverage"] for row in proposed["records"])
 
 
 @pytest.mark.parametrize("jobs", [True, "2", 2.5, 0, 17])
@@ -1000,7 +905,7 @@ def test_parallel_observer_fatal_failure_drains_active_receipts_without_new_repe
 
     from pluginbench import parallel
 
-    root = _native(tmp_path / "run")
+    root = _native(tmp_path / "run", distinct_handoffs=True)
     preserved = study._inventory(root)
     gate, lock = Barrier(2), Lock()
     cancellation = Event()
@@ -1030,7 +935,6 @@ def test_parallel_observer_fatal_failure_drains_active_receipts_without_new_repe
             profiles=_profile(tmp_path),
             revision="fatal-parallel",
             jobs=2,
-            allow_partial=True,
         )
     directory = root / "observer-revisions/fatal-parallel"
     state = json.loads((directory / "revision.json").read_text())

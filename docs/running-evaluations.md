@@ -2,7 +2,7 @@
 
 An evaluation fixes the harness, model, reasoning, and tasks. It includes vanilla plus each named guidance package. Attempt order is randomized; there are no automatic repair rounds.
 
-Vanilla submissions are cached in `.baseline-cache` beside the run directories. Reuse requires matching task code, prompt, harness, model, reasoning, runtime, timeout, jobs, and repeat count. Runtime includes the execution backend, CLI version, isolation boundary, and toolchain. Harbor also binds its version, Docker client and plugins, daemon, immutable task and prepared agent image identities, platform, and container resource limits. Local baselines cannot be reused for Harbor. Guidance packages, reviewer settings, and selected measurements do not change the coding cache key.
+Vanilla submissions are cached in `.baseline-cache` beside the run directories. Reuse requires matching task code, prompt, harness, model, reasoning, runtime, timeout, jobs, and repeat count. Runtime includes the execution backend, CLI version, isolation boundary, and toolchain. Harbor also binds its version, Docker client and plugins, daemon, immutable task and prepared agent image identities, platform, and container resource limits. Guidance packages, reviewer settings, and selected measurements do not change the coding cache key.
 
 A cached cohort includes failed attempts and unknown values. Missing isolation receipts, corrupt entries, or a concurrently reserved cohort stop reuse. Imported submissions keep their original tokens, timing, and evidence. Current grading, measurements, and reviews run again. Reports identify reuse and count new coding invocations separately. Reused baselines are not fresh independent samples; changing the repeat count creates a new cohort.
 
@@ -12,7 +12,7 @@ Use [the example YAML](../examples/evaluation.yaml). JSON accepts the same field
 
 Guidance accepts Markdown/text files, skill directories, or a plugin directory containing text skills. Files are supplied in the task prompt. Installation, automatic activation, scripts, hooks, and MCP tools are not measured. Vanilla receives no custom instructions; the harness's built-in instructions remain.
 
-New evaluations default to `backend: harbor`, installed with `pip install -e '.[harbor]'`. Docker must run Linux containers through a local Unix endpoint, with Compose and Buildx available. Preparation freezes the task image and exact selected harness CLI, retaining the image's Node/npm. It installs locked Linux dependencies and runs the task's visible base checks before model calls. Initial source must remain unchanged; generated test artifacts and personal settings are removed. Each attempt starts from that validated image, including nested workspace dependencies.
+Evaluations use Harbor, installed with `pip install -e '.[harbor]'`. Docker must run Linux containers through a local Unix endpoint, with Compose and Buildx available. Preparation freezes the task image and exact selected harness CLI, retaining the image's Node/npm. It installs locked Linux dependencies and runs the task's visible base checks before model calls. Initial source must remain unchanged; generated test artifacts and personal settings are removed. Each attempt starts from that validated image, including nested workspace dependencies.
 
 A prepared image is reusable only with a successful receipt binding its content, source, installation and check recipes, resources, and cleanup. Missing or inconsistent receipts stop execution. Visible base checks establish environment fitness; separate trusted checks grade each submitted solution. The task prompt leaves verification choices to the agent. This evaluates guidance in a prepared repository, including verification choices, rather than dependency setup skill. Native coding and trusted host grading can use different Node versions; their recorded environments are separate.
 
@@ -22,9 +22,7 @@ The agent's `timeout_seconds` remains a separate evaluation budget, defaulting t
 
 Separate trusted graders and observers work on disposable copies on the host. This is an adapted verifier environment, rather than the upstream task's separate Linux verifier. Harbor reward scores are not used as replacements for raw measurements.
 
-New Codex trials capture JSON events and stderr separately. Diagnostics remain available; malformed stdout, missing captures, and native failures remain failures. Older merged logs retain their original parsing rules and outcomes.
-
-Use `backend: local` or `--backend local` only for legacy local execution. Saved runs created before the backend field remain local. Reports from saved local or Pier runs remain readable; new Pier execution is retired.
+Codex trials capture JSON events and stderr separately. Diagnostics remain available; malformed stdout, missing captures, and native failures remain failures.
 
 Tasks use the public [DeepSWE Harbor format](https://github.com/datacurve-ai/deep-swe): `task.toml`, `instruction.md`, environment, tests, and solution. The current adapter supports these five tasks at revision `0b9fabbb63b9104d678fe965e1632f2dd9eaa2ea`:
 
@@ -36,7 +34,7 @@ Tasks use the public [DeepSWE Harbor format](https://github.com/datacurve-ai/dee
 
 PluginBench prepares source snapshots and checks each verifier against an oracle and negative controls before model calls. Hidden tests stay separate from agent code. These five adapters define trusted correctness, coverage, and Fallow scopes; other Harbor tasks are rejected before model calls. True-myth covers iterable, async, and curried collection APIs across four modules. IntersectionObserver adds asynchronous geometry and threshold notifications to Happy DOM.
 
-Coverage observers use the submitted visible tests, never held-out correctness tests. True-myth uses pinned Vitest/Istanbul 3.2.4 because its V8 provider reports ambiguous branch coordinates. Other tasks retain their declared providers; coverage rates across tasks describe different populations.
+Coverage observers use visible tests, never held-out correctness tests. Four adapters run fixed reference tests plus added or modified eligible visible test files; ofetch runs all declared visible test files. Testem coverage uses a controlled clock; its correctness checks use the original clock. True-myth uses pinned Vitest/Istanbul 3.2.4 because its V8 provider reports ambiguous branch coordinates. Other tasks retain their declared providers; coverage rates across tasks describe different populations.
 
 True-myth coverage includes the feature-owning Maybe, Result, Task, and toolbelt modules (including `src/task/**` helpers); LOC and Fallow cover all `src/**`. Helpers added outside those modules are outside its coverage population but remain in LOC and Fallow. True-myth’s observer disables coverage thresholds and measures runtime tests only; typechecking cases do not execute branches. Its correctness verifier retains the original typechecking runner. Testem receives a generated npm lock shared by all groups, recorded in task provenance.
 
@@ -62,7 +60,7 @@ Reviews add one native reviewer invocation per submitted attempt. A native invoc
 
 Independent coding attempts, measurement inputs, and reviews run concurrently. For Harbor, actual jobs are capped by the requested limit, four, Docker CPU capacity, and an 80% Docker memory budget. The default request is the smaller of four and host CPU count. Set `jobs: 2` or `--jobs 2` to request fewer; the resolved limit is saved. Dependency preparation and the two measurements of each snapshot stay sequential. Jobs changes scheduling, not planned model calls, and is part of the comparison identity because contention can affect timing and tests.
 
-On interruption or a fatal error, no further jobs are dispatched; active jobs finish or reach their timeout, and their receipts are preserved. Interruption can therefore take time. Resume uses the saved jobs setting; older runs use one.
+On interruption or a fatal error, no further jobs are dispatched; active jobs finish or reach their timeout, and their receipts are preserved. Interruption can therefore take time. Resume uses the saved jobs setting.
 
 Use `pluginbench run --resume runs/<run> --dry-run` to check what can continue, then omit `--dry-run` to resume. Resume requires a completed coding phase. It finishes measurement work and can start a review phase that has not begun. Once a review phase starts, interruption requires a fresh evaluation, even if some reviews remain unstarted. Saved submissions and failed evidence are preserved; existing model calls are never replayed. Resume cannot repair a submitted solution or turn an unavailable measurement into a zero. Citation recovery runs offline and can remove extra indentation or one redundant `after/` prefix when the exact quoted source supports the correction.
 
@@ -79,6 +77,6 @@ npm ci
 npm run build:charts
 ```
 
-These checks make no model calls. Saved runs and their frozen evidence are preserved.
+These checks make no model calls.
 
 For a deliberate reviewer repair, the Python API can create a separate `review_study(..., revision=...)` on frozen submissions. `regenerate_report(..., review_revision=...)` validates the fixed review settings and writes beneath that revision. Original settings, reports, failed calls, and usage remain available; coding is not replayed. This is separate from CLI resume.

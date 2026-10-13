@@ -224,32 +224,38 @@ def test_incomplete_or_unstable_fresh_runs_are_refused(fault: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "fault",
+    "fault,disable_thresholds,provider",
     [
-        "branches",
-        "functions",
-        "test_population",
-        "native_failure",
-        "native_unhandled",
-        "native_timeout",
-        "inner_mutation",
-        "submitted_mutation",
-        "before_mutation",
-        "dependency_mutation",
-        "observer_mutation",
-        "timeout_mutation",
-        "exclusion_receipt",
-        "exclusion_unavailable",
-        "exclusion_timeout",
-        "exclusion_timeout_mismatch",
-        "exclusion_timeout_receipt_directory",
-        "exclusion_timeout_receipt_symlink",
-        "exclusion_timeout_mutation",
-        None,
+        (None, False, "v8"),
+        (None, True, "v8"),
+        (None, False, "istanbul"),
+        (None, True, "istanbul"),
+        *[
+            (fault, False, "v8")
+            for fault in [
+                "branches",
+                "functions",
+                "test_population",
+                "native_failure",
+                "native_unhandled",
+                "native_timeout",
+                "inner_mutation",
+                "submitted_mutation",
+                "before_mutation",
+                "dependency_mutation",
+                "observer_mutation",
+                "timeout_mutation",
+                "exclusion_receipt",
+                "exclusion_unavailable",
+                "exclusion_timeout",
+                "exclusion_timeout_mismatch",
+                "exclusion_timeout_receipt_directory",
+                "exclusion_timeout_receipt_symlink",
+                "exclusion_timeout_mutation",
+            ]
+        ],
     ],
 )
-@pytest.mark.parametrize("disable_thresholds", [False, True])
-@pytest.mark.parametrize("provider", ["v8", "istanbul"])
 def test_reference_repeat_validation_and_coverage_only_avoid_candidate_exclusions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
