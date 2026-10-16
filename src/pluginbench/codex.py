@@ -449,6 +449,61 @@ def _token_usage(value: object) -> dict[str, int] | None:
     return value
 
 
+def _session_history(
+    events: list[dict[str, Any]], reasons: set[str]
+) -> tuple[dict[str, Any], list[dict[str, Any]], bool] | None:
+    metadata = [event.get("payload") for event in events if event.get("type") == "session_meta"]
+    first = events[0].get("payload") if events and events[0].get("type") == "session_meta" else None
+    inherited = isinstance(first, dict) and (
+        first.get("forked_from_id") is not None
+        or first.get("history_base") is not None
+        or first.get("subagent_history_start_ordinal") is not None
+    )
+    if not inherited:
+        if len(metadata) != 1 or not isinstance(metadata[0], dict):
+            reasons.add("trace lacks one unambiguous session identity")
+            return None
+        return metadata[0], events, False
+
+    # 0.162.1 protocol.rs defines this ordinal as the first own-history record.
+    # Earlier records are inherited model context, including other session headers.
+    assert isinstance(first, dict)
+    boundary = first.get("subagent_history_start_ordinal")
+    source = first.get("source")
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    spawned = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    parent = first.get("parent_thread_id")
+    path = first.get("agent_path")
+    valid = (
+        first.get("cli_version") == "0.162.1"
+        and first.get("history_mode") == "paginated"
+        and first.get("history_base") is None
+        and isinstance(parent, str)
+        and bool(parent)
+        and first.get("forked_from_id") == parent
+        and isinstance(first.get("session_id"), str)
+        and isinstance(path, str)
+        and bool(path)
+        and isinstance(spawned, dict)
+        and spawned.get("parent_thread_id") == parent
+        and spawned.get("agent_path") == path
+        and isinstance(boundary, int)
+        and not isinstance(boundary, bool)
+        and 1 <= boundary < len(events)
+        and all(
+            isinstance(event.get("ordinal"), int)
+            and not isinstance(event.get("ordinal"), bool)
+            and event["ordinal"] == ordinal
+            for ordinal, event in enumerate(events)
+        )
+        and not any(event.get("type") == "session_meta" for event in events[boundary:])
+    )
+    if not valid:
+        reasons.add(f"inherited history is unsupported for session {first.get('id')}")
+        return None
+    return first, [events[0], *events[boundary:]], True
+
+
 def _descendant_usage(
     stdout: list[dict[str, Any]],
     traces: list[list[dict[str, Any]]],
@@ -463,11 +518,10 @@ def _descendant_usage(
     reasons: set[str] = set()
     sessions: dict[str, dict[str, Any]] = {}
     for events in traces:
-        metadata = [event.get("payload") for event in events if event.get("type") == "session_meta"]
-        if len(metadata) != 1 or not isinstance(metadata[0], dict):
-            reasons.add("trace lacks one unambiguous session identity")
+        history = _session_history(events, reasons)
+        if history is None:
             continue
-        meta = metadata[0]
+        meta, events, inherited = history
         identity = meta.get("id")
         if not isinstance(identity, str) or not identity:
             reasons.add("trace lacks one unambiguous session identity")
@@ -494,9 +548,13 @@ def _descendant_usage(
             parent = None
         if subagent is not None and parent is None:
             reasons.add(f"unresolved subagent lineage for session {identity}")
-        if meta.get("forked_from_id") or meta.get("history_base"):
-            reasons.add(f"inherited history is unsupported for session {identity}")
-        sessions[identity] = {"events": events, "parent_thread_id": parent}
+        sessions[identity] = {
+            "events": events,
+            "parent_thread_id": parent,
+            "inherited": inherited,
+            "agent_path": meta.get("agent_path"),
+            "root_session_id": meta.get("session_id"),
+        }
 
     identity_safe = not reasons
     roots = sorted(
@@ -519,6 +577,7 @@ def _descendant_usage(
         identity_safe = False
 
     expected_children: set[str] = set()
+    expected_agent_paths: set[tuple[str, str]] = set()
     models: set[str] = set()
     child_models: set[str] = set()
     effort: set[str] = set()
@@ -533,17 +592,61 @@ def _descendant_usage(
         if parent is not None or root not in ancestors:
             reasons.add(f"session {identity} is not linked to the root")
             identity_safe = False
+        if session["inherited"] and session["root_session_id"] != root:
+            reasons.add(f"inherited root identity does not match session {identity}")
+            identity_safe = False
         total: dict[str, int] | None = None
         complete = False
         failed = False
         pending_spawns: set[str] = set()
+        named_spawns: dict[str, str | None] = {}
+        own_turn: str | None = None
         for event in session["events"]:
             payload = event.get("payload")
             if not isinstance(payload, dict):
                 continue
             kind = payload.get("type") if event.get("type") == "event_msg" else None
+            if event.get("type") == "response_item":
+                call_id = payload.get("call_id")
+                if (
+                    payload.get("type") == "function_call"
+                    and payload.get("namespace") == "collaboration"
+                    and payload.get("name") == "spawn_agent"
+                ):
+                    if isinstance(call_id, str) and call_id:
+                        if call_id in named_spawns:
+                            reasons.add(f"duplicate named spawn for session {identity}")
+                        named_spawns[call_id] = None
+                    else:
+                        reasons.add(f"unidentified named spawn for session {identity}")
+                if (
+                    payload.get("type") == "function_call_output"
+                    and isinstance(call_id, str)
+                    and call_id in named_spawns
+                ):
+                    try:
+                        output = (
+                            json.loads(payload["output"])
+                            if isinstance(payload.get("output"), str)
+                            else None
+                        )
+                    except ValueError:
+                        output = None
+                    path = output.get("task_name") if isinstance(output, dict) else None
+                    if not isinstance(path, str) or not path:
+                        reasons.add(f"unresolved named spawn for session {identity}")
+                    else:
+                        if named_spawns[call_id] not in (None, path):
+                            reasons.add(f"conflicting named spawn result for session {identity}")
+                        named_spawns[call_id] = path
+                        expected_agent_paths.add((identity, path))
             if event.get("type") == "turn_context":
                 complete = False
+                if session["inherited"] and (
+                    own_turn is None or payload.get("turn_id") != own_turn
+                ):
+                    reasons.add(f"unverified own turn for session {identity}")
+                    identity_safe = False
                 model = payload.get("model")
                 if isinstance(model, str):
                     if identity == root:
@@ -554,8 +657,16 @@ def _descendant_usage(
                     effort.add(payload["effort"])
             if kind in {"task_started", "turn_started"}:
                 complete = False
+                own_turn = (
+                    payload.get("turn_id") if isinstance(payload.get("turn_id"), str) else None
+                )
             if kind in {"task_complete", "turn_complete"}:
                 complete = True
+                if session["inherited"] and (
+                    own_turn is None or payload.get("turn_id") != own_turn
+                ):
+                    reasons.add(f"unverified own turn for session {identity}")
+                    identity_safe = False
             if kind in {"error", "turn_aborted", "turn_failed"}:
                 failed = True
             if kind == "token_count":
@@ -564,6 +675,21 @@ def _descendant_usage(
                     _token_usage(info.get("total_token_usage")) if isinstance(info, dict) else None
                 )
                 if observed is not None:
+                    if session["inherited"] and own_turn is None:
+                        reasons.add(f"unverified own turn for session {identity}")
+                        identity_safe = False
+                    if session["inherited"] and observed != total:
+                        last = (
+                            _token_usage(info.get("last_token_usage"))
+                            if isinstance(info, dict)
+                            else None
+                        )
+                        if last is None or any(
+                            last.get(key) != value - (total.get(key, 0) if total else 0)
+                            for key, value in observed.items()
+                        ):
+                            reasons.add(f"unverified cumulative origin for session {identity}")
+                            identity_safe = False
                     if total is not None and any(
                         key not in observed or observed[key] < value for key, value in total.items()
                     ):
@@ -594,6 +720,8 @@ def _descendant_usage(
             reasons.add(f"missing usage for session {identity}")
         if pending_spawns:
             reasons.add(f"unresolved spawns for session {identity}")
+        if any(path is None for path in named_spawns.values()):
+            reasons.add(f"unresolved named spawn for session {identity}")
         if not complete or failed:
             reasons.add(f"incomplete or failed session {identity}")
         session_reasons = reasons - prior_reasons
@@ -618,6 +746,17 @@ def _descendant_usage(
                 expected_children.update(value for value in receivers if isinstance(value, str))
     for child in sorted(expected_children - sessions.keys()):
         reasons.add(f"missing descendant session {child}")
+    for parent, path in sorted(expected_agent_paths):
+        matching = [
+            identity
+            for identity, session in sessions.items()
+            if session["parent_thread_id"] == parent and session["agent_path"] == path
+        ]
+        if not matching:
+            reasons.add(f"missing descendant agent {path} from session {parent}")
+        elif len(matching) != 1:
+            reasons.add(f"conflicting descendant identities for agent {path} from session {parent}")
+            identity_safe = False
     if stream_errors:
         reasons.add("native event stream contains errors")
     root_turns = [

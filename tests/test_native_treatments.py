@@ -122,11 +122,14 @@ def test_guidance_limits_prevent_native_truncation_and_other_harness_is_not_emul
         admit(Treatment(), "claude")
 
 
-def test_common_capability_limits_survive_real_harbor_option_parsing(tmp_path: Path) -> None:
+@pytest.mark.parametrize("subagents", [False, True])
+def test_common_capability_limits_survive_real_harbor_option_parsing(
+    tmp_path: Path, subagents: bool,
+) -> None:
     from pluginbench import harbor_backend
 
     sdk = pytest.importorskip("harbor.agents.installed.codex")
-    policy = NativeCapabilities(subagents=True, max_threads=3, max_depth=1)
+    policy = NativeCapabilities(subagents=subagents, max_threads=3, max_depth=1)
     configurations: list[dict[str, Any]] = []
     guidance = tmp_path / "guide.md"
     guidance.write_text("Use the existing module.\n")
@@ -146,7 +149,8 @@ def test_common_capability_limits_survive_real_harbor_option_parsing(tmp_path: P
         assert config["extra_instructions"] == []
     assert configurations[0] == configurations[1]
     assert configurations[0]["agents"]["max_threads"] == 3
-    assert configurations[0]["features"]["multi_agent_v2"] is False
+    assert configurations[0]["agents"]["enabled"] is subagents
+    assert "multi_agent_v2" not in configurations[0]["features"]
     assert configurations[0]["features"]["remote_plugin"] is False
     assert configurations[0]["features"]["apps"] is False
 

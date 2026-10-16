@@ -38,7 +38,6 @@ treatments:
 capabilities:
   subagents: true
   max_threads: 4
-  max_depth: 1
 ```
 
 Vanilla is included automatically. The task prompt is identical across arms. Guidance files become the attempt's private native global `AGENTS.md`; they are never appended to the task prompt or written into the source repository. Combined guidance is limited to 32,768 bytes, including separators, to prevent native truncation.
@@ -49,7 +48,7 @@ The private Codex configuration disables the remote plugin catalog and app integ
 
 Before coding, the pinned CLI must discover every declared skill and synchronous command hook with the expected identity and package contents. Missing or undeclared components stop the attempt. Discovery receipts prove availability; they do not prove skill activation or hook execution. Hook execution uses a per-invocation trust bypass inside the owned container for the verified frozen packages.
 
-The same capability policy applies to vanilla and every treatment. Subagents default to enabled, with four concurrently open children and V1 depth one. Children inherit the selected model and effort by default; explicit spawn settings can override them. These settings are neither model allowlists nor lifetime call or dollar limits. The attempt timeout bounds runtime, including child work. Dry runs count coding attempts, not total model requests.
+The same capability policy applies to vanilla and every treatment. Subagents default to enabled, with at most four concurrently running children. `subagents: false` disables native agents explicitly. The selected model determines the native agent runtime. V2 enforces concurrency only; the optional `max_depth` setting (default one) is a V1 preference and has no effect on V2. There is no enforced depth limit for V2 runs. Children inherit the selected model and effort by default; explicit spawn settings can override them. These settings are neither model allowlists nor lifetime call or dollar limits. The attempt timeout bounds runtime, including child work. Dry runs count coding attempts, not total model requests.
 
 New native treatment runs currently require Codex. Legacy file-only `guidance` maps migrate to native instructions; directory entries must move to `skills` or `plugins`. Existing single-handoff text-injection campaigns remain readable, but their delivery identity differs and their baselines cannot be reused for native treatments. Removed multi-stage standards/ledger formats are not supported by report regeneration. CLI flags support `--guidance`, `--skill`, and `--plugin`, each grouped by `--guidance-name`.
 

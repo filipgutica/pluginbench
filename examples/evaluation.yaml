@@ -14,7 +14,6 @@ treatments:
 capabilities:
   subagents: true
   max_threads: 4                # Concurrent children, not a lifetime call/spend cap.
-  max_depth: 1                  # Uses native V1 subagents.
 
 tasks:
   dataset: datacurve/deep-swe-1-1

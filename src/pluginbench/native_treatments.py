@@ -32,7 +32,10 @@ class NativeCapabilities(BaseModel):
 
     subagents: bool = True
     max_threads: int = Field(default=4, strict=True, ge=1, le=16)
-    max_depth: int = Field(default=1, strict=True, ge=1, le=2)
+    max_depth: int = Field(
+        default=1, strict=True, ge=1, le=2,
+        description="Native V1 depth preference; ignored by model-selected V2 agents.",
+    )
 
     def codex_config(self, *, model: str, effort: str) -> dict[str, object]:
         return {
@@ -44,11 +47,11 @@ class NativeCapabilities(BaseModel):
                 "apps": False,
                 "hooks": True,
                 "multi_agent": self.subagents,
-                # Depth limits are V1-only in the pinned CLI.
-                "multi_agent_v2": False,
             },
             "project_doc_max_bytes": MAX_GUIDANCE_BYTES,
             "agents": {
+                # Unlike feature flags, this also disables model-selected V2 agents.
+                "enabled": self.subagents,
                 "max_threads": self.max_threads,
                 "max_depth": self.max_depth,
                 "default_subagent_model": model,

@@ -267,8 +267,8 @@ remote_plugin = false
 apps = false
 hooks = true
 multi_agent = true
-multi_agent_v2 = false
 [agents]
+enabled = true
 max_threads = 4
 max_depth = 1
 default_subagent_model = "gpt-6.1-sol"

@@ -395,6 +395,7 @@ for path, operation in ((p, 'write'), (Path({str(outside)!r}), 'read'), (Path({s
 Path(os.environ['TMPDIR'], 'scratch.txt').write_text('private storage allowed')
 print(json.dumps({{'type':'turn.completed','usage':{{'input_tokens':0,'output_tokens':0}}}}))
 """
+
     def probe(**kwargs: object) -> list[str]:
         # Exercise the CLI's actual sandbox entry without invoking any model.
         return [
@@ -684,3 +685,228 @@ def test_native_stdout_identity_mismatch_and_inherited_history_cannot_supply_low
         "inherited history is unsupported for session root" in parsed["usage_accounting"]["reasons"]
     )
     assert "invalid stdout root identity" in parsed["usage_accounting"]["reasons"]
+
+
+def inherited_native_child() -> list[dict[str, object]]:
+    """Minimal 0.162.1 paginated child history, with an explicit own-history boundary."""
+    events: list[dict[str, object]] = [
+        {
+            "type": "session_meta",
+            "payload": {
+                "id": "child",
+                "session_id": "root",
+                "cli_version": "0.162.1",
+                "history_mode": "paginated",
+                "forked_from_id": "root",
+                "parent_thread_id": "root",
+                "subagent_history_start_ordinal": 4,
+                "agent_path": "/root/check",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": "root",
+                            "depth": 1,
+                            "agent_path": "/root/check",
+                        }
+                    }
+                },
+            },
+        },
+        {"type": "session_meta", "payload": {"id": "root"}},
+        {"type": "turn_context", "payload": {"model": "inherited-model", "effort": "low"}},
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {"input_tokens": 9000, "output_tokens": 100},
+                },
+            },
+        },
+        {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "child-turn"}},
+        {
+            "type": "turn_context",
+            "payload": {
+                "model": "child-model",
+                "effort": "low",
+                "turn_id": "child-turn",
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {"input_tokens": 7, "output_tokens": 2},
+                    "last_token_usage": {"input_tokens": 7, "output_tokens": 2},
+                },
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {"input_tokens": 11, "output_tokens": 3},
+                    "last_token_usage": {"input_tokens": 4, "output_tokens": 1},
+                },
+            },
+        },
+        {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "child-turn"}},
+    ]
+    return [{**event, "ordinal": ordinal} for ordinal, event in enumerate(events)]
+
+
+def named_native_spawn() -> list[dict[str, object]]:
+    return [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "namespace": "collaboration",
+                "name": "spawn_agent",
+                "call_id": "spawn-call",
+                "arguments": "{}",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "spawn-call",
+                "output": '{"task_name":"/root/check"}',
+            },
+        },
+    ]
+
+
+def test_native_inherited_child_counts_only_own_history_and_deduplicates_copies() -> None:
+    root = native_session(
+        "root", [{"input_tokens": 20, "output_tokens": 5}], extra=named_native_spawn()
+    )
+    events = inherited_native_child()
+    child = stream(*events)
+    parsed = codex.parse_events(
+        "", [root, child, child, stream(*events[:-1])], "codex", include_descendants=True
+    )
+    assert parsed["usage"] == {"input_tokens": 31, "output_tokens": 8}
+    assert parsed["actual_primary_models"] == ["primary"]
+    assert parsed["actual_descendant_models"] == ["child-model"]
+    assert parsed["usage_accounting"]["status"] == "complete"
+    assert len(parsed["usage_accounting"]["sessions"]) == 2
+
+
+def test_native_named_spawn_requires_captured_child_even_without_legacy_spawn_events() -> None:
+    root = native_session(
+        "root", [{"input_tokens": 20, "output_tokens": 5}], extra=named_native_spawn()
+    )
+    parsed = codex.parse_events("", [root], "codex", include_descendants=True)
+    assert parsed["usage"] is None
+    assert (
+        "missing descendant agent /root/check from session root"
+        in parsed["usage_accounting"]["reasons"]
+    )
+
+
+@pytest.mark.parametrize("boundary", [None, True, -1, 0, 2, 5, 99])
+def test_native_inherited_child_rejects_missing_or_invalid_own_history_boundary(
+    boundary: object,
+) -> None:
+    child = inherited_native_child()
+    metadata = child[0]["payload"]
+    assert isinstance(metadata, dict)
+    metadata["subagent_history_start_ordinal"] = boundary
+    root = native_session(
+        "root", [{"input_tokens": 20, "output_tokens": 5}], extra=named_native_spawn()
+    )
+    parsed = codex.parse_events("", [root, stream(*child)], "codex", include_descendants=True)
+    assert parsed["usage"] is None
+    assert parsed["usage_accounting"]["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("forked_from_id", "other"),
+        ("parent_thread_id", "other"),
+        ("agent_path", "/root/other"),
+        ("session_id", "other-root"),
+        ("cli_version", "0.162.2"),
+    ],
+)
+def test_native_inherited_child_requires_consistent_native_metadata(field: str, value: str) -> None:
+    child = inherited_native_child()
+    metadata = child[0]["payload"]
+    assert isinstance(metadata, dict)
+    metadata[field] = value
+    root = native_session(
+        "root", [{"input_tokens": 20, "output_tokens": 5}], extra=named_native_spawn()
+    )
+    parsed = codex.parse_events("", [root, stream(*child)], "codex", include_descendants=True)
+    assert parsed["usage"] is None
+    assert parsed["usage_accounting"]["status"] == "incomplete"
+
+
+def test_native_named_spawn_conflicting_result_cannot_claim_complete_usage() -> None:
+    spawn = named_native_spawn()
+    spawn.append(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "spawn-call",
+                "output": '{"task_name":"/root/other"}',
+            },
+        }
+    )
+    root = native_session("root", [{"input_tokens": 20, "output_tokens": 5}], extra=spawn)
+    parsed = codex.parse_events(
+        "", [root, stream(*inherited_native_child())], "codex", include_descendants=True
+    )
+    assert parsed["usage"] is None
+    assert parsed["usage_accounting"]["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(
+    "corruption", ["extra_header", "ordinal_gap", "inherited_counter", "wrong_turn"]
+)
+def test_native_inherited_child_rejects_ambiguous_own_suffix(corruption: str) -> None:
+    child = inherited_native_child()
+    if corruption == "extra_header":
+        child.append({"type": "session_meta", "payload": {"id": "other"}, "ordinal": len(child)})
+    elif corruption == "ordinal_gap":
+        child[-1]["ordinal"] = 50
+    else:
+        payload = child[6 if corruption == "inherited_counter" else 8]["payload"]
+        assert isinstance(payload, dict)
+        if corruption == "inherited_counter":
+            info = payload["info"]
+            assert isinstance(info, dict)
+            info["last_token_usage"] = {"input_tokens": 2, "output_tokens": 1}
+        else:
+            payload["turn_id"] = "inherited-turn"
+    root = native_session(
+        "root", [{"input_tokens": 20, "output_tokens": 5}], extra=named_native_spawn()
+    )
+    parsed = codex.parse_events("", [root, stream(*child)], "codex", include_descendants=True)
+    assert parsed["usage"] is None
+    assert parsed["usage_accounting"]["observed_usage_lower_bound"] is None
+
+
+def test_native_named_spawn_rejects_two_session_identities_for_one_child_path() -> None:
+    child = inherited_native_child()
+    second = inherited_native_child()
+    metadata = second[0]["payload"]
+    assert isinstance(metadata, dict)
+    metadata["id"] = "second-child"
+    root = native_session(
+        "root", [{"input_tokens": 20, "output_tokens": 5}], extra=named_native_spawn()
+    )
+    parsed = codex.parse_events(
+        "", [root, stream(*child), stream(*second)], "codex", include_descendants=True
+    )
+    assert parsed["usage"] is None
+    assert (
+        "conflicting descendant identities for agent /root/check from session root"
+        in parsed["usage_accounting"]["reasons"]
+    )
