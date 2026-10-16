@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
-import sys
+import shutil
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -13,55 +12,71 @@ from typing import Any
 import pytest
 import yaml
 from typer.testing import CliRunner
+from typer.main import get_group
 
-from pluginbench import claude, cli, codex, collectors, evaluation, harbor_backend
+from pluginbench import claude, cli, codex, evaluation, harbor_backend, study, submissions
 from pluginbench.remeasure import propose_remeasurement
 from pluginbench.study_review import recover_review_citations
+from native_support import (
+    task_entry,
+    execution as native_execution,
+    runtime_identity as native_runtime_identity,
+    synthetic_contract,
+    qualify_synthetic_source,
+)
 
 
 @pytest.fixture
 def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> evaluation.Evaluation:
+    monkeypatch.setattr(submissions, "reviewed_contract", synthetic_contract)
     suite = tmp_path / "deep-swe"
-    task = suite / "tasks" / evaluation.SUPPORTED_TASKS[0]
+    task = suite / "tasks" / "arbitrary-native-task"
     for name in ("environment", "tests", "solution"):
         (task / name).mkdir(parents=True)
     (task / "task.toml").write_text(
         "version='1.0'\n[agent]\ntimeout_sec=10800.0\n"
         "[environment]\ncpus=2\nmemory_mb=8192\nbuild_timeout_sec=1800.0\n"
-        "docker_image='fixture:pinned'\n"
+        "docker_image='fixture:pinned'\n[verifier]\nmode='separate'\n[verifier.environment]\ndocker_image='grader:pinned'\ncpus=2\nmemory_mb=8192\nbuild_timeout_sec=1800\n"
     )
     (task / "instruction.md").write_text("Implement the task.\n")
+    (task / "tests/test.sh").write_text("#!/bin/sh\nexit 0\n")
+    (task / "tests/test.patch").write_text("")
     (tmp_path / "a.md").write_text("Use existing helpers.\n")
     (tmp_path / "b.md").write_text("Keep state minimal.\n")
-    monkeypatch.setattr(
-        subprocess,
-        "check_output",
-        lambda argv, **kw: evaluation.SUITE_SHA if "rev-parse" in argv else "",
-    )
     monkeypatch.setattr(
         harbor_backend,
         "_engine",
         lambda: ({"NCPU": 16, "MemTotal": 64 * 1024**3}, "unix:///fixture"),
     )
-    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: {"offline": True})
+    monkeypatch.setattr(
+        harbor_backend,
+        "runtime_identity",
+        lambda **kwargs: {
+            **native_runtime_identity(),
+            "resources": {
+                "cpus": kwargs.get("cpus", 2),
+                "memory_mb": kwargs.get("memory_mb", 8192),
+            },
+        },
+    )
     monkeypatch.setattr(harbor_backend, "assert_runtime", lambda expected: None)
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {})
     return evaluation.resolve_evaluation(
         {
             "runner": {"harness": "codex", "model": "gpt-6.1-sol", "reasoning": "medium"},
             "guidance": {"workflow": ["a.md"], "superpowers": ["b.md"]},
-            "tasks": {"source": "deep-swe/tasks", "ids": [evaluation.SUPPORTED_TASKS[0]]},
+            "tasks": {"source": "deep-swe/tasks", "ids": ["arbitrary-native-task"]},
             "measurements": ["tokens", "lines"],
         },
         tmp_path,
     )
 
 
-def test_only_run_and_report_are_public() -> None:
+def test_public_commands_cover_evaluations_reports_and_task_selection() -> None:
     result = CliRunner().invoke(cli.app, ["--help"])
     assert result.exit_code == 0
-    assert "run" in result.stdout and "report" in result.stdout
-    assert all(name not in result.stdout for name in ("legacy", "Promptfoo", "measure ", "review "))
+    assert set(get_group(cli.app).commands) == {"run", "report", "tasks"}
+    assert set(get_group(cli.tasks_app).commands) == {"pick"}
     assert CliRunner().invoke(cli.app, ["--version"]).stdout.strip() == "0.3.0"
 
 
@@ -75,10 +90,7 @@ def test_config_dry_run_includes_fresh_vanilla_and_every_package(
     assert result.exit_code == 0, result.stderr
     plan = json.loads(result.stdout)
     assert plan["coding_calls"] == 9 and plan["review_calls"] == 0
-    assert plan["guidance"] == ["superpowers", "workflow"] or plan["guidance"] == [
-        "workflow",
-        "superpowers",
-    ]
+    assert set(plan["treatments"]) == {"superpowers", "workflow"}
     assert "fresh vanilla" in plan["baseline"]
 
 
@@ -87,7 +99,7 @@ def test_flags_match_single_package_config(
     config: evaluation.Evaluation, monkeypatch: pytest.MonkeyPatch, jobs: int
 ) -> None:
     expected = config.model_copy(deep=True)
-    expected.guidance = {"workflow": expected.guidance["workflow"]}
+    expected.treatments = {"workflow": expected.treatments["workflow"]}
     expected.jobs = jobs
     result = CliRunner().invoke(
         cli.app,
@@ -100,7 +112,7 @@ def test_flags_match_single_package_config(
             "--reasoning",
             "medium",
             "--guidance",
-            str(config.guidance["workflow"][0]),
+            str(config.treatments["workflow"].guidance[0]),
             "--guidance-name",
             "workflow",
             "--tasks",
@@ -126,7 +138,17 @@ def test_harbor_rejects_cli_versions_it_cannot_pin_exactly(
 ) -> None:
     selected = config.model_copy(deep=True)
     monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 1)
-    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: {"offline": True})
+    monkeypatch.setattr(
+        harbor_backend,
+        "runtime_identity",
+        lambda **kwargs: {
+            **native_runtime_identity(),
+            "resources": {
+                "cpus": kwargs.get("cpus", 2),
+                "memory_mb": kwargs.get("memory_mb", 8192),
+            },
+        },
+    )
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {})
     monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": version})
     monkeypatch.setattr(codex, "invoke", lambda **kwargs: pytest.fail("cannot launch"))
@@ -202,12 +224,13 @@ def test_mixed_task_resources_require_an_explicit_common_budget(
     config: evaluation.Evaluation, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     selected = config.model_copy(deep=True)
-    task = selected.tasks.source / evaluation.SUPPORTED_TASKS[1]
+    task = selected.tasks.resolve() / "another-native-task"
     for name in ("environment", "tests", "solution"):
         (task / name).mkdir(parents=True)
     (task / "instruction.md").write_text("Implement another task.\n")
+    (task / "tests/test.sh").write_text("#!/bin/sh\nexit 0\n")
     (task / "task.toml").write_text(
-        "[agent]\ntimeout_sec=10800\n[environment]\ncpus=2\nmemory_mb=4096\nbuild_timeout_sec=1800\n"
+        "[agent]\ntimeout_sec=10800\n[environment]\ncpus=2\nmemory_mb=4096\nbuild_timeout_sec=1800\ndocker_image='fixture:pinned'\n[verifier]\nmode='separate'\n[verifier.environment]\ndocker_image='grader:pinned'\ncpus=2\nmemory_mb=4096\nbuild_timeout_sec=1800\n"
     )
     selected.tasks.ids.append(task.name)
     monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 1)
@@ -230,45 +253,19 @@ def test_failed_native_preparation_stops_before_coding_or_grading(
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {})
     monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.162.0"})
     monkeypatch.setattr(codex, "runtime_environment", lambda *args, **kwargs: ({}, ()))
-    monkeypatch.setattr(harbor_backend, "resolve_image", lambda image: {"image": image})
-    monkeypatch.setattr(
-        harbor_backend, "prepare_toolchain", lambda *args, **kwargs: {"fixed": True}
-    )
     monkeypatch.setattr(codex, "invoke", lambda **kwargs: pytest.fail("no coding call"))
-    monkeypatch.setattr(harbor_backend, "invoke", lambda **kwargs: pytest.fail("no native call"))
-
-    def prepare(argv: list[str], **kwargs: Any) -> None:
-        assert str(evaluation.ADAPTER / "prepare.py") in argv
-        assert "--prepared-dependencies" in argv
-        destination = Path(argv[argv.index("--output") + 1])
-        (destination / "fixture").mkdir(parents=True)
-        (destination / "fixture/source.ts").write_text("export const value = 1;\n")
-        (destination / "native-environment.json").write_text("{}")
-        (destination / "tasks.json").write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "tasks": [
-                        {
-                            "id": selected.tasks.ids[0],
-                            "fixture": "fixture",
-                            "prompt": "Implement the change.",
-                            "verifier": {"command": [sys.executable], "script": "verify.py"},
-                        }
-                    ],
-                }
-            )
-        )
+    monkeypatch.setattr(
+        harbor_backend, "invoke_native", lambda **kwargs: pytest.fail("no native call")
+    )
 
     def reject(**kwargs: Any) -> None:
-        assert kwargs["fixture"].is_dir()
-        assert kwargs["cpus"] == 2 and kwargs["memory_mb"] == 8192
-        raise ValueError("native visible checks failed")
+        assert kwargs["task_dir"].is_dir()
+        assert kwargs["limits"]["cpus"] == 2 and kwargs["limits"]["memory_mb"] == 8192
+        raise ValueError("native preparation failed")
 
-    monkeypatch.setattr(subprocess, "run", prepare)
-    monkeypatch.setattr(harbor_backend, "prepare_task_image", reject)
+    monkeypatch.setattr(harbor_backend, "prepare_native_task", reject)
     root = tmp_path / "evaluation"
-    with pytest.raises(ValueError, match="native visible checks failed"):
+    with pytest.raises(ValueError, match="native preparation failed"):
         evaluation.run_evaluation(selected, root)
     assert not (root / "evidence/attempts").exists()
 
@@ -280,7 +277,6 @@ def test_failed_native_preparation_stops_before_coding_or_grading(
         {"measurements": ["nope"]},
         {"measurements": ["review"]},
         {"repeats": 0},
-        {"tasks": {"source": ".", "ids": ["unsupported-task"]}},
         {"guidance": {"vanilla": ["a.md"]}},
         *({"jobs": jobs} for jobs in (0, 17, True, False, 1.5, "2", None)),
     ],
@@ -290,7 +286,7 @@ def test_invalid_contract_rejected_before_calls(
 ) -> None:
     with pytest.raises(ValueError):
         evaluation.resolve_evaluation(
-            {**config.model_dump(mode="json"), **mutation}, config.tasks.source.parent.parent
+            {**config.model_dump(mode="json"), **mutation}, config.tasks.resolve().parent.parent
         )
 
 
@@ -301,7 +297,7 @@ def test_fixed_reviewer_separate_from_candidate_guidance(config: evaluation.Eval
         "harness": "claude",
         "model": "claude-sonnet-5-5",
         "reasoning": "high",
-        "guidance": [str(config.guidance["workflow"][0])],
+        "guidance": [str(config.treatments["workflow"].guidance[0])],
     }
     selected = evaluation.resolve_evaluation(raw, Path.cwd())
     plan = evaluation.plan_evaluation(selected)
@@ -316,14 +312,17 @@ def test_comparison_identity_ignores_guidance_label_but_tracks_task_and_runtime(
 ) -> None:
     original = evaluation.plan_evaluation(config)["comparison_identity"]
     changed = config.model_copy(deep=True)
-    changed.guidance = {"other": config.guidance["workflow"]}
+    changed.treatments = {"other": config.treatments["workflow"]}
     assert evaluation.plan_evaluation(changed)["comparison_identity"] == original
     changed.jobs = 1 if config.jobs != 1 else 2
     assert evaluation.plan_evaluation(changed)["comparison_identity"] != original
     changed.jobs = config.jobs
+    changed.capabilities.subagents = not config.capabilities.subagents
+    assert evaluation.plan_evaluation(changed)["comparison_identity"] != original
+    changed.capabilities = config.capabilities.model_copy()
     changed.runner.reasoning = "high"
     assert evaluation.plan_evaluation(changed)["comparison_identity"] != original
-    (config.tasks.source / config.tasks.ids[0] / "instruction.md").write_text("Changed task")
+    (config.tasks.resolve() / config.tasks.ids[0] / "instruction.md").write_text("Changed task")
     assert evaluation.plan_evaluation(config)["comparison_identity"] != original
 
 
@@ -364,15 +363,18 @@ def test_jobs_override_works_with_config_and_is_visible_in_dry_run(
 
 
 @pytest.mark.parametrize(
-    "unavailable,recover,citation_error,collection_unavailable,collection_integrity",
+    "unavailable,recover,citation_error,collection_unavailable,collection_integrity,no_profiles,readiness_required",
     [
-        (False, False, False, False, False),
-        (True, False, False, False, False),
-        (False, True, False, False, False),
-        (True, True, False, False, False),
-        (False, False, True, False, False),
-        (False, False, False, True, False),
-        (False, False, False, False, True),
+        (False, False, False, False, False, False, False),
+        (True, False, False, False, False, False, False),
+        (False, True, False, False, False, False, False),
+        (True, True, False, False, False, False, False),
+        (False, False, True, False, False, False, False),
+        (False, False, False, True, False, False, False),
+        (False, False, False, False, True, False, False),
+        (False, False, False, False, False, True, False),
+        (False, False, False, True, False, False, True),
+        (False, False, False, False, False, False, True),
     ],
 )
 def test_integrated_evaluation_and_report_regeneration(
@@ -384,7 +386,10 @@ def test_integrated_evaluation_and_report_regeneration(
     citation_error: bool,
     collection_unavailable: bool,
     collection_integrity: bool,
+    no_profiles: bool,
+    readiness_required: bool,
 ) -> None:
+    config.measurement_settings.require_ready = readiness_required
     config.jobs = 1 if recover else 4
     config.measurements += ["coverage", "review"]
     standards = tmp_path / "review-standards.md"
@@ -392,81 +397,70 @@ def test_integrated_evaluation_and_report_regeneration(
     config.reviewer = evaluation.Reviewer(
         harness="codex", model="gpt-6-astra", reasoning="high", guidance=[standards]
     )
-    real_run = subprocess.run
+    separate_coverage_scope = not any(
+        (
+            unavailable,
+            recover,
+            citation_error,
+            collection_unavailable,
+            collection_integrity,
+            no_profiles,
+            readiness_required,
+        )
+    )
+    config.measurement_settings.source_scope = ["*"] if separate_coverage_scope else ["src/**"]
+    config.measurement_settings.test_scope = ["tests/**"]
+    from pluginbench.measurement_profiles import CoverageSettings
 
-    def prepare(argv: list[str], **kwargs: Any) -> Any:
-        if str(evaluation.ADAPTER / "calibrate.py") in argv:
-            return None
-        if str(evaluation.ADAPTER / "prepare.py") not in argv:
-            return real_run(argv, **kwargs)
-        destination = Path(argv[argv.index("--output") + 1])
+    config.measurement_settings.coverage = CoverageSettings(
+        command=["python3", "-m", "coverage"],
+        report_path="coverage/lcov.info",
+        tool_version="fixture-1",
+        source_scope=["src/**"],
+    )
+    if no_profiles:
+        config.measurement_settings.coverage = None
+
+    def prepare(**kwargs: Any) -> dict[str, object]:
+        destination = kwargs["destination"]
         destination.mkdir(parents=True)
-        (destination / "native-environment.json").write_text("{}")
-        fixture = destination / "fixture"
-        (fixture / "src").mkdir(parents=True)
-        (fixture / "src/answer.py").write_text("answer = 0\n")
-        (destination / "verify.py").write_text(
-            "from pathlib import Path\nimport sys\nsys.exit(0 if Path('src/answer.py').read_text() == 'answer = 1\\n' else 1)\n"
+        entry = task_entry(destination, kwargs["task_dir"].name, version=kwargs["version"])
+        provenance = entry["provenance"]
+        assert isinstance(provenance, dict)
+        identity: dict[str, object] = json.loads(provenance["native_task_identity"])
+        native_task = Path(str(identity["task_dir"]))
+        shutil.rmtree(native_task)
+        shutil.copytree(kwargs["task_dir"], native_task)
+        identity.update(
+            task_assets_sha256=harbor_backend.native_task_assets(native_task),
+            original_task_assets_sha256=harbor_backend.native_task_assets(kwargs["task_dir"]),
+            resources=kwargs["limits"],
+            isolation=harbor_backend.runtime_identity(
+                cpus=kwargs["limits"]["cpus"], memory_mb=kwargs["limits"]["memory_mb"]
+            ),
         )
-        (destination / "tasks.json").write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "tasks": [
-                        {
-                            "id": config.tasks.ids[0],
-                            "fixture": "fixture",
-                            "prompt": "Set answer to one.",
-                            "verifier": {
-                                "command": [sys.executable],
-                                "script": "verify.py",
-                            },
-                        }
-                    ],
-                }
-            )
+        qualify_synthetic_source(identity)
+        if readiness_required and not collection_unavailable:
+            identity["source_qualification"] = {
+                "status": "unknown",
+                "reason": "grader baseline differs from coding fixture",
+            }
+        return identity
+
+    def native_coverage(**kwargs: Any) -> dict[str, object]:
+        destination = kwargs["destination"]
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "report.raw").write_text(
+            "SF:src/answer.py\nFN:1,answer\nFNDA:1,answer\nFNF:1\nFNH:1\nBRDA:1,0,0,1\nBRF:1\nBRH:1\nend_of_record\n"
         )
-        collector = destination / "coverage.py"
-        collector.write_text(
-            "import json,pathlib,sys\n"
-            "report={'files_measured':['src/answer.py'], 'branches':{'total':['src/answer.py:1:0'],'covered':['src/answer.py:1:0']}, 'functions':{'total':['src/answer.py:1:0'],'covered':['src/answer.py:1:0']}}\n"
-            "pathlib.Path(sys.argv[2]).write_text(json.dumps(report))\n"
-        )
-        profile = destination / "coverage.json"
-        profile.write_text('{"test_scope":["tests/**"]}')
-        (destination / "measurements.json").write_text(
-            json.dumps(
-                {
-                    config.tasks.ids[0]: [
-                        {
-                            "kind": "coverage",
-                            "config": str(profile),
-                            "scope": ["src/**"],
-                            "command": [sys.executable, str(collector), "{snapshot}", "{output}"],
-                            "tool_version": "fixture-1",
-                            "failure_protocol": "coverage-exit-v1",
-                        }
-                    ]
-                }
-            )
-        )
-        (destination / "provenance.json").write_text(
-            json.dumps(
-                {
-                    "source_scope": '["src/**"]',
-                    "test_scope": '["tests/**"]',
-                    "measurement_profile_version": "test-v1",
-                }
-            )
-        )
-        return None
+        return {"exit_code": 0, "timed_out": False, "report_collected": True}
 
     calls = []
     judge_calls = []
     call_lock = Lock()
 
     def invoke(**kwargs: Any) -> dict[str, Any]:
-        if kwargs.get("read_only"):
+        if kwargs.get("output_schema") is not None:
             judge_calls.append(kwargs)
             packet = json.loads((kwargs["area"] / "workspace/packet.json").read_text())
             issues = []
@@ -510,61 +504,103 @@ def test_integrated_evaluation_and_report_regeneration(
             (kwargs["area"] / "workspace/src/answer.py").write_text("answer = 1\n")
         elif unavailable:
             (kwargs["area"] / "workspace/src/alias.py").symlink_to("answer.py")
-        return {
-            "submission_collected": True,
-            "successful_native_completion": True,
-            "actual_primary_models": ["gpt-6.1-sol"],
-            "runtime_effort_evidence": ["medium"],
-            "usage": {"input_tokens": 100 + call_number, "output_tokens": 20},
-            "startup": [{"type": "session_meta", "payload": {"cli_version": "test-version"}}],
-        }
+        if separate_coverage_scope:
+            (kwargs["area"] / "workspace/outside.py").write_text("outside = 1\n")
+        result = native_execution(
+            kwargs["area"],
+            kwargs["protocol"]["native_task_identity"],
+            reward=0 if call_number == 1 else 1,
+            timeout=config.timeout_seconds,
+            version="0.162.0",
+        )
+        if separate_coverage_scope:
+            verifier = result["native_verifier_result"]
+            assert isinstance(verifier, dict)
+            rewards = verifier["rewards"]
+            assert isinstance(rewards, dict)
+            rewards.update(f2p=1.0, p2p=1.0)
+        result.update(
+            usage={"input_tokens": 100 + call_number, "output_tokens": 20},
+            startup=[
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "cli_version": "0.162.0" if separate_coverage_scope else "test-version"
+                    },
+                }
+            ],
+        )
+        return result
 
-    monkeypatch.setattr(subprocess, "run", prepare)
     monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.162.0"})
-    monkeypatch.setattr(
-        harbor_backend, "resolve_image", lambda image: {"image": "fixture@sha256:" + "a" * 64}
-    )
-    monkeypatch.setattr(
-        harbor_backend, "prepare_toolchain", lambda *args, **kwargs: {"fixed": True}
-    )
-    monkeypatch.setattr(harbor_backend, "prepare_task_image", lambda **kwargs: {"fixed": True})
+    monkeypatch.setattr(harbor_backend, "prepare_native_task", prepare)
+    monkeypatch.setattr(harbor_backend, "run_native_command", native_coverage)
     monkeypatch.setattr(codex, "runtime_environment", lambda *args: ({}, ()))
     monkeypatch.setattr(codex, "invoke", invoke)
-    monkeypatch.setattr(harbor_backend, "invoke", invoke)
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
     root = tmp_path / "results"
+    reward_decoder = study._binary_native_reward
+    if separate_coverage_scope:
+        monkeypatch.setattr(study, "_binary_native_reward", lambda value: None)
+
+    def _invalid_lcov(destination: Path) -> dict[str, object]:
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "report.raw").write_text("SF:../escape.py\nend_of_record\n")
+        return {"exit_code": 0, "timed_out": False, "report_collected": True}
+
     if collection_integrity:
         monkeypatch.setattr(
-            collectors,
-            "_execute",
-            lambda argv, cwd, timeout, *, output=None, config=None: subprocess.CompletedProcess(
-                argv, 2, stdout="", stderr="inner integrity rejected"
-            ),
+            harbor_backend,
+            "run_native_command",
+            lambda **kwargs: _invalid_lcov(kwargs["destination"]),
         )
-        with pytest.raises(ValueError, match="trusted coverage adapter rejected evidence"):
+        with pytest.raises(ValueError, match="Coverage"):
             evaluation.run_evaluation(config, root)
-        assert len(calls) == 9 and not judge_calls
-        state = json.loads(
-            (root / "evidence/observer-revisions/measurements/revision.json").read_text()
-        )
-        assert state["status"] == "failed"
+        assert not calls and not judge_calls
+        assert not (root / "evidence/run.json").exists()
         assert not (root / "report").exists()
         assert not (root / "evidence/review-revisions").exists()
         return
     if recover:
-        execute = collectors._execute
+        execute = harbor_backend.run_native_command
 
         def interrupted_initial(*args: Any, **kwargs: Any) -> Any:
+            if "measurement-readiness" in str(kwargs.get("destination")):
+                return execute(*args, **kwargs)
             raise KeyboardInterrupt("interrupted measurement job")
 
-        monkeypatch.setattr(collectors, "_execute", interrupted_initial)
+        monkeypatch.setattr(harbor_backend, "run_native_command", interrupted_initial)
         with pytest.raises(KeyboardInterrupt):
             evaluation.run_evaluation(config, root)
         assert len(calls) == 9 and not judge_calls
+        if unavailable:
+            # Simulate a historical file-only selection at the persisted resume boundary.
+            saved = evaluation._load_selection(root)
+            treatments = saved.pop("treatments")
+            assert isinstance(treatments, dict)
+            saved["guidance"] = {name: item["guidance"] for name, item in treatments.items()}
+            saved.pop("capabilities")
+            original_comparison = saved["comparison_identity"]
+            evaluation._save_selection(root, saved)
         assert evaluation.plan_resume(root)["jobs"] == config.jobs
-        monkeypatch.setattr(collectors, "_execute", execute)
-        frozen = next((root / "evidence/observer-revisions/measurements/profiles").rglob("*.py"))
+        if unavailable:
+            assert evaluation._load_selection(root)["comparison_identity"] == original_comparison
+        monkeypatch.setattr(harbor_backend, "run_native_command", execute)
+        for directory in ("diagnostic-source", "snapshot"):
+            source = next((root / "evidence/attempts").glob(f"*/handoff/{directory}/src/answer.py"))
+            mode = source.stat().st_mode
+            source.chmod(0o755)
+            with pytest.raises(
+                ValueError, match="metadata changed|canonical graded source changed"
+            ):
+                evaluation.plan_resume(root)
+            source.chmod(mode)
+            assert len(calls) == 9 and not judge_calls
+        frozen = next(
+            (root / "evidence/observer-revisions/measurements/profiles").rglob("config.json")
+        )
         original_profile = frozen.read_bytes()
-        frozen.write_bytes(original_profile + b"\n# edited\n")
+        frozen.write_bytes(original_profile + b"\n ")
         with pytest.raises(ValueError, match="frozen observer profiles changed"):
             evaluation.plan_resume(root)
         frozen.write_bytes(original_profile)
@@ -609,24 +645,37 @@ def test_integrated_evaluation_and_report_regeneration(
             assert evaluation.plan_resume(root)["coding_calls"] == 0
             assert len(calls) == 9 and not judge_calls
         monkeypatch.setattr(evaluation, "propose_remeasurement", propose_remeasurement)
-        for files in config.guidance.values():
+        for treatment in config.treatments.values():
+            files = treatment.guidance
             for file in files:
                 file.unlink()
         standards.unlink()
         result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes"])
         assert result.exit_code == 0, result.stderr
-        assert "0 coding calls +" in result.stdout
+        assert "0 coding attempts +" in result.stdout
         failed = root / "evidence/observer-revisions/measurements/revision.json"
         assert json.loads(failed.read_text())["status"] == "failed"
     else:
         if collection_unavailable:
             monkeypatch.setattr(
-                collectors,
-                "_execute",
-                lambda argv, cwd, timeout, *, output=None, config=None: subprocess.CompletedProcess(
-                    argv, 3, stdout="", stderr="coverage unavailable"
-                ),
+                harbor_backend,
+                "run_native_command",
+                lambda **kwargs: {"exit_code": 3, "timed_out": False, "report_collected": False},
             )
+        if readiness_required:
+            with pytest.raises(ValueError, match="no coding calls"):
+                evaluation.run_evaluation(config, root)
+            assert not calls and not judge_calls
+            readiness = json.loads((root / "measurement-readiness.json").read_text())
+            if collection_unavailable:
+                assert all(row["coverage"]["readiness"] == "failed" for row in readiness.values())
+            else:
+                assert all(
+                    row["submission_source"]["reason"]
+                    == "grader baseline differs from coding fixture"
+                    for row in readiness.values()
+                )
+            return
         if citation_error:
             recover_citations = recover_review_citations
 
@@ -641,6 +690,17 @@ def test_integrated_evaluation_and_report_regeneration(
             evaluation.resume_evaluation(root)
         else:
             evaluation.run_evaluation(config, root)
+    if separate_coverage_scope:
+        original_receipts = {
+            path: path.read_bytes()
+            for pattern in ("attempts/*/*/correctness.json", "attempts/*/*/verifier-result.json")
+            for path in (root / "evidence").glob(pattern)
+        }
+        model_calls = len(calls), len(judge_calls)
+        monkeypatch.setattr(study, "_binary_native_reward", reward_decoder)
+        evaluation.regenerate_report(root)
+        assert (len(calls), len(judge_calls)) == model_calls
+        assert all(path.read_bytes() == data for path, data in original_receipts.items())
     data = json.loads((root / "report/results.json").read_text())
     assert data["jobs"] == data["comparison_identity"]["jobs"] == config.jobs
     assert json.loads((root / "evidence/run.json").read_text())["jobs"] == config.jobs
@@ -649,7 +709,15 @@ def test_integrated_evaluation_and_report_regeneration(
         root / "evidence/observer-revisions" / str(saved_selection["measurement_revision"])
     )
     review = root / "evidence/review-revisions" / str(saved_selection["review_revision"])
-    assert json.loads((measurement / "revision.json").read_text())["jobs"] == config.jobs
+    if no_profiles:
+        assert saved_selection["measurement_required"] is False
+        assert not (root / "evidence/observer-revisions").exists()
+        assert evaluation.plan_resume(root)["collect_measurements"] is False
+        counts = len(calls), len(judge_calls)
+        evaluation.resume_evaluation(root)
+        assert (len(calls), len(judge_calls)) == counts
+    else:
+        assert json.loads((measurement / "revision.json").read_text())["jobs"] == config.jobs
     assert json.loads((review / "protocol.json").read_text())["jobs"] == config.jobs
     assert len(calls) == data["assigned"] == 9
     assert {row["guidance"] for row in data["attempts"]} == {"baseline", "workflow", "superpowers"}
@@ -666,8 +734,14 @@ def test_integrated_evaluation_and_report_regeneration(
     coverage = [row for row in data["observations"] if row["metric"] == "Branch coverage %"]
     findings = [row for row in data["observations"] if row["metric"] == "Total review findings"]
     assert len(coverage) == len(findings) == 9
+    if separate_coverage_scope:
+        assert all(row["status"] == "measured" for row in coverage)
+        source_lines = [
+            row for row in data["observations"] if row["metric"] == "Source lines added"
+        ]
+        assert sorted(row["value"] for row in source_lines) == [1] + [2] * 8
     assert sum(row["value"] is None for row in coverage) == (
-        9 if collection_unavailable else int(unavailable)
+        9 if collection_unavailable or no_profiles else int(unavailable)
     )
     assert sum(row["value"] is None for row in findings) == int(unavailable)
     assert data["comparison_identity"]["observed_reviewer_profiles"]
@@ -740,7 +814,7 @@ def test_integrated_evaluation_and_report_regeneration(
     if citation_error:
         result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes"])
         assert result.exit_code == 0, result.stderr
-        assert "0 coding calls + 0 review calls" in result.stdout
+        assert "0 coding attempts + 0 review calls" in result.stdout
         assert (root / "report/results.json").read_bytes() == original
     if recover:
         saved = json.loads((root / "evaluation.json").read_text())
@@ -749,7 +823,7 @@ def test_integrated_evaluation_and_report_regeneration(
         evaluation._save_selection(root, saved)
         result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes"])
         assert result.exit_code == 0, result.stderr
-        assert "0 coding calls + 0 review calls" in result.stdout
+        assert "0 coding attempts + 0 review calls" in result.stdout
         assert (root / "report/results.json").read_bytes() == original
     selection = root / "evaluation.json"
     selection.write_text(selection.read_text().replace('"repeats": 3', '"repeats": 4'))

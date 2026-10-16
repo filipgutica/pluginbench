@@ -82,6 +82,8 @@ METRICS = (
             ("unit-size maximum", "max_unit_size_reported"),
         )
     ),
+    ("Coverage", "Line coverage %", "coverage", "line_percent"),
+    ("Coverage", "Statement coverage %", "coverage", "statement_percent"),
     ("Coverage", "Branch coverage %", "coverage", "branch_percent"),
     ("Coverage", "Function coverage %", "coverage", "function_percent"),
     ("LOC", "Source LOC", "loc", "source_lines"),
@@ -133,6 +135,16 @@ METRICS = (
 # Display copy stays separate from the metric identities used in evidence and CSVs.
 # Each entry supplies a title, axis unit, and a brief explanation beside the plot.
 METRIC_GUIDE = {
+    "Line coverage %": (
+        "Line coverage",
+        "% covered",
+        "Executable source lines reached by the selected tests. Unsupported units remain unknown; coverage alone does not establish useful assertions.",
+    ),
+    "Statement coverage %": (
+        "Statement coverage",
+        "% covered",
+        "Source statements reached by the selected tests. Go counts statements within measured blocks; this is not branch or function coverage.",
+    ),
     "Input tokens": (
         "Input tokens",
         "tokens",
@@ -359,6 +371,49 @@ def _number(value: object) -> float | None:
     return None
 
 
+def execution_outcome(provenance: object) -> dict[str, object]:
+    """Explain bound native completion independently of source/task grading."""
+    evidence = _map(provenance)
+    if evidence.get("successful_native_completion") is True:
+        return {"status": "complete", "reason": None}
+    if evidence.get("timed_out") is True:
+        return {"status": "timed_out", "reason": "Native execution timed out."}
+    exit_code = evidence.get("exit_code")
+    if evidence.get("successful_native_completion") is not False and not (
+        type(exit_code) is int and exit_code != 0
+    ):
+        return {"status": "unknown", "reason": None}
+    error = _map(evidence.get("error"))
+    error_type = error.get("exception_type")
+    cause = None
+    stream_errors = evidence.get("stream_errors")
+    if isinstance(stream_errors, list):
+        for event in reversed(stream_errors):
+            row = _map(event)
+            message = _map(row.get("error")).get("message", row.get("message"))
+            if isinstance(message, str) and message.strip():
+                cause = message.strip()
+                break
+    if cause is None:
+        message = error.get("message")
+        if not message and not error_type:
+            message = error.get("exception_message")
+        if not message and isinstance(evidence.get("error"), str):
+            message = evidence["error"]
+        if isinstance(message, str) and message.strip():
+            cause = message.strip().splitlines()[0]
+    label = "Native execution failed"
+    if isinstance(error_type, str) and error_type:
+        label += " (" + error_type + ")"
+    if cause:
+        reason = label + ": " + cause
+    elif type(exit_code) is int and exit_code != 0:
+        reason = label + f" (exit {exit_code})."
+    else:
+        reason = label + "."
+    return {"status": "failed", "reason": reason}
+
+
 def _fingerprint(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
@@ -457,8 +512,17 @@ def _observation(
     attempt: dict[str, object], stage: dict[str, object], role: str, spec: tuple[str, str, str, str]
 ) -> Observation:
     panel, label, kind, key = spec
+    static_kind = (
+        "analysis"
+        if "analysis" in _map(stage.get("metrics"))
+        and _map(_map(stage.get("metrics")).get("analysis")).get("status") == "available"
+        else "fallow"
+    )
     work = _map(stage.get("work"))
-    evidence = _map(_map(stage.get("metrics")).get("fallow" if kind == "fallow_change" else kind))
+    native_outcome = execution_outcome(stage.get("execution_provenance"))
+    evidence = _map(
+        _map(stage.get("metrics")).get(static_kind if kind in {"fallow", "fallow_change"} else kind)
+    )
     metrics = _map(evidence.get("metrics"))
     provenance = _map(evidence.get("provenance"))
     settings = _runtime(attempt)
@@ -607,7 +671,7 @@ def _observation(
             identity.update(provenance)
             reason = "extension-classified LOC, including generated files; shared source/test classification"
     elif kind == "fallow_change":
-        comparison = _map(_map(stage.get("metric_comparison")).get("fallow"))
+        comparison = _map(_map(stage.get("metric_comparison")).get(static_kind))
         path = key.split(".")
         detail = _map(comparison.get(path[0]))
         population_metrics = _map(detail.get(path[1])) if len(path) == 3 else detail
@@ -667,21 +731,42 @@ def _observation(
                 if key == "clone_groups"
                 else "reported function maximum across declared scope, including tests when scoped; partial reporting is not a complete maximum"
             )
+            if static_kind == "analysis":
+                reason = (
+                    str(metrics.get("dead_code_detection"))
+                    if key == "dead_code"
+                    else "function scores under the named language analyzer; unlike analyzer definitions are not interchangeable"
+                )
+                if key != "dead_code" and metrics.get("language") == "python":
+                    reason += "; " + str(_map(metrics.get("settings")).get("python_rca_population"))
         if kind == "coverage":
-            denominator = (
-                "function_denominator_digest"
-                if key == "function_percent"
-                else "branch_denominator_digest"
-            )
+            unit = key.partition("_")[0] if key.endswith("_percent") else "branch"
+            denominator = f"{unit}_denominator_digest"
             provenance = {**provenance, denominator: metrics.get(denominator)}
             eligible = eligible and isinstance(metrics.get(denominator), str)
-            eligible = eligible and metrics.get("population_complete_for_declared_scope") is True
-            if metrics.get("population_complete_for_declared_scope") is not True:
+            complete = metrics.get(
+                f"{unit}_population_complete", metrics.get("population_complete_for_declared_scope")
+            )
+            eligible = eligible and complete is True
+            if metrics.get(denominator) is None:
+                reason = f"{unit} coverage is not supplied by {metrics.get('format') or 'this report format'}"
+            elif complete is not True:
                 reason = (
                     "reported coverage only; declared source population completeness is unproven"
                 )
             else:
                 reason = "coverage of each submission's source; populations may differ; descriptive per-submission rates, no fixed-denominator gain claim"
+            plural = {
+                "line": "lines",
+                "statement": "statements",
+                "branch": "branches",
+                "function": "functions",
+            }
+            limit = _map(_map(metrics.get("unavailable_populations")).get(plural[unit]))
+            if limit.get("reason") and (metrics.get(denominator) is None or complete is not True):
+                reason = str(limit["reason"])
+            if metrics.get(f"{unit}_total") == 0 and complete is True:
+                reason = f"measured {unit} population is empty; percentage is undefined"
             provenance.update(
                 {
                     name: metrics.get(name)
@@ -695,12 +780,8 @@ def _observation(
             )
             provenance.update(
                 {
-                    "covered": metrics.get(
-                        "function_covered" if key == "function_percent" else "branch_covered"
-                    ),
-                    "total": metrics.get(
-                        "function_total" if key == "function_percent" else "branch_total"
-                    ),
+                    "covered": metrics.get(f"{unit}_covered"),
+                    "total": metrics.get(f"{unit}_total"),
                 }
             )
         if key == "zero_marginal_count":
@@ -794,16 +875,30 @@ def _observation(
     compatibility = (
         _fingerprint(identity) if eligible and identity_known and value is not None else None
     )
+    provenance.update(
+        execution_status=native_outcome["status"], execution_reason=native_outcome["reason"]
+    )
     if value is None:
-        status, reason = (
-            "unknown",
-            reason + "; unknown is not zero"
-            if kind in {"fallow_change", "loc", "loc_change", "review_findings"}
-            or key == "zero_marginal_count"
-            else _text(evidence.get("reason"))
-            if evidence.get("reason")
-            else "measurement unavailable; unknown is not zero",
-        )
+        if kind == "work" and isinstance(provenance.get("execution_reason"), str):
+            reason = (
+                str(provenance["execution_reason"])
+                + "; final token usage unavailable; unknown is not zero"
+            )
+            partial = _map(stage.get("execution_provenance")).get("partial_usage")
+            if isinstance(partial, list) and partial:
+                reason += "; partial usage receipts are lower bounds, not totals"
+            status = "unknown"
+        else:
+            status, reason = (
+                "unknown",
+                reason + "; unknown is not zero"
+                if kind in {"fallow_change", "loc", "loc_change", "review_findings"}
+                or key == "zero_marginal_count"
+                or (kind == "coverage" and metrics)
+                else _text(evidence.get("reason"))
+                if evidence.get("reason")
+                else "measurement unavailable; unknown is not zero",
+            )
     else:
         status = "measured" if compatibility else "not comparable"
     change = _map(stage.get("change"))
@@ -1008,7 +1103,7 @@ def _measurement_completeness(attempts: list[dict[str, object]]) -> list[dict[st
         for attempt in attempts
         if (
             isinstance(configured := attempt.get("configured_metrics"), list)
-            and any(kind in configured for kind in ("coverage", "fallow"))
+            and any(kind in configured for kind in ("coverage", "fallow", "analysis"))
         )
         or any(
             _map(evidence.get(kind)).get("metrics")
@@ -1016,7 +1111,7 @@ def _measurement_completeness(attempts: list[dict[str, object]]) -> list[dict[st
                 _map(attempt.get("before_metrics")),
                 *(_map(stage.get("metrics")) for stage in _rows(attempt.get("stages"))),
             )
-            for kind in ("coverage", "fallow")
+            for kind in ("coverage", "fallow", "analysis")
         )
     }
     rows = []
@@ -1026,12 +1121,23 @@ def _measurement_completeness(attempts: list[dict[str, object]]) -> list[dict[st
         stages = _rows(attempt.get("stages"))
         stage = stages[0]
         evidence = _map(stage.get("metrics"))
-        static = _map(_map(evidence.get("fallow")).get("metrics"))
+        static_kind = (
+            "analysis" if _map(evidence.get("analysis")).get("status") == "available" else "fallow"
+        )
+        static = _map(_map(evidence.get(static_kind)).get("metrics"))
         coverage = _map(_map(evidence.get("coverage")).get("metrics"))
         overlap = _map(coverage.get("test_contribution"))
-        comparison = _map(_map(stage.get("metric_comparison")).get("fallow"))
+        comparison = _map(_map(stage.get("metric_comparison")).get(static_kind))
         work = stage.get("work")
         tokens = _map(_map(work).get("tokens"))
+        coverage_units = [
+            unit
+            for unit in ("line", "statement", "branch", "function")
+            if any(
+                coverage.get(f"{unit}_{key}") is not None
+                for key in ("total", "covered", "percent", "denominator_digest")
+            )
+        ]
         captured = {
             "Input/output tokens": all(
                 _number(tokens.get(key)) is not None for key in ("input_tokens", "output_tokens")
@@ -1046,16 +1152,18 @@ def _measurement_completeness(attempts: list[dict[str, object]]) -> list[dict[st
             ),
             "Complexity population": static.get("complexity_complete_for_declared_scope") is True
             and _number(static.get("function_count_reported")) is not None,
-            "Coverage covered/total counts": coverage.get("population_complete_for_declared_scope")
-            is True
+            "Coverage covered/total counts": bool(coverage_units)
             and all(
-                _number(coverage.get(key)) is not None
-                for key in (
-                    "branch_total",
-                    "branch_covered",
-                    "function_total",
-                    "function_covered",
+                coverage.get(
+                    f"{unit}_population_complete",
+                    coverage.get("population_complete_for_declared_scope"),
                 )
+                is True
+                and all(
+                    _number(coverage.get(f"{unit}_{key}")) is not None
+                    for key in ("total", "covered")
+                )
+                for unit in coverage_units
             ),
             "Introduced dead findings": _map(comparison.get("dead_findings")).get("status")
             == "available"

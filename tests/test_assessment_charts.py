@@ -631,6 +631,29 @@ def test_coverage_without_declared_population_proof_stays_raw() -> None:
     assert row["value"] == 75 and "population completeness is unproven" in str(row["reason"])
 
 
+@pytest.mark.parametrize("missing,empty", [(True, False), (False, False), (False, True)])
+def test_public_coverage_observation_preserves_lcov_ambiguity_reason(
+    missing: bool, empty: bool
+) -> None:
+    report = _report()
+    coverage = _metric_values(report, "coverage")
+    reason = "Repeated LCOV function names have mixed hits; FNDA has no source line"
+    coverage.update(
+        function_population_complete=False,
+        unavailable_populations={"functions": {"files": ["src/fixture.ts"], "reason": reason}},
+    )
+    if missing:
+        coverage.update(function_percent=None, function_denominator_digest=None)
+    if empty:
+        coverage.update(function_percent=None, function_total=0)
+    data = chart_data(report)
+    row = next(
+        row for row in _observations(data, "Function coverage %") if row["arm"] == "candidate"
+    )
+    assert row["reason"] == reason + ("; unknown is not zero" if missing or empty else "")
+    assert not _matched(data, "Function coverage %")
+
+
 @pytest.mark.parametrize(
     "actual,version,correctness,state",
     [
@@ -808,8 +831,16 @@ def test_complete_capture_retains_failed_configured_observers(all_failed: bool) 
         attempt["configured_metrics"] = ["fallow", "coverage"]
         _stage(report, index)["metrics"] = {
             "fallow": {"status": "unavailable", "metrics": None},
-            "coverage": {"status": "unavailable", "metrics": None},
+            "coverage": {
+                "status": "unavailable",
+                "metrics": None,
+                "reason": "coverage command timed out",
+            },
         }
+    coverage_rows = _observations(chart_data(report), "Branch coverage %")
+    failed_coverage = next(row for row in coverage_rows if row["arm"] == "candidate")
+    assert failed_coverage["value"] is None
+    assert failed_coverage["reason"] == "coverage command timed out"
     rows = [
         row
         for row in _chart_rows(chart_data(report), "measurement_completeness")
@@ -1053,3 +1084,53 @@ def test_review_token_comparisons_require_same_bound_criteria(
             bool(rows[0]["compatibility"] and rows[0]["compatibility"] == rows[1]["compatibility"])
             is comparable
         )
+
+
+@pytest.mark.parametrize("statement_support", ["measured", "unsupported", "empty"])
+def test_coverage_observations_keep_each_units_supporting_counts(statement_support: str) -> None:
+    report = _report()
+    coverage = _metric_values(report, "coverage")
+    coverage.update(
+        line_total=10,
+        line_covered=8,
+        line_percent=80.0,
+        line_denominator_digest="lines",
+        line_population_complete=True,
+        statement_total=7,
+        statement_covered=3,
+        statement_percent=300 / 7,
+        statement_denominator_digest="statements",
+        statement_population_complete=True,
+    )
+    if statement_support != "measured":
+        coverage.update(
+            format="lcov",
+            statement_total=0 if statement_support == "empty" else None,
+            statement_covered=0 if statement_support == "empty" else None,
+            statement_percent=None,
+            statement_denominator_digest="empty" if statement_support == "empty" else None,
+            statement_population_complete=statement_support == "empty",
+        )
+    rows = _chart_rows(chart_data(report), "observations")
+    for metric, covered, total in (("Line coverage %", 8, 10), ("Statement coverage %", 3, 7)):
+        row = next(
+            row
+            for row in rows
+            if row["metric"] == metric and row["arm"] == "candidate" and row["role"] == "handoff"
+        )
+        provenance = row["provenance"]
+        assert isinstance(provenance, dict)
+        if metric == "Statement coverage %" and statement_support != "measured":
+            count = 0 if statement_support == "empty" else None
+            assert row["value"] is None
+            assert row["compatibility"] is None
+            assert provenance["covered"] == provenance["total"] == count
+            expected = (
+                "measured statement population is empty; percentage is undefined"
+                if statement_support == "empty"
+                else "statement coverage is not supplied by lcov"
+            )
+            assert row["reason"] == expected + "; unknown is not zero"
+        else:
+            assert provenance["covered"] == covered
+            assert provenance["total"] == total

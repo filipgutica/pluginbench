@@ -151,7 +151,7 @@ def _code_size(
 ) -> dict[str, object]:
     kinds = {
         kind
-        for kind in ("fallow", "coverage")
+        for kind in ("fallow", "analysis", "coverage")
         if kind in (record.before_evidence or {}) or kind in (stage.evidence or {})
     }
     if not kinds:

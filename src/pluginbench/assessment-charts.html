@@ -324,6 +324,17 @@ document.getElementById("limitations").after(methodology);
 document.getElementById("limitations").querySelector("summary").textContent = "Measurement limits";
 
 const emptyFunctionMaximum = row => ["Complexity", "Changed functions", "New-file functions"].includes(row.panel) && row.value === null && row.provenance.reported_functions === 0 && row.provenance.complete_for_declared_scope === true;
+function taskCheckSummary(attempts) {
+  const executions = attempts.filter(row => ["failed", "timed_out"].includes(row.execution?.status));
+  const completed = attempts.filter(row => !executions.includes(row));
+  const passed = completed.filter(row => row.correctness === "pass").length;
+  const failed = completed.filter(row => row.correctness === "fail" && row.execution?.status === "complete").length;
+  const unknown = attempts.length - passed - failed - executions.length;
+  return {
+    passed: passed + "/" + attempts.length + " attempts passed",
+    remainder: failed + " failed task check" + (failed === 1 ? "" : "s") + " · " + executions.length + " execution failure" + (executions.length === 1 ? "" : "s") + " · " + unknown + " unknown",
+  };
+}
 function showPackageSummary() {
   const metricsOpen = packageSummary.querySelector("details")?.open || false;
   packageSummary.replaceChildren();
@@ -339,9 +350,9 @@ function showPackageSummary() {
   const counts = rowFor("Measurement values");
   for (const arm of arms) {
     const attempts = data.attempts.filter(row => row.guidance === arm && (!taskSelect.value || row.task === taskSelect.value));
-    const pass = attempts.filter(row => row.correctness === "pass").length, fail = attempts.filter(row => row.correctness === "fail").length;
-    const cell = create("td", pass + "/" + attempts.length + " attempts passed", checks);
-    create("small", fail + " failed · " + (attempts.length - pass - fail) + " unknown", cell);
+    const summary = taskCheckSummary(attempts);
+    const cell = create("td", summary.passed, checks);
+    create("small", summary.remainder, cell);
     const rows = observations.filter(row => row.arm === arm && (!taskSelect.value || row.task === taskSelect.value));
     const numeric = rows.filter(row => row.value !== null).length, empty = rows.filter(emptyFunctionMaximum).length;
     const countCell = create("td", numeric + "/" + rows.length + " numeric", counts);
@@ -367,7 +378,7 @@ function showPackageSummary() {
       const result = valueRows.length === 1 ? valueRows[0] : null;
       const members = observations.filter(row => row.arm === arm && row.metric === metric && (!taskSelect.value || row.task === taskSelect.value));
       const empty = members.length && members.every(emptyFunctionMaximum);
-      const cell = create("td", result?.value !== undefined && result.value !== null ? format(result.value) : empty ? "No functions" : "Unknown", row);
+      const cell = create("td", valueRows.length > 1 && !taskSelect.value ? "Separate analyzer groups" : result?.value !== undefined && result.value !== null ? format(result.value) : empty ? "No functions" : "Unknown", row);
       if (!taskSelect.value && result) create("small", result.measured_tasks + "/" + result.assigned_tasks + " tasks", cell);
       if (arm !== "baseline") {
         const deltaRows = taskSelect.value ? (data.comparisons || []).filter(row => row.task === taskSelect.value && row.metric === metric && row.guidance === arm) : valueRows;
@@ -436,15 +447,29 @@ function showOutcomes() {
   const target = document.getElementById("outcomes");
   target.replaceChildren();
   create("h2", "Task checks", target);
-  create("p", "Task checks are separate from metric completeness. Failed and unknown attempts remain assigned.", target).className = "counts";
+  create("p", "Completed task-check failures, native execution failures, and unknown outcomes are counted separately. All attempts remain assigned; these counts do not establish why an execution failed.", target).className = "counts";
   const attempts = (data.attempts || []).filter(row => !taskSelect.value || row.task === taskSelect.value);
   const table = create("table", undefined, target);
   const header = create("tr", undefined, table);
-  for (const text of ["Task", "Guidance", "Checks passed / assigned"]) create("th", text, header);
+  for (const text of ["Task", "Guidance", "Checks passed / assigned"]) create("th", text, header).scope = "col";
   for (const key of unique(attempts.map(row => JSON.stringify([row.task, row.guidance])))) {
     const [task, arm] = JSON.parse(key), members = attempts.filter(row => row.task === task && row.guidance === arm);
     const tr = create("tr", undefined, table);
-    for (const value of [task, armLabel(arm), members.filter(row => row.correctness === "pass").length + " / " + members.length]) create("td", value, tr);
+    for (const value of [task, armLabel(arm)]) create("td", value, tr);
+    const summary = taskCheckSummary(members), cell = create("td", summary.passed, tr);
+    create("small", summary.remainder, cell);
+  }
+  const failures = attempts.filter(row => ["failed", "timed_out"].includes(row.execution?.status));
+  if (!failures.length) return;
+  create("h3", "Native execution failures", target);
+  create("p", "Execution failures are separate from task checks. Available metrics remain shown; partial token receipts are lower bounds, not final totals.", target).className = "counts";
+  const wrap = create("div", undefined, target); wrap.className = "table-wrap";
+  const failureTable = create("table", undefined, wrap), head = create("tr", undefined, create("thead", undefined, failureTable));
+  for (const label of ["Task", "Guidance", "Run", "Execution reason"]) create("th", label, head).scope = "col";
+  const body = create("tbody", undefined, failureTable);
+  for (const failure of failures) {
+    const row = create("tr", undefined, body);
+    for (const value of [failure.task, armLabel(failure.guidance), failure.repeat ?? failure.id, failure.execution.reason]) create("td", value, row);
   }
 }
 
@@ -511,7 +536,7 @@ function evaluationPlotRows({ rows, metric }) {
     const medians = raw ? (data.raw_medians || []) : (data.comparisons || []);
     return medians.filter(row => row.metric === metric).map(row => ({ ...row, guidance: row.guidance || row.arm, label: row.task.replaceAll("-", " "), plotted: raw ? row.value : row.absolute_delta_vs_vanilla, status: raw ? "measured" : row.status, reason: raw ? "Raw task median for one measurement profile. Comparison eligibility is separate." : row.reason, population: raw ? row.measured + " runs" : "Vanilla " + row.baseline_measured + "/" + row.baseline_assigned + " · guidance " + row.guidance_measured + "/" + row.guidance_assigned + " runs", rawRuns: [] })).sort((a, b) => a.task.localeCompare(b.task) || Number(b.guidance === "baseline") - Number(a.guidance === "baseline") || a.guidance.localeCompare(b.guidance));
   }
-  if (overview) return (data.aggregates || []).filter(row => row.metric === metric).map(row => ({ ...row, status: raw ? row.status : row.comparison_status, label: armLabel(row.guidance), plotted: raw ? row.value : row.absolute_delta_vs_vanilla, population: row.measured_tasks + "/" + row.assigned_tasks + " tasks", rawRuns: [] }));
+  if (overview) return (data.aggregates || []).filter(row => row.metric === metric).map(row => ({ ...row, status: raw ? row.status : row.comparison_status, label: armLabel(row.guidance) + (row.analysis_group ? " · " + row.analysis_group : ""), plotted: raw ? row.value : row.absolute_delta_vs_vanilla, population: row.measured_tasks + "/" + row.assigned_tasks + " tasks", rawRuns: [] }));
   if (!raw) return (data.comparisons || []).filter(row => row.metric === metric && row.task === taskSelect.value).map(row => ({ ...row, label: row.guidance, plotted: row.absolute_delta_vs_vanilla, population: "Vanilla " + row.baseline_measured + "/" + row.baseline_assigned + " · guidance " + row.guidance_measured + "/" + row.guidance_assigned + " runs", rawRuns: [] }));
   const medians = (data.raw_medians || []).filter(row => row.role === "handoff" && row.metric === metric && row.task === taskSelect.value);
   const arms = unique(rows.map(row => row.arm));
@@ -605,10 +630,11 @@ function renderPanel({ section, panel, metric }) {
   }
   if (!rows.length) { create("p", "No observations for these settings.", section); return; }
   if (!taskSelect.value) create("p", (data.aggregates || []).filter(row => row.metric === metric).map(row => {
-    const observed = rows.filter(attempt => attempt.arm === row.guidance);
+    const tasks = new Set(row.task_medians.map(item => item.task));
+    const observed = rows.filter(attempt => attempt.arm === row.guidance && tasks.has(attempt.task));
     const empty = observed.filter(emptyComplexityPopulation).length;
     const unknown = observed.filter(attempt => attempt.value === null && !emptyComplexityPopulation(attempt)).length;
-    return armLabel(row.guidance) + ": " + row.measured_tasks + "/" + row.assigned_tasks + (row.assigned_tasks === 1 ? " task" : " tasks") + " with defined values" + (empty ? " · " + empty + (empty === 1 ? " complete scan" : " complete scans") + " with no functions" : "") + (unknown ? " · " + unknown + (unknown === 1 ? " unknown attempt" : " unknown attempts") : "");
+    return armLabel(row.guidance) + (row.analysis_group ? " · " + row.analysis_group : "") + ": " + row.measured_tasks + "/" + row.assigned_tasks + (row.assigned_tasks === 1 ? " task" : " tasks") + " with defined values" + (empty ? " · " + empty + (empty === 1 ? " complete scan" : " complete scans") + " with no functions" : "") + (unknown ? " · " + unknown + (unknown === 1 ? " unknown attempt" : " unknown attempts") : "");
   }).join(" · "), section).className = "counts";
   else create("p", unique(rows.map(row => row.arm)).map(arm => {
     const observed = rows.filter(row => row.arm === arm);
@@ -626,7 +652,9 @@ function renderPanel({ section, panel, metric }) {
   }
   if (rows.every(row => row.value === null)) {
     const empty = rows.filter(emptyComplexityPopulation).length;
-    create("p", empty === rows.length ? "Complete scans found no functions in this population. There is no maximum to plot." : empty ? empty + " of " + rows.length + " attempts have complete scans with no functions, so their maxima are undefined. The other attempts are unknown. See attempt details." : "Not measured. This study cannot answer this question yet.", section);
+    if (empty === rows.length) create("p", "Complete scans found no functions in this population. There is no maximum to plot.", section);
+    else if (empty) create("p", empty + " of " + rows.length + " attempts have complete scans with no functions, so their maxima are undefined. The other attempts are unknown. See attempt details.", section);
+    else for (const reason of unique(rows.map(row => row.reason || "Measurement unavailable."))) create("p", reason, section);
   }
   else {
     drawEvaluationPlot({ parent: section, rows, metric });
@@ -659,6 +687,7 @@ function update() {
   }
 }
 for (const control of [taskSelect, showRuns, comparisonView, metricSelect, chartBreakdown]) control.addEventListener("change", update);
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", update);
 new MutationObserver(update).observe(document.documentElement, { attributes: true, attributeFilter: ["style", "class", "data-theme"] });
 new MutationObserver(update).observe(document.head, { subtree: true, childList: true, characterData: true });
 new ResizeObserver(() => {

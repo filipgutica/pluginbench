@@ -7,8 +7,14 @@ import pytest
 
 from pluginbench.assessment_metrics import evaluate_evidence, inspect_snapshot
 from pluginbench import isolation
-from pluginbench.collectors import Collector, _execute, collect_measurements, freeze_collectors
-from pluginbench.task_data.deepswe.measurements import prepare_observer
+from pluginbench.collectors import (
+    observer_identity,
+    Collector,
+    _execute,
+    collect_measurements,
+    freeze_collectors,
+)
+from pluginbench.measurement_profiles import prepare_observer
 
 
 def source(root: Path) -> Path:
@@ -307,11 +313,15 @@ def test_fallow_calibration_counts_planted_dead_code_and_type_only_files(
 ) -> None:
     snapshot = source(tmp_path)
     (snapshot / "src/types.ts").write_text("export interface Value { value: number }\n")
+    (snapshot / "vitest.config.ts").write_text("export const development = () => 1;\n")
+    (snapshot / ".prettierrc.js").write_text("module.exports = {};\n")
+    (snapshot / "src/app.config.ts").write_text("export const runtime = () => 0;\n")
     (snapshot / "src/used.ts").write_text(
-        "import type {Value} from './types';\nexport const value = (): Value => ({value: 42});\nconst unused = () => 9;\n"
+        "import type {Value} from './types';\nimport {runtime} from './app.config';\nexport const value = (): Value => ({value: 42 + runtime()});\nconst unused = () => 9;\n"
     )
     collector = Collector(
         kind="fallow",
+        scope=["*"],
         syntax_command=_syntax_command(tmp_path / "parser-cache") if with_syntax else None,
         config=config(
             tmp_path,
@@ -331,6 +341,7 @@ def test_fallow_calibration_counts_planted_dead_code_and_type_only_files(
     assert isinstance(metrics, dict)
     assert metrics["complexity_complete_for_declared_scope"] is with_syntax
     assert metrics["dead_code_complete_for_declared_scope"] is with_syntax
+    assert "src/app.config.ts" in {row["path"] for row in metrics["functions"]}
     # Fallow counts unused exports/files, not arbitrary unexported local variables.
     assert metrics["dead_code"] == 0
     (snapshot / "src/dead.ts").write_text("export const unused = () => 9;\n")
@@ -681,24 +692,116 @@ def test_trusted_adapter_outer_timeout_is_unclassified_and_fatal(
     assert not (tmp_path / "evidence/coverage/failure.json").exists()
 
 
-def test_prepared_coverage_profile_declares_and_freezes_failure_contract(tmp_path: Path) -> None:
-    from pluginbench.task_data.deepswe import measurements
-    from pluginbench.remeasure import load_profiles
-    from test_real_coding_measurements import prepared_task
+@pytest.mark.parametrize("outcome", ["complete", "line-only", "failed", "malformed"])
+def test_native_lcov_dispatch_preserves_runtime_unknown_and_integrity_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    from pluginbench import harbor_backend
 
-    prepared = tmp_path / "prepared"
-    task = "ofetch-per-origin-circuit-breaker"
-    verifier, payload = prepared_task(measurements, prepared, task)
-    collectors = measurements.prepare_measurements(
-        prepared=prepared,
-        task=task,
-        payload={key: value for key, value in payload.items()},
-        verifier=verifier,
-        selection=["coverage"],
-        observer_cache=tmp_path / "cache",
+    snapshot = source(tmp_path)
+    identity: dict[str, object] = {"task_dir": str(tmp_path / "native"), "workdir": "/app"}
+    collector = Collector(
+        kind="coverage",
+        config=config(
+            tmp_path,
+            {
+                "native_task_identity": identity,
+                "test_scope": ["test/**"],
+                "implementation": observer_identity("lcov"),
+            },
+        ),
+        scope=["src/**"],
+        command=["npm", "test"],
+        report_format="lcov",
+        report_path="coverage/lcov.info",
+        tool_version="coverage-tool 1",
     )
-    assert collectors[0].failure_protocol == "coverage-exit-v1"
-    assert load_profiles(prepared / "measurements.json")[task] == collectors
-    assert (
-        freeze_collectors(collectors, tmp_path / "frozen")[0].failure_protocol == "coverage-exit-v1"
+    original = inspect_snapshot(snapshot)
+
+    def execute(
+        *,
+        snapshot: Path,
+        task_identity: dict[str, object],
+        destination: Path,
+        command: list[str],
+        report_path: str,
+        timeout: int,
+    ) -> dict[str, object]:
+        assert task_identity == identity and command == ["npm", "test"]
+        assert report_path == "coverage/lcov.info"
+        assert snapshot != tmp_path / "source"  # The archive is never the execution directory.
+        report = "SF:/app/src/used.ts\nFN:1,value\nFNDA:1,value\nFNF:1\nFNH:1\nBRF:0\nBRH:0\nend_of_record\n"
+        if outcome == "line-only":
+            report = "SF:/app/src/used.ts\nDA:1,1\nend_of_record\n"
+        elif outcome == "malformed":
+            report = report.replace("FNF:1", "FNF:2")
+        receipt: dict[str, object] = {
+            "exit_code": 1 if outcome == "failed" else 0,
+            "timed_out": False,
+            "report_collected": outcome != "failed",
+        }
+        (destination / "execution.json").write_text(json.dumps(receipt))
+        if outcome != "failed":
+            (destination / "report.raw").write_text(report)
+        return receipt
+
+    monkeypatch.setattr(harbor_backend, "run_native_command", execute)
+    evidence = tmp_path / "evidence"
+    if outcome == "malformed":
+        with pytest.raises(ValueError, match="summaries disagree"):
+            collect_measurements(snapshot, evidence, [collector])
+    else:
+        result = collect_measurements(snapshot, evidence, [collector])
+        if outcome in {"complete", "line-only"}:
+            metrics = evaluate_evidence(snapshot, {"coverage": str(result["coverage"])}, evidence)
+            coverage = metrics["coverage"]
+            assert isinstance(coverage, dict)
+            if outcome == "complete":
+                assert coverage["metrics"]["function_total"] == 1
+            else:
+                assert coverage["metrics"]["line_total"] == 1
+                assert coverage["metrics"]["function_total"] is None
+                assert coverage["metrics"]["branch_total"] is None
+        else:
+            assert result == {}
+            failure = json.loads((evidence / "coverage/failure.json").read_text())
+            assert failure["status"] == "unavailable"
+    assert inspect_snapshot(snapshot) == original
+
+
+def test_native_coverage_command_arguments_are_not_host_script_inputs(tmp_path: Path) -> None:
+    script = tmp_path / "project-script.py"
+    script.write_text("print('project test')\n")
+    collector = Collector(
+        kind="coverage",
+        config=config(tmp_path, {}),
+        command=["python", str(script)],
+        report_format="lcov",
+        report_path="coverage.info",
+        tool_version="1",
     )
+    frozen = freeze_collectors([collector], tmp_path / "frozen")[0]
+    assert frozen.command == collector.command
+    assert list((tmp_path / "frozen/0").iterdir()) == [tmp_path / "frozen/0/config.json"]
+
+
+def test_native_observer_drift_is_rejected_before_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pluginbench import collectors
+
+    snapshot = source(tmp_path)
+    collector = Collector(
+        kind="coverage",
+        config=config(tmp_path, {"implementation": {"coverage_report.py": "old"}}),
+        command=["pytest"],
+        report_format="lcov",
+        report_path="coverage/lcov.info",
+        tool_version="1",
+    )
+    monkeypatch.setattr(
+        collectors, "_collect", lambda *args: pytest.fail("must not execute a changed observer")
+    )
+    with pytest.raises(ValueError, match="implementation differs"):
+        collect_measurements(snapshot, tmp_path / "evidence", [collector])
+    assert inspect_snapshot(snapshot)["source_lines"] == 1

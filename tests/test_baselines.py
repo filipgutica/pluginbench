@@ -2,45 +2,32 @@ from __future__ import annotations
 
 import json
 import shutil
-import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
 
-from pluginbench import baselines, harbor_backend, study
+from pluginbench import baselines, harbor_backend, study, submissions
 from pluginbench.assessment_metrics import inspect_snapshot
-from pluginbench.datasets import TaskSpec
+from pluginbench.datasets import TaskSpec, native_identity, portable_native_identity
+from native_support import (
+    task_entry,
+    runtime_identity,
+    execution as native_execution,
+    synthetic_contract,
+)
+
+
+@pytest.fixture(autouse=True)
+def synthetic_admission(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(submissions, "reviewed_contract", synthetic_contract)
 
 
 def _study(directory: Path, *, guidance: str = "candidate") -> study.ResolvedStudy:
     directory.mkdir()
-    (directory / "fixture").mkdir()
-    (directory / "fixture/answer.py").write_text("answer = 0\n")
-    (directory / "verify.py").write_text(
-        "from pathlib import Path\nimport json\n"
-        "print(json.dumps({'pass': Path('answer.py').read_text() == 'answer = 1\\n'}))\n"
-    )
-    (directory / "tasks.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "schema_version": 1,
-                "tasks": [
-                    {
-                        "id": "answer",
-                        "prompt": "Set the answer to one.",
-                        "fixture": "fixture",
-                        "provenance": {
-                            "agent_image": "registry.example/fixture@sha256:" + "b" * 64,
-                            "build_timeout_seconds": "1800",
-                        },
-                        "verifier": {"command": [sys.executable], "script": "verify.py"},
-                    }
-                ],
-            }
-        )
-    )
+    entry = task_entry(directory, "answer", answer_path="answer.py", version="0.143.0")
+    (directory / "tasks.yaml").write_text(yaml.safe_dump({"schema_version": 1, "tasks": [entry]}))
     (directory / "guidance.md").write_text(f"Follow {guidance}.\n")
     recipe = directory / "recipe.yaml"
     recipe.write_text(
@@ -52,7 +39,6 @@ def _study(directory: Path, *, guidance: str = "candidate") -> study.ResolvedStu
                 "repeats": 2,
                 "harness_version": "0.143.0",
                 "timeout_seconds": 1800,
-                "container_memory_mb": 1024,
                 "guidance": {guidance: ["guidance.md"]},
             }
         )
@@ -60,201 +46,53 @@ def _study(directory: Path, *, guidance: str = "candidate") -> study.ResolvedStu
     return study.load_study(recipe)
 
 
-def _harbor_identity() -> dict[str, object]:
+def _coding(tasks: tuple[TaskSpec, ...]) -> dict[str, object]:
     return {
-        "isolation": {
-            "protocol": "harbor-docker-v1",
-            "harbor_version": "0.24.0",
-            "implementation_sha256": "a" * 64,
-            "docker_cli": {
-                "path": "/tools/bin/docker",
-                "resolved_path": "/tools/docker/docker",
-                "sha256": "1" * 64,
-                "version": "29.5.3",
-            },
-            "docker_plugins": {
-                "compose": {
-                    "path": "/tools/cli-plugins/docker-compose",
-                    "resolved_path": "/tools/plugins/docker-compose",
-                    "sha256": "2" * 64,
-                    "version": "v2.38.0",
-                },
-                "buildx": {
-                    "path": "/tools/cli-plugins/docker-buildx",
-                    "resolved_path": "/tools/plugins/docker-buildx",
-                    "sha256": "3" * 64,
-                    "version": "v0.30.1",
-                },
-            },
-            "docker_engine": {
-                "id": "daemon-one",
-                "version": "29.5.3",
-                "platform": "linux/arm64",
-                "endpoint": "unix:///var/run/docker.sock",
-            },
-            "resources": {"cpus": 1, "memory_mb": 1024},
-            "submission_receipt_version": 2,
-        },
+        "delivery": "native-instructions-skills-plugins-v1",
+        "capabilities": {"subagents": True, "max_threads": 4, "max_depth": 1},
+        "isolation": runtime_identity(),
         "harness_version": "0.143.0",
         "timeout_seconds": 1800,
         "study": {"harness": "codex", "model": "gpt-6.1-sol", "reasoning": "medium"},
         "task_environment": {
-            "answer": {
-                "image_identity": {
-                    "image": "registry.example/fixture@sha256:" + "b" * 64,
-                    "image_id": "sha256:" + "c" * 64,
-                    "platform": "linux/arm64",
-                    "workdir": "/app",
-                    "original_image": "registry.example/fixture:source-provenance",
-                },
-                "toolchain_identity": {
-                    "image_id": "sha256:" + "e" * 64,
-                    "platform": "linux/arm64",
-                    "harness": "codex",
-                    "harness_version": "0.143.0",
-                    "install_policy": "base-runtime-frozen-support-exact-npm-cli-v1",
-                    "base_image_identity": {
-                        "image": "registry.example/fixture@sha256:" + "b" * 64,
-                        "image_id": "sha256:" + "c" * 64,
-                        "platform": "linux/arm64",
-                        "workdir": "/app",
-                    },
-                },
-                "cli_version": "0.143.0",
-                "cpus": 1,
-                "memory_mb": 1024,
-                "build_timeout_seconds": "1800",
-            }
+            task.task_id: portable_native_identity(native_identity(task)) for task in tasks
         },
     }
 
 
-def _harbor_artifacts(
-    *, artifacts: Path, identity: dict[str, object], repeat: int, digest: object
-) -> None:
-    assert isinstance(digest, str)
-    runtime = identity["isolation"]
-    assert isinstance(runtime, dict)
-    resources = runtime.get("resources", {"cpus": 1, "memory_mb": 1024})
-    assert isinstance(resources, dict)
-    environments = identity["task_environment"]
-    assert isinstance(environments, dict)
-    environment = environments["answer"]
-    assert isinstance(environment, dict)
-    image = environment["image_identity"]
-    assert isinstance(image, dict)
-    toolchain = environment["toolchain_identity"]
-    assert isinstance(toolchain, dict)
-    artifacts.mkdir()
-    owner = f"{repeat:032x}"
-    (artifacts / "worker.json").write_text(json.dumps({"session_id": f"pluginbench-{owner}__env"}))
-    (artifacts / "container-state.json").write_text(
-        json.dumps(
-            {
-                "container_id": f"{repeat:064x}",
-                "owner": owner,
-                "state": {
-                    "Running": False,
-                    "Status": "exited",
-                    "OOMKilled": False,
-                    "ExitCode": 137,
-                    "Error": "",
-                    "StartedAt": "2026-10-11T19:00:00Z",
-                    "FinishedAt": "2026-10-11T19:30:00Z",
-                },
-                "resources": {key: resources[key] for key in ("cpus", "memory_mb")},
-                "derived_image_id": "sha256:" + "f" * 64,
-            }
-        )
-    )
-    plugins = runtime["docker_plugins"]
-    assert isinstance(plugins, dict)
-    cli = runtime["docker_cli"]
-    assert isinstance(cli, dict)
-    (artifacts / "docker-client.json").write_text(
-        json.dumps(
-            {
-                "docker_cli": {
-                    **cli,
-                    "path": str(artifacts.parent / "private/docker-bin/docker"),
-                },
-                "docker_plugins": {
-                    name: {
-                        **binary,
-                        "path": str(artifacts.parent / "private/cli-plugins" / ("docker-" + name)),
-                    }
-                    for name, binary in plugins.items()
-                },
-            }
-        )
-    )
-    (artifacts / "runtime-isolation.json").write_text(
-        json.dumps(
-            {
-                "container": identity["isolation"],
-                "export": {
-                    "status": "complete",
-                    "stopped": True,
-                    "snapshot_digest": digest,
-                    "resources": {key: resources[key] for key in ("cpus", "memory_mb")},
-                    "derived_image_id": "sha256:" + "f" * 64,
-                    "base_image_identity": {
-                        key: image[key] for key in ("image", "image_id", "platform", "workdir")
-                    },
-                    "toolchain_identity": toolchain,
-                },
-                "cleanup": {
-                    "status": "complete",
-                    "residuals": {"containers": [], "networks": [], "images": []},
-                },
-            }
-        )
-    )
-    (artifacts / "invocation.json").write_text(
-        json.dumps(
-            {
-                "backend": "harbor-docker-v1",
-                "harness": "codex-cli",
-                "harness_version": identity["harness_version"],
-                "requested_model": "gpt-6.1-sol",
-                "requested_effort": "medium",
-                "timeout_seconds": identity["timeout_seconds"],
-                "build_timeout_seconds": int(environment["build_timeout_seconds"]),
-                "image_identity": image,
-                "toolchain_identity": toolchain,
-            }
-        )
-    )
-
-
-def _harbor_cohort(
-    directory: Path, cache_path: Path, identity: dict[str, object] | None = None
+def _cohort(
+    directory: Path, cache_path: Path
 ) -> tuple[baselines.BaselineCache, tuple[TaskSpec, ...], list[dict[str, Any]]]:
     directory.mkdir()
-    config = _study(directory / "config")
-    tasks = tuple(task for task in config.tasks if isinstance(task, TaskSpec))
+    tasks = _study(directory / "config").tasks
+    identity = _coding(tasks)
     root = directory / "run"
-    identity = identity or _harbor_identity()
     records = []
     for repeat in (1, 2):
         identifier = f"baseline-{repeat}"
         target = root / "attempts" / identifier / "handoff"
         snapshot = target / "snapshot"
-        snapshot.mkdir(parents=True)
+        shutil.copytree(tasks[0].fixture, snapshot)
         (snapshot / "answer.py").write_text("answer = 1\n")
-        digest = inspect_snapshot(snapshot)["digest"]
-        _harbor_artifacts(
-            artifacts=target / "artifacts", identity=identity, repeat=repeat, digest=digest
+        # Generate authentic native receipt contracts, then preserve their frozen paths.
+        area = directory / f"area-{repeat}"
+        shutil.copytree(snapshot, area / "workspace")
+        execution = native_execution(
+            area,
+            native_identity(tasks[0]),
+            answer_path="answer.py",
+            timeout=1800,
+            version="0.143.0",
+            diagnostic_files={"dist/temporary.js": "generated after patch collection\n"},
         )
-        (target / "execution.json").write_text(
-            json.dumps(
-                {
-                    "successful_native_completion": repeat == 2,
-                    "actual_primary_models": [],
-                    "runtime_effort_evidence": [],
-                }
-            )
+        shutil.copytree(area / "workspace", target / "diagnostic-source")
+        shutil.move(str(area / "artifacts"), target / "artifacts")
+        execution.update(
+            successful_native_completion=repeat == 2,
+            actual_primary_models=[],
+            runtime_effort_evidence=[],
         )
+        (target / "execution.json").write_text(json.dumps(execution))
         invocation = root / "invocations" / identifier / "handoff.json"
         invocation.parent.mkdir(parents=True)
         invocation.write_text(json.dumps({"status": "native invocation started"}))
@@ -271,7 +109,10 @@ def _harbor_cohort(
                 "stages": [
                     {
                         "id": "handoff",
-                        "snapshot": {"path": str(snapshot.relative_to(root)), "sha256": digest},
+                        "snapshot": {
+                            "path": str(snapshot.relative_to(root)),
+                            "sha256": inspect_snapshot(snapshot)["digest"],
+                        },
                         "correctness": None,
                         "evidence": None,
                         "work": {
@@ -282,31 +123,31 @@ def _harbor_cohort(
                 ],
             }
         )
-    cache = baselines.BaselineCache(
-        path=cache_path, root=root, tasks=tasks, entries=records, identity=identity
+    return (
+        baselines.BaselineCache(
+            path=cache_path, root=root, tasks=tasks, entries=records, identity=identity
+        ),
+        tasks,
+        records,
     )
-    return cache, tasks, records
 
 
-def test_harbor_cache_reuses_complete_deliveries_including_failed_unknown_usage(
+def _publish(
+    cache: baselines.BaselineCache, tasks: tuple[TaskSpec, ...], records: list[dict[str, Any]]
+) -> None:
+    try:
+        cache.reserve().publish(records, tasks)
+    finally:
+        cache.close()
+
+
+def test_native_cache_reuses_failed_attempts_and_unknown_usage_without_observers(
     tmp_path: Path,
 ) -> None:
-    cache_path = tmp_path / "cache"
-    identity = _harbor_identity()
-    runtime = identity["isolation"]
-    assert isinstance(runtime, dict)
-    first, tasks, records = _harbor_cohort(tmp_path / "first", cache_path, identity)
-    for record in records:
-        artifacts = first.root / "attempts" / record["id"] / "handoff/artifacts"
-        path = artifacts / "container-state.json"
-        receipt = json.loads(path.read_text())
-        receipt["state"]["OOMKilled"] = True
-        path.write_text(json.dumps(receipt))
-    try:
-        first.reserve().publish(records, tasks)
-    finally:
-        first.close()
-    second, _, entries = _harbor_cohort(tmp_path / "second", cache_path, identity)
+    path = tmp_path / "cache"
+    first, tasks, records = _cohort(tmp_path / "first", path)
+    _publish(first, tasks, records)
+    second, _, entries = _cohort(tmp_path / "second", path)
     shutil.rmtree(second.root)
     second.root.mkdir()
     try:
@@ -316,350 +157,271 @@ def test_harbor_cache_reuses_complete_deliveries_including_failed_unknown_usage(
     finally:
         second.close()
     assert imported == records
-    failed = imported[0]
-    assert failed is not None
-    assert failed["stages"][0]["work"]["tokens"] is None
+    assert imported[0] is not None
+    assert imported[0]["stages"][0]["work"]["tokens"] is None
     execution = second.root / "attempts/baseline-1/handoff/execution.json"
     assert json.loads(execution.read_text())["successful_native_completion"] is False
+    assert list(second.root.glob("baseline-evidence/*/origin.json"))
 
 
 @pytest.mark.parametrize(
-    "change",
-    ["version", "wrapper", "engine", "image", "toolchain", "resources", "harness"],
+    "field",
+    [
+        "model",
+        "reasoning",
+        "jobs",
+        "timeout_seconds",
+        "harness_version",
+        "grader_image",
+        "source",
+        "task_assets",
+        "runtime",
+        "toolchain",
+        "trusted_tests",
+        "source_policy",
+        "delivery",
+        "capabilities",
+    ],
 )
-def test_harbor_changed_execution_identity_misses(tmp_path: Path, change: str) -> None:
-    cache_path = tmp_path / "cache"
-    first, tasks, records = _harbor_cohort(tmp_path / "first", cache_path)
-    try:
-        first.reserve().publish(records, tasks)
-    finally:
-        first.close()
-    identity = _harbor_identity()
-    runtime = identity["isolation"]
-    assert isinstance(runtime, dict)
-    environments = identity["task_environment"]
-    assert isinstance(environments, dict)
-    environment = environments["answer"]
-    assert isinstance(environment, dict)
-    if change == "version":
-        runtime["harbor_version"] = "0.25.0"
-    elif change == "wrapper":
-        runtime["implementation_sha256"] = "c" * 64
-    elif change == "engine":
-        runtime["docker_engine"]["id"] = "daemon-two"
-    elif change == "image":
-        image = environment["image_identity"]
-        assert isinstance(image, dict)
-        image["image"] = "registry.example/fixture@sha256:" + "d" * 64
-        image["image_id"] = "sha256:" + "e" * 64
-        toolchain = environment["toolchain_identity"]
-        assert isinstance(toolchain, dict)
-        toolchain["base_image_identity"] = {
-            key: image[key] for key in ("image", "image_id", "platform", "workdir")
-        }
-    elif change == "toolchain":
-        toolchain = environment["toolchain_identity"]
-        assert isinstance(toolchain, dict)
-        toolchain["image_id"] = "sha256:" + "f" * 64
-    elif change == "resources":
-        environment["memory_mb"] = 2048
-        limits = runtime["resources"]
-        assert isinstance(limits, dict)
-        limits["memory_mb"] = 2048
-    elif change == "harness":
-        environment["cli_version"] = "0.144.0"
-        identity["harness_version"] = "0.144.0"
-        toolchain = environment["toolchain_identity"]
-        assert isinstance(toolchain, dict)
-        toolchain["harness_version"] = "0.144.0"
-    second, _, _ = _harbor_cohort(tmp_path / "second", cache_path, identity)
-    try:
-        second.reserve()
-        assert all(row["status"] == "miss" for row in second.decisions().values())
-    finally:
-        second.close()
+def test_changed_native_coding_identity_misses(tmp_path: Path, field: str) -> None:
+    path = tmp_path / "cache"
+    first, tasks, records = _cohort(tmp_path / "first", path)
+    _publish(first, tasks, records)
+    other, _, _ = _cohort(tmp_path / "second", path)
+    context = json.loads(json.dumps(other.contexts["answer"]))
+    coding = context["coding"]
+    native = coding["native_task_identity"]
+    if field == "source_policy":
+        context["source_policy"] = "old working tree source policy"
+    elif field in {"model", "reasoning", "jobs"}:
+        coding["study"][field] = "different"
+    elif field in {"harness_version", "timeout_seconds", "delivery", "capabilities"}:
+        coding[field] = "different"
+    elif field == "grader_image":
+        native["grader_image_identity"]["image_id"] = "sha256:" + "9" * 64
+    elif field == "runtime":
+        coding["isolation"]["docker_engine"]["id"] = "new daemon"
+    elif field == "toolchain":
+        native["toolchain_identity"]["image_id"] = "sha256:" + "9" * 64
+    else:
+        native[
+            {
+                "source": "source_digest",
+                "task_assets": "task_assets_sha256",
+                "trusted_tests": "trusted_tests_sha256",
+            }[field]
+        ] = "9" * 64
+    assert baselines._hash(context) != first.keys["answer"]
 
 
 @pytest.mark.parametrize(
-    "failure",
+    "fault",
     [
         "running",
         "digest",
+        "before",
+        "cleanup",
         "residuals",
-        "unknown-cleanup",
         "runtime",
-        "bare-protocol",
-        "resource-limit",
-        "derived-image",
-        "launch-pin",
-        "observed-version",
-    ],
-)
-def test_harbor_incomplete_or_mismatched_delivery_never_seeds_cache(
-    tmp_path: Path, failure: str
-) -> None:
-    cache_path = tmp_path / "cache"
-    cache, tasks, records = _harbor_cohort(tmp_path / "first", cache_path)
-    receipt_path = cache.root / "attempts/baseline-1/handoff/artifacts/runtime-isolation.json"
-    receipt = json.loads(receipt_path.read_text())
-    if failure == "running":
-        receipt["export"]["stopped"] = False
-    elif failure == "digest":
-        receipt["export"]["snapshot_digest"] = "sha256:" + "e" * 64
-    elif failure == "residuals":
-        receipt["cleanup"]["residuals"]["containers"] = ["leftover"]
-    elif failure == "unknown-cleanup":
-        del receipt["cleanup"]["residuals"]
-    elif failure == "runtime":
-        receipt["container"]["docker_engine"]["id"] = "wrong-daemon"
-    elif failure == "bare-protocol":
-        coding = cache.contexts["answer"]["coding"]
-        assert isinstance(coding, dict)
-        coding["isolation"] = {"protocol": "harbor-docker-v1"}
-        receipt["container"] = coding["isolation"]
-    elif failure == "resource-limit":
-        receipt["export"]["resources"]["memory_mb"] = 2048
-    elif failure == "derived-image":
-        receipt["export"]["derived_image_id"] = "unresolved-image"
-    elif failure == "launch-pin":
-        invocation = receipt_path.with_name("invocation.json")
-        launch = json.loads(invocation.read_text())
-        del launch["harness_version"]
-        invocation.write_text(json.dumps(launch))
-    else:
-        execution_path = receipt_path.parent.parent / "execution.json"
-        execution = json.loads(execution_path.read_text())
-        execution["startup"] = [
-            {"type": "session_meta", "payload": {"cli_version": "0.143.0"}},
-            {"type": "session_meta", "payload": {"cli_version": "0.144.0"}},
-        ]
-        execution_path.write_text(json.dumps(execution))
-    receipt_path.write_text(json.dumps(receipt))
-    try:
-        cache.reserve().publish(records, tasks)
-    finally:
-        cache.close()
-    assert not list(cache_path.glob("*/manifest.json"))
-
-
-@pytest.mark.parametrize("source", ["invocation", "export"])
-@pytest.mark.parametrize("fault", ["foreign-image", "missing-field"])
-def test_harbor_actual_image_mismatch_never_seeds_cache(
-    tmp_path: Path, source: str, fault: str
-) -> None:
-    cache_path = tmp_path / "cache"
-    cache, tasks, records = _harbor_cohort(tmp_path / "first", cache_path)
-    artifacts = cache.root / "attempts/baseline-1/handoff/artifacts"
-    receipt_path = artifacts / (
-        "invocation.json" if source == "invocation" else "runtime-isolation.json"
-    )
-    receipt = json.loads(receipt_path.read_text())
-    image = (
-        receipt["image_identity"]
-        if source == "invocation"
-        else receipt["export"]["base_image_identity"]
-    )
-    if fault == "foreign-image":
-        image["image_id"] = "sha256:" + "d" * 64
-    else:
-        del image["workdir"]
-    receipt_path.write_text(json.dumps(receipt))
-    try:
-        cache.reserve().publish(records, tasks)
-    finally:
-        cache.close()
-    assert not list(cache_path.glob("*/manifest.json"))
-
-
-@pytest.mark.parametrize("source", ["invocation", "export"])
-@pytest.mark.parametrize("fault", ["different-content", "version-only"])
-def test_harbor_toolchain_content_mismatch_never_seeds_cache(
-    tmp_path: Path, source: str, fault: str
-) -> None:
-    cache_path = tmp_path / "cache"
-    cache, tasks, records = _harbor_cohort(tmp_path / "first", cache_path)
-    artifacts = cache.root / "attempts/baseline-1/handoff/artifacts"
-    receipt_path = artifacts / (
-        "invocation.json" if source == "invocation" else "runtime-isolation.json"
-    )
-    receipt = json.loads(receipt_path.read_text())
-    delivery = receipt if source == "invocation" else receipt["export"]
-    if fault == "different-content":
-        delivery["toolchain_identity"]["image_id"] = "sha256:" + "f" * 64
-    else:
-        delivery["toolchain_identity"] = {"harness_version": "0.143.0"}
-    receipt_path.write_text(json.dumps(receipt))
-    try:
-        cache.reserve().publish(records, tasks)
-    finally:
-        cache.close()
-    assert not list(cache_path.glob("*/manifest.json"))
-
-
-@pytest.mark.parametrize(
-    "fault",
-    [
+        "private",
+        "image",
+        "toolchain",
+        "version",
+        "budget",
+        "model",
+        "effort",
+        "source-proof",
+        "client-proof",
         "cli-hash",
-        "plugin-executable",
+        "plugin-hash",
         "plugin-version",
-        "missing-proof",
-        "malformed-json",
-        "missing-field",
-        "relative-alias",
-        "malformed-hash",
+        "linked-client",
+        "relative-client",
+        "nonbinary-state",
+        "container-id",
+        "project",
+        "grader-image",
+        "grader-running",
+        "grader-resources",
+        "grader-proof",
+        "coding-resources",
+        "diagnostic-bytes",
+        "diagnostic-mode",
+        "canonical-bytes",
+        "canonical-mode",
+        "native-missing-delivery",
+        "native-wrong-delivery",
+        "native-capabilities",
+        "native-missing-receipt",
+        "native-unverified-receipt",
+        "native-execution-receipt",
+        "native-nonempty-inventory",
+        "native-effective-config",
+        "native-prompt",
     ],
 )
-def test_harbor_actual_private_docker_client_mismatch_never_seeds_cache(
+def test_incomplete_or_mismatched_native_delivery_cannot_seed_cache(
     tmp_path: Path, fault: str
 ) -> None:
-    cache_path = tmp_path / "cache"
-    cache, tasks, records = _harbor_cohort(tmp_path / "first", cache_path)
-    receipt_path = cache.root / "attempts/baseline-1/handoff/artifacts/docker-client.json"
-    client = json.loads(receipt_path.read_text())
-    if fault == "missing-proof":
-        receipt_path.unlink()
-    elif fault == "malformed-json":
-        receipt_path.write_text('{"truncated":')
-    else:
+    path = tmp_path / "cache"
+    cache, tasks, records = _cohort(tmp_path / "first", path)
+    target = cache.root / "attempts/baseline-1/handoff"
+    artifacts = target / "artifacts"
+    if fault.startswith("native-"):
+        invocation_path = artifacts / "invocation.json"
+        invocation = json.loads(invocation_path.read_text())
+        receipt_path = artifacts / "native-treatment.json"
+        treatment = json.loads(receipt_path.read_text())
+        execution_path = target / "execution.json"
+        execution = json.loads(execution_path.read_text())
+        if fault == "native-missing-delivery":
+            invocation.pop("delivery")
+        elif fault == "native-wrong-delivery":
+            invocation["delivery"] = "forced-text"
+        elif fault == "native-capabilities":
+            invocation["capabilities"]["subagents"] = False
+        elif fault == "native-missing-receipt":
+            receipt_path.unlink()
+        elif fault == "native-unverified-receipt":
+            treatment["status"] = "failed"
+        elif fault == "native-execution-receipt":
+            execution.pop("native_treatment")
+        elif fault == "native-nonempty-inventory":
+            inventory = {"guidance": [{"name": "extra.md"}], "skills": [], "plugins": []}
+            invocation["treatment_inventory"] = inventory
+            treatment["inventory"] = inventory
+        elif fault == "native-effective-config":
+            treatment["effective_config"] = treatment["effective_config"].replace(
+                "multi_agent = true", "multi_agent = false"
+            )
+        else:
+            (artifacts / "prompt.txt").write_text("Treatment injected into prompt")
+        if fault != "native-execution-receipt":
+            execution["native_treatment"] = treatment
+        invocation_path.write_text(json.dumps(invocation))
+        execution_path.write_text(json.dumps(execution))
+        if fault != "native-missing-receipt":
+            receipt_path.write_text(json.dumps(treatment))
+    elif fault.startswith(("diagnostic-", "canonical-")):
+        directory = "diagnostic-source" if fault.startswith("diagnostic-") else "snapshot"
+        file = target / directory / "answer.py"
+        if fault.endswith("bytes"):
+            file.write_text("tampered = True\n")
+        else:
+            file.chmod(0o755)
+    elif fault in {"client-proof", "source-proof"}:
+        (
+            artifacts / ("docker-client.json" if fault == "client-proof" else "before-source.json")
+        ).unlink()
+    elif fault in {"cli-hash", "plugin-hash", "plugin-version", "relative-client", "linked-client"}:
+        file = artifacts / "docker-client.json"
+        client = json.loads(file.read_text())
         if fault == "cli-hash":
             client["docker_cli"]["sha256"] = "9" * 64
-        elif fault == "plugin-executable":
-            client["docker_plugins"]["compose"]["resolved_path"] = "/tools/foreign/docker-compose"
+        elif fault == "plugin-hash":
+            client["docker_plugins"]["compose"]["sha256"] = "9" * 64
         elif fault == "plugin-version":
-            client["docker_plugins"]["buildx"]["version"] = "v0.99.0"
-        elif fault == "missing-field":
-            del client["docker_plugins"]["compose"]["resolved_path"]
-        elif fault == "relative-alias":
+            client["docker_plugins"]["buildx"]["version"] = "different"
+        elif fault == "relative-client":
             client["docker_cli"]["path"] = "relative/docker"
         else:
-            client["docker_cli"]["sha256"] = "unknown"
-        receipt_path.write_text(json.dumps(client))
-    try:
-        cache.reserve().publish(records, tasks)
-    finally:
-        cache.close()
-    assert not list(cache_path.glob("*/manifest.json"))
-
-
-@pytest.mark.parametrize(
-    "fault",
-    [
-        "cleanup",
-        "invocation-image",
-        "export-image",
-        "toolchain-content",
-        "version-only",
-        "docker-client",
-        "missing-client-proof",
-        "missing-state-proof",
-        "state-running",
-        "unknown-oom",
-        "missing-container-id",
-        "rebound-owner",
-        "state-resources",
-        "state-image",
-        "state-file-missing",
-        "state-worker-mismatch",
-        "invocation-agent-budget",
-        "invocation-build-budget",
-        "invocation-missing-agent-budget",
-        "invocation-missing-build-budget",
-    ],
-)
-def test_cached_harbor_delivery_tampering_is_rejected_before_import(
-    tmp_path: Path, fault: str
-) -> None:
-    cache_path = tmp_path / "cache"
-    first, tasks, records = _harbor_cohort(tmp_path / "first", cache_path)
-    try:
-        first.reserve().publish(records, tasks)
-    finally:
-        first.close()
-    manifest_path = next(cache_path.glob("*/manifest.json"))
-    filename = (
-        "container-state.json"
-        if fault.startswith("state-")
-        or fault
-        in {
-            "missing-state-proof",
-            "state-running",
-            "unknown-oom",
-            "missing-container-id",
-            "rebound-owner",
-        }
-        else "invocation.json"
-        if fault.startswith("invocation-")
-        else "docker-client.json"
-        if fault in {"docker-client", "missing-client-proof"}
-        else "runtime-isolation.json"
-    )
-    receipt_path = next(manifest_path.parent.glob(f"attempts/*/handoff/artifacts/{filename}"))
-    receipt = json.loads(receipt_path.read_text())
-    if fault == "cleanup":
-        receipt["cleanup"]["residuals"]["networks"] = ["leaked-network"]
-    elif fault == "invocation-image":
-        receipt["image_identity"]["platform"] = "linux/amd64"
-    elif fault == "invocation-agent-budget":
-        receipt["timeout_seconds"] = 30
-    elif fault == "invocation-build-budget":
-        receipt["build_timeout_seconds"] = 300
-    elif fault == "invocation-missing-agent-budget":
-        del receipt["timeout_seconds"]
-    elif fault == "invocation-missing-build-budget":
-        del receipt["build_timeout_seconds"]
-    elif fault == "export-image":
-        receipt["export"]["base_image_identity"]["workdir"] = "/foreign-repo"
-    elif fault == "toolchain-content":
-        receipt["export"]["toolchain_identity"]["image_id"] = "sha256:" + "f" * 64
-    elif fault == "version-only":
-        del receipt["export"]["toolchain_identity"]
-    elif fault == "docker-client":
-        receipt["docker_plugins"]["compose"]["sha256"] = "9" * 64
-    elif fault == "missing-state-proof":
-        del receipt["state"]
-    elif fault == "state-running":
-        receipt["state"]["Running"] = True
-    elif fault == "unknown-oom":
-        receipt["state"]["OOMKilled"] = None
-    elif fault == "missing-container-id":
-        del receipt["container_id"]
-    elif fault == "rebound-owner":
-        receipt["owner"] = "f" * 32
-    elif fault == "state-resources":
-        receipt["resources"]["memory_mb"] = 2048
-    elif fault == "state-image":
-        receipt["derived_image_id"] = "sha256:" + "0" * 64
-    elif fault == "state-worker-mismatch":
-        worker = receipt_path.with_name("worker.json")
-        worker.write_text(json.dumps({"session_id": "another-trial"}))
-    if fault in {"missing-client-proof", "state-file-missing"}:
-        receipt_path.unlink()
+            # Filesystem inventory refuses the link even when its bytes are valid.
+            original = file.with_suffix(".original")
+            file.rename(original)
+            file.symlink_to(original)
+        if fault != "linked-client":
+            file.write_text(json.dumps(client))
+    elif fault in {"image", "toolchain", "version", "budget", "model", "effort", "runtime"}:
+        file = artifacts / "invocation.json"
+        invocation = json.loads(file.read_text())
+        native = invocation["native_task_identity"]
+        if fault == "image":
+            native["image_identity"]["image_id"] = "sha256:" + "9" * 64
+        elif fault == "toolchain":
+            native["toolchain_identity"] = {"harness_version": "0.143.0"}
+        elif fault == "runtime":
+            native["isolation"]["docker_engine"]["id"] = "foreign daemon"
+        else:
+            invocation[
+                {
+                    "version": "harness_version",
+                    "budget": "timeout_seconds",
+                    "model": "requested_model",
+                    "effort": "requested_effort",
+                }[fault]
+            ] = "wrong"
+        file.write_text(json.dumps(invocation))
+    elif fault == "private":
+        file = target / "execution.json"
+        execution = json.loads(file.read_text())
+        execution["private_runtime_removed"] = False
+        file.write_text(json.dumps(execution))
     else:
-        receipt_path.write_text(json.dumps(receipt))
-    manifest = json.loads(manifest_path.read_text())
-    manifest["inventory"] = baselines._inventory(manifest_path.parent)
-    manifest_path.write_text(json.dumps(manifest))
-    second, _, _ = _harbor_cohort(tmp_path / "second", cache_path)
-    reason = (
-        "immutable.*toolchain" if fault == "version-only" else "complete isolated baseline evidence"
-    )
-    with pytest.raises(ValueError, match=reason):
+        file = artifacts / "runtime-isolation.json"
+        receipt = json.loads(file.read_text())
+        if fault == "grader-proof":
+            del receipt["verifier"]
+        elif fault == "grader-image":
+            receipt["verifier"]["image_id"] = "sha256:" + "9" * 64
+        elif fault == "grader-running":
+            receipt["verifier"]["state"]["Running"] = True
+        elif fault == "grader-resources":
+            receipt["verifier"]["resources"]["Memory"] = 4096
+        elif fault == "cleanup":
+            receipt["cleanup"]["status"] = "incomplete"
+        elif fault == "residuals":
+            receipt["cleanup"]["projects"]["coding"]["residuals"]["containers"] = ["leftover"]
+        elif fault == "before":
+            before = artifacts / "before-source.json"
+            data = json.loads(before.read_text())
+            data["snapshot_digest"] = "sha256:" + "9" * 64
+            before.write_text(json.dumps(data))
+        else:
+            exported = receipt["export"]
+            if fault == "coding-resources":
+                exported["resources"]["memory_mb"] = 4096
+            elif fault == "running":
+                exported["stopped"] = False
+            elif fault == "digest":
+                exported["snapshot_digest"] = "sha256:" + "9" * 64
+            elif fault == "container-id":
+                exported["container_id"] = "unknown"
+            elif fault == "project":
+                exported["project"] = "another project"
+            else:
+                exported["state"]["OOMKilled"] = "unknown"
+            (artifacts / "submission-source.json").write_text(json.dumps(exported))
+        file.write_text(json.dumps(receipt))
+    if fault == "linked-client":
+        with pytest.raises(ValueError, match="unsupported artifact"):
+            _publish(cache, tasks, records)
+    else:
+        _publish(cache, tasks, records)
+    assert not list(path.glob("*/manifest.json"))
+
+
+def test_cached_artifact_tampering_is_rejected_before_import(tmp_path: Path) -> None:
+    path = tmp_path / "cache"
+    first, tasks, records = _cohort(tmp_path / "first", path)
+    _publish(first, tasks, records)
+    cohort = path / first.keys["answer"]
+    (cohort / "attempts/baseline-1/handoff/artifacts/submission-source.json").write_text("tampered")
+    second, _, _ = _cohort(tmp_path / "second", path)
+    with pytest.raises(ValueError, match="cohort changed"):
         second.reserve()
 
 
-def test_harbor_missing_cohort_is_exclusive_and_partial_publication_stays_a_miss(
-    tmp_path: Path,
-) -> None:
-    cache_path = tmp_path / "cache"
-    first, tasks, records = _harbor_cohort(tmp_path / "first", cache_path)
-    second, _, _ = _harbor_cohort(tmp_path / "second", cache_path)
+def test_missing_cohort_lock_and_partial_publication_preserve_full_repeats(tmp_path: Path) -> None:
+    path = tmp_path / "cache"
+    first, tasks, records = _cohort(tmp_path / "first", path)
+    second, _, _ = _cohort(tmp_path / "second", path)
     try:
         first.reserve()
-        with pytest.raises(ValueError, match="baseline cache cohort is in use"):
+        with pytest.raises(ValueError, match="cohort is in use"):
             second.reserve()
-        with pytest.raises(ValueError, match="complete isolated baseline evidence"):
+        with pytest.raises(ValueError):
             first.publish(records[:1], tasks)
-        assert not list(cache_path.glob("*/manifest.json"))
+        assert not list(path.glob("*/manifest.json"))
     finally:
         first.close()
     try:
@@ -669,74 +431,98 @@ def test_harbor_missing_cohort_is_exclusive_and_partial_publication_stays_a_miss
         second.close()
 
 
-def test_reuse_keeps_failed_attempts_unknown_work_and_regrades(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("unsupported_patch", [False, True])
+def test_reuse_regrades_without_replaying_models_and_retains_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsupported_patch: bool
 ) -> None:
-    identity = _harbor_identity()
-    calls: list[dict[str, Any]] = []
-    grades: list[Path] = []
-    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: identity["isolation"])
+    calls = []
+    regrades = []
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: runtime_identity())
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
 
     def invoke(**kwargs: Any) -> dict[str, Any]:
         calls.append(kwargs)
-        area, entry = kwargs["area"], kwargs["entry"]
+        area = kwargs["area"]
         (area / "workspace/answer.py").write_text("answer = 1\n")
-        _harbor_artifacts(
-            artifacts=area / "artifacts",
-            identity=identity,
-            repeat=entry["attempt"],
-            digest=inspect_snapshot(area / "workspace")["digest"],
+        result = native_execution(
+            area,
+            kwargs["protocol"]["native_task_identity"],
+            answer_path="answer.py",
+            timeout=1800,
+            version="0.143.0",
+            diagnostic_files={"dist/temporary.js": "generated after patch collection\n"},
         )
-        return {
-            "submission_collected": True,
-            "successful_native_completion": not (
-                entry["arm"] == "baseline" and entry["attempt"] == 1
+        result.update(
+            successful_native_completion=not (
+                kwargs["entry"]["arm"] == "baseline" and kwargs["entry"]["attempt"] == 1
             ),
-            "usage": None if entry["attempt"] == 1 else {"input_tokens": 13},
-            "elapsed_seconds": 7.0,
-            "actual_primary_models": [],
-            "runtime_effort_evidence": [],
+            usage=None if kwargs["entry"]["attempt"] == 1 else {"input_tokens": 13},
+            elapsed_seconds=7.0,
+        )
+        if (
+            unsupported_patch
+            and kwargs["entry"]["arm"] == "baseline"
+            and kwargs["entry"]["attempt"] == 2
+        ):
+            artifacts = area / "artifacts/harbor/trial/artifacts"
+            (artifacts / submissions.PATCH_ARTIFACT).write_text("invalid patch\n")
+            result["native_artifact_hashes"] = harbor_backend._native_artifact_hashes(artifacts)
+        return result
+
+    def regrade(**kwargs: Any) -> dict[str, object]:
+        regrades.append(kwargs)
+        return {
+            "verifier_result": {"rewards": {"reward": 1}},
+            "exception_info": None,
+            "receipt": {"model_calls": 0},
         }
 
-    original_grade = study._grade
-
-    def grade(snapshot: Path, task: TaskSpec, directory: Path) -> dict[str, Any]:
-        grades.append(snapshot)
-        return original_grade(snapshot, task, directory)
-
-    monkeypatch.setattr(harbor_backend, "invoke", invoke)
-    monkeypatch.setattr(study, "_grade", grade)
-    cache = tmp_path / "cache"
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
+    monkeypatch.setattr(harbor_backend, "regrade_native", regrade)
+    one = _study(tmp_path / "one")
     first = study.run_study(
-        _study(tmp_path / "one"),
+        one,
         tmp_path / "first",
-        baseline_cache=cache,
-        baseline_identity=identity,
+        baseline_cache=tmp_path / "cache",
+        baseline_identity=_coding(one.tasks),
     )
-    assert len(calls) == 4
+    two = _study(tmp_path / "two", guidance="another")
+    recipe = yaml.safe_load(two.source.read_text())
+    recipe["guidance"]["third"] = ["guidance.md"]
+    recipe["guidance"]["fourth"] = ["guidance.md"]
+    two.source.write_text(yaml.safe_dump(recipe))
+    two = study.load_study(two.source)
     second = study.run_study(
-        _study(tmp_path / "two", guidance="another"),
+        two,
         tmp_path / "second",
-        baseline_cache=cache,
-        baseline_identity=identity,
+        baseline_cache=tmp_path / "cache",
+        baseline_identity=_coding(two.tasks),
     )
-    assert len(calls) == 6 and len(grades) == 8
-    assert all(call["entry"]["arm"] == "another" for call in calls[4:])
+    assert len(calls) == 10 and len(regrades) == (1 if unsupported_patch else 2)
+    assert all(call["entry"]["arm"] in {"another", "third", "fourth"} for call in calls[4:])
     run = json.loads((second / "run.json").read_text())
-    assert run["actual_calls"] == 2 and len(run["baseline_origin"]) == 2
-    assert all(
-        row["status"] == "hit"
-        for row in json.loads((second / "plan.json").read_text())["baseline_cache"].values()
-    )
+    assert run["actual_calls"] == 6 and len(run["baseline_origin"]) == 2
     records = json.loads((second / "assessment-input.json").read_text())["records"]
     baseline = sorted(
         (row for row in records if row["arm"] == "baseline"), key=lambda row: row["attempt"]
     )
     assert baseline[0]["stages"][0]["work"]["tokens"] is None
     assert baseline[1]["stages"][0]["work"]["tokens"] == {"input_tokens": 13}
-    assert all(row["stages"][0]["work"]["elapsed_seconds"] == 7.0 for row in baseline)
     correctness = second / baseline[0]["stages"][0]["correctness"]["path"]
     assert json.loads(correctness.read_text())["checks"]["native_completion"] is False
     assert all(item["origin_run"] == str(first) for item in run["baseline_origin"].values())
-    assert not any(path.is_symlink() for path in second.rglob("*"))
+    for record in baseline:
+        if unsupported_patch and record["attempt"] == 2:
+            assert record["stages"][0]["snapshot"] is None
+            assert record["stages"][0]["correctness"] is None
+            target = second / "attempts" / record["id"] / "handoff"
+            assert (target / "diagnostic-source/dist/temporary.js").is_file()
+            original_id = run["baseline_origin"][record["id"]]["original_record"]["id"]
+            assert original_id != record["id"]
+            assert (target / "unsupported-submission.json").read_bytes() == (
+                first / "attempts" / original_id / "handoff/unsupported-submission.json"
+            ).read_bytes()
+            continue
+        snapshot = second / record["stages"][0]["snapshot"]["path"]
+        assert not (snapshot / "dist/temporary.js").exists()
+        assert (snapshot.parent / "diagnostic-source/dist/temporary.js").is_file()

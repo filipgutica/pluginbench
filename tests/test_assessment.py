@@ -154,6 +154,7 @@ def test_baseline_evidence_produces_bound_before_after_delta(tmp_path: Path) -> 
             {
                 "branches": {"total": ["src/answer.py:branch-1"], "covered": covered},
                 "functions": {"total": ["src/answer.py:answer"], "covered": []},
+                "files_measured": ["src/answer.py"],
             },
         )
         receipt = base / f"{name}-coverage-receipt.json"

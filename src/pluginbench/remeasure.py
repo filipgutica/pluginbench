@@ -12,7 +12,7 @@ from functools import partial
 from threading import Event
 from pathlib import Path
 
-from pluginbench import study
+from pluginbench import harbor_backend, study
 from pluginbench.parallel import run_jobs, validate_jobs
 from pluginbench.assessment import _load_manifest, build_assessment
 from pluginbench.assessment_metrics import evaluate_evidence, inspect_snapshot
@@ -190,6 +190,7 @@ def _native_state(root: Path) -> tuple[dict[str, object], AssessmentInput, Path]
     original = study._bound_path(root, run["assessment_input"])
     manifest = AssessmentInput.model_validate_json(original.read_text())
     plan = study._bound_document(root, run["plan"])
+    study._assert_saved_sources(root=root, run=run, plan=plan)
     entries = {entry["id"]: entry for entry in plan["entries"]}
     if set(states) != {record.id for record in manifest.records} or set(entries) != set(states):
         raise ValueError("native attempt identities differ from their frozen plan")
@@ -206,7 +207,26 @@ def _native_state(root: Path) -> tuple[dict[str, object], AssessmentInput, Path]
     study._bound_document(root, run["runtime_preflight"])
     if run.get("calibration"):
         study._bound_document(root, run["calibration"])
-    _verify_native_references(root, run, set())
+    seen: set[Path] = set()
+    for value in _object(run.get("baseline_origin", {})).values():
+        origin = _object(value)
+        if study._bound_document(root, origin["evidence"]) != {
+            key: item for key, item in origin.items() if key != "evidence"
+        }:
+            raise ValueError("baseline origin differs from its bound evidence")
+        # original_record retains origin_run's namespace, including snapshots.
+        # Other provenance references belong to the imported run.
+        history = origin.get("historical_evidence")
+        if not isinstance(history, list):
+            raise ValueError("baseline origin requires historical evidence references")
+        _verify_native_references(
+            root,
+            {key: item for key, item in origin.items() if key not in {"original_record", "evidence"}},
+            seen,
+        )
+    _verify_native_references(
+        root, {key: value for key, value in run.items() if key != "baseline_origin"}, seen
+    )
     # Validate source, correctness and metric-envelope bindings too.
     _load_manifest(original)
     build_assessment(original)
@@ -258,7 +278,15 @@ def _preserved_inventory(root: Path, manifest: AssessmentInput, base: Path) -> d
         if run.get(key):
             path = study._bound_path(root, run[key])
             files[path.relative_to(root).as_posix()] = study._digest(path)
-    return {"files": files, "snapshots": snapshots}
+    diagnostics = {
+        path.relative_to(root).as_posix(): harbor_backend.native_task_assets(path)
+        for path in sorted(root.glob("attempts/*/*/diagnostic-source"))
+    }
+    return {
+        "files": files,
+        "snapshots": snapshots,
+        **({"diagnostics": diagnostics} if diagnostics else {}),
+    }
 
 
 def _rebased(manifest: AssessmentInput, base: Path, destination: Path) -> AssessmentInput:

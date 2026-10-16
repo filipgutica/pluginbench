@@ -11,6 +11,7 @@ from pluginbench.assessment_charts import (
     _rows,
     chart_artifacts_from_data,
     chart_data,
+    execution_outcome,
 )
 
 MEASUREMENT_METRICS = {
@@ -30,7 +31,12 @@ MEASUREMENT_METRICS = {
         "New-file function cognitive maximum",
     ),
     "dead_code": ("Introduced dead findings",),
-    "coverage": ("Branch coverage %", "Function coverage %"),
+    "coverage": (
+        "Line coverage %",
+        "Statement coverage %",
+        "Branch coverage %",
+        "Function coverage %",
+    ),
     "test_overlap": ("Zero marginal branch contribution cases",),
     "review": (
         "Total review findings",
@@ -75,6 +81,9 @@ OBSERVATION_FIELDS = (
     "provenance",
 )
 PROVENANCE_FIELDS = (
+    "language",
+    "analyzers",
+    "metric_settings",
     "tool",
     "tool_version",
     "method",
@@ -91,6 +100,8 @@ PROVENANCE_FIELDS = (
     "selection_policy",
     "branch_denominator_digest",
     "function_denominator_digest",
+    "line_denominator_digest",
+    "statement_denominator_digest",
     "judge_model",
     "judge_harness",
     "judge_reasoning_effort",
@@ -100,6 +111,8 @@ PROVENANCE_FIELDS = (
     "review_stage",
     "criteria_sha256",
     "reasoning_comparison",
+    "execution_status",
+    "execution_reason",
 )
 
 COMPLETENESS_COUNTS = {
@@ -265,6 +278,65 @@ def _comparison_rows(data: dict[str, object]) -> list[dict[str, object]]:
     return results
 
 
+def _aggregate_groups(data: dict[str, object]) -> list[tuple[str, str | None, list[str]]]:
+    tasks = sorted({str(row["task"]) for row in _rows(data["attempts"])})
+    observations = _rows(data["observations"])
+    groups: dict[tuple[str, str | None], set[str]] = {}
+    task_analyzers: dict[tuple[str, str], set[str]] = {}
+    unbound_values: set[tuple[str, str]] = set()
+    for row in observations:
+        group = None
+        if row.get("family") in {"cognitive", "cyclomatic", "dead_code"}:
+            known = task_analyzers.setdefault((str(row["metric"]), str(row["task"])), set())
+            provenance = _map(row.get("provenance"))
+            analyzers = _map(provenance.get("analyzers"))
+            language = str(
+                provenance.get("language")
+                or ("JS/TS" if provenance.get("tool") == "fallow" else "unknown language")
+            )
+            family = str(row.get("family"))
+            tool_name = (
+                {"python": "vulture", "go": "staticcheck", "rust": "rustc"}.get(language, "fallow")
+                if family == "dead_code"
+                else "go_analysis"
+                if language == "go"
+                else "rca"
+            )
+            tool = _map(analyzers.get(tool_name))
+            version = tool.get("version", provenance.get("tool_version"))
+            if not version or version == "unknown" or (not tool and not provenance.get("tool")):
+                if row.get("value") is not None:
+                    unbound_values.add((str(row["metric"]), str(row["task"])))
+                continue
+            version = str(version)
+            if tool_name == "go_analysis" and "gocognit=" in version:
+                part = "gocognit=" if family == "cognitive" else "gocyclo="
+                name = part[:-1] + " " + version.split(part)[-1].split()[0]
+            else:
+                name = (
+                    version
+                    if tool
+                    else str(provenance.get("tool", "unknown analyzer")) + " " + version
+                )
+            group = f"{language.title()} · {name}"
+            known.add(group)
+            continue
+        groups.setdefault((str(row["metric"]), group), set()).add(str(row["task"]))
+    for (metric, task), known in task_analyzers.items():
+        group = (
+            "Conflicting analyzers"
+            if len(known) > 1
+            else next(iter(known))
+            if known and (metric, task) not in unbound_values
+            else "Unknown analyzer"
+        )
+        groups.setdefault((metric, group), set()).add(task)
+    return [
+        (metric, group, sorted(members) if group else tasks)
+        for (metric, group), members in sorted(groups.items(), key=str)
+    ]
+
+
 def _aggregate_rows(data: dict[str, object]) -> list[dict[str, object]]:
     """Give each assigned task one median, independent of its repeat count."""
     observations = _rows(data["observations"])
@@ -284,13 +356,12 @@ def _aggregate_rows(data: dict[str, object]) -> list[dict[str, object]]:
             comparison_rows.setdefault((row["task"], row["metric"], row["guidance"]), []).append(
                 row
             )
-    tasks = sorted({str(row["task"]) for row in _rows(data["attempts"])})
     arms = sorted(
         {str(row["arm"]) for row in observations}, key=lambda arm: (arm != "baseline", arm)
     )
-    metrics = sorted({str(row["metric"]) for row in observations})
     results = []
-    for metric in metrics:
+    for metric, analysis_group, tasks in _aggregate_groups(data):
+        unresolved_analyzer = analysis_group in {"Unknown analyzer", "Conflicting analyzers"}
         baseline_values = {task: median_rows.get((task, metric, "baseline"), []) for task in tasks}
         for arm in arms:
             task_values = []
@@ -298,10 +369,12 @@ def _aggregate_rows(data: dict[str, object]) -> list[dict[str, object]]:
             comparison_statuses = []
             matching_baselines = []
             for task in tasks:
-                rows = raw_rows.get((task, metric, arm), [])
+                rows = [] if unresolved_analyzer else raw_rows.get((task, metric, arm), [])
                 value = rows[0].get("value") if len(rows) == 1 else None
                 task_values.append({"task": task, "value": value})
-                matches = comparison_rows.get((task, metric, arm), [])
+                matches = (
+                    [] if unresolved_analyzer else comparison_rows.get((task, metric, arm), [])
+                )
                 baseline = baseline_values[task]
                 measured = rows[0].get("measured", 0) if len(rows) == 1 else 0
                 assigned = assigned_counts.get((task, metric, arm), 0)
@@ -332,6 +405,7 @@ def _aggregate_rows(data: dict[str, object]) -> list[dict[str, object]]:
             results.append(
                 {
                     "metric": metric,
+                    "analysis_group": analysis_group,
                     "guidance": arm,
                     "value": value,
                     "unit": guide.get("unit"),
@@ -359,7 +433,9 @@ def _aggregate_rows(data: dict[str, object]) -> list[dict[str, object]]:
                     "absolute_delta_unit": "percentage points"
                     if guide.get("unit") == "% covered"
                     else guide.get("unit"),
-                    "reason": "Each task has equal weight, regardless of repetitions. Deltas require matching vanilla and guidance medians for every assigned task. Partial raw averages describe the measured tasks only.",
+                    "reason": "Analyzer provenance is missing or conflicting; overview values are unavailable. Raw observations and task medians remain separate."
+                    if unresolved_analyzer
+                    else "Each task has equal weight, regardless of repetitions. Deltas require matching vanilla and guidance medians for every assigned task. Partial raw averages describe the measured tasks only.",
                 }
             )
     return results
@@ -389,6 +465,13 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         metric = str(source["metric"])
         row = {field: source.get(field) for field in OBSERVATION_FIELDS}
         row.update(family=families[metric], unit=_map(guide.get(metric)).get("unit"))
+        capability = _map(
+            _map(_map(config.get("measurement_capabilities")).get(str(row.get("task")))).get(
+                families[metric]
+            )
+        )
+        if row.get("value") is None and capability.get("status") == "unavailable":
+            row.update(status="unavailable", reason=capability.get("reason"))
         row["provenance"] = {
             key: value
             for key, value in _map(source.get("provenance")).items()
@@ -402,6 +485,7 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
             row for row in _rows(attempt.get("stages")) if row.get("id") == attempt.get("handoff")
         )
         provenance = _map(attempt.get("provenance"))
+        execution = _map(stage.get("execution_provenance"))
         attempts.append(
             {
                 "id": attempt.get("id"),
@@ -415,6 +499,26 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
                 if str(attempt.get("id")) in origins
                 else None,
                 "correctness": _map(stage.get("correctness")).get("status", "unknown"),
+                "native_grading": stage.get("task_result"),
+                "execution": {
+                    **execution_outcome(execution),
+                    **{
+                        key: execution.get(key)
+                        for key in (
+                            "successful_native_completion",
+                            "timed_out",
+                            "exit_code",
+                            "stream_errors",
+                            "partial_usage",
+                            "usage_accounting",
+                            "actual_descendant_models",
+                            "native_treatment",
+                            "native_session_usage",
+                            "error",
+                            "attempt_status",
+                        )
+                    },
+                },
                 "actual_model": attempt.get("model"),
                 "runtime": {
                     name: provenance.get(name)
@@ -473,6 +577,8 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         "reviewer": config.get("reviewer") if "review" in selected else None,
         "measurements": selected,
         "measurement_collection": config.get("measurement_collection"),
+        "measurement_capabilities": config.get("measurement_capabilities", {}),
+        "measurement_readiness": config.get("measurement_readiness", {}),
         "assigned": len(attempts),
         "coding_invocations": _map(report.get("study_progress")).get("native_invocations"),
         "reused_baseline_attempts": len(origins),

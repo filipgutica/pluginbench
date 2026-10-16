@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 from typing import TypedDict, Unpack
 
@@ -10,6 +9,7 @@ import yaml
 
 from pluginbench import codex, harbor_backend, study, study_review
 from test_study import _offline_harbor
+from native_support import task_entry, execution as native_execution, qualify_synthetic_source
 
 
 class NativeInvocationKwargs(TypedDict):
@@ -17,7 +17,6 @@ class NativeInvocationKwargs(TypedDict):
     protocol: dict[str, object]
     prompt: str
     timeout: int
-    read_only: bool
     output_schema: Path | None
 
 
@@ -30,30 +29,17 @@ def _existing_study(
     prefixed_source: bool = False,
 ) -> Path:
     suite = tmp_path / "suite"
-    (suite / "fixture/src").mkdir(parents=True)
-    (suite / "fixture/src/answer.py").write_text("answer = 0\n")
+    entry = task_entry(suite, "answer")
     if prefixed_source:
-        (suite / "fixture/after/src").mkdir(parents=True)
-        (suite / "fixture/after/src/answer.py").write_text("answer = 2\n")
-    (suite / "verify.py").write_text(
-        "import json, pathlib, sys\npassed = pathlib.Path('src/answer.py').read_text() == 'answer = 1\\n'\nprint(json.dumps({'pass': passed}))\nsys.exit(0 if passed else 1)\n"
-    )
-    (suite / "tasks.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "schema_version": 1,
-                "tasks": [
-                    {
-                        "id": "answer",
-                        "prompt": "Set the answer to one.",
-                        "fixture": "fixture",
-                        "provenance": {"agent_image": "example@sha256:" + "a" * 64},
-                        "verifier": {"command": [sys.executable], "script": "verify.py"},
-                    }
-                ],
-            }
-        )
-    )
+        fixture = suite / "fixtures/answer"
+        (fixture / "after/src").mkdir(parents=True)
+        (fixture / "after/src/answer.py").write_text("answer = 2\n")
+        provenance = entry["provenance"]
+        assert isinstance(provenance, dict)
+        identity = json.loads(provenance["native_task_identity"])
+        qualify_synthetic_source(identity)
+        provenance["native_task_identity"] = json.dumps(identity)
+    (suite / "tasks.yaml").write_text(yaml.safe_dump({"schema_version": 1, "tasks": [entry]}))
     (tmp_path / "guidance.md").write_text("SECRET TREATMENT GUIDANCE\n")
     recipe = tmp_path / "recipe.yaml"
     recipe.write_text(
@@ -78,16 +64,11 @@ def _existing_study(
         if interrupted:
             raise RuntimeError("offline interruption")
         (area / "workspace/src/answer.py").write_text("answer = 1\n")
-        return {
-            "submission_collected": True,
-            "successful_native_completion": True,
-            "elapsed_seconds": 1.0,
-            "usage": {"input_tokens": 10, "output_tokens": 5},
-            "actual_primary_models": ["gpt-6.1-sol"],
-            "runtime_effort_evidence": ["medium"],
-        }
+        protocol = kwargs["protocol"]
+        assert isinstance(protocol, dict)
+        return native_execution(area, protocol["native_task_identity"])
 
-    monkeypatch.setattr(harbor_backend, "invoke", implement)
+    monkeypatch.setattr(harbor_backend, "invoke_native", implement)
     root = tmp_path / "results"
     if interrupted:
         with pytest.raises(RuntimeError, match="offline interruption"):
@@ -114,14 +95,12 @@ def _judge(
     def invoke(
         *,
         area: Path,
-        read_only: bool,
         output_schema: Path,
         protocol: dict[str, object],
         **kwargs: object,
     ) -> dict[str, object]:
         calls.append(area)
         workspace = area / "workspace"
-        assert read_only is True
         assert output_schema == workspace / "response-schema.json"
         assert protocol.get("models") == {"codex": "gpt-6-astra"}
         assert protocol.get("reasoning") == "high"

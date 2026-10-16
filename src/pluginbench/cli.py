@@ -23,10 +23,38 @@ from pluginbench.evaluation import (
 )
 
 app = typer.Typer(
-    help="Compare text skills and guidance with vanilla coding agents.",
+    help="Compare native instructions, skills, and plugins with vanilla coding agents.",
     no_args_is_help=True,
     invoke_without_command=True,
 )
+tasks_app = typer.Typer(help="Browse tasks and emit a pinned evaluation YAML block.")
+app.add_typer(tasks_app, name="tasks")
+
+
+@tasks_app.command("pick")
+def pick(
+    dataset: str = typer.Option(
+        ..., "--dataset", help="Harbor dataset, e.g. datacurve/deep-swe-1-1."
+    ),
+    version: str | None = typer.Option(
+        None, "--version", help="Dataset version; resolved and pinned if omitted."
+    ),
+    copy: bool = typer.Option(
+        False, "--copy", help="Also copy the emitted tasks YAML to the clipboard."
+    ),
+) -> None:
+    """Search, preview and multiselect tasks with fzf; no evaluation calls."""
+    from pluginbench.task_sources import copy_yaml, pick_tasks
+
+    try:
+        block = pick_tasks(dataset, version)
+        if block is not None:
+            typer.echo(block, nl=False)
+            if copy:
+                copy_yaml(block)
+                typer.echo("Copied tasks YAML to clipboard.", err=True)
+    except (OSError, ValueError, ImportError, subprocess.SubprocessError) as exc:
+        _error(exc)
 
 
 def _error(exc: Exception) -> None:
@@ -51,17 +79,23 @@ def run(
     config: Path | None = typer.Option(
         None, "--config", help="Evaluation YAML or JSON; relative paths use its directory."
     ),
-    harness: str | None = typer.Option(None, "--harness", help="codex or claude."),
+    harness: str | None = typer.Option(None, "--harness", help="Coding harness; native treatments currently require codex."),
     model: str | None = typer.Option(None, "--model"),
     reasoning: str | None = typer.Option(None, "--reasoning"),
     guidance: list[Path] | None = typer.Option(
-        None, "--guidance", help="Text file, skill, or package directory; repeat for one bundle."
+        None, "--guidance", help="Instruction file; composed into native AGENTS.md, never the task prompt."
+    ),
+    skill: list[Path] | None = typer.Option(
+        None, "--skill", help="Native skill directory or collection; repeat for one treatment."
+    ),
+    plugin: list[Path] | None = typer.Option(
+        None, "--plugin", help="Complete native plugin package; repeat for one treatment."
     ),
     guidance_name: str = typer.Option(
         "guidance", "--guidance-name", help="Bundle label when using flags."
     ),
     tasks: Path | None = typer.Option(
-        None, "--tasks", help="Pinned DeepSWE checkout or tasks directory."
+        None, "--tasks", help="Local Harbor task directory or checkout."
     ),
     task: list[str] | None = typer.Option(
         None, "--task", help="Exact task ID; repeat to select tasks."
@@ -90,18 +124,20 @@ def run(
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
-        help="Validate inputs and show planned calls; no model calls or preparation.",
+        help="Validate inputs and show planned attempts; no model calls or preparation.",
     ),
     output: Path | None = typer.Option(None, "--output", help="New run directory."),
     yes: bool = typer.Option(False, "--yes", help="Start without confirmation."),
 ) -> None:
-    """Run vanilla and guidance attempts, selected measurements, and fixed reviews."""
+    """Run vanilla and native treatments, selected measurements, and fixed reviews."""
     try:
         overrides = [
             harness,
             model,
             reasoning,
             guidance,
+            skill,
+            plugin,
             tasks,
             task,
             measure,
@@ -139,7 +175,9 @@ def run(
         else:
             raw: dict[str, object] = {
                 "runner": {"harness": harness, "model": model, "reasoning": reasoning},
-                "guidance": {guidance_name: guidance or []},
+                "treatments": {guidance_name: {
+                    "guidance": guidance or [], "skills": skill or [], "plugins": plugin or []
+                }},
                 "tasks": {"source": tasks, "ids": task or []},
                 "measurements": measure or [],
             }
@@ -168,7 +206,7 @@ def run(
             typer.echo(json.dumps(plan, indent=2))
             return
         typer.echo(
-            f"{plan['coding_calls']} coding calls + {plan['review_calls']} review calls; "
+            f"{plan['coding_calls']} coding attempts + {plan['review_calls']} review calls; "
             + ("saved submissions reused." if resume else "vanilla reused when compatible.")
         )
         if not yes and not typer.confirm("Start evaluation?"):

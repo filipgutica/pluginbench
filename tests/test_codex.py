@@ -395,16 +395,13 @@ for path, operation in ((p, 'write'), (Path({str(outside)!r}), 'read'), (Path({s
 Path(os.environ['TMPDIR'], 'scratch.txt').write_text('private storage allowed')
 print(json.dumps({{'type':'turn.completed','usage':{{'input_tokens':0,'output_tokens':0}}}}))
 """
-    native_command = codex.command
-
     def probe(**kwargs: object) -> list[str]:
         # Exercise the CLI's actual sandbox entry without invoking any model.
-        profile = ":read-only" if kwargs["read_only"] else ":danger-full-access"
         return [
             "codex",
             "sandbox",
             "-P",
-            profile,
+            ":danger-full-access",
             "-C",
             str(packet),
             "--",
@@ -420,14 +417,11 @@ print(json.dumps({{'type':'turn.completed','usage':{{'input_tokens':0,'output_to
         protocol={"models": {"codex": "setup-only"}, "auth_file": str(auth)},
         prompt="No model calls: sandbox boundary probe only.",
         timeout=15,
-        read_only=True,
     )
     assert result["exit_code"] == 0, (area / "artifacts/stderr.log").read_text()
     assert source.read_text() == "bounded packet"
     assert outside.read_text() == "outside packet"
     assert result["private_runtime_removed"] and not (area / "private").exists()
-    argv = native_command(host="codex", model="test", workspace=packet, plugin=None, read_only=True)
-    assert argv[argv.index("--sandbox") + 1] == "read-only"
 
 
 def test_invocation_cannot_overwrite_existing_execution_evidence(tmp_path: Path) -> None:
@@ -472,3 +466,221 @@ def test_truncated_trace_reports_usage_lower_bound_without_completed_usage() -> 
     assert not parsed["successful_native_completion"]
     assert parsed["partial_usage"][0]["tokens"] == {"input_tokens": 15, "output_tokens": 5}
     assert parsed["partial_usage"][0]["trace_sha256"].startswith("sha256:")
+
+
+def native_session(
+    identity: str,
+    totals: list[dict[str, int]],
+    *,
+    parent: str | None = None,
+    completed: bool = True,
+    extra: list[dict[str, object]] | None = None,
+) -> str:
+    # Shapes come from Codex rust-v0.162.1 protocol/src/protocol.rs.
+    metadata: dict[str, object] = {"id": identity, "cli_version": "0.162.1", "source": "exec"}
+    if parent is not None:
+        metadata["source"] = {
+            "subagent": {"thread_spawn": {"parent_thread_id": parent, "depth": 1}}
+        }
+    events: list[dict[str, object]] = [
+        {"type": "session_meta", "payload": metadata},
+        {
+            "type": "turn_context",
+            "payload": {
+                "model": "primary" if parent is None else "child-model",
+                "effort": "high" if parent is None else "low",
+            },
+        },
+    ]
+    events.extend(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": total},
+            },
+        }
+        for total in totals
+    )
+    events.extend(extra or [])
+    if completed:
+        events.append({"type": "event_msg", "payload": {"type": "task_complete"}})
+    return stream(*events)
+
+
+def test_native_descendant_usage_counts_session_totals_once_and_keeps_primary_identity() -> None:
+    root = native_session(
+        "root",
+        [
+            {"input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 3},
+            {"input_tokens": 30, "cached_input_tokens": 5, "output_tokens": 8},
+        ],
+    )
+    child = native_session(
+        "child",
+        [
+            {"input_tokens": 7, "cached_input_tokens": 2, "output_tokens": 4},
+        ],
+        parent="root",
+    )
+    stdout = stream(
+        {"type": "thread.started", "thread_id": "root"},
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 30,
+                "cached_input_tokens": 5,
+                "output_tokens": 8,
+            },
+        },
+    )
+    parsed = codex.parse_events(
+        stdout, [root, child, child, child.rsplit("\n", 1)[0]], "codex", include_descendants=True
+    )
+    assert parsed["usage"] == {"input_tokens": 37, "cached_input_tokens": 7, "output_tokens": 12}
+    assert parsed["actual_primary_models"] == ["primary"]
+    assert parsed["actual_descendant_models"] == ["child-model"]
+    assert parsed["runtime_effort_evidence"] == ["high"]
+    assert parsed["usage_accounting"]["status"] == "complete"
+    assert len(parsed["usage_accounting"]["sessions"]) == 2
+    assert parsed["successful_native_completion"]
+
+
+@pytest.mark.parametrize("spawn_evidence", ["trace", "stdout"])
+def test_native_missing_descendant_keeps_observed_root_as_lower_bound(spawn_evidence: str) -> None:
+    spawn: dict[str, object] = {
+        "type": "event_msg",
+        "payload": {
+            "type": "collab_agent_spawn_end",
+            "sender_thread_id": "root",
+            "new_thread_id": "missing",
+        },
+    }
+    stdout: list[dict[str, object]] = [
+        {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 3}}
+    ]
+    if spawn_evidence == "stdout":
+        stdout.append(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "collab_tool_call",
+                    "tool": "spawn_agent",
+                    "receiver_thread_ids": ["missing"],
+                },
+            }
+        )
+    root = native_session(
+        "root",
+        [{"input_tokens": 10, "output_tokens": 3}],
+        extra=[spawn] if spawn_evidence == "trace" else [],
+    )
+    parsed = codex.parse_events(stream(*stdout), [root], "codex", include_descendants=True)
+    assert parsed["usage"] is None
+    accounting = parsed["usage_accounting"]
+    assert accounting["observed_usage_lower_bound"] == {"input_tokens": 10, "output_tokens": 3}
+    assert "missing descendant session missing" in accounting["reasons"]
+    assert accounting["status"] == "incomplete"
+
+
+def test_native_failed_descendant_keeps_partial_tokens_without_claiming_complete_usage() -> None:
+    root = native_session("root", [{"input_tokens": 10, "output_tokens": 3}])
+    child = native_session(
+        "child",
+        [{"input_tokens": 8, "output_tokens": 2}],
+        parent="root",
+        completed=False,
+        extra=[
+            {"type": "event_msg", "payload": {"type": "turn_aborted", "reason": "interrupted"}},
+        ],
+    )
+    parsed = codex.parse_events(
+        stream({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 3}}),
+        [root, child],
+        "codex",
+        include_descendants=True,
+    )
+    assert parsed["usage"] is None
+    accounting = parsed["usage_accounting"]
+    assert accounting["observed_usage_lower_bound"] == {"input_tokens": 18, "output_tokens": 5}
+    assert "incomplete or failed session child" in accounting["reasons"]
+    assert accounting["sessions"][0]["status"] == "incomplete"
+
+
+def test_native_multiple_roots_and_conflicting_session_copies_are_not_complete() -> None:
+    root = native_session("root", [{"input_tokens": 10, "output_tokens": 3}])
+    other = native_session("other", [{"input_tokens": 20, "output_tokens": 5}])
+    conflict = native_session("root", [{"input_tokens": 11, "output_tokens": 3}])
+    parsed = codex.parse_events("", [root, other, conflict], "codex", include_descendants=True)
+    assert parsed["usage"] is None
+    assert parsed["actual_primary_models"] == []
+    assert "expected exactly one root session" in parsed["usage_accounting"]["reasons"]
+    assert "conflicting traces for session root" in parsed["usage_accounting"]["reasons"]
+
+
+def test_native_completed_child_without_usage_is_unknown_instead_of_zero() -> None:
+    root = native_session("root", [{"input_tokens": 10, "output_tokens": 3}])
+    child = native_session("child", [], parent="root")
+    parsed = codex.parse_events("", [root, child], "codex", include_descendants=True)
+    assert parsed["usage"] is None
+    assert "missing usage for session child" in parsed["usage_accounting"]["reasons"]
+    assert parsed["usage_accounting"]["sessions"][0]["observed_usage"] is None
+
+
+@pytest.mark.parametrize(
+    "extra, reason",
+    [
+        ([{"type": "event_msg", "payload": {"type": "task_started"}}], "incomplete or failed"),
+        (
+            [
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "collab_agent_spawn_begin",
+                        "call_id": "unresolved",
+                    },
+                }
+            ],
+            "unresolved spawns",
+        ),
+        (
+            [
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"input_tokens": -1}},
+                    },
+                }
+            ],
+            "invalid cumulative usage",
+        ),
+    ],
+)
+def test_native_incomplete_activity_after_completion_is_not_complete_usage(
+    extra: list[dict[str, object]], reason: str
+) -> None:
+    root = native_session("root", [{"input_tokens": 10, "output_tokens": 3}])
+    parsed = codex.parse_events(
+        "", [root + "\n" + stream(*extra)], "codex", include_descendants=True
+    )
+    assert parsed["usage"] is None
+    assert any(reason in message for message in parsed["usage_accounting"]["reasons"])
+
+
+def test_native_stdout_identity_mismatch_and_inherited_history_cannot_supply_lower_bound() -> None:
+    root = native_session("root", [{"input_tokens": 10, "output_tokens": 3}])
+    events = [json.loads(line) for line in root.splitlines()]
+    events[0]["payload"]["forked_from_id"] = "previous-session"
+    parsed = codex.parse_events(
+        stream({"type": "thread.started", "thread_id": {"invalid": "identity"}}),
+        [stream(*events)],
+        "codex",
+        include_descendants=True,
+    )
+    assert parsed["usage"] is None
+    assert parsed["usage_accounting"]["observed_usage_lower_bound"] is None
+    assert (
+        "inherited history is unsupported for session root" in parsed["usage_accounting"]["reasons"]
+    )
+    assert "invalid stdout root identity" in parsed["usage_accounting"]["reasons"]

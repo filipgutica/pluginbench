@@ -31,7 +31,7 @@ GUIDANCE_NAMES = {
 def reject_guidance(
     workspace: Path, *, include_ancestors: bool = True, reject_git: bool = False
 ) -> None:
-    """Reject custom instruction discovery surfaces before staging treatment text."""
+    """Reject undeclared instruction discovery surfaces in task source."""
     root = workspace.resolve()
     if not root.is_dir():
         raise ValueError(f"workspace is not a directory: {workspace}")
@@ -231,16 +231,12 @@ def command(
     host: str,
     model: str,
     workspace: Path,
-    plugin: Path | None,
     effort: str = "medium",
-    read_only: bool = False,
 ) -> list[str]:
     if host == "claude":
         from pluginbench import claude
 
-        return claude.command(
-            model=model, workspace=workspace, plugin=plugin, effort=effort, read_only=read_only
-        )
+        return claude.command(model=model, effort=effort)
     if host == "codex":
         return [
             "codex",
@@ -256,11 +252,12 @@ def command(
             'web_search="disabled"',
             "-c",
             "features.multi_agent=false",
-            *(
-                ["--sandbox", "read-only", "-c", 'approval_policy="never"']
-                if read_only
-                else ["--dangerously-bypass-approvals-and-sandbox"]
-            ),
+            "--enable",
+            "code_mode",
+            "--enable",
+            "code_mode_only",
+            # The mandatory outer OS wrapper owns read-only scope. Nested Seatbelt fails.
+            "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",
             "-C",
             str(workspace),
@@ -292,7 +289,12 @@ def observed_cli_version(startup: object, *, host: str = "codex") -> str | None:
 
 
 def parse_events(
-    stdout: str, traces: list[str], host: str, *, requested_effort: str = "medium"
+    stdout: str,
+    traces: list[str],
+    host: str,
+    *,
+    requested_effort: str = "medium",
+    include_descendants: bool = False,
 ) -> dict[str, Any]:
     if host == "claude":
         from pluginbench import claude
@@ -309,6 +311,7 @@ def parse_events(
     final = []
     successful_completion = False
     turn_usage: list[dict[str, int]] = []
+    stdout_events: list[dict[str, Any]] = []
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
@@ -318,6 +321,7 @@ def parse_events(
         if not isinstance(event, dict):
             errors.append("stdout JSONL event is not an object")
             continue
+        stdout_events.append(event)
         item = event.get("item", {})
         if not isinstance(item, dict):
             errors.append("stdout item is not an object")
@@ -346,8 +350,10 @@ def parse_events(
             tools.append(item)
     effort = set()
     partial_usage = []
+    trace_events: list[list[dict[str, Any]]] = []
     for trace in traces:
         last_observed_usage = None
+        decoded_trace = []
         for line in trace.splitlines():
             try:
                 event = json.loads(line)
@@ -357,6 +363,7 @@ def parse_events(
             if not isinstance(event, dict):
                 errors.append("trace JSONL event is not an object")
                 continue
+            decoded_trace.append(event)
             if event.get("type") == "event_msg":
                 payload = event.get("payload", {})
                 info = payload.get("info") if isinstance(payload, dict) else None
@@ -386,6 +393,7 @@ def parse_events(
                         effort.add(payload["effort"])
                     elif payload.get("effort") is not None:
                         errors.append("invalid trace effort")
+        trace_events.append(decoded_trace)
         if last_observed_usage is not None:
             partial_usage.append(
                 {
@@ -398,7 +406,7 @@ def parse_events(
         # Missing usage fields stay unknown instead of being silently undercounted.
         common_keys = set.intersection(*(set(turn) for turn in turn_usage))
         usage = {key: sum(turn[key] for turn in turn_usage) for key in sorted(common_keys)}
-    return {
+    result = {
         "command_items": commands,
         "actual_primary_models": sorted(models),
         "usage": usage,
@@ -414,6 +422,246 @@ def parse_events(
         "final": final[-1] if final else "",
         "agent_messages": final,
         "successful_native_completion": successful_completion and not errors,
+    }
+    if include_descendants:
+        accounting = _descendant_usage(stdout_events, trace_events, errors)
+        result.update(accounting)
+    return result
+
+
+def _sum_usage(totals: list[dict[str, int]]) -> dict[str, int] | None:
+    if not totals:
+        return None
+    common_keys = set.intersection(*(set(total) for total in totals))
+    return {key: sum(total[key] for total in totals) for key in sorted(common_keys)}
+
+
+def _token_usage(value: object) -> dict[str, int] | None:
+    if (
+        not isinstance(value, dict)
+        or not value
+        or not all(
+            isinstance(count, int) and not isinstance(count, bool) and count >= 0
+            for count in value.values()
+        )
+    ):
+        return None
+    return value
+
+
+def _descendant_usage(
+    stdout: list[dict[str, Any]],
+    traces: list[list[dict[str, Any]]],
+    stream_errors: list[Any],
+) -> dict[str, Any]:
+    """Account once per native thread; unproven coverage remains a lower bound.
+
+    Codex 0.162.1 protocol.rs defines session_meta.id as the thread identity,
+    source.subagent.thread_spawn as lineage, and token_count as cumulative usage.
+    A successful task_complete closes a turn, not a delta to add to that usage.
+    """
+    reasons: set[str] = set()
+    sessions: dict[str, dict[str, Any]] = {}
+    for events in traces:
+        metadata = [event.get("payload") for event in events if event.get("type") == "session_meta"]
+        if len(metadata) != 1 or not isinstance(metadata[0], dict):
+            reasons.add("trace lacks one unambiguous session identity")
+            continue
+        meta = metadata[0]
+        identity = meta.get("id")
+        if not isinstance(identity, str) or not identity:
+            reasons.add("trace lacks one unambiguous session identity")
+            continue
+        previous = sessions.get(identity)
+        if previous is not None:
+            old_events = previous["events"]
+            if events[: len(old_events)] == old_events:
+                previous["events"] = events
+            elif old_events[: len(events)] != events:
+                reasons.add(f"conflicting traces for session {identity}")
+            continue
+        source = meta.get("source")
+        subagent = source.get("subagent") if isinstance(source, dict) else None
+        spawned = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+        source_parent = spawned.get("parent_thread_id") if isinstance(spawned, dict) else None
+        parent = meta.get("parent_thread_id", source_parent)
+        if parent is None:
+            parent = source_parent
+        if source_parent is not None and parent != source_parent:
+            reasons.add(f"conflicting parent identity for session {identity}")
+        if parent is not None and (not isinstance(parent, str) or not parent):
+            reasons.add(f"invalid parent identity for session {identity}")
+            parent = None
+        if subagent is not None and parent is None:
+            reasons.add(f"unresolved subagent lineage for session {identity}")
+        if meta.get("forked_from_id") or meta.get("history_base"):
+            reasons.add(f"inherited history is unsupported for session {identity}")
+        sessions[identity] = {"events": events, "parent_thread_id": parent}
+
+    identity_safe = not reasons
+    roots = sorted(
+        identity for identity, session in sessions.items() if session["parent_thread_id"] is None
+    )
+    root = roots[0] if len(roots) == 1 else None
+    if root is None:
+        reasons.add("expected exactly one root session")
+        identity_safe = False
+    stdout_roots = set()
+    for event in stdout:
+        if event.get("type") == "thread.started":
+            if isinstance(event.get("thread_id"), str):
+                stdout_roots.add(event["thread_id"])
+            else:
+                reasons.add("invalid stdout root identity")
+                identity_safe = False
+    if stdout_roots and stdout_roots != {root}:
+        reasons.add("stdout root identity does not match captured sessions")
+        identity_safe = False
+
+    expected_children: set[str] = set()
+    models: set[str] = set()
+    child_models: set[str] = set()
+    effort: set[str] = set()
+    records = []
+    for identity, session in sorted(sessions.items()):
+        prior_reasons = set(reasons)
+        parent = session["parent_thread_id"]
+        ancestors = {identity}
+        while parent is not None and parent in sessions and parent not in ancestors:
+            ancestors.add(parent)
+            parent = sessions[parent]["parent_thread_id"]
+        if parent is not None or root not in ancestors:
+            reasons.add(f"session {identity} is not linked to the root")
+            identity_safe = False
+        total: dict[str, int] | None = None
+        complete = False
+        failed = False
+        pending_spawns: set[str] = set()
+        for event in session["events"]:
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            kind = payload.get("type") if event.get("type") == "event_msg" else None
+            if event.get("type") == "turn_context":
+                complete = False
+                model = payload.get("model")
+                if isinstance(model, str):
+                    if identity == root:
+                        models.add(model)
+                    elif session["parent_thread_id"] is not None:
+                        child_models.add(model)
+                if identity == root and isinstance(payload.get("effort"), str):
+                    effort.add(payload["effort"])
+            if kind in {"task_started", "turn_started"}:
+                complete = False
+            if kind in {"task_complete", "turn_complete"}:
+                complete = True
+            if kind in {"error", "turn_aborted", "turn_failed"}:
+                failed = True
+            if kind == "token_count":
+                info = payload.get("info")
+                observed = (
+                    _token_usage(info.get("total_token_usage")) if isinstance(info, dict) else None
+                )
+                if observed is not None:
+                    if total is not None and any(
+                        key not in observed or observed[key] < value for key, value in total.items()
+                    ):
+                        reasons.add(f"nonmonotonic cumulative usage for session {identity}")
+                    total = observed
+                elif isinstance(info, dict):
+                    reasons.add(f"invalid cumulative usage for session {identity}")
+            if kind == "collab_agent_spawn_begin":
+                call_id = payload.get("call_id")
+                if isinstance(call_id, str):
+                    pending_spawns.add(call_id)
+                else:
+                    reasons.add(f"unidentified spawn for session {identity}")
+            if kind == "collab_agent_spawn_end":
+                call_id = payload.get("call_id")
+                if isinstance(call_id, str):
+                    pending_spawns.discard(call_id)
+                child = payload.get("new_thread_id")
+                if isinstance(child, str) and child:
+                    expected_children.add(child)
+                    if isinstance(payload.get("model"), str):
+                        child_models.add(payload["model"])
+                    if child in sessions and sessions[child]["parent_thread_id"] != identity:
+                        reasons.add(f"spawn lineage does not match session {child}")
+                        identity_safe = False
+        has_usage = total is not None and {"input_tokens", "output_tokens"}.issubset(total)
+        if not has_usage:
+            reasons.add(f"missing usage for session {identity}")
+        if pending_spawns:
+            reasons.add(f"unresolved spawns for session {identity}")
+        if not complete or failed:
+            reasons.add(f"incomplete or failed session {identity}")
+        session_reasons = reasons - prior_reasons
+        records.append(
+            {
+                "session_id": identity,
+                "parent_thread_id": session["parent_thread_id"],
+                "observed_usage": total,
+                "status": "complete"
+                if complete and not failed and has_usage and not session_reasons
+                else "incomplete",
+                "reasons": sorted(session_reasons),
+            }
+        )
+
+    # exec's stdout exposes collab tool receivers even if a child rollout was lost.
+    for event in stdout:
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "collab_tool_call":
+            receivers = item.get("receiver_thread_ids")
+            if isinstance(receivers, list):
+                expected_children.update(value for value in receivers if isinstance(value, str))
+    for child in sorted(expected_children - sessions.keys()):
+        reasons.add(f"missing descendant session {child}")
+    if stream_errors:
+        reasons.add("native event stream contains errors")
+    root_turns = [
+        reported
+        for event in stdout
+        if event.get("type") == "turn.completed"
+        if (reported := _token_usage(event.get("usage"))) is not None
+    ]
+    root_usage = _sum_usage(root_turns)
+    if root is not None and root_usage is not None:
+        captured = next(
+            record["observed_usage"] for record in records if record["session_id"] == root
+        )
+        if captured is None or any(captured.get(key) != value for key, value in root_usage.items()):
+            reasons.add("root stdout usage does not match cumulative session usage")
+    observed_totals = [
+        record["observed_usage"] for record in records if record["observed_usage"] is not None
+    ]
+    observed_usage = _sum_usage(observed_totals)
+    # An ambiguous identity/history can include the same work more than once.
+    # Retain individual observations, but do not label their sum a lower bound.
+    complete = not reasons
+    return {
+        "usage": observed_usage if complete else None,
+        "partial_usage": [
+            {
+                "session_id": record["session_id"],
+                "tokens": record["observed_usage"],
+                "status": "last observed session total; incomplete usage lower bound",
+            }
+            for record in records
+            if not complete and identity_safe and record["observed_usage"] is not None
+        ],
+        "actual_primary_models": sorted(models),
+        "actual_descendant_models": sorted(child_models),
+        "runtime_effort_evidence": sorted(effort),
+        "usage_accounting": {
+            "status": "complete" if complete else "incomplete",
+            "scope": "root_and_descendants",
+            "root_session_id": root,
+            "reasons": sorted(reasons),
+            "sessions": records,
+            "observed_usage_lower_bound": observed_usage if identity_safe else None,
+        },
     }
 
 
@@ -447,9 +695,9 @@ def invoke(
     protocol: dict[str, Any],
     prompt: str,
     timeout: int,
-    read_only: bool = False,
     output_schema: Path | None = None,
 ) -> dict[str, Any]:
+    """Invoke a local reviewer with an OS-enforced read-only source packet."""
     artifacts = area / "artifacts"
     artifacts.mkdir(exist_ok=True)
     if any((artifacts / name).exists() for name in ("invocation.json", "execution.json")):
@@ -462,10 +710,7 @@ def invoke(
         host=entry["host"],
         model=protocol["models"][entry["host"]],
         workspace=area / "workspace",
-        plugin=None,
         effort=effort,
-        # The mandatory OS wrapper owns Codex's read-only scope. Nested Seatbelt fails.
-        read_only=read_only and entry["host"] != "codex",
     )
     if output_schema is not None:
         if entry["host"] == "claude":
@@ -502,7 +747,7 @@ def invoke(
         )
         argv, filesystem = isolation.command(
             argv,
-            writable=[private, *([] if read_only else [area / "workspace"])],
+            writable=[private],
             readable=[area / "workspace", *([output_schema] if output_schema else [])],
             expected=protocol.get("isolation"),
         )

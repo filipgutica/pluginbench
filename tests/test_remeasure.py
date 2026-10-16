@@ -140,10 +140,36 @@ def _profile(root: Path, *, broken: bool = False) -> dict[str, list[Collector]]:
     }
 
 
+def _cached_baseline_origin(root: Path) -> None:
+    record = json.loads((root / "assessment-input.json").read_text())["records"][0]
+    record["id"] = "previous-a"
+    for stage in record["stages"]:
+        for key in ("snapshot", "correctness"):
+            stage[key]["path"] = stage[key]["path"].replace("attempts/a/", "attempts/previous-a/")
+    historical = root / "baseline-evidence/a/native-starts.json"
+    _write(historical, {"started": True})
+    origin = {
+        "status": "reused",
+        "cache_key": "cached-cohort",
+        "context": {"fixture_digest": record["before"]["sha256"]},
+        "origin_run": "/previous/run/no-longer-present",
+        "origin_attempt": "previous-a",
+        "original_record": record,
+        "original_task_digest": "original-task",
+        "historical_evidence": [study._reference(root, historical)],
+    }
+    path = root / "baseline-evidence/a/origin.json"
+    _write(path, origin)
+    run = json.loads((root / "run.json").read_text())
+    run["baseline_origin"] = {"a": {**origin, "evidence": study._reference(root, path)}}
+    _write(root / "run.json", run)
+
+
 def test_remeasurement_deduplicates_repeats_and_preserves_native_fields(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _native(tmp_path / "run")
+    _cached_baseline_origin(root)
     previous = study._inventory(root)
     calls: list[Path] = []
 
@@ -200,12 +226,25 @@ def test_remeasurement_deduplicates_repeats_and_preserves_native_fields(
 
 @pytest.mark.parametrize(
     "fault",
-    ["running", "pending", "frozen", "snapshot", "execution"],
+    [
+        "running",
+        "pending",
+        "frozen",
+        "snapshot",
+        "execution",
+        "origin_file",
+        "origin_inline",
+        "origin_extra_reference",
+        "historical_file",
+        "historical_escape",
+        "historical_link",
+    ],
 )
 def test_remeasurement_rejects_invalid_native_state_before_tools(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
 ) -> None:
     root = _native(tmp_path / "run")
+    _cached_baseline_origin(root)
     run = json.loads((root / "run.json").read_text())
     if fault == "running":
         run["status"] = "running"
@@ -217,6 +256,34 @@ def test_remeasurement_rejects_invalid_native_state_before_tools(
         (root / "attempts/a/handoff/snapshot/value.js").write_text("changed")
     elif fault == "execution":
         (root / "attempts/a/handoff/execution.json").write_text("{}")
+    elif fault == "origin_file":
+        (root / "baseline-evidence/a/origin.json").write_text("{}")
+    elif fault == "origin_inline":
+        run["baseline_origin"]["a"]["original_record"]["model"] = "changed"
+    elif fault == "origin_extra_reference":
+        extra = root / "baseline-evidence/a/extra.json"
+        _write(extra, {"bound": True})
+        origin = run["baseline_origin"]["a"]
+        origin["context"]["provenance"] = {"receipt": study._reference(root, extra)}
+        _write(extra, {"bound": False})
+        origin_path = root / "baseline-evidence/a/origin.json"
+        _write(origin_path, {key: value for key, value in origin.items() if key != "evidence"})
+        origin["evidence"] = study._reference(root, origin_path)
+    elif fault == "historical_file":
+        (root / "baseline-evidence/a/native-starts.json").write_text("{}")
+    elif fault in {"historical_escape", "historical_link"}:
+        outside = tmp_path / "outside.json"
+        _write(outside, {"started": True})
+        origin = run["baseline_origin"]["a"]
+        reference = origin["historical_evidence"][0]
+        if fault == "historical_escape":
+            reference["path"] = "../outside.json"
+        else:
+            (root / "historical-link.json").symlink_to(outside)
+            reference["path"] = "historical-link.json"
+        origin_path = root / "baseline-evidence/a/origin.json"
+        _write(origin_path, {key: value for key, value in origin.items() if key != "evidence"})
+        origin["evidence"] = study._reference(root, origin_path)
     _write(root / "run.json", run)
     monkeypatch.setattr(
         remeasure,

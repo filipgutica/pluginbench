@@ -10,14 +10,16 @@ import re
 import shutil
 import tarfile
 import tempfile
+import tomllib
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
-from pluginbench import codex, harbor_backend
+from pluginbench import harbor_backend, submissions
+from pluginbench.native_treatments import DELIVERY_POLICY, NativeCapabilities
 from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.assessment_models import AttemptInput
-from pluginbench.datasets import TaskSpec
+from pluginbench.datasets import TaskSpec, native_identity, portable_native_identity
 
 
 def _hash(value: object) -> str:
@@ -57,35 +59,6 @@ def _copy_attempt(source: Path, target: Path) -> None:
             # Keep unsupported link evidence inert; never extract or follow its targets.
             with tarfile.open(target / stage.name / "unsupported-submission.tar", "w") as archive:
                 archive.add(raw, arcname="unsupported-submission", recursive=True)
-
-
-def _immutable_image(value: object) -> dict[str, str] | None:
-    if not isinstance(value, dict):
-        return None
-    image = {}
-    for key in ("image", "image_id", "platform", "workdir"):
-        field = value.get(key)
-        if not isinstance(field, str) or not field:
-            return None
-        image[key] = field
-    return image
-
-
-def _immutable_toolchain(value: object) -> dict[str, object] | None:
-    if not isinstance(value, dict):
-        return None
-    image_id = value.get("image_id")
-    if (
-        not isinstance(image_id, str)
-        or not re.fullmatch(r"sha256:[a-f0-9]{64}", image_id)
-        or not all(
-            isinstance(value.get(key), str) and value[key]
-            for key in ("platform", "harness", "harness_version", "install_policy")
-        )
-        or _immutable_image(value.get("base_image_identity")) is None
-    ):
-        return None
-    return value
 
 
 def _docker_executable(value: object) -> dict[str, object] | None:
@@ -132,217 +105,238 @@ def _matches_docker_client(artifacts: Path, expected: dict[str, object]) -> bool
     return True
 
 
-def _matches_settings(
-    attempt: Path,
-    record: dict[str, Any],
-    coding: object,
-    *,
-    image: dict[str, str] | None = None,
-    toolchain: dict[str, object] | None = None,
-) -> bool:
+def _eligible(*, attempt: Path, record: dict[str, Any], coding: object, task: TaskSpec) -> bool:
+    """Admission binds actual native source, private runtime and cleanup receipts."""
     if not isinstance(coding, dict):
         return False
+    expected = coding.get("isolation")
+    identity = coding.get("native_task_identity")
     settings = coding.get("study")
-    if not isinstance(settings, dict) or not all(
-        isinstance(settings.get(key), str) and settings[key]
-        for key in ("harness", "model", "reasoning")
-    ):
-        return False
-    harness = settings["harness"] + "-cli"
-    version = coding.get("harness_version")
     if (
-        not isinstance(version, str)
-        or not version
-        or image is None
-        or toolchain is None
-        or toolchain.get("harness") != settings["harness"]
-        or toolchain.get("harness_version") != version
+        not isinstance(expected, dict)
+        or not isinstance(identity, dict)
+        or not isinstance(settings, dict)
     ):
         return False
-    environment = coding.get("task_environment")
-    build = environment.get("build_timeout_seconds") if isinstance(environment, dict) else None
-    agent = coding.get("timeout_seconds")
+    image = identity.get("image_identity")
+    toolchain = identity.get("toolchain_identity")
     if (
-        type(agent) is not int
-        or agent <= 0
-        or not isinstance(build, str)
-        or not build.isdecimal()
-        or int(build) <= 0
+        not isinstance(image, dict)
+        or not isinstance(toolchain, dict)
+        or toolchain.get("image_id") != image.get("image_id")
+        or toolchain.get("harness") != settings.get("harness")
+        or toolchain.get("harness_version") != coding.get("harness_version")
+        or identity.get("isolation") != expected
     ):
         return False
-    budgets = {"timeout_seconds": agent, "build_timeout_seconds": int(build)}
     runtime = record.get("runtime") or {}
-    observations = [
-        (record.get("model"), settings["model"]),
-        (runtime.get("harness"), harness),
-        (runtime.get("reasoning_effort"), settings["reasoning"]),
-    ]
-    if isinstance(version, str) and version:
-        observations.append((runtime.get("harness_version"), version))
-    for stage in record["stages"]:
-        execution = json.loads((attempt / stage["id"] / "execution.json").read_text())
-        invocation_path = attempt / stage["id"] / "artifacts/invocation.json"
-        if not invocation_path.is_file():
-            return False
-        invocation = json.loads(invocation_path.read_text())
-        if (
-            not isinstance(invocation, dict)
-            or _immutable_image(invocation.get("image_identity")) != image
-            or _immutable_toolchain(invocation.get("toolchain_identity")) != toolchain
-            or any(
-                type(invocation.get(key)) is not int or invocation[key] != expected
-                for key, expected in budgets.items()
-            )
-            or any(
-                invocation.get(key) != expected
-                for key, expected in (
-                    ("backend", "harbor-docker-v1"),
-                    ("harness", harness),
-                    ("harness_version", version),
-                    ("requested_model", settings["model"]),
-                    ("requested_effort", settings["reasoning"]),
-                )
-            )
-        ):
-            return False
-        if isinstance(version, str) and version:
-            observations.append((execution.get("launch_harness_version"), version))
-            startup = execution.get("startup")
-            if isinstance(startup, list):
-                observations.extend(
-                    (codex.observed_cli_version([event], host=settings["harness"]), version)
-                    for event in startup
-                )
-        for key, expected in (
-            ("actual_primary_models", settings["model"]),
-            ("runtime_effort_evidence", settings["reasoning"]),
-        ):
-            actual = execution.get(key)
-            if isinstance(actual, list):
-                observations.extend((value, expected) for value in actual)
-        launch = execution.get("launch")
-        if isinstance(launch, dict):
-            if isinstance(version, str) and version:
-                observations.append((launch.get("harness_version"), version))
-            observations.extend(
-                (launch.get(key), expected)
-                for key, expected in (
-                    ("harness", harness),
-                    ("requested_model", settings["model"]),
-                    ("requested_effort", settings["reasoning"]),
-                )
-            )
-    return all(
-        not isinstance(actual, str) or not actual or actual == expected
-        for actual, expected in observations
-    )
-
-
-def _matches_harbor_runtime(
-    attempt: Path,
-    record: dict[str, Any],
-    expected: dict[str, Any],
-    *,
-    image: dict[str, str],
-    toolchain: dict[str, object],
-) -> bool:
-    engine = expected.get("docker_engine")
-    resources = expected.get("resources")
-    if (
-        type(expected.get("submission_receipt_version")) is not int
-        or expected["submission_receipt_version"] != 2
-        or not isinstance(expected.get("harbor_version"), str)
-        or not expected["harbor_version"]
-        or not isinstance(expected.get("implementation_sha256"), str)
-        or not re.fullmatch(r"[a-f0-9]{64}", expected["implementation_sha256"])
-        or not isinstance(engine, dict)
-        or not all(
-            isinstance(engine.get(key), str) and engine[key]
-            for key in ("id", "version", "platform", "endpoint")
-        )
-        or not isinstance(resources, dict)
-        or not all(
-            type(resources.get(key)) is int and resources[key] > 0 for key in ("cpus", "memory_mb")
-        )
+    for actual, requested in (
+        (record.get("model"), settings.get("model")),
+        (runtime.get("harness"), str(settings.get("harness")) + "-cli"),
+        (runtime.get("reasoning_effort"), settings.get("reasoning")),
+        (runtime.get("harness_version"), coding.get("harness_version")),
     ):
-        return False
-    for stage in record["stages"]:
-        artifacts = attempt / stage["id"] / "artifacts"
-        if not _matches_docker_client(artifacts, expected):
+        if actual is not None and actual != requested:
             return False
-        receipt = artifacts / "runtime-isolation.json"
-        if not receipt.is_file():
-            return False
-        actual = json.loads(receipt.read_text())
-        export = actual.get("export", {})
-        cleanup = actual.get("cleanup", {})
-        if (
-            actual.get("container") != expected
-            or not isinstance(export, dict)
-            or export.get("status") != "complete"
-            or export.get("stopped") is not True
-            or export.get("resources") != {key: resources[key] for key in ("cpus", "memory_mb")}
-            or not isinstance(export.get("derived_image_id"), str)
-            or not re.fullmatch(r"sha256:[a-f0-9]{64}", export["derived_image_id"])
-            or _immutable_image(export.get("base_image_identity")) != image
-            or _immutable_toolchain(export.get("toolchain_identity")) != toolchain
-            or (
-                stage.get("snapshot") is not None
-                and export.get("snapshot_digest") != stage["snapshot"]["sha256"]
+    try:
+        return all(
+            _matches_native_stage(
+                target=attempt / stage["id"], stage=stage, coding=coding, task=task
             )
-            or not isinstance(cleanup, dict)
-            or cleanup.get("status") != "complete"
-            or cleanup.get("residuals") != {"containers": [], "networks": [], "images": []}
-        ):
-            return False
-        try:
-            proof = json.loads((artifacts / "container-state.json").read_text())
-            if not isinstance(proof, dict):
+            for stage in record["stages"]
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def _matches_treatment_delivery(
+    *, artifacts: Path, invocation: dict[str, Any], execution: dict[str, Any],
+    coding: dict[str, Any],
+) -> bool:
+    """Bind a native vanilla cache entry to its installed policy and empty treatment."""
+    if "delivery" not in coding:
+        return True  # Historical cache identities cannot equal a native identity.
+    if coding["delivery"] != DELIVERY_POLICY:
+        return False
+    inventory: dict[str, list[object]] = {"guidance": [], "skills": [], "plugins": []}
+    if (invocation.get("delivery") != DELIVERY_POLICY
+            or invocation.get("capabilities") != coding.get("capabilities")
+            or invocation.get("treatment_inventory") != inventory
+            or (artifacts / "prompt.txt").read_bytes() != b""):
+        return False
+    receipt = json.loads((artifacts / "native-treatment.json").read_text())
+    if (not isinstance(receipt, dict) or receipt.get("status") != "verified"
+            or receipt.get("delivery") != DELIVERY_POLICY
+            or receipt.get("inventory") != inventory
+            or execution.get("native_treatment") != receipt):
+        return False
+    configuration = receipt.get("effective_config")
+    if not isinstance(configuration, str):
+        return False
+    actual = tomllib.loads(configuration)
+    policy = NativeCapabilities.model_validate(coding.get("capabilities"))
+    expected = policy.codex_config(
+        model=coding["study"]["model"], effort=coding["study"]["reasoning"],
+    )
+    for key, value in expected.items():
+        if isinstance(value, dict):
+            observed = actual.get(key)
+            if not isinstance(observed, dict) or any(
+                observed.get(setting) != required for setting, required in value.items()
+            ):
                 return False
-            harbor_backend.stopped_container_state(proof.get("state"))
-            worker = json.loads((artifacts / "worker.json").read_text())
-        except (OSError, ValueError):
-            return False
-        owner, container_id = proof.get("owner"), proof.get("container_id")
-        if (
-            proof.get("resources") != export["resources"]
-            or proof.get("derived_image_id") != export["derived_image_id"]
-            or not isinstance(owner, str)
-            or re.fullmatch(r"[0-9a-f]{32}", owner) is None
-            or not isinstance(container_id, str)
-            or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
-            or not isinstance(worker, dict)
-            or worker.get("session_id") != f"pluginbench-{owner}__env"
-        ):
+        elif actual.get(key) != value:
             return False
     return True
 
 
-def _eligible(attempt: Path, record: dict[str, Any], coding: object) -> bool:
-    expected = coding.get("isolation") if isinstance(coding, dict) else None
-    if isinstance(expected, dict) and expected.get("protocol") == "harbor-docker-v1":
-        environment = coding.get("task_environment") if isinstance(coding, dict) else None
-        image = (
-            _immutable_image(environment.get("image_identity"))
-            if isinstance(environment, dict)
-            else None
-        )
-        toolchain = (
-            _immutable_toolchain(environment.get("toolchain_identity"))
-            if isinstance(environment, dict)
-            else None
-        )
-        if (
-            image is None
-            or toolchain is None
-            or _immutable_image(toolchain.get("base_image_identity")) != image
-            or toolchain.get("platform") != image["platform"]
-        ):
+def _matches_native_stage(
+    *, target: Path, stage: dict[str, Any], coding: dict[str, Any], task: TaskSpec
+) -> bool:
+    identity, expected, settings = (
+        coding["native_task_identity"],
+        coding["isolation"],
+        coding["study"],
+    )
+    artifacts = target / "artifacts"
+    if not _matches_docker_client(artifacts, expected):
+        return False
+    invocation = json.loads((artifacts / "invocation.json").read_text())
+    observed_identity = invocation.get("native_task_identity")
+    if (
+        not isinstance(observed_identity, dict)
+        or portable_native_identity(observed_identity) != identity
+    ):
+        return False
+    if any(
+        invocation.get(key) != value
+        for key, value in {
+            "backend": harbor_backend.PROTOCOL,
+            "harness": str(settings.get("harness")) + "-cli",
+            "harness_version": coding.get("harness_version"),
+            "requested_model": settings.get("model"),
+            "requested_effort": settings.get("reasoning"),
+            "timeout_seconds": settings.get("timeout_seconds", coding.get("timeout_seconds")),
+            "task_assets_sha256": identity.get("task_assets_sha256"),
+        }.items()
+    ):
+        return False
+    execution = json.loads((target / "execution.json").read_text())
+    if not _matches_treatment_delivery(
+        artifacts=artifacts, invocation=invocation, execution=execution, coding=coding,
+    ):
+        return False
+    if execution.get("private_runtime_removed") is not True:
+        return False
+    for key, requested in (
+        ("actual_primary_models", settings.get("model")),
+        ("runtime_effort_evidence", settings.get("reasoning")),
+    ):
+        values = execution.get(key, [])
+        if not isinstance(values, list) or any(value != requested for value in values):
             return False
-        return _matches_harbor_runtime(
-            attempt, record, expected, image=image, toolchain=toolchain
-        ) and _matches_settings(attempt, record, coding, image=image, toolchain=toolchain)
-    return False
+    receipt = json.loads((artifacts / "runtime-isolation.json").read_text())
+    before = json.loads((artifacts / "before-source.json").read_text())
+    exported = submissions.validate_export(
+        diagnostic=target / "diagnostic-source", artifacts=artifacts, execution=execution
+    )
+    if (
+        receipt.get("export") != exported
+        or not _native_export_matches(before, identity, identity.get("source_digest"))
+        or not _native_export_matches(exported, identity, exported["snapshot_digest"])
+    ):
+        return False
+    if before.get("container_id") != exported.get("container_id") or before.get(
+        "project"
+    ) != exported.get("project"):
+        return False
+    if execution.get("native_verifier_result") is not None and not _native_grader_matches(
+        receipt.get("verifier"), identity
+    ):
+        return False
+    if stage.get("snapshot"):
+        source = submissions.validate(
+            before=task.fixture,
+            task_dir=task.native_task,
+            identity=native_identity(task),
+            artifacts=artifacts,
+            execution=execution,
+            snapshot=target / "snapshot",
+        )
+        if source["snapshot_digest"] != stage["snapshot"]["sha256"]:
+            return False
+    else:
+        failure = json.loads((target / "unsupported-submission.json").read_text())
+        if failure.get("source_policy") != submissions.SOURCE_POLICY:
+            return False
+        with tempfile.TemporaryDirectory(prefix="pluginbench-cache-source-") as temporary:
+            try:
+                submissions.reconstruct(
+                    before=task.fixture,
+                    task_dir=task.native_task,
+                    identity=native_identity(task),
+                    artifacts=artifacts,
+                    execution=execution,
+                    destination=Path(temporary).resolve() / "source",
+                )
+            except ValueError:
+                pass
+            else:
+                return False
+    return _native_cleanup_matches(receipt.get("cleanup"))
+
+
+def _native_grader_matches(verifier: object, identity: dict[str, Any]) -> bool:
+    if not isinstance(verifier, dict):
+        return False
+    if verifier.get("image_id") != identity["grader_image_identity"].get("image_id"):
+        return False
+    harbor_backend.stopped_container_state(verifier.get("state"))
+    limits = identity["isolation"]["resources"]
+    resources = verifier.get("resources")
+    if not isinstance(resources, dict):
+        return False
+    return bool(
+        resources.get("NanoCpus") == limits["cpus"] * 1_000_000_000
+        and resources.get("Memory") == limits["memory_mb"] * 1024 * 1024
+    )
+
+
+def _native_cleanup_matches(cleanup: object) -> bool:
+    if not isinstance(cleanup, dict) or cleanup.get("status") != "complete":
+        return False
+    projects = cleanup.get("projects")
+    if not isinstance(projects, dict) or not projects:
+        return False
+    return all(
+        isinstance(project, dict)
+        and project.get("status") == "complete"
+        and project.get("residuals") == {"containers": [], "networks": [], "images": []}
+        for project in projects.values()
+    )
+
+
+def _native_export_matches(value: object, identity: dict[str, Any], digest: object) -> bool:
+    if not isinstance(value, dict) or not isinstance(identity.get("image_identity"), dict):
+        return False
+    image = identity["image_identity"]
+    if (
+        value.get("status") != "complete"
+        or value.get("stopped") is not True
+        or value.get("snapshot_digest") != digest
+        or not isinstance(digest, str)
+        or value.get("image_id") != image.get("image_id")
+        or value.get("workdir") != identity.get("workdir")
+        or value.get("resources")
+        != {key: identity["isolation"]["resources"][key] for key in ("cpus", "memory_mb")}
+        or not isinstance(value.get("container_id"), str)
+        or not re.fullmatch(r"[a-f0-9]{64}", value["container_id"])
+        or not isinstance(value.get("project"), str)
+        or not re.fullmatch(r"pluginbench-[a-f0-9]{32}__env", value["project"])
+    ):
+        return False
+    harbor_backend.stopped_container_state(value.get("state"))
+    return True
 
 
 class BaselineCache:
@@ -359,20 +353,23 @@ class BaselineCache:
     ) -> None:
         self.path = path.absolute()
         self.root = root
+        self.tasks = {task.task_id: task for task in tasks}
         self.entries = [entry for entry in entries if entry["arm"] == "baseline"]
         self.contexts = {}
         for task in tasks:
-            assert task.fixture is not None
             coding = {
                 key: value.get(task.task_id)
                 if key in {"task_assets", "task_environment"} and isinstance(value, dict)
                 else value
                 for key, value in identity.items()
             }
+            coding["native_task_identity"] = portable_native_identity(native_identity(task))
             self.contexts[task.task_id] = {
-                "protocol": "isolated-baseline-cohort-v1",
+                "protocol": "native-harbor-baseline-cohort-v3",
+                "source_policy": submissions.SOURCE_POLICY,
                 "coding": coding,
                 "task_id": task.task_id,
+                "task_digest": task.digest,
                 "prompt": task.prompt,
                 "fixture_digest": inspect_snapshot(task.fixture)["digest"],
                 "repeats": sorted(
@@ -437,28 +434,16 @@ class BaselineCache:
             record["task_id"] != task_id
             or record["arm"] != "baseline"
             or not _eligible(
-                cached / "attempts" / record["id"],
-                record,
-                self.contexts[task_id]["coding"],
+                attempt=cached / "attempts" / record["id"],
+                record=record,
+                coding=self.contexts[task_id]["coding"],
+                task=self.tasks[task_id],
             )
             for record in records
         ):
-            coding = self.contexts[task_id]["coding"]
-            runtime = coding.get("isolation") if isinstance(coding, dict) else None
-            reason = "baseline cache cohort lacks complete isolated baseline evidence"
-            if isinstance(runtime, dict) and runtime.get("protocol") == "harbor-docker-v1":
-                reason += "; Harbor reuse requires immutable agent toolchain image evidence, not a CLI version alone"
-            raise ValueError(reason)
-        for record in records:
-            for stage in record["stages"]:
-                if (
-                    stage["snapshot"] is not None
-                    and inspect_snapshot(
-                        cached / "attempts" / record["id"] / stage["id"] / "snapshot"
-                    )["digest"]
-                    != stage["snapshot"]["sha256"]
-                ):
-                    raise ValueError("baseline cache submitted snapshot changed")
+            raise ValueError(
+                "baseline cache cohort lacks complete isolated native baseline evidence"
+            )
         return manifest
 
     def decisions(self) -> dict[str, dict[str, Any]]:
@@ -566,9 +551,10 @@ class BaselineCache:
             ]
             if not all(
                 _eligible(
-                    self.root / "attempts" / record["id"],
-                    record,
-                    self.contexts[task_id]["coding"],
+                    attempt=self.root / "attempts" / record["id"],
+                    record=record,
+                    coding=self.contexts[task_id]["coding"],
+                    task=self.tasks[task_id],
                 )
                 for record in cohort
             ):

@@ -17,7 +17,7 @@ from pydantic import (
 )
 
 Digest = str
-MetricKind = Literal["fallow", "coverage"]
+MetricKind = Literal["fallow", "analysis", "coverage"]
 
 
 class InputModel(BaseModel):
