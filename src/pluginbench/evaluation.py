@@ -77,6 +77,7 @@ class Runner(BaseModel):
 
 
 class Reviewer(Runner):
+    timeout_seconds: int | None = Field(default=None, strict=True, ge=1)
     guidance: list[Path] = Field(default_factory=list)
 
 
@@ -563,7 +564,7 @@ def _finish_evaluation(
             harness=config.reviewer.harness,
             model=config.reviewer.model,
             effort=config.reviewer.reasoning,
-            timeout=config.timeout_seconds,
+            timeout=config.reviewer.timeout_seconds or config.timeout_seconds,
             seed=config.seed,
             revision="review",
             guidance=guidance,
@@ -811,7 +812,7 @@ def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path
             "criteria_sha256": comparison["review_criteria_sha256"],
             "seed": config["seed"],
             "jobs": config["jobs"],
-            "timeout_seconds": config["timeout_seconds"],
+            "timeout_seconds": reviewer.get("timeout_seconds") or config["timeout_seconds"],
             "stage": "handoff",
         }
         if any(protocol.get(key) != value for key, value in expected.items()):

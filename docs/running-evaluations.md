@@ -70,7 +70,7 @@ A native reward applies to the canonical submission only when its source binding
 
 CPU and memory budgets must cover both coding and verifier requirements. Tasks with different declarations need explicit common `container_cpus` and `container_memory_mb` settings. Smaller budgets are rejected. Docker capacity is checked before preparation; PluginBench never increases the VM allocation automatically.
 
-`timeout_seconds` is a separate agent budget, defaulting to 1,800 seconds. The plan records native and effective budgets. Setup, artifact collection, and verification have separate bounded allowances. A timeout preserves the attempt; incomplete usage remains unknown or a labelled lower bound.
+`timeout_seconds` is the coding agent budget, defaulting to 1,800 seconds. Set `reviewer.timeout_seconds: 600` to give each independent review a separate 600-second budget. The review timeout must be a positive integer; when omitted or null, it inherits `timeout_seconds`, including for saved evaluations. The plan records native and effective coding budgets. Setup, artifact collection, and verification have separate bounded allowances. A timeout preserves the attempt; incomplete usage remains unknown or a labelled lower bound.
 
 Cleanup removes owned containers, networks, sidecars, temporary homes, and job copies, and records residual resources. Frozen evidence and reusable task/prepared-image/baseline caches remain. A restart can bypass cleanup; PluginBench does not delete unowned resources. See [Security](../SECURITY.md).
 

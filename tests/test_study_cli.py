@@ -307,6 +307,22 @@ def test_fixed_reviewer_separate_from_candidate_guidance(config: evaluation.Eval
     assert selected.reviewer and selected.reviewer.harness == "claude"
 
 
+@pytest.mark.parametrize("timeout", [0, -1, True, False, 1.5, "600"])
+def test_invalid_review_timeout_rejected_before_calls(
+    config: evaluation.Evaluation, timeout: object
+) -> None:
+    raw = config.model_dump(mode="json")
+    raw["measurements"].append("review")
+    raw["reviewer"] = {
+        "harness": "codex",
+        "model": "gpt-6-astra",
+        "reasoning": "high",
+        "timeout_seconds": timeout,
+    }
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        evaluation.resolve_evaluation(raw, Path.cwd())
+
+
 def test_comparison_identity_ignores_guidance_label_but_tracks_task_and_runtime(
     config: evaluation.Evaluation,
 ) -> None:
@@ -363,18 +379,20 @@ def test_jobs_override_works_with_config_and_is_visible_in_dry_run(
 
 
 @pytest.mark.parametrize(
-    "unavailable,recover,citation_error,collection_unavailable,collection_integrity,no_profiles,readiness_required",
+    "unavailable,recover,citation_error,collection_unavailable,collection_integrity,"
+    "no_profiles,readiness_required,review_timeout",
     [
-        (False, False, False, False, False, False, False),
-        (True, False, False, False, False, False, False),
-        (False, True, False, False, False, False, False),
-        (True, True, False, False, False, False, False),
-        (False, False, True, False, False, False, False),
-        (False, False, False, True, False, False, False),
-        (False, False, False, False, True, False, False),
-        (False, False, False, False, False, True, False),
-        (False, False, False, True, False, False, True),
-        (False, False, False, False, False, False, True),
+        (False, False, False, False, False, False, False, None),
+        (True, False, False, False, False, False, False, None),
+        (False, True, False, False, False, False, False, None),
+        (True, True, False, False, False, False, False, None),
+        (False, False, True, False, False, False, False, None),
+        (False, False, False, True, False, False, False, None),
+        (False, False, False, False, True, False, False, None),
+        (False, False, False, False, False, True, False, None),
+        (False, False, False, True, False, False, True, None),
+        (False, False, False, False, False, False, True, None),
+        (False, False, False, False, False, False, False, 600),
     ],
 )
 def test_integrated_evaluation_and_report_regeneration(
@@ -388,6 +406,7 @@ def test_integrated_evaluation_and_report_regeneration(
     collection_integrity: bool,
     no_profiles: bool,
     readiness_required: bool,
+    review_timeout: int | None,
 ) -> None:
     config.measurement_settings.require_ready = readiness_required
     config.jobs = 1 if recover else 4
@@ -397,6 +416,11 @@ def test_integrated_evaluation_and_report_regeneration(
     config.reviewer = evaluation.Reviewer(
         harness="codex", model="gpt-6-astra", reasoning="high", guidance=[standards]
     )
+    if review_timeout is not None:
+        # Validate the explicit setting through the same config boundary as real runs.
+        raw = config.model_dump(mode="json")
+        raw["reviewer"]["timeout_seconds"] = review_timeout
+        config = evaluation.resolve_evaluation(raw, Path.cwd())
     separate_coverage_scope = not any(
         (
             unavailable,
@@ -731,6 +755,13 @@ def test_integrated_evaluation_and_report_regeneration(
         "review",
     }
     assert len(judge_calls) == (8 if unavailable else 9)
+    expected_review_timeout = 1800 if review_timeout is None else 600
+    assert all(call["timeout"] == expected_review_timeout for call in judge_calls)
+    assert all(call["timeout"] == 1800 for call in calls)
+    assert (
+        json.loads((review / "protocol.json").read_text())["timeout_seconds"]
+        == expected_review_timeout
+    )
     coverage = [row for row in data["observations"] if row["metric"] == "Branch coverage %"]
     findings = [row for row in data["observations"] if row["metric"] == "Total review findings"]
     assert len(coverage) == len(findings) == 9
@@ -793,12 +824,17 @@ def test_integrated_evaluation_and_report_regeneration(
         assert projected["review_projection"]["native_invocations_in_these_revisions"] == 9
         assert (len(calls), len(judge_calls)) == native_counts
         assert all(path.read_bytes() == content for path, content in protected.items())
+        changed_settings = {**saved}
+        if review_timeout is None:
+            changed_settings["timeout_seconds"] = config.timeout_seconds + 1
+        else:
+            saved_reviewer = saved["reviewer"]
+            assert isinstance(saved_reviewer, dict)
+            changed_settings["reviewer"] = {
+                **saved_reviewer, "timeout_seconds": expected_review_timeout + 1
+            }
         with monkeypatch.context() as changed:
-            changed.setattr(
-                evaluation,
-                "_load_selection",
-                lambda _: {**saved, "timeout_seconds": config.timeout_seconds + 1},
-            )
+            changed.setattr(evaluation, "_load_selection", lambda _: changed_settings)
             with pytest.raises(ValueError, match="fixed comparison settings"):
                 evaluation.regenerate_report(root, review_revision=revision)
         assert all(path.read_bytes() == content for path, content in protected.items())
