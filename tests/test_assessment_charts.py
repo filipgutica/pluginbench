@@ -355,6 +355,7 @@ def _controller_result(data: dict[str, object], tmp_path: Path) -> dict[str, obj
     stub = r"""
 const unique = items => [...new Set(items)];
 const armLabel = arm => arm === 'baseline' ? 'Vanilla' : arm;
+const byArm = (a, b) => Number(b === 'baseline') - Number(a === 'baseline') || a.localeCompare(b);
 const create = (tag, text, parent) => { const node = {textContent:text}; parent.append(node); return node; };
 """
     capture = r"""

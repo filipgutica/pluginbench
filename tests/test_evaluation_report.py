@@ -4,6 +4,7 @@ import copy
 import csv
 import io
 import json
+import os
 import re
 from pathlib import Path
 import subprocess
@@ -545,6 +546,38 @@ def test_only_selected_families_and_compact_runtime_evidence_are_exported() -> N
     assert report == original
 
 
+def _shared_helpers(controller: str) -> str:
+    """Return the template's own ordering and formatting helpers for extracted functions."""
+    names = (
+        "formatCompact",
+        "formatSigned",
+        "packageNames",
+        "armRank",
+        "byArm",
+        "seriesVariable",
+        "formatLimited",
+        "KEY_METRICS",
+    )
+    lines = [re.search(rf"^const {name} = .*$", controller, re.M) for name in names]
+    assert all(lines)
+    return "".join(line.group(0) + "\n" for line in lines if line)
+
+
+def test_summary_numbers_keep_small_nonzero_differences(tmp_path: Path) -> None:
+    controller = Path("src/pluginbench/assessment-charts.html").read_text().rsplit("<script>", 1)[1]
+    script = tmp_path / "format.js"
+    script.write_text(
+        "const data={attempts:[]},observations=[],unique=items=>[...new Set(items)];\n"
+        + _shared_helpers(controller)
+        + "console.log(JSON.stringify([0.014,-0.004,0,2133.5,1281072.25].map(formatSigned)));\n"
+    )
+    # The template formats with the reader's locale; pin one for a deterministic expectation.
+    locale = {**os.environ, "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"}
+    result = subprocess.run(["node", str(script)], capture_output=True, text=True, env=locale)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["+0.014", "-0.004", "0", "+2,133.5", "+1.28M"]
+
+
 def _outcome_text(
     data: dict[str, object], tmp_path: Path, *, package: bool = False, task: str = ""
 ) -> list[str]:
@@ -556,13 +589,14 @@ def _outcome_text(
     script = tmp_path / "outcomes.js"
     script.write_text(
         "const data=" + json.dumps(data) + ";\n"
-        "const texts=[];const element=()=>({replaceChildren(){},querySelector(){return null},setAttribute(){},append(){},cloneNode(){return element()},addEventListener(){},firstChild:{}});\n"
+        "const texts=[];const element=()=>({replaceChildren(){},querySelector(){return null},setAttribute(){},append(){},prepend(){},style:{setProperty(){}},cloneNode(){return element()},addEventListener(){},firstChild:{}});\n"
         "const document={getElementById:element},packageSummary=element(),taskSelect={value:"
         + json.dumps(task)
         + "},observations=data.observations,metricSelect={value:''};\n"
         "const unique=items=>[...new Set(items)],armLabel=arm=>arm==='baseline'?'Vanilla':arm;\n"
         "const emptyFunctionMaximum=()=>false,format=value=>String(value);\n"
         "const create=(tag,text,parent)=>{if(text!==undefined)texts.push(String(text));return element();};\n"
+        + _shared_helpers(controller)
         + (summary.group(0) if summary else "")
         + function.group(0)
         + "\n"

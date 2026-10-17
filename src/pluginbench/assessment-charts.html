@@ -200,6 +200,10 @@ p a, dd a { text-decoration: underline; text-underline-offset: 0.18em; }
 }
 
 :root { --pb-bg:var(--background,var(--bg)); --pb-surface:var(--card,var(--surface-raised)); --pb-text:var(--foreground,var(--text)); --pb-muted:var(--muted-foreground,var(--text-muted)); --pb-border:var(--input,var(--border-subtle)); --pb-accent:var(--primary,var(--accent)); }
+/* Categorical package colors in fixed order, validated against --bg in each mode. Vanilla stays neutral. */
+:root { --series-1:#2a78d6; --series-2:#eb6834; --series-3:#1baf7a; --series-4:#eda100; --series-5:#e87ba4; --series-6:#008300; --series-7:#6250d6; --series-8:#e34948; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70; --series-4:#c98500; --series-5:#d55181; --series-6:#008300; --series-7:#9085e9; --series-8:#e66767; } }
+:root[data-theme="dark"] { --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70; --series-4:#c98500; --series-5:#d55181; --series-6:#008300; --series-7:#9085e9; --series-8:#e66767; }
 body { background:var(--pb-bg); color:var(--pb-text); }
 main { max-width:var(--page-wide); margin:auto; padding:var(--space-6); }
 h1 { font-size:var(--text-2xl); } h2 { font-size:var(--text-xl); }
@@ -216,9 +220,7 @@ section { border-top:1px solid var(--pb-border); padding-top:var(--space-6); min
 section > * + * { margin-top:var(--space-3); } .task { border-top:1px solid var(--pb-border); padding-top:var(--space-3); }
 h3 { font-size:var(--text-md); overflow-wrap:anywhere; } .chart { width:100%; height:320px; }
 .legend { display:flex; gap:var(--space-4); flex-wrap:wrap; font-size:var(--text-sm); }
-.legend span::before { content:''; display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:8px; background:var(--pb-accent); }
-.legend span:first-child::before { background:var(--pb-muted); }
-.legend.package-legend span::before { background:var(--series-color); }
+.legend span::before, .swatch::before { content:''; display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:var(--space-2); background:var(--series-color, var(--pb-accent)); }
 .run-toggle { display:flex; align-items:center; gap:8px; font-size:var(--text-sm); cursor:pointer; min-height:32px; }
 summary { cursor:pointer; min-height:32px; padding-top:var(--space-2); } pre { font-size:var(--text-xs); white-space:pre-wrap; overflow-wrap:anywhere; } details { color:var(--pb-muted); } footer { margin-top:var(--space-6); font-size:var(--text-sm); }
 .review-findings { overflow-wrap:anywhere; }
@@ -228,6 +230,9 @@ summary { cursor:pointer; min-height:32px; padding-top:var(--space-2); } pre { f
 .package-summary th { font-weight:var(--weight-medium); }
 .package-summary td { vertical-align:top; }
 .package-summary small { display:block; color:var(--pb-muted); }
+.package-summary thead th { white-space:nowrap; }
+.package-summary h3 { margin-top:var(--space-5); margin-bottom:var(--space-2); }
+.scope-context h2 { font-size:var(--text-lg); }
 .metric-link { padding:0; font:inherit; color:var(--pb-text); background:none; border:0; cursor:pointer; text-align:left; text-decoration:underline; text-underline-offset:3px; }
 .metric-link[aria-pressed=true] { color:var(--pb-accent); }
 .chart-controls { display:flex; flex-wrap:wrap; align-items:end; gap:var(--space-4); margin:var(--space-5) 0 var(--space-3); }
@@ -263,6 +268,10 @@ const create = (tag, text, parent) => {
 const unique = (items) => [...new Set(items)];
 const format = (value) => value === null ? "Unknown" : new Intl.NumberFormat(void 0, { maximumFractionDigits: 2 }).format(value);
 const formatTick = value => new Intl.NumberFormat(undefined, { notation: Math.abs(value) >= 10000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(value);
+// Summaries and bar labels; exact values stay in the detail tables, tooltips and CSV.
+// Values below one keep two significant digits so a small real difference never reads as zero.
+const formatCompact = value => value === null || value === undefined ? "Unknown" : new Intl.NumberFormat(undefined, Math.abs(value) >= 10000 ? { notation: "compact", maximumFractionDigits: 2 } : value !== 0 && Math.abs(value) < 1 ? { maximumSignificantDigits: 2 } : { maximumFractionDigits: 2 }).format(value);
+const formatSigned = value => (value > 0 ? "+" : "") + formatCompact(value);
 const armLabel = (arm) => arm === "baseline" ? "Vanilla" : arm === "unknown" ? "Unlabelled skill set" : arm;
 const choices = (select, values) => {
   for (const value of values) create("option", value, select).value = value;
@@ -272,6 +281,11 @@ create("option", "Choose a task…", taskSelect).value = "";
 const knownTasks = unique(observations.map(row => row.task).filter(task => task !== "unknown"));
 choices(taskSelect, knownTasks);
 taskSelect.value = "";
+// One package order and color per package everywhere: Vanilla first, then packages by name.
+const packageNames = unique([...observations.map(row => row.arm), ...data.attempts.map(row => row.guidance)]).filter(arm => arm !== "baseline").sort();
+const armRank = arm => arm === "baseline" ? -1 : packageNames.indexOf(arm);
+const byArm = (a, b) => armRank(a) - armRank(b);
+const seriesVariable = arm => arm !== "baseline" && armRank(arm) >= 0 ? "--series-" + (armRank(arm) % 8 + 1) : "--pb-muted";
 const viewLabel = create("label", "Chart values", document.querySelector(".controls"));
 const comparisonView = create("select", undefined, viewLabel);
 for (const [value, label] of [["delta", "Delta vs vanilla"], ["raw", "Raw values"]]) create("option", label, comparisonView).value = value;
@@ -288,10 +302,12 @@ overviewButton.addEventListener("click", () => { taskSelect.value = ""; update()
 const scopeContext = create("div", undefined, document.querySelector("header"));
 scopeContext.className = "scope-context";
 scopeContext.setAttribute("aria-live", "polite");
-scopeHeading = create("h1", undefined, scopeContext);
+scopeHeading = create("h2", undefined, scopeContext);
 scopeDescription = create("p", undefined, scopeContext);
 scopeDescription.className = "muted";
-document.querySelector("header > h1").replaceWith(scopeContext);
+const pageTitle = document.querySelector("header > h1");
+if (data.name) { pageTitle.textContent = data.name; document.title = data.name; }
+pageTitle.after(scopeContext);
 const footer = document.querySelector("footer"); footer.replaceChildren();
 create("span", "Each set's delta is relative to this evaluation's vanilla runs. Negative is not automatically better. ", footer);
 const download = create("a", "Download observations CSV", footer); download.href = data.download_csv; download.download = "";
@@ -324,6 +340,13 @@ document.getElementById("limitations").after(methodology);
 document.getElementById("limitations").querySelector("summary").textContent = "Measurement limits";
 
 const emptyFunctionMaximum = row => ["Complexity", "Changed functions", "New-file functions"].includes(row.panel) && row.value === null && row.provenance.reported_functions === 0 && row.provenance.complete_for_declared_scope === true;
+// A parsed coverage report whose format has no population for this unit (for example, LCOV statements).
+const formatLimited = row => row.panel === "Coverage" && row.value === null && Boolean(row.provenance.tool_version) && Object.entries(row.provenance).some(([key, value]) => key.endsWith("_denominator_digest") && value === null);
+for (const option of metricSelect.querySelectorAll("option")) {
+  const rows = observations.filter(row => row.metric === option.value);
+  if (rows.length && rows.every(row => row.value === null)) option.textContent += rows.every(formatLimited) ? " — not reported by the format" : " — no values";
+}
+const KEY_METRICS = ["Input tokens", "Output tokens", "Source lines added", "Test lines added", "After changed-function cyclomatic maximum", "After changed-function cognitive maximum", "Line coverage %", "Branch coverage %", "Introduced dead findings", "Total review findings", "Correctness review findings"];
 function taskCheckSummary(attempts) {
   const executions = attempts.filter(row => ["failed", "timed_out"].includes(row.execution?.status));
   const completed = attempts.filter(row => !executions.includes(row));
@@ -339,11 +362,52 @@ function showPackageSummary() {
   const metricsOpen = packageSummary.querySelector("details")?.open || false;
   packageSummary.replaceChildren();
   create("h2", taskSelect.value ? "Task comparison" : "Package comparison", packageSummary);
-  const arms = unique(data.attempts.map(row => row.guidance)).sort((a, b) => Number(b === "baseline") - Number(a === "baseline"));
+  const arms = unique(data.attempts.map(row => row.guidance)).sort(byArm);
+  const headerRow = parent => {
+    const head = create("tr", undefined, create("thead", undefined, parent));
+    create("th", "Measure", head).scope = "col";
+    for (const arm of arms) {
+      const cell = create("th", armLabel(arm), head); cell.scope = "col";
+      const swatch = create("span", undefined); swatch.className = "swatch"; swatch.setAttribute("aria-hidden", "true");
+      swatch.style.setProperty("--series-color", "var(" + seriesVariable(arm) + ")"); cell.prepend(swatch);
+    }
+  };
+  const metricTable = (parent, label, metrics) => {
+    const metricsWrap = create("div", undefined, parent); metricsWrap.className = "table-wrap";
+    const metricsTable = create("table", undefined, metricsWrap);
+    metricsTable.setAttribute("aria-label", label);
+    headerRow(metricsTable);
+    const metricsBody = create("tbody", undefined, metricsTable);
+    for (const metric of metrics) {
+      const row = create("tr", undefined, metricsBody); create("th", "", row).scope = "row";
+      const button = create("button", data.metric_guide[metric].title, row.firstChild); button.className = "metric-link"; button.type = "button";
+      button.setAttribute("aria-pressed", String(metricSelect.value === metric));
+      button.addEventListener("click", () => { metricSelect.value = metric; update(); metricSelect.focus(); });
+      for (const arm of arms) {
+        const valueRows = taskSelect.value ? (data.raw_medians || []).filter(row => row.task === taskSelect.value && row.metric === metric && row.arm === arm) : (data.aggregates || []).filter(row => row.metric === metric && row.guidance === arm);
+        const members = observations.filter(row => row.arm === arm && row.metric === metric && (!taskSelect.value || row.task === taskSelect.value));
+        const empty = members.length && members.every(emptyFunctionMaximum);
+        const unsupported = members.length && members.every(formatLimited);
+        // Separate analyzer groups have unlike scores: show each group on its own line, never pooled.
+        const groups = valueRows.length > 1 && !taskSelect.value ? valueRows : [valueRows.length === 1 ? valueRows[0] : null];
+        const cell = create("td", undefined, row);
+        for (const result of groups) {
+          const text = result?.value !== undefined && result.value !== null ? formatCompact(result.value) : unsupported ? "Not reported" : empty ? "No functions" : "Unknown";
+          create("div", text + (groups.length > 1 && result?.analysis_group ? " · " + result.analysis_group : ""), cell);
+          if (!taskSelect.value && result) create("small", result.measured_tasks + "/" + result.assigned_tasks + " tasks", cell);
+          if (arm !== "baseline") {
+            const deltaRows = taskSelect.value ? (data.comparisons || []).filter(row => row.task === taskSelect.value && row.metric === metric && row.guidance === arm) : [result];
+            const delta = deltaRows.length === 1 ? deltaRows[0] : null;
+            const value = delta?.absolute_delta_vs_vanilla ?? null;
+            create("small", value === null ? "Delta unavailable" : formatSigned(value) + " " + delta.absolute_delta_unit + " vs vanilla", cell);
+          }
+        }
+      }
+    }
+  };
   const wrap = create("div", undefined, packageSummary); wrap.className = "table-wrap";
   const table = create("table", undefined, wrap); table.setAttribute("aria-label", "Package comparison");
-  const head = create("tr", undefined, create("thead", undefined, table));
-  for (const label of ["Measure", ...arms.map(armLabel)]) create("th", label, head).scope = "col";
+  headerRow(table);
   const body = create("tbody", undefined, table);
   const rowFor = label => { const row = create("tr", undefined, body); create("th", label, row).scope = "row"; return row; };
   const checks = rowFor("Task checks");
@@ -354,40 +418,21 @@ function showPackageSummary() {
     const cell = create("td", summary.passed, checks);
     create("small", summary.remainder, cell);
     const rows = observations.filter(row => row.arm === arm && (!taskSelect.value || row.task === taskSelect.value));
-    const numeric = rows.filter(row => row.value !== null).length, empty = rows.filter(emptyFunctionMaximum).length;
+    const numeric = rows.filter(row => row.value !== null).length, empty = rows.filter(emptyFunctionMaximum).length, limited = rows.filter(formatLimited).length;
     const countCell = create("td", numeric + "/" + rows.length + " numeric", counts);
-    create("small", empty + " empty maxima · " + (rows.length - numeric - empty) + " missing", countCell);
+    create("small", (limited ? limited + " not reported by the format · " : "") + empty + " empty maxima · " + (rows.length - numeric - empty - limited) + " missing", countCell);
   }
   const mainMetrics = unique(observations.map(row => row.metric));
+  const keyMetrics = KEY_METRICS.filter(metric => mainMetrics.includes(metric));
+  if (keyMetrics.length) {
+    create("h3", "Key results", packageSummary);
+    create("p", (taskSelect.value ? "Medians of this task's runs. " : "Averages of task medians, each task weighted equally. ") + "Deltas compare each package with vanilla; lower is not automatically better. Choose a metric name to chart it.", packageSummary).className = "counts";
+    metricTable(packageSummary, "Key results", keyMetrics);
+  }
   const metricsDetails = create("details", undefined, packageSummary);
   metricsDetails.open = metricsOpen;
-  create("summary", "Compare all per-task metrics", metricsDetails);
-  create("p", (taskSelect.value ? "Values are medians of this task's runs. " : "Values average task medians with equal task weights. ") + "Deltas compare each package with vanilla. Choose a metric name to chart it.", metricsDetails).className = "counts";
-  const metricsWrap = create("div", undefined, metricsDetails); metricsWrap.className = "table-wrap";
-  const metricsTable = create("table", undefined, metricsWrap);
-  metricsTable.setAttribute("aria-label", "All per-task metrics");
-  metricsTable.append(head.cloneNode(true));
-  const metricsBody = create("tbody", undefined, metricsTable);
-  for (const metric of mainMetrics.filter(metric => observations.some(row => row.metric === metric))) {
-    const row = create("tr", undefined, metricsBody); create("th", "", row).scope = "row";
-    const button = create("button", data.metric_guide[metric].title, row.firstChild); button.className = "metric-link"; button.type = "button";
-    button.setAttribute("aria-pressed", String(metricSelect.value === metric));
-    button.addEventListener("click", () => { metricSelect.value = metric; update(); metricSelect.focus(); });
-    for (const arm of arms) {
-      const valueRows = taskSelect.value ? (data.raw_medians || []).filter(row => row.task === taskSelect.value && row.metric === metric && row.arm === arm) : (data.aggregates || []).filter(row => row.metric === metric && row.guidance === arm);
-      const result = valueRows.length === 1 ? valueRows[0] : null;
-      const members = observations.filter(row => row.arm === arm && row.metric === metric && (!taskSelect.value || row.task === taskSelect.value));
-      const empty = members.length && members.every(emptyFunctionMaximum);
-      const cell = create("td", valueRows.length > 1 && !taskSelect.value ? "Separate analyzer groups" : result?.value !== undefined && result.value !== null ? format(result.value) : empty ? "No functions" : "Unknown", row);
-      if (!taskSelect.value && result) create("small", result.measured_tasks + "/" + result.assigned_tasks + " tasks", cell);
-      if (arm !== "baseline") {
-        const deltaRows = taskSelect.value ? (data.comparisons || []).filter(row => row.task === taskSelect.value && row.metric === metric && row.guidance === arm) : valueRows;
-        const delta = deltaRows.length === 1 ? deltaRows[0] : null;
-        const value = delta?.absolute_delta_vs_vanilla ?? null;
-        create("small", value === null ? "Delta unavailable" : (value > 0 ? "+" : "") + format(value) + " " + delta.absolute_delta_unit + " vs vanilla", cell);
-      }
-    }
-  }
+  create("summary", "Compare all metrics", metricsDetails);
+  metricTable(metricsDetails, "All metrics", mainMetrics);
 }
 function showMetadata() {
   const target = document.getElementById("run-metadata");
@@ -452,8 +497,9 @@ function showOutcomes() {
   const table = create("table", undefined, target);
   const header = create("tr", undefined, table);
   for (const text of ["Task", "Guidance", "Checks passed / assigned"]) create("th", text, header).scope = "col";
-  for (const key of unique(attempts.map(row => JSON.stringify([row.task, row.guidance])))) {
-    const [task, arm] = JSON.parse(key), members = attempts.filter(row => row.task === task && row.guidance === arm);
+  const keys = unique(attempts.map(row => JSON.stringify([row.task, row.guidance]))).map(key => JSON.parse(key)).sort((a, b) => a[0].localeCompare(b[0]) || byArm(a[1], b[1]));
+  for (const [task, arm] of keys) {
+    const members = attempts.filter(row => row.task === task && row.guidance === arm);
     const tr = create("tr", undefined, table);
     for (const value of [task, armLabel(arm)]) create("td", value, tr);
     const summary = taskCheckSummary(members), cell = create("td", summary.passed, tr);
@@ -547,8 +593,13 @@ function evaluationPlotRows({ rows, metric }) {
   });
 }
 function drawEvaluationPlot({ parent, rows, metric }) {
-  const plotRows = evaluationPlotRows({ rows, metric }), raw = comparisonView.value === "raw", overview = !taskSelect.value;
+  const raw = comparisonView.value === "raw", overview = !taskSelect.value;
   const byTask = overview && chartBreakdown.value === "tasks";
+  const groupOf = row => byTask ? row.label : overview && row.analysis_group ? row.analysis_group : null;
+  const plotRows = evaluationPlotRows({ rows, metric }).map(row => ({ ...row, group: groupOf(row) })).sort((a, b) => (a.group ?? "").localeCompare(b.group ?? "") || byArm(a.guidance, b.guidance));
+  // Group bars only when each group has one value per package and colors are unique (eight packages at most);
+  // otherwise keep one labelled bar per row.
+  const grouped = packageNames.length <= 8 && plotRows.some(row => row.group !== null) && unique(plotRows.map(row => row.group + "\u0000" + row.guidance)).length === plotRows.length;
   const details = create("details", undefined, parent); create("summary", overview && !byTask ? (raw ? "Package averages" : "Package averages and deltas vs vanilla") : (raw ? "Task medians" : "Task medians and deltas vs vanilla"), details);
   const wrap = create("div", undefined, details); wrap.className = "table-wrap";
   const table = create("table", undefined, wrap), head = create("tr", undefined, table);
@@ -559,26 +610,32 @@ function drawEvaluationPlot({ parent, rows, metric }) {
   }
   if (!plotRows.some(row => row.plotted !== null || row.rawRuns.length)) { create("p", raw ? "No defined values to plot. Complete empty scans and missing measurements are listed separately." : "No matching baseline values for a delta. Switch to Raw values to see the available measurements.", parent); return 0; }
   const container = create("div", undefined, parent); container.className = "chart";
-  container.style.height = Math.max(260, plotRows.length * (overview && chartBreakdown.value === "tasks" ? 54 : 64) + 70) + "px";
-  const text = resolvedColor("--pb-text"), border = resolvedColor("--pb-border"), accent = resolvedColor("--pb-accent"), muted = resolvedColor("--pb-muted");
+  const arms = unique(plotRows.map(row => row.guidance));
+  const categories = grouped ? unique(plotRows.map(row => row.group)) : plotRows.map(row => byTask ? row.label + " · " + armLabel(row.guidance) : row.label);
+  container.style.height = Math.max(260, (grouped ? categories.length * (arms.length * 20 + 28) : plotRows.length * 64) + 70) + "px";
+  const text = resolvedColor("--pb-text"), border = resolvedColor("--pb-border");
   const chart = echarts.init(container, null, { renderer: "svg" });
   const unit = raw ? data.metric_guide[metric].unit : plotRows[0]?.absolute_delta_unit;
-  const palette = [accent, resolvedColor("--info"), resolvedColor("--success"), resolvedColor("--warning")];
-  const packageNames = unique(observations.map(row => row.arm).filter(arm => arm !== "baseline")).sort();
-  const color = row => row.guidance === "baseline" ? muted : palette[packageNames.indexOf(row.guidance) % palette.length];
-  if (byTask) {
-    const legend = create("div", undefined, parent); legend.className = "legend package-legend";
+  const colors = new Map(arms.map(arm => [arm, resolvedColor(seriesVariable(arm))]));
+  const color = row => colors.get(row.guidance);
+  if (grouped) {
+    const legend = create("div", undefined, parent); legend.className = "legend";
     container.before(legend);
-    for (const arm of unique(plotRows.map(row => row.guidance))) create("span", armLabel(arm), legend).style.setProperty("--series-color", color({ guidance: arm }));
+    for (const arm of arms) create("span", armLabel(arm), legend).style.setProperty("--series-color", color({ guidance: arm }));
   }
-  const series = [{ type: "bar", name: raw ? "Raw values" : "Delta vs vanilla", barMaxWidth: 16, itemStyle: { opacity: .75 }, label: { show: true, position: "right", color: text, formatter: params => format(params.value) }, data: plotRows.map(row => row.plotted === null ? null : ({ value: row.plotted, comparison: row, itemStyle: { color: color(row) } })) }];
+  // Run dots carry the values when shown; bar labels would collide with them.
+  const label = { show: !(raw && !overview && showRuns.checked), position: "right", color: text, formatter: params => formatCompact(params.value) };
+  const barItem = row => !row || row.plotted === null ? null : ({ value: row.plotted, comparison: row, itemStyle: { color: color(row), borderRadius: row.plotted < 0 ? [4, 0, 0, 4] : [0, 4, 4, 0] } });
+  const series = grouped
+    ? arms.map(arm => ({ type: "bar", name: armLabel(arm), barMaxWidth: 14, barGap: "15%", label, data: categories.map(group => barItem(plotRows.find(row => row.group === group && row.guidance === arm))) }))
+    : [{ type: "bar", name: raw ? "Raw values" : "Delta vs vanilla", barMaxWidth: 16, label, data: plotRows.map(barItem) }];
   if (!raw) series[0].markLine = { silent: true, symbol: "none", data: [{ xAxis: 0 }], lineStyle: { color: text }, label: { show: false } };
   if (raw && !overview && showRuns.checked) series.push({ type: "scatter", symbolSize: 7, data: plotRows.flatMap((row, index) => row.rawRuns.map((observation, repeat) => ({ value: [observation.value, index], observation, symbol: observation.correctness === "fail" ? "rect" : observation.correctness === "unknown" ? "emptyCircle" : "circle", symbolOffset: [0, (repeat % 3 - 1) * 4], itemStyle: { color: color(row) } }))) });
   chart.setOption({ animation: false,
     aria: { enabled: true, label: { description: overview && chartBreakdown.value === "tasks" ? "One bar per task and package; select a task to inspect repeated runs." : overview ? "Equal-weight average of each task's median. Each package is compared with vanilla; negative deltas are not automatically better." : "Task-level medians or deltas vs vanilla, with individual runs available in raw mode." } },
     grid: { left: container.clientWidth < 500 ? 120 : 180, right: 100, top: 16, bottom: 48 }, textStyle: { color: text, fontFamily: getComputedStyle(document.body).fontFamily },
     xAxis: { type: "value", min: raw ? 0 : undefined, name: unit + (raw ? "" : " vs vanilla"), nameLocation: "middle", nameGap: 32, splitNumber: container.clientWidth < 500 ? 2 : 5, axisLabel: { color: text, hideOverlap: true, formatter: formatTick }, splitLine: { lineStyle: { color: border, type: "dashed" } } },
-    yAxis: { type: "category", inverse: true, data: plotRows.map(row => row.label), axisLabel: { color: text, width: container.clientWidth < 500 ? 110 : 168, overflow: "break" }, axisLine: { show: false }, axisTick: { show: false } },
+    yAxis: { type: "category", inverse: true, data: categories, axisLabel: { color: text, width: container.clientWidth < 500 ? 110 : 168, overflow: "break" }, axisLine: { show: false }, axisTick: { show: false } },
     tooltip: { trigger: "item", confine: true, backgroundColor: resolvedColor("--pb-surface"), borderColor: border, textStyle: { color: text }, formatter: params => {
       const node = create("div"); node.className = "tooltip";
       if (params.data.observation) node.textContent = observationText(params.data.observation);
@@ -593,7 +650,7 @@ function drawEvaluationPlot({ parent, rows, metric }) {
   parent.plots.push(chart); return 0;
 }
 function complexityNote(parent, rows) {
-  for (const arm of unique(rows.map((row) => row.arm))) {
+  for (const arm of unique(rows.map((row) => row.arm)).sort(byArm)) {
     const values = rows.filter((row) => row.arm === arm);
     const counts = unique(values.map((row) => row.provenance.reported_functions ?? "unknown"));
     const completeness = unique(values.map((row) => row.provenance.complete_for_declared_scope));
@@ -629,14 +686,14 @@ function renderPanel({ section, panel, metric }) {
     if (controlled.length) create("p", "Controlled-clock coverage: " + controlled.join(", ") + ". Ambient Date reads advance by a configured step. Native correctness checks use their original clock; the clock policy is in each run's details.", section).className = "counts";
   }
   if (!rows.length) { create("p", "No observations for these settings.", section); return; }
-  if (!taskSelect.value) create("p", (data.aggregates || []).filter(row => row.metric === metric).map(row => {
+  if (!taskSelect.value) create("p", (data.aggregates || []).filter(row => row.metric === metric).sort((a, b) => byArm(a.guidance, b.guidance)).map(row => {
     const tasks = new Set(row.task_medians.map(item => item.task));
     const observed = rows.filter(attempt => attempt.arm === row.guidance && tasks.has(attempt.task));
     const empty = observed.filter(emptyComplexityPopulation).length;
     const unknown = observed.filter(attempt => attempt.value === null && !emptyComplexityPopulation(attempt)).length;
     return armLabel(row.guidance) + (row.analysis_group ? " · " + row.analysis_group : "") + ": " + row.measured_tasks + "/" + row.assigned_tasks + (row.assigned_tasks === 1 ? " task" : " tasks") + " with defined values" + (empty ? " · " + empty + (empty === 1 ? " complete scan" : " complete scans") + " with no functions" : "") + (unknown ? " · " + unknown + (unknown === 1 ? " unknown attempt" : " unknown attempts") : "");
   }).join(" · "), section).className = "counts";
-  else create("p", unique(rows.map(row => row.arm)).map(arm => {
+  else create("p", unique(rows.map(row => row.arm)).sort(byArm).map(arm => {
     const observed = rows.filter(row => row.arm === arm);
     const denominator = observed.length;
     const defined = observed.filter(row => row.value !== null).length, empty = observed.filter(emptyComplexityPopulation).length;
