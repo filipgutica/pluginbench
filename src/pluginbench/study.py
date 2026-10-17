@@ -1138,6 +1138,14 @@ def report_study(
     report = build_assessment(manifest_path)
     if measurement_state is not None:
         report["measurement_revision"] = measurement_state
+        if measurement_state.get("references") is not None:
+            from pluginbench.remeasure import reference_comparison
+
+            references = _bound_document(root, measurement_state["references"])
+            for value in references.values():
+                if value.get("status") == "available":
+                    value["comparison"] = reference_comparison(root, value)
+            report["references"] = references
     report["study_progress"] = {
         "status": run.get("status", "complete"),
         "completed_attempts": run["completed_attempts"],

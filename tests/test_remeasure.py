@@ -16,13 +16,10 @@ def _write(path: Path, value: object) -> None:
     path.write_text(json.dumps(value))
 
 
-def _native(root: Path, *, visible_tests: bool = False, distinct_handoffs: bool = False) -> Path:
+def _native(root: Path, *, distinct_handoffs: bool = False) -> Path:
     before = root / "frozen/before"
     before.mkdir(parents=True)
     (before / "value.js").write_text("export const value = 0;\n")
-    if visible_tests:
-        (before / "tests").mkdir()
-        (before / "tests/old_tests.js").write_text("old reference test\n")
     records: list[dict[str, object]] = []
     executions: dict[str, dict[str, dict[str, str]]] = {}
     verifiers: dict[str, dict[str, dict[str, str]]] = {}
@@ -34,10 +31,6 @@ def _native(root: Path, *, visible_tests: bool = False, distinct_handoffs: bool 
             snapshot = directory / "snapshot"
             snapshot.mkdir(parents=True)
             (snapshot / "value.js").write_text(f"export const value = {value};\n")
-            if visible_tests:
-                (snapshot / "tests").mkdir()
-                (snapshot / "tests/old_tests.js").write_text("old reference test\n")
-                (snapshot / "tests/new_tests.js").write_text("two added test cases\n")
             reference = study._reference(root, snapshot, snapshot=True)
             _write(
                 directory / "correctness.json",
@@ -305,103 +298,6 @@ def test_metric_normalization_preserves_multiplicity_but_ignores_set_order() -> 
     assert remeasure._normalized(first) == remeasure._normalized(second)
     second["coverage"]["metrics"]["identities"] = ["b", "a"]
     assert remeasure._normalized(first) != remeasure._normalized(second)
-
-
-@pytest.mark.parametrize("difference", ["lost", "gained"])
-def test_finished_validator_rejects_equal_counts_with_different_removal_coordinates(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, difference: str
-) -> None:
-    root = _native(tmp_path / "run", visible_tests=True)
-    profiles = _profile(tmp_path)
-    collector = profiles["task"][0]
-    one, two, other = (
-        "tests/new_tests.js::one",
-        "tests/new_tests.js::two",
-        "tests/old_tests.js::other",
-    )
-    report = {
-        "files_measured": ["value.js"],
-        "branches": {
-            "total": ["value.js:1", "value.js:2", "value.js:3"],
-            "covered": ["value.js:1", "value.js:2"],
-        },
-        "functions": {"total": [], "covered": []},
-        "test_scope": ["tests/**"],
-        "contribution": {
-            "method": "leave-one-out-branches-v1",
-            "reference_ids": [one, two, other],
-            "reference_statuses": {one: "passed", two: "passed", other: "passed"},
-            "executed_ids": [one, two, other],
-            "passing_ids": [one, two, other],
-            "candidate_ids": [one, two],
-            "selection": "all runnable cases in added/modified visible test files",
-            "changed_test_files": ["tests/new_tests.js"],
-            "removal_runs": [
-                {
-                    "excluded_id": one,
-                    "executed_ids": [two, other],
-                    "passing_ids": [two, other],
-                    "test_statuses": {two: "passed", other: "passed"},
-                    "covered_branches": ["value.js:1", "value.js:2"],
-                    "unique_branches": [],
-                    "exit_code": 0,
-                },
-                {
-                    "excluded_id": two,
-                    "executed_ids": [one, other],
-                    "passing_ids": [one, other],
-                    "test_statuses": {one: "passed", other: "passed"},
-                    "covered_branches": ["value.js:1"],
-                    "unique_branches": ["value.js:2"],
-                    "exit_code": 0,
-                },
-            ],
-            "zero_marginal_ids": [one],
-        },
-    }
-    script = tmp_path / "coverage.py"
-    script.write_text(
-        "import json,pathlib,sys\nfrom pluginbench.assessment_metrics import inspect_snapshot\n"
-        f"report={report!r}\n"
-        "report['source_digest']=inspect_snapshot(pathlib.Path(sys.argv[1]))['digest']\n"
-        "report['before_digest']=inspect_snapshot(pathlib.Path(sys.argv[3]))['digest']\n"
-        "if not (pathlib.Path(sys.argv[1])/'tests/new_tests.js').exists():\n"
-        f" c=report['contribution']; c['reference_statuses']={{{other!r}:'passed'}}\n"
-        f" for key in ['reference_ids','executed_ids','passing_ids']: c[key]=[{other!r}]\n"
-        " for key in ['candidate_ids','changed_test_files','removal_runs','zero_marginal_ids']: c[key]=[]\n"
-        "pathlib.Path(sys.argv[2]).write_text(json.dumps(report))\n"
-    )
-    assert collector.command is not None
-    collector.command.append("{before}")
-    sidecar = remeasure.propose_remeasurement(root, profiles=profiles, revision="coordinates")
-    protocol = json.loads(sidecar.read_text())
-    target = sidecar.parent / "measurements/1/1/coverage"
-    changed = json.loads((target / "report.json").read_text())
-    removal = changed["contribution"]["removal_runs"][1]
-    removal["covered_branches"] = (
-        ["value.js:2"] if difference == "lost" else ["value.js:1", "value.js:3"]
-    )
-    removal["unique_branches"] = ["value.js:1"] if difference == "lost" else ["value.js:2"]
-    _write(target / "report.json", changed)
-    envelope = json.loads((target / "envelope.json").read_text())
-    envelope["report_digest"] = study._digest(target / "report.json")
-    _write(target / "envelope.json", envelope)
-    for observation in protocol["observations"]:
-        if observation["stage"] == "handoff":
-            observation["repeats"][1]["coverage"] = study._reference(root, target / "envelope.json")
-    # Seal the synthetic second receipt as an authentic different observation,
-    # rather than testing rejection of an unbound artifact edit.
-    protocol["measurement_inventory"] = study._inventory(sidecar.parent / "measurements")
-    _write(sidecar, protocol)
-    previous = study._inventory(root)
-    monkeypatch.setattr(
-        remeasure,
-        "collect_measurements",
-        lambda *args, **kwargs: pytest.fail("validation must not collect"),
-    )
-    with pytest.raises(ValueError, match="recorded family outcome differs from bound repeats"):
-        remeasure.validate_remeasurement(root, sidecar.parent)
-    assert study._inventory(root) == previous
 
 
 @pytest.mark.parametrize("claim", ["matching", "absent", "different", "unconfigured", "missing"])
@@ -1011,3 +907,78 @@ def test_parallel_observer_fatal_failure_drains_active_receipts_without_new_repe
     assert not (directory / "assessment-input.json").exists()
     assert not list(directory.glob("measurements/*/1"))
     assert all(study._inventory(root)[name] == value for name, value in preserved.items())
+
+
+def test_reference_patch_applies_to_a_copy_or_reports_why(tmp_path: Path) -> None:
+    before = tmp_path / "before"
+    before.mkdir()
+    (before / "a.txt").write_text("one\n")
+    patch = tmp_path / "solution.patch"
+    patch.write_text("--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n")
+    destination = tmp_path / "reference"
+    assert remeasure._apply_reference(before, patch, destination) is None
+    assert (destination / "a.txt").read_text() == "two\n"
+    assert (before / "a.txt").read_text() == "one\n"
+    patch.write_text("--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-missing\n+two\n")
+    reason = remeasure._apply_reference(before, patch, tmp_path / "other")
+    assert reason is not None and reason.startswith("reference patch does not apply")
+    assert not (tmp_path / "other").exists()
+
+
+def test_reference_record_compares_like_a_submission_and_requires_repeatability(
+    tmp_path: Path,
+) -> None:
+    from pluginbench.assessment_metrics import compare_evidence, compare_snapshots
+    from test_assessment_metrics import _bound_fallow, _function
+
+    source = "function a() {\n  return 1;\n}\n"
+    before, left = _bound_fallow(
+        tmp_path / "before", {"src/index.ts": source}, [_function("a", 1, 3, 2)]
+    )
+    after, right = _bound_fallow(
+        tmp_path / "after",
+        {"src/index.ts": source + "function b() {\n  return 2;\n}\n"},
+        [_function("a", 1, 3, 2), _function("b", 4, 3, 7)],
+    )
+    change = compare_snapshots(before, after)
+    record = remeasure._reference_record([right, right], change)
+    assert record["status"] == "available" and "comparison" not in record
+    code_added = compare_evidence(left, right, change=change)["fallow"]["code_added"]
+    assert code_added["net_cognitive"] == 7 and code_added["functions_added"] == 1
+    _, other = _bound_fallow(
+        tmp_path / "other",
+        {"src/index.ts": source + "function b() {\n  return 2;\n}\n"},
+        [_function("a", 1, 3, 2), _function("b", 4, 3, 9)],
+    )
+    assert remeasure._reference_record([right, other], change)["status"] == "unavailable"
+
+
+def test_reference_comparison_reextracts_stored_raw_evidence(tmp_path: Path) -> None:
+    from pluginbench.assessment_metrics import compare_snapshots
+    from test_assessment_metrics import _bound_fallow, _function
+
+    root = tmp_path / "evidence"
+    source = "function a() {\n  return 1;\n}\n"
+    before, _ = _bound_fallow(
+        root / "ref/before", {"src/index.ts": source}, [_function("a", 1, 3, 2)]
+    )
+    after, _ = _bound_fallow(
+        root / "ref/after",
+        {"src/index.ts": source + "function b() {\n  return 2;\n}\n"},
+        [_function("a", 1, 3, 2), _function("b", 4, 3, 7)],
+    )
+    # Same location builder the producer uses, so key drift breaks this test.
+    reference = {
+        "status": "available",
+        "change": compare_snapshots(before, after),
+        **remeasure.reference_locations(
+            root,
+            before=(before, "ref/before", {"fallow": "evidence.json"}),
+            after=(after, "ref/after", {"fallow": "evidence.json"}),
+        ),
+    }
+    code_added = remeasure.reference_comparison(root, reference)["fallow"]["code_added"]
+    assert code_added["net_cognitive"] == 7 and code_added["functions_added"] == 1
+    (after / "src/index.ts").write_text("changed\n")
+    with pytest.raises(ValueError, match="reference snapshot changed"):
+        remeasure.reference_comparison(root, reference)

@@ -57,6 +57,12 @@ def _report() -> dict[str, object]:
             "source_lines_removed": 1,
             "test_lines_added": 5,
             "test_lines_removed": 0,
+            "test_duplication": {
+                "window_lines": 3,
+                "added_test_lines": 5,
+                "duplicated_added_test_lines": 0,
+                "method": "repeated runs of consecutive added test lines",
+            },
         },
         "work": {
             "tokens": {
@@ -214,32 +220,56 @@ def _matched(data: dict[str, object], metric: str) -> list[dict[str, object]]:
     ]
 
 
-def _empty_baseline_population_report() -> dict[str, object]:
+def _code_added(**values: object) -> dict[str, object]:
+    """A complete code-added comparison, shaped like compare_evidence output."""
+    return {
+        "status": "available",
+        "net_cognitive": 0,
+        "net_cyclomatic": 0,
+        "functions_added": 0,
+        "source_files_added": 0,
+        "hotspots_added": 0,
+        "hotspot_threshold": 15,
+        "function_count_reported": 0,
+        "method": "after-side minus before-side scores of changed source functions",
+        "limitations": "added functions match on (path, name)",
+        **values,
+    }
+
+
+def _incomplete_code_added() -> dict[str, object]:
+    return {
+        "status": "incomplete",
+        "reason": "complexity population incomplete on one side",
+        "method": "after-side minus before-side scores of changed source functions",
+        "limitations": "added functions match on (path, name)",
+    }
+
+
+def _with_code_added(report: dict[str, object], index: int, detail: dict[str, object]) -> None:
+    _stage(report, index)["metric_comparison"] = {
+        "fallow": {"status": "available", "code_added": detail}
+    }
+
+
+def _unknown_baseline_code_added_report() -> dict[str, object]:
     report = _report()
-    for index, count, cognitive, cyclomatic in ((0, 0, None, None), (1, 3, 14, 11)):
-        _stage(report, index)["metric_comparison"] = {
-            "fallow": {
-                "status": "available",
-                "new_file_functions": {
-                    "status": "available",
-                    "method": "paths absent before",
-                    "after": {
-                        "function_count_reported": count,
-                        "max_cognitive_reported": cognitive,
-                        "max_cyclomatic_reported": cyclomatic,
-                        "complete_for_declared_scope": True,
-                    },
-                },
-            }
-        }
+    _with_code_added(report, 0, _incomplete_code_added())
+    _with_code_added(
+        report,
+        1,
+        _code_added(
+            net_cognitive=14, net_cyclomatic=11, functions_added=3, function_count_reported=3
+        ),
+    )
     return report
 
 
-def test_raw_medians_keep_numeric_guidance_when_baseline_population_is_empty() -> None:
-    data = chart_data(_empty_baseline_population_report())
+def test_raw_medians_keep_numeric_guidance_when_baseline_values_are_unknown() -> None:
+    data = chart_data(_unknown_baseline_code_added_report())
     for metric, value in (
-        ("New-file function cognitive maximum", 14),
-        ("New-file function cyclomatic maximum", 11),
+        ("Net cognitive complexity added", 14),
+        ("Net cyclomatic complexity added", 11),
     ):
         rows = [row for row in _chart_rows(data, "raw_medians") if row["metric"] == metric]
         assert len(rows) == 1 and rows[0]["arm"] == "candidate" and rows[0]["value"] == value
@@ -250,7 +280,7 @@ def test_raw_medians_keep_numeric_guidance_when_baseline_population_is_empty() -
 
 
 def test_raw_medians_do_not_pool_incompatible_or_unknown_repeat_profiles() -> None:
-    report = _empty_baseline_population_report()
+    report = _unknown_baseline_code_added_report()
     attempts = report["attempts"]
     assert isinstance(attempts, list)
     second = copy.deepcopy(_attempt(report, 1))
@@ -259,7 +289,7 @@ def test_raw_medians_do_not_pool_incompatible_or_unknown_repeat_profiles() -> No
     metrics = _stage(report, 2)["metrics"]
     assert isinstance(metrics, dict)
     metrics["fallow"]["provenance"]["tool_version"] = "different"
-    metric = "New-file function cognitive maximum"
+    metric = "Net cognitive complexity added"
     for unknown in (False, True):
         if unknown:
             for index in (1, 2):
@@ -290,17 +320,19 @@ def test_chart_omits_full_judge_records_without_mutating_canonical_evidence() ->
 def test_compact_syntax_provenance_retains_full_binding_compatibility() -> None:
     report = _report()
     syntax = {"parser": "oxc", "version": "1", "dependency_hashes": {"parser": "original"}}
+    metric = "Net cognitive complexity added"
     for index in (0, 1):
         metrics = _stage(report, index)["metrics"]
         assert isinstance(metrics, dict)
         provenance = metrics["fallow"]["provenance"]
         provenance["syntax_observer"] = copy.deepcopy(syntax)
+        _with_code_added(report, index, _code_added(net_cognitive=4))
     original = copy.deepcopy(report)
     data = chart_data(report)
-    assert _matched(data, "Reported cognitive maximum")
-    rows = _observations(data, "Reported cognitive maximum")
+    assert _matched(data, metric)
+    rows = _observations(data, metric)
     assert [row["value"] for row in rows] == [4, 4]
-    assert _matched(data, "Reported cognitive maximum")[0]["measured"] == 1
+    assert _matched(data, metric)[0]["measured"] == 1
     for row in rows:
         assert isinstance(row["compatibility"], str) and len(row["compatibility"]) == 64
         provenance = row["provenance"]
@@ -313,8 +345,8 @@ def test_compact_syntax_provenance_retains_full_binding_compatibility() -> None:
     assert isinstance(metrics, dict)
     metrics["fallow"]["provenance"]["syntax_observer"]["dependency_hashes"]["parser"] = "changed"
     changed = chart_data(report)
-    assert not _matched(changed, "Reported cognitive maximum")
-    assert [row["value"] for row in _observations(changed, "Reported cognitive maximum")] == [4, 4]
+    assert not _matched(changed, metric)
+    assert [row["value"] for row in _observations(changed, metric)] == [4, 4]
 
 
 def test_compact_loc_inventories_do_not_change_scope_based_comparison() -> None:
@@ -325,7 +357,7 @@ def test_compact_loc_inventories_do_not_change_scope_based_comparison() -> None:
             "method": "scoped-source-lines-v1",
             "scope": ["src/**"],
             "after_source_lines": 20 + index,
-            "source_lines_added": 2,
+            "source_lines_added": 2 + index,
             "source_lines_removed": 1,
             "before_paths": ["src/index.ts"],
             "after_paths": ["src/index.ts"] + (["src/new.ts"] if index else []),
@@ -334,9 +366,9 @@ def test_compact_loc_inventories_do_not_change_scope_based_comparison() -> None:
         }
     original = copy.deepcopy(report)
     data = chart_data(report)
-    rows = _observations(data, "Source LOC")
-    assert [row["value"] for row in rows] == [20, 21]
-    assert _matched(data, "Source LOC")[0]["measured"] == 1
+    rows = _observations(data, "Source lines added")
+    assert [row["value"] for row in rows] == [2, 3]
+    assert _matched(data, "Source lines added")[0]["measured"] == 1
     for index, row in enumerate(rows):
         provenance = row["provenance"]
         assert isinstance(provenance, dict)
@@ -360,7 +392,7 @@ const create = (tag, text, parent) => { const node = {textContent:text}; parent.
 """
     capture = r"""
 const notes = [];
-complexityNote({append: node => notes.push(node.textContent)}, data.observations.filter(row => row.panel === 'Complexity'));
+complexityNote({append: node => notes.push(node.textContent)}, data.observations.filter(row => row.panel === 'Code added'));
 console.log(JSON.stringify({complexity_note: notes.join(' ')}));
 """
     script.write_text(
@@ -386,7 +418,7 @@ def test_controller_complexity_note_keeps_unknown_distinct_from_partial(
     observations = data["observations"]
     assert isinstance(observations, list)
     for row in observations:
-        if row["panel"] == "Complexity":
+        if row["panel"] == "Code added":
             provenance = row["provenance"]
             if completeness == "missing":
                 provenance.pop("complete_for_declared_scope")
@@ -400,16 +432,16 @@ def test_controller_complexity_note_keeps_unknown_distinct_from_partial(
         assert "scan completeness unknown" in note and "partial declared scan" not in note
 
 
-def test_native_subsets_are_not_added_and_loc_uses_snapshot_totals() -> None:
+def test_native_token_subsets_are_reported_separately_and_lines_use_the_bound_change() -> None:
     data = chart_data(_report())
     assert [row["value"] for row in _observations(data, "Input tokens")] == [100, 100]
+    assert [row["value"] for row in _observations(data, "Cached input tokens")] == [80, 80]
+    assert [row["value"] for row in _observations(data, "Uncached input tokens")] == [20, 20]
     assert [row["value"] for row in _observations(data, "Output tokens")] == [10, 10]
-    assert [row["value"] for row in _observations(data, "Source LOC")] == [20, 20]
-    assert [row["value"] for row in _observations(data, "Test LOC")] == [30, 30]
-    assert _matched(data, "Reported cognitive maximum")[0]["value"] == 4
-    assert not _matched(data, "Reported dead findings")
-    dead = _observations(data, "Reported dead findings")[0]
-    assert dead["value"] == 0 and "not absence" in str(dead["reason"])
+    assert [row["value"] for row in _observations(data, "Reasoning output tokens")] == [7, 7]
+    assert [row["value"] for row in _observations(data, "Source lines added")] == [2, 2]
+    assert [row["value"] for row in _observations(data, "Test lines added")] == [5, 5]
+    assert _matched(data, "Source lines added")[0]["value"] == 2
 
 
 @pytest.mark.parametrize(
@@ -445,80 +477,58 @@ def test_unknown_runtime_in_both_arms_retains_raw_values_without_comparing(field
         provenance.pop(field)
     data = chart_data(report)
     assert not _matched(data, "Input tokens")
-    assert not _matched(data, "Reported cognitive maximum")
+    assert not _matched(data, "Source lines added")
     assert all(
         row["value"] == 100 and row["status"] == "not comparable"
         for row in _observations(data, "Input tokens")
     )
 
 
-def test_task_quality_charts_keep_raw_populations_and_partial_or_missing_evidence() -> None:
+def test_code_added_keeps_incomplete_and_missing_evidence_unknown_not_zero() -> None:
     report = _report()
-    population = {
-        "function_count_reported": 2,
-        "max_cognitive_reported": 20,
-        "max_cyclomatic_reported": 4,
-        "max_unit_size_reported": 12,
-        "complete_for_declared_scope": True,
-    }
-    comparison = {
-        "status": "available",
-        "changed_functions": {
-            "status": "available",
-            "before": population,
-            "after": {**population, "function_count_reported": 1, "max_cognitive_reported": 10},
-            "method": "bound source hunk overlap",
-            "limitations": "not matched functions",
-        },
-        "new_file_functions": {
-            "status": "available",
-            "after": population,
-            "method": "paths absent before",
-        },
-        "dead_findings": {
+    for index in (0, 1):
+        _with_code_added(
+            report,
+            index,
+            _code_added(net_cognitive=10, functions_added=1, function_count_reported=2),
+        )
+        comparison = _stage(report, index)["metric_comparison"]
+        assert isinstance(comparison, dict)
+        comparison["fallow"]["dead_findings"] = {
             "status": "available",
             "introduced_count": 1,
             "resolved_count": 1,
             "method": "declaration identity",
-        },
-    }
-    for index in (0, 1):
-        _stage(report, index)["metric_comparison"] = {"fallow": copy.deepcopy(comparison)}
+        }
     partial_comparison = _stage(report, 1)["metric_comparison"]
     assert isinstance(partial_comparison, dict)
     partial_fallow = partial_comparison["fallow"]
     assert isinstance(partial_fallow, dict)
-    partial = partial_fallow["changed_functions"]
-    assert isinstance(partial, dict)
-    partial["status"] = "incomplete"
-    partial["after"]["complete_for_declared_scope"] = False
+    partial_fallow["code_added"] = _incomplete_code_added()
     partial_fallow["dead_findings"] = {
         "status": "unavailable",
         "introduced_count": None,
         "resolved_count": None,
     }
     data = chart_data(report)
-    before = _observations(data, "Before changed-function count")
-    after = _observations(data, "After changed-function count")
-    assert [row["value"] for row in before] == [2, 2]
-    assert [row["value"] for row in after] == [1, 1]
-    assert after[0]["status"] == "measured" and after[1]["status"] == "not comparable"
-    reason = after[1]["reason"]
+    added = _observations(data, "Net cognitive complexity added")
+    assert [row["value"] for row in added] == [10, None]
+    assert added[0]["status"] == "measured" and added[1]["status"] == "unknown"
+    reason = added[1]["reason"]
     assert isinstance(reason, str)
-    assert "population incomplete" in reason
-    assert _observations(data, "After changed-function cognitive maximum")[1]["value"] == 10
+    assert "population incomplete" in reason and "unknown is not zero" in reason
+    assert _observations(data, "Functions added")[1]["value"] is None
     dead = _observations(data, "Introduced dead findings")
     assert dead[0]["value"] == 1 and dead[1]["value"] is None
     assert dead[1]["status"] == "unknown"
     _, csv_text = chart_artifacts_from_data(chart_data(report))
     exported = list(csv.DictReader(io.StringIO(csv_text)))
-    row = next(
-        row
-        for row in exported
-        if row["metric"] == "After changed-function cognitive maximum" and row["arm"] == "candidate"
-    )
-    assert row["value"] == "10.0" and row["status"] == "not comparable"
-    assert "not matched functions" in json.loads(row["provenance"])["limitations"]
+    rows = {
+        row["arm"]: row for row in exported if row["metric"] == "Net cognitive complexity added"
+    }
+    assert rows["baseline"]["value"] == "10.0" and rows["baseline"]["status"] == "measured"
+    assert rows["candidate"]["value"] == "" and rows["candidate"]["status"] == "unknown"
+    assert "(path, name)" in json.loads(rows["baseline"]["provenance"])["limitations"]
 
 
 @pytest.mark.parametrize(
@@ -536,10 +546,11 @@ def test_analyzer_provenance_mismatch_retains_unpaired_points(field: str, value:
 
 def test_coverage_rates_describe_each_complete_submission_despite_different_denominators() -> None:
     report = _report()
-    _metric_values(report, "fallow")["complexity_complete_for_declared_scope"] = False
+    _with_code_added(report, 0, _code_added())
+    _with_code_added(report, 1, _incomplete_code_added())
     _metric_values(report, "coverage")["branch_denominator_digest"] = "changed coordinates"
     data = chart_data(report)
-    assert not _matched(data, "Reported cognitive maximum")
+    assert not _matched(data, "Net cognitive complexity added")
     assert _matched(data, "Branch coverage %")
     assert _matched(data, "Function coverage %")
     candidate = next(
@@ -582,9 +593,11 @@ def test_missing_failed_submission_remains_assigned_with_unknown_metrics() -> No
     )
     data = chart_data(report)
     assert data["assigned"] == 2
-    candidate = [row for row in _observations(data, "Source LOC") if row["arm"] == "candidate"][0]
+    candidate = [
+        row for row in _observations(data, "Source lines added") if row["arm"] == "candidate"
+    ][0]
     assert candidate["value"] is None and candidate["correctness"] == "fail"
-    assert not _matched(data, "Source LOC")
+    assert not _matched(data, "Source lines added")
 
 
 def test_scoped_loc_and_raw_generated_fallback_do_not_pool() -> None:
@@ -604,19 +617,20 @@ def test_scoped_loc_and_raw_generated_fallback_do_not_pool() -> None:
     }
     _stage(report)["change"] = {"source_lines_added": 22, "source_lines_removed": 0}
     data = chart_data(report)
-    candidate = next(row for row in _observations(data, "Source LOC") if row["arm"] == "candidate")
-    baseline = next(row for row in _observations(data, "Source LOC") if row["arm"] == "baseline")
-    assert candidate["value"] == 4 and baseline["value"] == 20
+    metric = "Source lines added"
+    candidate = next(row for row in _observations(data, metric) if row["arm"] == "candidate")
+    baseline = next(row for row in _observations(data, metric) if row["arm"] == "baseline")
+    assert candidate["value"] == 2 and baseline["value"] == 2
     assert candidate["source_lines_added"] == 2
     change_provenance = candidate["change_loc_provenance"]
     assert isinstance(change_provenance, dict)
     assert change_provenance["raw_extension_classified_counts"]["source_lines_added"] == 22
     assert "src/**" in str(candidate["reason"])
     assert "including generated files" in str(baseline["reason"])
-    assert not _matched(data, "Source LOC")
+    assert not _matched(data, metric)
     _stage(report)["code_size"] = {"status": "unavailable", "reason": "scopes disagree"}
     candidate = next(
-        row for row in _observations(chart_data(report), "Source LOC") if row["arm"] == "candidate"
+        row for row in _observations(chart_data(report), metric) if row["arm"] == "candidate"
     )
     assert candidate["value"] is None
     assert "scopes disagree" in str(candidate["reason"])
@@ -746,39 +760,6 @@ def test_zero_unique_signals_are_among_supplied_tests_and_never_redundancy_claim
     assert not _matched(data, "Branch contribution")
 
 
-@pytest.mark.parametrize("candidate_scope", [["test/**"], ["integration/**"], None])
-def test_test_overlap_requires_matching_declared_test_scope(candidate_scope: object) -> None:
-    report = _report()
-    for index, scope in ((0, ["test/**"]), (1, candidate_scope)):
-        stages = _attempt(report, index)["stages"]
-        assert isinstance(stages, list) and isinstance(stages[0], dict)
-        metrics = stages[0]["metrics"]
-        assert isinstance(metrics, dict) and isinstance(metrics["coverage"], dict)
-        coverage = metrics["coverage"]["metrics"]
-        assert isinstance(coverage, dict)
-        coverage.update(
-            test_scope=scope,
-            test_contribution={
-                "status": "available",
-                "method": "leave-one-out-branches-v1",
-                "selection": "all runnable cases in added/modified visible test files",
-                "candidate_count": 2,
-                "tested_count": 2,
-                "zero_marginal_count": 1,
-            },
-        )
-    data = chart_data(report)
-    rows = _observations(data, "Zero marginal branch contribution cases")
-    assert all(
-        isinstance(row["provenance"], dict) and row["provenance"]["test_scope"] is not None
-        for row in rows
-        if row["status"] == "measured"
-    )
-    assert bool(_matched(data, "Zero marginal branch contribution cases")) is (
-        candidate_scope == ["test/**"]
-    )
-
-
 def test_complete_capture_accepts_zero_counts_and_rejects_a_missing_denominator() -> None:
     report = _report()
     stage = _stage(report)
@@ -799,12 +780,6 @@ def test_complete_capture_accepts_zero_counts_and_rejects_a_missing_denominator(
         branch_covered=0,
         function_total=0,
         function_covered=0,
-        test_contribution={
-            "status": "available",
-            "candidate_count": 0,
-            "tested_count": 0,
-            "zero_marginal_count": 0,
-        },
     )
     row = next(
         row
@@ -1135,3 +1110,92 @@ def test_coverage_observations_keep_each_units_supporting_counts(statement_suppo
         else:
             assert provenance["covered"] == covered
             assert provenance["total"] == total
+
+
+def _with_changed_lines(report: dict[str, object], index: int, detail: dict[str, object]) -> None:
+    # Real comparisons mark whole-suite coverage incomplete whenever executable lines change.
+    _stage(report, index)["metric_comparison"] = {
+        "coverage": {
+            "status": "incomplete",
+            "reason": "no compatible complete coverage populations; see per-unit reasons",
+            "deltas": None,
+            "changed_lines": detail,
+        }
+    }
+
+
+def test_changed_line_coverage_and_redundant_tests_come_from_the_coverage_comparison() -> None:
+    report = _report()
+    detail = {
+        "status": "available",
+        "line_percent": 75.0,
+        "branch_percent": 50.0,
+        "redundant_added_tests": 1,
+        "method": "added source lines intersected with executed coordinates",
+        "limitations": "redundant tests are candidates",
+    }
+    for index in (0, 1):
+        _with_changed_lines(report, index, copy.deepcopy(detail))
+    data = chart_data(report)
+    for metric, value in (
+        ("Changed-line coverage %", 75),
+        ("Changed-branch coverage %", 50),
+        ("Redundant added tests", 1),
+    ):
+        rows = _observations(data, metric)
+        assert [row["value"] for row in rows] == [value, value]
+        assert all(row["status"] == "measured" and row["panel"] == "Tests added" for row in rows)
+        assert _matched(data, metric)
+    # Per-test coverage missing for one submission: redundancy is unknown, never zero.
+    _with_changed_lines(report, 1, {**detail, "redundant_added_tests": None})
+    candidate = _observations(chart_data(report), "Redundant added tests")[1]
+    assert candidate["value"] is None and candidate["status"] == "unknown"
+    assert "unknown is not zero" in str(candidate["reason"])
+    _with_changed_lines(
+        report,
+        1,
+        {"status": "unavailable", "reason": "bound source diff or line coordinates missing"},
+    )
+    candidate = _observations(chart_data(report), "Changed-line coverage %")[1]
+    assert candidate["value"] is None and candidate["status"] == "unknown"
+    assert "line coordinates missing" in str(candidate["reason"])
+
+
+def test_duplicated_added_test_lines_come_from_the_bound_change() -> None:
+    report = _report()
+    data = chart_data(report)
+    rows = _observations(data, "Duplicated added test lines")
+    assert [row["value"] for row in rows] == [0, 0]
+    assert all(row["status"] == "measured" and row["panel"] == "Tests added" for row in rows)
+    assert _matched(data, "Duplicated added test lines")
+    change = _stage(report)["change"]
+    assert isinstance(change, dict)
+    change.pop("test_duplication")
+    candidate = _observations(chart_data(report), "Duplicated added test lines")[1]
+    assert candidate["value"] is None and candidate["status"] == "unknown"
+    assert "unknown is not zero" in str(candidate["reason"])
+
+
+def test_uncached_input_and_coding_time_stay_unknown_without_their_inputs() -> None:
+    report = _report()
+    data = chart_data(report)
+    assert [row["value"] for row in _observations(data, "Uncached input tokens")] == [20, 20]
+    assert [row["value"] for row in _observations(data, "Coding time")] == [5, 5]
+    work = _stage(report)["work"]
+    assert isinstance(work, dict) and isinstance(work["tokens"], dict)
+    work["tokens"].pop("cached_input_tokens")
+    work.pop("elapsed_seconds")
+    data = chart_data(report)
+    for metric in ("Uncached input tokens", "Coding time"):
+        candidate = _observations(data, metric)[1]
+        assert candidate["value"] is None and candidate["status"] == "unknown"
+    assert _observations(data, "Input tokens")[1]["value"] == 100
+
+
+def test_simplifying_code_reports_negative_complexity_added_not_unknown() -> None:
+    report = _report()
+    _with_code_added(report, 0, _code_added(net_cognitive=2, net_cyclomatic=1))
+    _with_code_added(report, 1, _code_added(net_cognitive=-4, net_cyclomatic=-2))
+    rows = _observations(chart_data(report), "Net cognitive complexity added")
+    assert [row["value"] for row in rows] == [2, -4]
+    assert all(row["status"] == "measured" for row in rows)

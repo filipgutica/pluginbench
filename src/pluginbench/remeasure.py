@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
+import subprocess
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
@@ -15,7 +18,12 @@ from pathlib import Path
 from pluginbench import harbor_backend, study
 from pluginbench.parallel import run_jobs, validate_jobs
 from pluginbench.assessment import _load_manifest, build_assessment
-from pluginbench.assessment_metrics import evaluate_evidence, inspect_snapshot
+from pluginbench.assessment_metrics import (
+    compare_evidence,
+    compare_snapshots,
+    evaluate_evidence,
+    inspect_snapshot,
+)
 from pluginbench.assessment_models import ArtifactRef, AssessmentInput, MetricKind
 from pluginbench.collectors import (
     Collector,
@@ -221,7 +229,11 @@ def _native_state(root: Path) -> tuple[dict[str, object], AssessmentInput, Path]
             raise ValueError("baseline origin requires historical evidence references")
         _verify_native_references(
             root,
-            {key: item for key, item in origin.items() if key not in {"original_record", "evidence"}},
+            {
+                key: item
+                for key, item in origin.items()
+                if key not in {"original_record", "evidence"}
+            },
             seen,
         )
     _verify_native_references(
@@ -332,6 +344,139 @@ def load_profiles(path: Path) -> dict[str, list[Collector]]:
                     setattr(collector, field, resolve_collector_command(source.parent, command))
         profiles[task_id] = collectors
     return profiles
+
+
+def _apply_reference(before: Path, patch: Path, destination: Path) -> str | None:
+    """Apply a task's reference patch to a copy of its starting snapshot; return a failure reason."""
+    # Apply outside any repository so Git cannot resolve paths against an enclosing work tree.
+    with tempfile.TemporaryDirectory(prefix="pluginbench-reference-") as temporary:
+        work = Path(temporary) / "snapshot"
+        shutil.copytree(before, work, symlinks=True)
+        applied = subprocess.run(
+            ["git", "apply", "--whitespace=nowarn", str(patch.resolve())],
+            cwd=work,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if applied.returncode:
+            return "reference patch does not apply: " + applied.stderr.strip()[:400]
+        shutil.copytree(work, destination, symlinks=True)
+    return None
+
+
+def _reference_record(
+    repeats: list[dict[str, object]], change: dict[str, object]
+) -> dict[str, object]:
+    """Accept a reference only when its two collections normalize identically."""
+    if len(repeats) != 2 or _normalized(repeats[0]) != _normalized(repeats[1]):
+        return {"status": "unavailable", "reason": "reference measurements are not repeatable"}
+    return {"status": "available", "snapshot_digest": change["after_digest"], "change": change}
+
+
+def reference_locations(
+    root: Path,
+    *,
+    before: tuple[Path, str, dict[str, str]],
+    after: tuple[Path, str, dict[str, str]],
+) -> dict[str, object]:
+    """Snapshot bindings and raw report refs that reference_comparison reads back."""
+    sides = {"before": before, "after": after}
+    return {
+        **{
+            side: study._reference(root, snapshot, snapshot=True)
+            for side, (snapshot, _, _) in sides.items()
+        },
+        # Raw reports, not extracted metrics, so reports re-extract them like submissions.
+        "evidence_base": {side: base for side, (_, base, _) in sides.items()},
+        "evidence": {side: refs for side, (_, _, refs) in sides.items()},
+    }
+
+
+def reference_comparison(root: Path, reference: dict[str, object]) -> dict[str, object]:
+    """Re-extract stored raw reference reports at report time, exactly as submissions are."""
+    evaluated = []
+    for side in ("before", "after"):
+        bound = _object(reference[side])
+        snapshot = (root / str(bound["path"])).resolve()
+        if (
+            not snapshot.is_relative_to(root.resolve())
+            or inspect_snapshot(snapshot)["digest"] != bound["sha256"]
+        ):
+            raise ValueError("reference snapshot changed after measurement")
+        refs = _object(_object(reference["evidence"])[side])
+        directory = (root / str(_object(reference["evidence_base"])[side])).resolve()
+        if not directory.is_relative_to(root.resolve()):
+            raise ValueError("reference evidence must stay inside its native study")
+        evaluated.append(
+            evaluate_evidence(
+                snapshot, {str(kind): str(path) for kind, path in refs.items()}, directory
+            )
+        )
+    return compare_evidence(evaluated[0], evaluated[1], change=_object(reference["change"]))
+
+
+def _collect_references(
+    root: Path,
+    directory: Path,
+    manifest: AssessmentInput,
+    base: Path,
+    frozen: dict[str, list[Collector]],
+) -> dict[str, object]:
+    """Measure each task's reference solution with the frozen code collectors (not coverage)."""
+    catalog = root / "frozen/tasks.json"
+    entries = _object(json.loads(catalog.read_text())).get("tasks", []) if catalog.is_file() else []
+    if not isinstance(entries, list):
+        raise ValueError("frozen task catalog requires a task list")
+    tasks = {
+        str(entry["id"]): root / "frozen" / str(entry["native_task"])
+        for entry in entries
+        if isinstance(entry, dict)
+    }
+    befores: dict[str, Path] = {}
+    for record in manifest.records:
+        assert record.before is not None
+        befores.setdefault(record.task_id, (base / record.before.path).resolve())
+    references: dict[str, object] = {}
+    for task, collectors in sorted(frozen.items()):
+        code = [collector for collector in collectors if collector.kind != "coverage"]
+        patch = tasks[task] / "solution/solution.patch" if task in tasks else None
+        if patch is None or not patch.is_file():
+            references[task] = {
+                "status": "unavailable",
+                "reason": "task ships no solution/solution.patch",
+            }
+            continue
+        if not code:
+            references[task] = {"status": "unavailable", "reason": "no code collectors selected"}
+            continue
+        target = directory / "references" / task
+        snapshot = target / "snapshot"
+        failure = _apply_reference(befores[task], patch, snapshot)
+        if failure is not None:
+            references[task] = {"status": "unavailable", "reason": failure}
+            continue
+        evaluations, stored = [], {}
+        for label in ("before", "0", "1"):
+            source = befores[task] if label == "before" else snapshot
+            evidence = (target / "measurements" / label).resolve()
+            paths = collect_measurements(source, evidence, code, before=befores[task])
+            refs = {
+                kind: path.resolve().relative_to(evidence).as_posix()
+                for kind, path in paths.items()
+            }
+            stored[label] = (evidence.relative_to(root.resolve()).as_posix(), refs)
+            evaluations.append(evaluate_evidence(source, refs, evidence))
+        references[task] = {
+            **_reference_record(evaluations[1:], compare_snapshots(befores[task], snapshot)),
+            **reference_locations(
+                root,
+                before=(befores[task], *stored["before"]),
+                after=(snapshot, *stored["0"]),
+            ),
+            "patch_sha256": hashlib.sha256(patch.read_bytes()).hexdigest(),
+        }
+    return references
 
 
 def propose_remeasurement(
@@ -563,6 +708,12 @@ def propose_remeasurement(
         ):
             raise ValueError("native evidence or frozen observer profile changed during collection")
         _native_state(root)
+        if progress:
+            progress("Measuring task reference solutions")
+        references_path = directory / "references.json"
+        _json(
+            references_path, _collect_references(root, directory, manifest, original.parent, frozen)
+        )
         proposed_path = directory / "assessment-input.json"
         _json(proposed_path, revised.model_dump(mode="json"))
         assessment = build_assessment(proposed_path)
@@ -582,6 +733,10 @@ def propose_remeasurement(
             frozen_profiles=study._reference(root, profile_path),
             profile_inventory=profile_inventory,
             measurement_inventory=study._inventory(directory / "measurements"),
+            references=study._reference(root, references_path),
+            reference_inventory=study._inventory(directory / "references")
+            if (directory / "references").is_dir()
+            else {},
             observations=bindings,
             proposed_assessment=study._reference(root, proposed_path),
             proposed_report=study._reference(root, report_path),
@@ -639,6 +794,15 @@ def validate_remeasurement(root: Path, directory: Path) -> Path:
         raise ValueError("frozen measurement profile changed")
     if study._inventory(directory / "measurements") != protocol.get("measurement_inventory"):
         raise ValueError("measurement artifacts changed")
+    if "references" in protocol:
+        study._bound_path(root, protocol["references"])
+        references = (
+            study._inventory(directory / "references")
+            if (directory / "references").is_dir()
+            else {}
+        )
+        if references != protocol.get("reference_inventory"):
+            raise ValueError("reference measurement artifacts changed")
     profiles = load_profiles(study._bound_path(root, protocol["frozen_profiles"]))
     if set(profiles) != {record.task_id for record in original.records}:
         raise ValueError("observer profiles differ from native task assignment")

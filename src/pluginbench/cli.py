@@ -79,11 +79,15 @@ def run(
     config: Path | None = typer.Option(
         None, "--config", help="Evaluation YAML or JSON; relative paths use its directory."
     ),
-    harness: str | None = typer.Option(None, "--harness", help="Coding harness; native treatments currently require codex."),
+    harness: str | None = typer.Option(
+        None, "--harness", help="Coding harness; native treatments currently require codex."
+    ),
     model: str | None = typer.Option(None, "--model"),
     reasoning: str | None = typer.Option(None, "--reasoning"),
     guidance: list[Path] | None = typer.Option(
-        None, "--guidance", help="Instruction file; composed into native AGENTS.md, never the task prompt."
+        None,
+        "--guidance",
+        help="Instruction file; composed into native AGENTS.md, never the task prompt.",
     ),
     skill: list[Path] | None = typer.Option(
         None, "--skill", help="Native skill directory or collection; repeat for one treatment."
@@ -103,7 +107,7 @@ def run(
     measure: list[str] | None = typer.Option(
         None,
         "--measure",
-        help="tokens, lines, cyclomatic, cognitive, dead_code, coverage, test_overlap, review; repeat.",
+        help="tokens, lines, cyclomatic, cognitive, dead_code, coverage, review; repeat.",
     ),
     review_harness: str | None = typer.Option(None, "--review-harness"),
     review_model: str | None = typer.Option(None, "--review-model"),
@@ -175,9 +179,13 @@ def run(
         else:
             raw: dict[str, object] = {
                 "runner": {"harness": harness, "model": model, "reasoning": reasoning},
-                "treatments": {guidance_name: {
-                    "guidance": guidance or [], "skills": skill or [], "plugins": plugin or []
-                }},
+                "treatments": {
+                    guidance_name: {
+                        "guidance": guidance or [],
+                        "skills": skill or [],
+                        "plugins": plugin or [],
+                    }
+                },
                 "tasks": {"source": tasks, "ids": task or []},
                 "measurements": measure or [],
             }

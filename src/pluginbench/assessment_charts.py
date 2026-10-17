@@ -27,9 +27,15 @@ REVIEW_CATEGORIES = {
 }
 
 # Panel, subtype, canonical evidence kind, canonical metric key.
+# Panels marked diagnostic stay in results JSON/CSV but out of report charts and summaries.
+DIAGNOSTIC_PANELS = frozenset({"Whole-suite coverage"})
 METRICS = (
     ("Tokens", "Input tokens", "work", "input_tokens"),
+    ("Tokens", "Cached input tokens", "work", "cached_input_tokens"),
+    ("Tokens", "Uncached input tokens", "work", "uncached_input_tokens"),
     ("Tokens", "Output tokens", "work", "output_tokens"),
+    ("Tokens", "Reasoning output tokens", "work", "reasoning_output_tokens"),
+    ("Time", "Coding time", "work", "elapsed_seconds"),
     ("Review tokens", "Judge input tokens", "review_work", "input_tokens"),
     ("Review tokens", "Judge output tokens", "review_work", "output_tokens"),
     ("Review findings", "Total review findings", "review_findings", "finding_count"),
@@ -51,79 +57,46 @@ METRICS = (
         )
         for category in REVIEW_CATEGORIES
     ),
-    ("Complexity", "Reported cognitive maximum", "fallow", "max_cognitive_reported"),
-    ("Complexity", "Reported cyclomatic maximum", "fallow", "max_cyclomatic_reported"),
-    *(
-        (
-            "Changed functions",
-            f"{side.title()} changed-function {label}",
-            "fallow_change",
-            f"changed_functions.{side}.{key}",
-        )
-        for side in ("before", "after")
-        for label, key in (
-            ("count", "function_count_reported"),
-            ("cognitive maximum", "max_cognitive_reported"),
-            ("cyclomatic maximum", "max_cyclomatic_reported"),
-            ("unit-size maximum", "max_unit_size_reported"),
-        )
-    ),
-    *(
-        (
-            "New-file functions",
-            f"New-file function {label}",
-            "fallow_change",
-            f"new_file_functions.after.{key}",
-        )
-        for label, key in (
-            ("count", "function_count_reported"),
-            ("cognitive maximum", "max_cognitive_reported"),
-            ("cyclomatic maximum", "max_cyclomatic_reported"),
-            ("unit-size maximum", "max_unit_size_reported"),
-        )
-    ),
-    ("Coverage", "Line coverage %", "coverage", "line_percent"),
-    ("Coverage", "Statement coverage %", "coverage", "statement_percent"),
-    ("Coverage", "Branch coverage %", "coverage", "branch_percent"),
-    ("Coverage", "Function coverage %", "coverage", "function_percent"),
-    ("LOC", "Source LOC", "loc", "source_lines"),
-    ("LOC", "Test LOC", "loc", "test_lines"),
-    ("LOC", "Source lines added", "loc_change", "source_lines_added"),
-    ("LOC", "Source lines removed", "loc_change", "source_lines_removed"),
-    ("LOC", "Test lines added", "loc_change", "test_lines_added"),
-    ("LOC", "Test lines removed", "loc_change", "test_lines_removed"),
-    ("Reported dead findings", "Reported dead findings", "fallow", "dead_code"),
+    ("Code added", "Net cognitive complexity added", "fallow_change", "code_added.net_cognitive"),
+    ("Code added", "Net cyclomatic complexity added", "fallow_change", "code_added.net_cyclomatic"),
+    ("Code added", "Functions added", "fallow_change", "code_added.functions_added"),
+    ("Code added", "Source files added", "fallow_change", "code_added.source_files_added"),
+    ("Code added", "Complexity hotspots added", "fallow_change", "code_added.hotspots_added"),
     (
-        "Reported dead findings",
+        "Code added",
         "Introduced dead findings",
         "fallow_change",
         "dead_findings.introduced_count",
     ),
     (
-        "Reported dead findings",
-        "Resolved dead findings",
-        "fallow_change",
-        "dead_findings.resolved_count",
-    ),
-    (
-        "Test overlap",
-        "Zero marginal branch contribution cases",
-        "coverage",
-        "zero_marginal_count",
-    ),
-    ("Reported clone groups", "Reported clone groups", "fallow", "clone_groups"),
-    (
-        "Reported clone groups",
+        "Code added",
         "Introduced clone groups",
         "fallow_change",
         "clone_findings.introduced_count",
     ),
+    ("LOC", "Source lines added", "loc_change", "source_lines_added"),
+    ("LOC", "Source lines removed", "loc_change", "source_lines_removed"),
+    ("LOC", "Source lines net", "loc_change", "source_lines_net"),
+    ("LOC", "Test lines added", "loc_change", "test_lines_added"),
+    ("LOC", "Test lines removed", "loc_change", "test_lines_removed"),
+    ("Tests added", "Changed-line coverage %", "coverage_change", "changed_lines.line_percent"),
+    ("Tests added", "Changed-branch coverage %", "coverage_change", "changed_lines.branch_percent"),
     (
-        "Reported clone groups",
-        "Resolved clone groups",
-        "fallow_change",
-        "clone_findings.resolved_count",
+        "Tests added",
+        "Redundant added tests",
+        "coverage_change",
+        "changed_lines.redundant_added_tests",
     ),
+    (
+        "Tests added",
+        "Duplicated added test lines",
+        "change",
+        "test_duplication.duplicated_added_test_lines",
+    ),
+    ("Whole-suite coverage", "Line coverage %", "coverage", "line_percent"),
+    ("Whole-suite coverage", "Statement coverage %", "coverage", "statement_percent"),
+    ("Whole-suite coverage", "Branch coverage %", "coverage", "branch_percent"),
+    ("Whole-suite coverage", "Function coverage %", "coverage", "function_percent"),
     (
         "Tests with zero unique contribution",
         "Branch contribution",
@@ -181,18 +154,6 @@ METRIC_GUIDE = {
         "Percentage of functions called by the selected tests. "
         "Higher means a larger share ran; it does not prove every path or result was checked.",
     ),
-    "Source LOC": (
-        "Total source lines",
-        "lines",
-        "Source lines in the measured code after the task, including comments and blank lines. "
-        "This is the total size, not the number of lines the agent added.",
-    ),
-    "Test LOC": (
-        "Total test lines",
-        "lines",
-        "Test lines in the measured code after the task, including comments and blank lines. "
-        "More lines do not necessarily mean better tests.",
-    ),
     **{
         f"{kind} lines {action}": (
             f"{kind} lines {action}",
@@ -203,47 +164,17 @@ METRIC_GUIDE = {
         for kind in ("Source", "Test")
         for action in ("added", "removed")
     },
-    "Reported dead findings": (
-        "Total unused-code warnings",
-        "warnings",
-        "Unused-code warnings reported by the analyzer after the task, including inherited ones. "
-        "Public APIs and runtime calls can produce false positives. Zero means no warnings detected.",
-    ),
     "Introduced dead findings": (
         "New unused-code warnings",
         "warnings",
         "Unused-code warnings present after the task that were absent from the starting scan. "
         "Public APIs and runtime calls can produce false positives. Zero means no new warnings.",
     ),
-    "Resolved dead findings": (
-        "Unused-code warnings cleared",
-        "warnings",
-        "Warnings from the starting unused-code scan that are absent after the task. "
-        "Higher means more warnings disappeared; the code may have been removed or made reachable.",
-    ),
-    "Reported clone groups": (
-        "Total duplicate-code groups",
-        "groups",
-        "Groups of matching code blocks reported by the analyzer after the task, including inherited ones. "
-        "This counts groups, not duplicated lines; some duplication may be intentional.",
-    ),
     "Introduced clone groups": (
         "New duplicate-code groups",
         "groups",
         "Groups of matching code blocks detected after the task but absent from the starting scan. "
         "Lower means fewer new groups; this counts groups, not duplicated lines.",
-    ),
-    "Resolved clone groups": (
-        "Duplicate-code groups cleared",
-        "groups",
-        "Duplicate-code groups from the starting scan that are absent after the task. "
-        "Higher means more groups disappeared; it does not prove the remaining design is better.",
-    ),
-    "Zero marginal branch contribution cases": (
-        "Test cases adding no branch coverage",
-        "test cases",
-        "Test cases from added or edited test files whose removal leaves the suite's covered branches unchanged. "
-        "More means more coverage overlap; those tests may still check different behavior.",
     ),
     "Branch contribution": (
         "Tests with no unique branch coverage",
@@ -253,50 +184,84 @@ METRIC_GUIDE = {
     ),
 }
 
-_FUNCTION_GUIDE = {
-    "count": (
-        "Function count",
-        "functions",
-        "Number of reported functions",
-        "This describes the measured code; fewer functions is not automatically better.",
-    ),
-    "cognitive maximum": (
-        "Highest cognitive complexity",
-        "score",
-        "Highest branching-and-nesting score for any one function",
-        "Lower suggests simpler control flow. The score starts at zero; it is not the complexity added.",
-    ),
-    "cyclomatic maximum": (
-        "Highest cyclomatic complexity",
-        "paths",
-        "Most independent execution paths through any one function",
-        "Higher means more paths to consider. A function with no branching starts at one.",
-    ),
-    "unit-size maximum": (
-        "Longest function",
-        "lines",
-        "Most source lines occupied by any one function",
-        "Lower means a shorter function; shortness alone does not establish good design.",
-    ),
-}
-for _label, (_title, _unit, _meaning, _reading) in _FUNCTION_GUIDE.items():
-    if _label in {"cognitive maximum", "cyclomatic maximum"}:
-        METRIC_GUIDE[f"Reported {_label}"] = (
-            _title,
-            _unit,
-            f"{_meaning} in the declared scan. {_reading}",
-        )
-    for _side in ("before", "after"):
-        METRIC_GUIDE[f"{_side.title()} changed-function {_label}"] = (
-            f"{_title} · {_side}",
-            _unit,
-            f"{_meaning} touched by changed lines, {_side} the agent's edits. {_reading}",
-        )
-    METRIC_GUIDE[f"New-file function {_label}"] = (
-        f"{_title} in new files",
-        _unit,
-        f"{_meaning} in files added by the agent. {_reading}",
-    )
+METRIC_GUIDE.update(
+    {
+        "Cached input tokens": (
+            "Cached input tokens",
+            "tokens",
+            "Input tokens served from the provider's prompt cache. Usually priced far below fresh input.",
+        ),
+        "Uncached input tokens": (
+            "Uncached input tokens",
+            "tokens",
+            "Input tokens that were not served from cache: input minus cached input. The better input-cost signal.",
+        ),
+        "Reasoning output tokens": (
+            "Reasoning output tokens",
+            "tokens",
+            "Output tokens spent on hidden reasoning. A subset of output tokens, not added to them.",
+        ),
+        "Source lines net": (
+            "Source lines net",
+            "lines",
+            "Source lines added minus source lines removed. Negative means the submission shrank the code.",
+        ),
+        "Coding time": (
+            "Coding time",
+            "seconds",
+            "Elapsed time of the coding run, including subagents. Shared machine load can affect it.",
+        ),
+        "Net cognitive complexity added": (
+            "Cognitive complexity added",
+            "score",
+            "Branching-and-nesting the agent added to source code: changed functions after the edit "
+            "minus the same functions before. New functions count in full; deleted ones subtract.",
+        ),
+        "Net cyclomatic complexity added": (
+            "Cyclomatic complexity added",
+            "paths",
+            "Independent paths the agent added to source code, measured like cognitive complexity "
+            "added. Editing an already-complex function counts only its growth.",
+        ),
+        "Functions added": (
+            "Functions added",
+            "functions",
+            "Source functions after the edit whose path and name did not exist before. Renames count as added.",
+        ),
+        "Source files added": (
+            "Source files added",
+            "files",
+            "New non-test source files. More files is not automatically worse; compare with the reference.",
+        ),
+        "Complexity hotspots added": (
+            "Complexity hotspots added",
+            "functions",
+            "New or grown source functions whose cognitive score is above 15, a common review threshold.",
+        ),
+        "Changed-line coverage %": (
+            "Changed-line coverage",
+            "% covered",
+            "Share of the agent's added executable source lines that its submitted tests run. "
+            "Running a line does not prove its behavior is checked.",
+        ),
+        "Changed-branch coverage %": (
+            "Changed-branch coverage",
+            "% covered",
+            "Share of branches on the agent's added source lines that its submitted tests take.",
+        ),
+        "Redundant added tests": (
+            "Redundant added tests",
+            "tests",
+            "Added tests whose covered added lines are all covered by other tests. "
+            "Candidates only: equal coverage does not mean equal assertions.",
+        ),
+        "Duplicated added test lines": (
+            "Duplicated added test lines",
+            "lines",
+            "Added test lines inside a six-line block that repeats elsewhere in the added tests.",
+        ),
+    }
+)
 
 METRIC_GUIDE["Total review findings"] = (
     "Review findings",
@@ -368,6 +333,21 @@ def _text(value: object) -> str:
 def _number(value: object) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value) if math.isfinite(value) and value >= 0 else None
+    return None
+
+
+def _net_lines(size: dict[str, object]) -> float | None:
+    added, removed = (
+        _number(size.get("source_lines_added")),
+        _number(size.get("source_lines_removed")),
+    )
+    return added - removed if added is not None and removed is not None else None
+
+
+def _signed(value: object) -> float | None:
+    """Like _number, for measures that can fall below zero, such as complexity removed."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value) if math.isfinite(value) else None
     return None
 
 
@@ -521,7 +501,13 @@ def _observation(
     work = _map(stage.get("work"))
     native_outcome = execution_outcome(stage.get("execution_provenance"))
     evidence = _map(
-        _map(stage.get("metrics")).get(static_kind if kind in {"fallow", "fallow_change"} else kind)
+        _map(stage.get("metrics")).get(
+            {
+                "fallow": static_kind,
+                "fallow_change": static_kind,
+                "coverage_change": "coverage",
+            }.get(kind, kind)
+        )
     )
     metrics = _map(evidence.get("metrics"))
     provenance = _map(evidence.get("provenance"))
@@ -623,17 +609,26 @@ def _observation(
                 else "valid fixed-criteria review, runtime identity, or explicit finding counts unavailable"
             )
     elif kind == "work":
-        value = _number(_map(work.get("tokens")).get(key))
+        tokens = _map(work.get("tokens"))
+        if key == "uncached_input_tokens":
+            total, cached = (
+                _number(tokens.get(name)) for name in ("input_tokens", "cached_input_tokens")
+            )
+            value = total - cached if total is not None and cached is not None else None
+        elif key == "elapsed_seconds":
+            value = _number(work.get("elapsed_seconds"))
+        else:
+            value = _number(tokens.get(key))
         provenance = {"token_format": work.get("token_format")}
         eligible = isinstance(work.get("token_format"), str) and bool(work["token_format"])
         identity.update(provenance)
         reason = "native tokens at handoff; cached input and reasoning output subsets are not added"
-    elif kind in {"loc", "loc_change"}:
+    elif kind == "loc_change":
         classification = "source" if key.startswith("source_") else "test"
         code_size = _map(stage.get("code_size" if classification == "source" else "test_code_size"))
         if code_size.get("status") == "available":
-            value = _number(
-                code_size.get(f"after_{classification}_lines" if kind == "loc" else key)
+            value = (
+                _net_lines(code_size) if key == "source_lines_net" else _number(code_size.get(key))
             )
             provenance = {
                 field: code_size.get(field)
@@ -660,8 +655,11 @@ def _observation(
             provenance = {"classification": f"scoped {classification} LOC unavailable"}
             reason = str(code_size.get("reason"))
         else:
-            value = _number(
-                _map(stage.get("snapshot_metadata" if kind == "loc" else "change")).get(key)
+            change_size = _map(stage.get("change"))
+            value = (
+                _net_lines(change_size)
+                if key == "source_lines_net"
+                else _number(change_size.get(key))
             )
             provenance = {
                 "exclusion_names": _map(stage.get("snapshot_metadata")).get("exclusion_names"),
@@ -670,13 +668,32 @@ def _observation(
             eligible = provenance["exclusion_names"] is not None
             identity.update(provenance)
             reason = "extension-classified LOC, including generated files; shared source/test classification"
-    elif kind == "fallow_change":
-        comparison = _map(_map(stage.get("metric_comparison")).get(static_kind))
+    elif kind == "change":
+        section, field = key.split(".")
+        detail = _map(_map(stage.get("change")).get(section))
+        value = _number(detail.get(field))
+        provenance = {"method": detail.get("method")}
+        eligible = bool(detail)
+        identity.update(provenance)
+        reason = str(detail.get("method") or "bound source diff unavailable")
+    elif kind in {"fallow_change", "coverage_change"}:
+        comparison = _map(
+            _map(stage.get("metric_comparison")).get(
+                "coverage" if kind == "coverage_change" else static_kind
+            )
+        )
         path = key.split(".")
         detail = _map(comparison.get(path[0]))
         population_metrics = _map(detail.get(path[1])) if len(path) == 3 else detail
-        value = _number(population_metrics.get(path[-1]))
-        eligible = comparison.get("status") == detail.get("status") == "available" and all(
+        value = (_signed if path[-1].startswith("net_") else _number)(
+            population_metrics.get(path[-1])
+        )
+        # Changed-line results stand on their own; whole-suite coverage is incomplete whenever lines
+        # change. Code-added results still require their static comparison to be available.
+        eligible = (
+            detail.get("status") == "available"
+            and (kind == "coverage_change" or comparison.get("status") == "available")
+        ) and all(
             provenance.get(field) is not None
             for field in ("tool", "tool_version", "config_digest", "scope")
         )
@@ -689,6 +706,14 @@ def _observation(
             "complete_for_declared_scope": population_metrics.get("complete_for_declared_scope"),
             "reported_functions": population_metrics.get("function_count_reported"),
         }
+        if kind == "coverage_change" and key.endswith("_percent"):
+            # Changed-line rates keep their own covered/total counts beside the percentage.
+            covered_key, total_key = (
+                ("added_lines_covered", "added_executable_lines")
+                if key.endswith("line_percent")
+                else ("branch_covered", "branch_total")
+            )
+            provenance.update(covered=detail.get(covered_key), total=detail.get(total_key))
         reason = str(
             detail.get("method")
             or detail.get("reason")
@@ -696,9 +721,7 @@ def _observation(
             or "bound before/after comparison unavailable"
         )
         if detail.get("status") == "incomplete":
-            reason += "; reported functions only; population incomplete"
-        if value is None and population_metrics.get("function_count_reported") == 0:
-            reason += "; no reported functions in this population; maximum undefined"
+            reason += "; population incomplete"
         population = None
     else:
         value = _number(metrics.get(key))
@@ -784,38 +807,6 @@ def _observation(
                     "total": metrics.get(f"{unit}_total"),
                 }
             )
-        if key == "zero_marginal_count":
-            contribution = _map(metrics.get("test_contribution"))
-            value = _number(contribution.get("zero_marginal_count"))
-            population = _number(contribution.get("candidate_count"))
-            eligible = eligible and contribution.get("status") == "available"
-            test_scope = metrics.get("test_scope")
-            valid_test_scope = (
-                isinstance(test_scope, list)
-                and bool(test_scope)
-                and all(isinstance(name, str) and name for name in test_scope)
-            )
-            normalized_test_scope = (
-                sorted({str(name).removeprefix("./") for name in test_scope})
-                if valid_test_scope and isinstance(test_scope, list)
-                else None
-            )
-            eligible = eligible and valid_test_scope
-            identity["method"] = contribution.get("method")
-            identity["test_scope"] = normalized_test_scope
-            provenance.update(
-                {
-                    "method": contribution.get("method"),
-                    "test_scope": normalized_test_scope,
-                    "selection": contribution.get("selection"),
-                    "reference_count": contribution.get("reference_count"),
-                    "candidate_count": population,
-                    "tested_count": contribution.get("tested_count"),
-                    "limitations": contribution.get("limitations"),
-                }
-            )
-            identity["selection"] = contribution.get("selection")
-            reason = "fresh leave-one-out runs; zero marginal branch contribution is a test-overlap proxy, not a count of unnecessary tests"
         if key.startswith("zero_unique_"):
             names = metrics.get(key)
             value = (
@@ -825,7 +816,7 @@ def _observation(
             )
             eligible = False
             reason = "among supplied tests only; full-suite population completeness is not attested; shown as raw counts, not semantic redundancy"
-        elif key != "zero_marginal_count":
+        else:
             population = None
         if kind == "coverage" and metrics.get("clock") is not None:
             clock = _map(metrics["clock"])
@@ -892,8 +883,15 @@ def _observation(
             status, reason = (
                 "unknown",
                 reason + "; unknown is not zero"
-                if kind in {"fallow_change", "loc", "loc_change", "review_findings"}
-                or key == "zero_marginal_count"
+                if kind
+                in {
+                    "fallow_change",
+                    "coverage_change",
+                    "change",
+                    "loc",
+                    "loc_change",
+                    "review_findings",
+                }
                 or (kind == "coverage" and metrics)
                 else _text(evidence.get("reason"))
                 if evidence.get("reason")
@@ -1126,7 +1124,6 @@ def _measurement_completeness(attempts: list[dict[str, object]]) -> list[dict[st
         )
         static = _map(_map(evidence.get(static_kind)).get("metrics"))
         coverage = _map(_map(evidence.get("coverage")).get("metrics"))
-        overlap = _map(coverage.get("test_contribution"))
         comparison = _map(_map(stage.get("metric_comparison")).get(static_kind))
         work = stage.get("work")
         tokens = _map(_map(work).get("tokens"))
@@ -1171,10 +1168,6 @@ def _measurement_completeness(attempts: list[dict[str, object]]) -> list[dict[st
             "Introduced clone groups": _map(comparison.get("clone_findings")).get("status")
             == "available"
             and _number(_map(comparison.get("clone_findings")).get("introduced_count")) is not None,
-            "Test-overlap candidate counts": overlap.get("status") == "available"
-            and _number(overlap.get("candidate_count")) is not None
-            and overlap.get("tested_count") == overlap.get("candidate_count")
-            and _number(overlap.get("zero_marginal_count")) is not None,
         }
         rows.append(
             {

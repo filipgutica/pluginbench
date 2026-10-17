@@ -258,7 +258,8 @@ body.evaluation .chart-options { margin-top:var(--space-2); }
 </main><script>__ECHARTS_SCRIPT__</script><script id="assessment-data" type="application/json">__ASSESSMENT_DATA__</script><script>
 "use strict";
 const data = JSON.parse(document.getElementById("assessment-data").textContent);
-const observations = data.observations;
+// Diagnostic panels stay in results JSON/CSV only.
+const observations = data.observations.filter(row => !(data.diagnostic_panels || []).includes(row.panel));
 const create = (tag, text, parent) => {
   const node = document.createElement(tag);
   if (text !== void 0) node.textContent = text;
@@ -339,14 +340,11 @@ create("pre", JSON.stringify({ runner: data.runner, reviewer: data.reviewer, com
 document.getElementById("limitations").after(methodology);
 document.getElementById("limitations").querySelector("summary").textContent = "Measurement limits";
 
-const emptyFunctionMaximum = row => ["Complexity", "Changed functions", "New-file functions"].includes(row.panel) && row.value === null && row.provenance.reported_functions === 0 && row.provenance.complete_for_declared_scope === true;
-// A parsed coverage report whose format has no population for this unit (for example, LCOV statements).
-const formatLimited = row => row.panel === "Coverage" && row.value === null && Boolean(row.provenance.tool_version) && Object.entries(row.provenance).some(([key, value]) => key.endsWith("_denominator_digest") && value === null);
 for (const option of metricSelect.querySelectorAll("option")) {
   const rows = observations.filter(row => row.metric === option.value);
-  if (rows.length && rows.every(row => row.value === null)) option.textContent += rows.every(formatLimited) ? " — not reported by the format" : " — no values";
+  if (rows.length && rows.every(row => row.value === null)) option.textContent += " — no values";
 }
-const KEY_METRICS = ["Input tokens", "Output tokens", "Source lines added", "Test lines added", "After changed-function cyclomatic maximum", "After changed-function cognitive maximum", "Line coverage %", "Branch coverage %", "Introduced dead findings", "Total review findings", "Correctness review findings"];
+const KEY_METRICS = ["Uncached input tokens", "Output tokens", "Coding time", "Source lines added", "Net cognitive complexity added", "Net cyclomatic complexity added", "Functions added", "Complexity hotspots added", "Introduced dead findings", "Test lines added", "Changed-line coverage %", "Redundant added tests", "Duplicated added test lines", "Total review findings"];
 function taskCheckSummary(attempts) {
   const executions = attempts.filter(row => ["failed", "timed_out"].includes(row.execution?.status));
   const completed = attempts.filter(row => !executions.includes(row));
@@ -357,6 +355,26 @@ function taskCheckSummary(attempts) {
     passed: passed + "/" + attempts.length + " attempts passed",
     remainder: failed + " failed task check" + (failed === 1 ? "" : "s") + " · " + executions.length + " execution failure" + (executions.length === 1 ? "" : "s") + " · " + unknown + " unknown",
   };
+}
+// Overview: equal-weight mean of per-task ratios. Task view: this task's ratio, or a difference when the reference is zero.
+function referenceText(arm, metric) {
+  if (!taskSelect.value) {
+    const row = (data.reference_aggregates || []).find(item => item.guidance === arm && item.metric === metric);
+    return row && row.ratio_to_reference !== null ? formatCompact(row.ratio_to_reference) + "× reference (" + row.measured_tasks + "/" + row.assigned_tasks + " tasks)" : null;
+  }
+  const rows = (data.reference_comparisons || []).filter(item => item.task === taskSelect.value && item.guidance === arm && item.metric === metric);
+  if (rows.length !== 1) return null;
+  const row = rows[0];
+  return row.ratio_to_reference !== null ? formatCompact(row.ratio_to_reference) + "× reference" : row.difference_vs_reference !== null ? formatSigned(row.difference_vs_reference) + " vs reference" : null;
+}
+// Passing-only summaries are labelled separately and never replace all-attempt values.
+function passingText(arm, metric, group) {
+  if (!taskSelect.value) {
+    const row = (data.passing_aggregates || []).find(item => item.arm === arm && item.metric === metric && (item.analysis_group ?? null) === (group ?? null));
+    return row && row.value !== null ? "Passing only: " + formatCompact(row.value) + " (" + row.measured_tasks + "/" + row.assigned_tasks + " tasks)" : null;
+  }
+  const row = (data.passing_medians || []).find(item => item.task === taskSelect.value && item.arm === arm && item.metric === metric);
+  return row ? "Passing only: " + formatCompact(row.value) + " (" + row.passing + " runs)" : null;
 }
 function showPackageSummary() {
   const metricsOpen = packageSummary.querySelector("details")?.open || false;
@@ -381,18 +399,17 @@ function showPackageSummary() {
     for (const metric of metrics) {
       const row = create("tr", undefined, metricsBody); create("th", "", row).scope = "row";
       const button = create("button", data.metric_guide[metric].title, row.firstChild); button.className = "metric-link"; button.type = "button";
+      const referenceValue = taskSelect.value ? (data.reference_values || []).find(item => item.task === taskSelect.value && item.metric === metric) : null;
+      if (referenceValue) create("small", "Reference: " + formatCompact(referenceValue.value), row.firstChild);
       button.setAttribute("aria-pressed", String(metricSelect.value === metric));
       button.addEventListener("click", () => { metricSelect.value = metric; update(); metricSelect.focus(); });
       for (const arm of arms) {
         const valueRows = taskSelect.value ? (data.raw_medians || []).filter(row => row.task === taskSelect.value && row.metric === metric && row.arm === arm) : (data.aggregates || []).filter(row => row.metric === metric && row.guidance === arm);
-        const members = observations.filter(row => row.arm === arm && row.metric === metric && (!taskSelect.value || row.task === taskSelect.value));
-        const empty = members.length && members.every(emptyFunctionMaximum);
-        const unsupported = members.length && members.every(formatLimited);
         // Separate analyzer groups have unlike scores: show each group on its own line, never pooled.
         const groups = valueRows.length > 1 && !taskSelect.value ? valueRows : [valueRows.length === 1 ? valueRows[0] : null];
         const cell = create("td", undefined, row);
         for (const result of groups) {
-          const text = result?.value !== undefined && result.value !== null ? formatCompact(result.value) : unsupported ? "Not reported" : empty ? "No functions" : "Unknown";
+          const text = result?.value !== undefined && result.value !== null ? formatCompact(result.value) : "Unknown";
           create("div", text + (groups.length > 1 && result?.analysis_group ? " · " + result.analysis_group : ""), cell);
           if (!taskSelect.value && result) create("small", result.measured_tasks + "/" + result.assigned_tasks + " tasks", cell);
           if (arm !== "baseline") {
@@ -401,7 +418,12 @@ function showPackageSummary() {
             const value = delta?.absolute_delta_vs_vanilla ?? null;
             create("small", value === null ? "Delta unavailable" : formatSigned(value) + " " + delta.absolute_delta_unit + " vs vanilla", cell);
           }
+          // Each analyzer group keeps its own passing-only value.
+          const passing = passingText(arm, metric, result?.analysis_group);
+          if (passing) create("small", passing, cell);
         }
+        const reference = referenceText(arm, metric);
+        if (reference) create("small", reference, cell).className = "reference";
       }
     }
   };
@@ -418,15 +440,24 @@ function showPackageSummary() {
     const cell = create("td", summary.passed, checks);
     create("small", summary.remainder, cell);
     const rows = observations.filter(row => row.arm === arm && (!taskSelect.value || row.task === taskSelect.value));
-    const numeric = rows.filter(row => row.value !== null).length, empty = rows.filter(emptyFunctionMaximum).length, limited = rows.filter(formatLimited).length;
+    const numeric = rows.filter(row => row.value !== null).length;
     const countCell = create("td", numeric + "/" + rows.length + " numeric", counts);
-    create("small", (limited ? limited + " not reported by the format · " : "") + empty + " empty maxima · " + (rows.length - numeric - empty - limited) + " missing", countCell);
+    create("small", rows.length - numeric + " unknown", countCell);
+  }
+  const priced = (data.cost || []).filter(row => row.dollars !== null && (!taskSelect.value || row.task === taskSelect.value));
+  if (priced.length) {
+    const cost = rowFor("Coding cost");
+    for (const arm of arms) {
+      const values = priced.filter(row => row.arm === arm).map(row => row.dollars);
+      const cell = create("td", values.length ? "$" + (values.reduce((a, b) => a + b, 0) / values.length).toFixed(2) + " per attempt" : "Unknown", cost);
+      create("small", values.length + " priced attempts · prices as of " + unique(priced.map(row => row.price_as_of)).join(", "), cell);
+    }
   }
   const mainMetrics = unique(observations.map(row => row.metric));
   const keyMetrics = KEY_METRICS.filter(metric => mainMetrics.includes(metric));
   if (keyMetrics.length) {
     create("h3", "Key results", packageSummary);
-    create("p", (taskSelect.value ? "Medians of this task's runs. " : "Averages of task medians, each task weighted equally. ") + "Deltas compare each package with vanilla; lower is not automatically better. Choose a metric name to chart it.", packageSummary).className = "counts";
+    create("p", (taskSelect.value ? "Medians of this task's runs. " : "Averages of task medians, each task weighted equally. ") + "Deltas compare each package with vanilla. \"× reference\" compares code measures with the task's reference solution: 1× means the same amount. Lower is not automatically better. Choose a metric name to chart it.", packageSummary).className = "counts";
     metricTable(packageSummary, "Key results", keyMetrics);
   }
   const metricsDetails = create("details", undefined, packageSummary);
@@ -453,7 +484,7 @@ function showCompleteness() {
   if (!rows.length) return;
   target.querySelector("summary").textContent = rows.filter(row => row.complete).length + "/" + rows.length + " coding submissions have complete metric counts";
   const body = target.querySelector("div"); body.replaceChildren();
-  create("p", "Counts are separate from correctness. Zero findings and 0/0 candidate cases are measured; an empty population has no defined maximum or coverage percentage.", body).className = "counts";
+  create("p", "Counts are separate from correctness. Zero findings are measured; a submission that adds no source lines has no changed-line coverage percentage.", body).className = "counts";
   const table = create("table", undefined, body);
   for (const metric of Object.keys(rows[0].counts)) {
     const tr = create("tr", undefined, table);
@@ -479,7 +510,7 @@ function showCollectionStatus() {
   const body = create("tbody", undefined, table);
   for (const failure of failures) {
     const attempt = byId.get(failure.attempt_id), row = create("tr", undefined, body);
-    const family = failure.family === "coverage" ? "Coverage and test overlap" : failure.family === "fallow" ? "Complexity and unused-code warnings" : failure.family;
+    const family = failure.family === "coverage" ? "Coverage" : failure.family === "fallow" ? "Complexity and unused-code warnings" : failure.family;
     const diagnostic = (failure.diagnostics || []).find(value => typeof value === "string" && value);
     const reason = [failure.reason || failure.status, diagnostic?.split(/\r?\n/)[0]].filter(Boolean).join(": ");
     for (const value of [attempt.task, armLabel(attempt.guidance), failure.stage === "before" ? "Starting code" : attempt.repeat, family, reason.slice(0, 450)]) create("td", value, row);
@@ -527,7 +558,7 @@ function resolvedColor(variable) {
   return color;
 }
 function observationValue(row) {
-  const counts = row.panel === "Coverage" && row.provenance.covered !== undefined && row.provenance.total !== undefined ? " (" + format(row.provenance.covered) + "/" + format(row.provenance.total) + " covered)" : row.per_test_count !== null ? " / " + format(row.per_test_count) + (row.panel === "Test overlap" ? " candidate cases" : " supplied tests") : "";
+  const counts = row.provenance.covered !== undefined && row.provenance.covered !== null && row.provenance.total !== undefined && row.provenance.total !== null ? " (" + format(row.provenance.covered) + "/" + format(row.provenance.total) + " covered)" : row.per_test_count !== null ? " / " + format(row.per_test_count) + " supplied tests" : "";
   return format(row.value) + " " + data.metric_guide[row.metric].unit + counts;
 }
 function observationText(row) {
@@ -588,7 +619,7 @@ function evaluationPlotRows({ rows, metric }) {
   const arms = unique(rows.map(row => row.arm));
   return arms.flatMap(arm => {
     const values = medians.filter(row => row.arm === arm);
-    if (!values.length) return [{ guidance: arm, label: armLabel(arm), plotted: null, value: null, population: "No defined maximum", status: "empty or unknown", reason: "See scan counts and attempt details.", rawRuns: [] }];
+    if (!values.length) return [{ guidance: arm, label: armLabel(arm), plotted: null, value: null, population: "No defined value", status: "unknown", reason: "See scan counts and attempt details.", rawRuns: [] }];
     return values.map(median => ({ ...median, guidance: arm, label: armLabel(arm), plotted: median.value, population: median.measured + " runs", status: "measured", reason: "Raw task median. Comparison eligibility is separate.", rawRuns: rows.filter(row => row.arm === arm && row.value !== null && (median.compatibility !== null ? row.compatibility === median.compatibility : median.attempt_ids.includes(row.attempt_id))) }));
   });
 }
@@ -634,7 +665,7 @@ function drawEvaluationPlot({ parent, rows, metric }) {
   chart.setOption({ animation: false,
     aria: { enabled: true, label: { description: overview && chartBreakdown.value === "tasks" ? "One bar per task and package; select a task to inspect repeated runs." : overview ? "Equal-weight average of each task's median. Each package is compared with vanilla; negative deltas are not automatically better." : "Task-level medians or deltas vs vanilla, with individual runs available in raw mode." } },
     grid: { left: container.clientWidth < 500 ? 120 : 180, right: 100, top: 16, bottom: 48 }, textStyle: { color: text, fontFamily: getComputedStyle(document.body).fontFamily },
-    xAxis: { type: "value", min: raw ? 0 : undefined, name: unit + (raw ? "" : " vs vanilla"), nameLocation: "middle", nameGap: 32, splitNumber: container.clientWidth < 500 ? 2 : 5, axisLabel: { color: text, hideOverlap: true, formatter: formatTick }, splitLine: { lineStyle: { color: border, type: "dashed" } } },
+    xAxis: { type: "value", min: raw && plotRows.every(row => row.plotted === null || row.plotted >= 0) ? 0 : undefined, name: unit + (raw ? "" : " vs vanilla"), nameLocation: "middle", nameGap: 32, splitNumber: container.clientWidth < 500 ? 2 : 5, axisLabel: { color: text, hideOverlap: true, formatter: formatTick }, splitLine: { lineStyle: { color: border, type: "dashed" } } },
     yAxis: { type: "category", inverse: true, data: categories, axisLabel: { color: text, width: container.clientWidth < 500 ? 110 : 168, overflow: "break" }, axisLine: { show: false }, axisTick: { show: false } },
     tooltip: { trigger: "item", confine: true, backgroundColor: resolvedColor("--pb-surface"), borderColor: border, textStyle: { color: text }, formatter: params => {
       const node = create("div"); node.className = "tooltip";
@@ -660,28 +691,22 @@ function complexityNote(parent, rows) {
 }
 function renderPanel({ section, panel, metric }) {
     const rows = observations.filter(row => row.panel === panel && row.metric === metric && (!taskSelect.value || row.task === taskSelect.value));
-  const emptyComplexityPopulation = emptyFunctionMaximum;
   const help = data.metric_guide[metric];
   create("h2", help.title, section);
   create("p", help.explanation, section).className = "metric-explanation";
   if (panel.startsWith("Review ")) create("p", "Independent review of " + (data.independent_review?.stage || "handoff") + " submissions. Judge costs are separate from implementation.", section).className = "counts";
   const counting = {
-    "Complexity": "Maximum across reported functions within the declared scope; tests are included only when scoped. Partial scans cannot describe the whole solution.",
-    "Changed functions": "Selected by overlapping changed lines, not matched function identities. Moves, nested functions and same-line edits can affect the count. Before and after can contain different functions, so their maxima are not a matched-function change. Tests are included when scoped. Partial scans stay raw and are not comparable.",
-    "New-file functions": "Only functions in files absent from the starting code. Functions added inside existing files are excluded. Tests are included when scoped. Empty populations have a count of zero and no maximum.",
-    "Coverage": "Coverage of each submission's source; source populations may differ. Bars show the median of individual submission rates. Covered/total counts are in each run's details; these are descriptive rates, not a fixed-denominator coverage gain.",
-    "Test overlap": "Each candidate case from an added or modified visible test file is removed in a fresh run of the declared passing suite. Zero marginal contribution means the covered branch set stays unchanged; equal coverage does not establish equal assertions or unnecessary tests.",
+    "Code added": "Source code only; tests are excluded. Complexity added sums the scores of changed functions after the edit and subtracts the same functions before, so editing an inherited complex function counts only its growth. Functions are matched on path and name; renames count as added. Each task's reference solution is measured the same way.",
+    "Tests added": "Changed-line coverage uses the submission's own tests and only the source lines it added. Redundant added tests come from per-test coverage in one run: an added test is a candidate when other tests cover every added line it covers. Equal coverage does not prove equal assertions.",
     "LOC": "Totals use the declared source/test scope when available, otherwise file-name and extension classification. Line changes count additions and removals separately; a moved or rewritten block can appear in both. Exact scope and exclusions are in each run's details.",
-    "Reported dead findings": "Counts analyzer findings within the declared scan, not unused lines. New and cleared findings compare the starting and submitted scans. A finding may concern a file, declaration, export or dependency. Zero findings is not proof that all code is used.",
-    "Reported clone groups": "Each group contains code blocks matched under the analyzer's duplication settings. New and cleared groups compare the starting and submitted scans. A changed match can alter the groups even without adding or removing the same number of duplicate blocks.",
-    "Tests with zero unique contribution": "Uses recorded per-test coverage results among the supplied tests. This is not the fresh test-removal experiment or a claim about the complete suite. Raw counts are not comparison bars."
+    "Tests with zero unique contribution": "Uses recorded per-test coverage results among the supplied tests. This is not a claim about the complete suite. Raw counts are not comparison bars."
   }[panel];
   if (counting) {
     const details = create("details", undefined, section);
     create("summary", "How this is counted", details);
     create("p", counting, details);
   }
-  if (panel === "Coverage" || panel === "Test overlap") {
+  if (panel === "Tests added") {
     const controlled = unique(rows.filter(row => row.provenance.clock).map(row => row.task));
     if (controlled.length) create("p", "Controlled-clock coverage: " + controlled.join(", ") + ". Ambient Date reads advance by a configured step. Native correctness checks use their original clock; the clock policy is in each run's details.", section).className = "counts";
   }
@@ -689,17 +714,16 @@ function renderPanel({ section, panel, metric }) {
   if (!taskSelect.value) create("p", (data.aggregates || []).filter(row => row.metric === metric).sort((a, b) => byArm(a.guidance, b.guidance)).map(row => {
     const tasks = new Set(row.task_medians.map(item => item.task));
     const observed = rows.filter(attempt => attempt.arm === row.guidance && tasks.has(attempt.task));
-    const empty = observed.filter(emptyComplexityPopulation).length;
-    const unknown = observed.filter(attempt => attempt.value === null && !emptyComplexityPopulation(attempt)).length;
-    return armLabel(row.guidance) + (row.analysis_group ? " · " + row.analysis_group : "") + ": " + row.measured_tasks + "/" + row.assigned_tasks + (row.assigned_tasks === 1 ? " task" : " tasks") + " with defined values" + (empty ? " · " + empty + (empty === 1 ? " complete scan" : " complete scans") + " with no functions" : "") + (unknown ? " · " + unknown + (unknown === 1 ? " unknown attempt" : " unknown attempts") : "");
+    const unknown = observed.filter(attempt => attempt.value === null).length;
+    return armLabel(row.guidance) + (row.analysis_group ? " · " + row.analysis_group : "") + ": " + row.measured_tasks + "/" + row.assigned_tasks + (row.assigned_tasks === 1 ? " task" : " tasks") + " with defined values" + (unknown ? " · " + unknown + (unknown === 1 ? " unknown attempt" : " unknown attempts") : "");
   }).join(" · "), section).className = "counts";
   else create("p", unique(rows.map(row => row.arm)).sort(byArm).map(arm => {
     const observed = rows.filter(row => row.arm === arm);
     const denominator = observed.length;
-    const defined = observed.filter(row => row.value !== null).length, empty = observed.filter(emptyComplexityPopulation).length;
-    return armLabel(arm) + ": " + defined + "/" + denominator + (empty ? (denominator === 1 ? " attempt" : " attempts") + " with defined values · " + empty + (empty === 1 ? " complete scan" : " complete scans") + " with no functions · " + Math.max(0, denominator - defined - empty) + " unknown" : denominator === 1 ? " measured attempt" : " measured attempts");
+    const defined = observed.filter(row => row.value !== null).length;
+    return armLabel(arm) + ": " + defined + "/" + denominator + (denominator === 1 ? " measured attempt" : " measured attempts");
   }).join(" · "), section).className = "counts";
-  if (panel === "Complexity") {
+  if (panel === "Code added") {
     const scope = create("details", undefined, section);
     create("summary", "Scan completeness by task", scope);
     for (const task of unique(rows.map(row => row.task))) {
@@ -708,10 +732,7 @@ function renderPanel({ section, panel, metric }) {
     }
   }
   if (rows.every(row => row.value === null)) {
-    const empty = rows.filter(emptyComplexityPopulation).length;
-    if (empty === rows.length) create("p", "Complete scans found no functions in this population. There is no maximum to plot.", section);
-    else if (empty) create("p", empty + " of " + rows.length + " attempts have complete scans with no functions, so their maxima are undefined. The other attempts are unknown. See attempt details.", section);
-    else for (const reason of unique(rows.map(row => row.reason || "Measurement unavailable."))) create("p", reason, section);
+    for (const reason of unique(rows.map(row => row.reason || "Measurement unavailable."))) create("p", reason, section);
   }
   else {
     drawEvaluationPlot({ parent: section, rows, metric });

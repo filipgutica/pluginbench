@@ -11,14 +11,24 @@ import subprocess
 
 import pytest
 
-from pluginbench.evaluation_report import evaluation_data, write_evaluation_report
+from pluginbench.evaluation_report import (
+    _passing_summaries,
+    _reference_aggregates,
+    _reference_comparisons,
+    _reference_values,
+    evaluation_data,
+    write_evaluation_report,
+)
 from pluginbench.assessment_charts import chart_data
 from test_assessment_charts import (
     _attempt,
-    _empty_baseline_population_report,
+    _code_added,
     _fixed_review_report,
+    _incomplete_code_added,
     _report,
     _stage,
+    _unknown_baseline_code_added_report,
+    _with_code_added,
 )
 
 
@@ -175,20 +185,15 @@ def test_selected_review_completeness_keeps_missing_review_and_cost_unknown() ->
 
 
 def _complete_selected_population_report() -> dict[str, object]:
-    report = _empty_baseline_population_report()
-    for index in (0, 1):
-        comparison = _stage(report, index)["metric_comparison"]
-        assert isinstance(comparison, dict)
-        comparison["fallow"]["changed_functions"] = {
-            "status": "available",
-            "method": "bound source hunk overlap",
-            "after": {
-                "function_count_reported": 0,
-                "max_cognitive_reported": None,
-                "max_cyclomatic_reported": None,
-                "complete_for_declared_scope": True,
-            },
-        }
+    report = _report()
+    _with_code_added(report, 0, _code_added())
+    _with_code_added(
+        report,
+        1,
+        _code_added(
+            net_cognitive=14, net_cyclomatic=11, functions_added=3, function_count_reported=3
+        ),
+    )
     return report
 
 
@@ -202,27 +207,27 @@ def test_selected_complexity_completeness_keeps_complete_empty_populations() -> 
     baseline = next(
         row
         for row in _rows(data, "observations")
-        if row["arm"] == "baseline" and row["metric"] == "New-file function cognitive maximum"
+        if row["arm"] == "baseline" and row["metric"] == "Net cognitive complexity added"
     )
     provenance = baseline["provenance"]
     assert isinstance(provenance, dict)
-    assert baseline["value"] is None and provenance["reported_functions"] == 0
+    # A complete empty population adds nothing: its sum is zero, not undefined.
+    assert baseline["value"] == 0 and provenance["reported_functions"] == 0
 
 
-@pytest.mark.parametrize("fault", ["incomplete_empty", "unknown_count", "undefined_nonempty"])
-def test_selected_complexity_requires_declared_complete_populations_and_defined_nonempty_maxima(
-    fault: str,
-) -> None:
+@pytest.mark.parametrize("fault", ["incomplete", "missing_selected_metric", "unavailable"])
+def test_selected_complexity_requires_every_selected_code_added_value(fault: str) -> None:
     report = _complete_selected_population_report()
-    comparison = _stage(report, 1)["metric_comparison"]
-    assert isinstance(comparison, dict)
-    if fault == "incomplete_empty":
-        comparison["fallow"]["changed_functions"]["after"]["complete_for_declared_scope"] = False
+    if fault == "incomplete":
+        _with_code_added(report, 1, _incomplete_code_added())
+    elif fault == "missing_selected_metric":
+        comparison = _stage(report, 1)["metric_comparison"]
+        assert isinstance(comparison, dict)
+        comparison["fallow"]["code_added"].pop("hotspots_added")
     else:
-        population = comparison["fallow"]["new_file_functions"]["after"]
-        population[
-            "function_count_reported" if fault == "unknown_count" else "max_cognitive_reported"
-        ] = None
+        _with_code_added(
+            report, 1, {"status": "unavailable", "reason": "bound source diff missing"}
+        )
     rows = _rows(evaluation_data(report, _config("cognitive")), "measurement_completeness")
     assert rows[0]["counts"] == {"Complexity population": True} and rows[0]["complete"]
     assert rows[1]["counts"] == {"Complexity population": False} and not rows[1]["complete"]
@@ -232,7 +237,7 @@ def test_selected_complexity_requires_declared_complete_populations_and_defined_
 def test_complete_all_function_scan_does_not_capture_missing_selected_changed_populations(
     family: str,
 ) -> None:
-    report = _empty_baseline_population_report()
+    report = _report()
     for index in (0, 1):
         metrics = _stage(report, index)["metrics"]
         assert isinstance(metrics, dict)
@@ -311,8 +316,8 @@ def test_actual_task_plot_rows_have_raw_status_and_reason_and_baseline_first(
         row["status"] == "measured" and isinstance(row["reason"], str) and row["reason"]
         for row in rows
     )
-    complexity = evaluation_data(_empty_baseline_population_report(), _config("cognitive"))
-    metric = "New-file function cognitive maximum"
+    complexity = evaluation_data(_unknown_baseline_code_added_report(), _config("cognitive"))
+    metric = "Net cognitive complexity added"
     assert [
         row["plotted"] for row in _evaluation_plot_rows(complexity, tmp_path, metric=metric)
     ] == [14]
@@ -366,10 +371,12 @@ def test_zero_vanilla_keeps_absolute_delta_but_percentage_unknown() -> None:
 
 
 def test_unpaired_guidance_complexity_stays_visible_in_raw_task_and_overview_values() -> None:
-    data = evaluation_data(_empty_baseline_population_report(), _config("cognitive", "cyclomatic"))
+    data = evaluation_data(
+        _unknown_baseline_code_added_report(), _config("cognitive", "cyclomatic")
+    )
     for metric, value in (
-        ("New-file function cognitive maximum", 14),
-        ("New-file function cyclomatic maximum", 11),
+        ("Net cognitive complexity added", 14),
+        ("Net cyclomatic complexity added", 11),
     ):
         overview = next(
             row
@@ -393,7 +400,7 @@ def test_unpaired_guidance_complexity_stays_visible_in_raw_task_and_overview_val
 
 
 def test_overview_does_not_average_incompatible_raw_repeat_profiles() -> None:
-    report = _empty_baseline_population_report()
+    report = _unknown_baseline_code_added_report()
     attempts = report["attempts"]
     assert isinstance(attempts, list)
     repeat = copy.deepcopy(_attempt(report, 1))
@@ -403,7 +410,7 @@ def test_overview_does_not_average_incompatible_raw_repeat_profiles() -> None:
     assert isinstance(metrics, dict)
     metrics["fallow"]["provenance"]["tool_version"] = "different"
     data = evaluation_data(report, _config("cognitive"))
-    metric = "New-file function cognitive maximum"
+    metric = "Net cognitive complexity added"
     raw = [row for row in _rows(data, "raw_medians") if row["metric"] == metric]
     assert len(raw) == 2 and all(row["value"] == 14 for row in raw)
     overview = next(
@@ -422,7 +429,7 @@ def test_overview_does_not_average_incompatible_raw_repeat_profiles() -> None:
 def test_overview_resolves_analyzers_from_unambiguous_task_peers_only(
     provenance_state: str,
 ) -> None:
-    report = _empty_baseline_population_report()
+    report = _unknown_baseline_code_added_report()
     attempts = _rows(report, "attempts")
     for index in (0, 1):
         metrics = _stage(report, index)["metrics"]
@@ -451,7 +458,7 @@ def test_overview_resolves_analyzers_from_unambiguous_task_peers_only(
     attempts.append(missing)
 
     data = evaluation_data(report, _config("cognitive"))
-    metric = "New-file function cognitive maximum"
+    metric = "Net cognitive complexity added"
     overview = [
         row
         for row in _rows(data, "aggregates")
@@ -555,7 +562,6 @@ def _shared_helpers(controller: str) -> str:
         "armRank",
         "byArm",
         "seriesVariable",
-        "formatLimited",
         "KEY_METRICS",
     )
     lines = [re.search(rf"^const {name} = .*$", controller, re.M) for name in names]
@@ -586,6 +592,9 @@ def _outcome_text(
     function = re.search(r"function " + name + r"\(\) \{.*?\n\}", controller, re.S)
     assert function is not None
     summary = re.search(r"function taskCheckSummary\(attempts\) \{.*?\n\}", controller, re.S)
+    reference = re.search(r"function referenceText\(arm, metric\) \{.*?\n\}", controller, re.S)
+    passing = re.search(r"function passingText\(arm, metric, group\) \{.*?\n\}", controller, re.S)
+    assert summary is not None and reference is not None and passing is not None
     script = tmp_path / "outcomes.js"
     script.write_text(
         "const data=" + json.dumps(data) + ";\n"
@@ -594,10 +603,12 @@ def _outcome_text(
         + json.dumps(task)
         + "},observations=data.observations,metricSelect={value:''};\n"
         "const unique=items=>[...new Set(items)],armLabel=arm=>arm==='baseline'?'Vanilla':arm;\n"
-        "const emptyFunctionMaximum=()=>false,format=value=>String(value);\n"
+        "const format=value=>String(value);\n"
         "const create=(tag,text,parent)=>{if(text!==undefined)texts.push(String(text));return element();};\n"
         + _shared_helpers(controller)
-        + (summary.group(0) if summary else "")
+        + summary.group(0)
+        + reference.group(0)
+        + passing.group(0)
         + function.group(0)
         + "\n"
         + name
@@ -733,22 +744,41 @@ def test_writer_json_csv_and_echarts_share_exact_selected_values(
         assert reason in visible
         assert message in reason if execution_state == "provider" else "timed out" in reason
         assert execution["partial_usage"] == partial_usage
+        # Elapsed time is still observed; only token totals become unknown lower bounds.
         assert measurement != "tokens" or all(
             not row["value"]
             and row["status"] == "unknown"
             and reason in row["reason"]
             and "lower bounds" in row["reason"]
             for row in selected_rows
+            if row["metric"] != "Coding time"
         )
     else:
         assert execution["reason"] is None
         assert "Native execution failures" not in visible
         if measurement == "tokens":
-            assert [float(row["value"]) for row in selected_rows] == [80, 10]
+            assert {
+                row["metric"]: float(row["value"]) if row["value"] else None
+                for row in selected_rows
+            } == {
+                "Input tokens": 80,
+                "Cached input tokens": None,
+                "Uncached input tokens": None,
+                "Output tokens": 10,
+                "Reasoning output tokens": None,
+                "Coding time": 5,
+            }
         if execution_state == "complete":
             assert attempt["correctness"] == "fail"
     if measurement == "lines":
-        assert [float(row["value"]) for row in selected_rows] == [2, 1, 5, 0]
+        assert {row["metric"]: float(row["value"]) for row in selected_rows} == {
+            "Source lines added": 2,
+            "Source lines removed": 1,
+            "Source lines net": 1,
+            "Test lines added": 5,
+            "Test lines removed": 0,
+            "Duplicated added test lines": 0,
+        }
         peers = {row["metric"]: row for row in csv_rows if row["attempt_id"] == "baseline-1"}
         assert all(
             row["status"] == peers[row["metric"]]["status"] == "measured"
@@ -847,12 +877,12 @@ def test_overview_missing_task_is_partial_and_has_no_unmatched_delta() -> None:
 def test_coverage_absolute_delta_is_percentage_points() -> None:
     report = _report()
     data = evaluation_data(report, _config("coverage"))
-    assert all(
-        row["absolute_delta_unit"] == "percentage points" for row in _rows(data, "comparisons")
-    )
-    assert all(
-        row["absolute_delta_unit"] == "percentage points" for row in _rows(data, "aggregates")
-    )
+    for key in ("comparisons", "aggregates"):
+        rates = [row for row in _rows(data, key) if str(row["metric"]).endswith("%")]
+        counts = [row for row in _rows(data, key) if not str(row["metric"]).endswith("%")]
+        assert rates and all(row["absolute_delta_unit"] == "percentage points" for row in rates)
+        assert [row["metric"] for row in counts] == ["Redundant added tests"] * len(counts)
+        assert all(row["absolute_delta_unit"] != "percentage points" for row in counts)
 
 
 @pytest.mark.parametrize("bound_launch", [True, False])
@@ -1012,8 +1042,12 @@ def test_report_explains_unsupported_metrics_and_preserves_native_grade_binding(
         and row["reason"] == "No coverage command configured"
         for row in missing
     )
+    # The fixture records input/output totals and elapsed time; coverage gaps leave them measured.
+    supplied = {"Input tokens", "Output tokens", "Coding time"}
     assert all(
-        row["value"] is not None for row in _rows(data, "observations") if row["family"] == "tokens"
+        row["value"] is not None
+        for row in _rows(data, "observations")
+        if row["family"] == "tokens" and row["metric"] in supplied
     )
 
 
@@ -1023,7 +1057,7 @@ def test_overview_keeps_language_analyzers_separate() -> None:
         "observations": [
             {
                 "task": "py",
-                "metric": "After changed-function cognitive maximum",
+                "metric": "Net cognitive complexity added",
                 "family": "cognitive",
                 "provenance": {
                     "language": "python",
@@ -1034,7 +1068,7 @@ def test_overview_keeps_language_analyzers_separate() -> None:
             },
             {
                 "task": "go",
-                "metric": "After changed-function cognitive maximum",
+                "metric": "Net cognitive complexity added",
                 "family": "cognitive",
                 "provenance": {
                     "language": "go",
@@ -1078,3 +1112,233 @@ def test_rust_unused_aggregate_names_rustc_not_complexity_analyzer() -> None:
     }
     groups = _aggregate_groups(data)
     assert groups[0][1] == "Rust · rustc 1.92.0"
+
+
+def _reference(**code_added: object) -> dict[str, object]:
+    return {
+        "status": "available",
+        "comparison": {
+            "fallow": {
+                "status": "available",
+                "code_added": _code_added(**code_added),
+                "dead_findings": {"status": "available", "introduced_count": 0},
+                "clone_findings": {"status": "unavailable", "reason": "not scanned"},
+            }
+        },
+        "code_size": {"source_lines_added": 12, "source_lines_removed": 3},
+    }
+
+
+def test_reference_values_measure_the_reference_like_a_submission_and_keep_unknown() -> None:
+    analysis = _reference(net_cognitive=99)
+    comparison = analysis["comparison"]
+    assert isinstance(comparison, dict)
+    comparison["analysis"] = {"status": "available", "code_added": _code_added(net_cognitive=5)}
+    report = {
+        "references": {
+            "fallow-task": _reference(net_cognitive=7, functions_added=2),
+            "analysis-task": analysis,
+            "no-patch": {"status": "unavailable", "reason": "reference patch does not apply"},
+        }
+    }
+    rows = {(row["task"], row["metric"]): row for row in _reference_values(report)}
+    assert rows[("fallow-task", "Net cognitive complexity added")]["value"] == 7
+    assert rows[("fallow-task", "Functions added")]["value"] == 2
+    assert rows[("fallow-task", "Introduced dead findings")]["value"] == 0
+    assert rows[("fallow-task", "Source lines added")]["value"] == 12
+    assert rows[("fallow-task", "Source lines removed")]["value"] == 3
+    clones = rows[("fallow-task", "Introduced clone groups")]
+    assert clones["value"] is None and clones["status"] == "unknown"
+    # An available language analyzer is the reference's static source, as for submissions.
+    assert rows[("analysis-task", "Net cognitive complexity added")]["value"] == 5
+    missing = [row for (task, _), row in rows.items() if task == "no-patch"]
+    assert missing and all(
+        row["value"] is None
+        and row["status"] == "unknown"
+        and row["reason"] == "reference patch does not apply"
+        for row in missing
+    )
+
+
+def test_reference_comparisons_report_ratio_or_labelled_difference_and_keep_unknown() -> None:
+    def median(task: str, metric: str, value: float | None) -> dict[str, object]:
+        return {
+            "task": task,
+            "arm": "workflow",
+            "metric": metric,
+            "value": value,
+            "role": "handoff",
+        }
+
+    data: dict[str, object] = {
+        "reference_values": [
+            {"task": "a", "metric": "Functions added", "value": 4},
+            {"task": "a", "metric": "Net cyclomatic complexity added", "value": 0},
+            {"task": "a", "metric": "Net cognitive complexity added", "value": -3},
+            {"task": "b", "metric": "Functions added", "value": None},
+        ],
+        "raw_medians": [
+            median("a", "Functions added", 6),
+            median("a", "Net cyclomatic complexity added", 3),
+            median("a", "Net cognitive complexity added", 5),
+            median("b", "Functions added", 2),
+            median("a", "Input tokens", 9),
+        ],
+    }
+    rows = {(row["task"], row["metric"]): row for row in _reference_comparisons(data)}
+    assert set(rows) == {
+        ("a", "Functions added"),
+        ("a", "Net cyclomatic complexity added"),
+        ("a", "Net cognitive complexity added"),
+        ("b", "Functions added"),
+    }
+    ratio = rows[("a", "Functions added")]
+    assert ratio["ratio_to_reference"] == 1.5 and ratio["status"] == "ratio"
+    assert ratio["difference_vs_reference"] == 2 and ratio["guidance"] == "workflow"
+    zero = rows[("a", "Net cyclomatic complexity added")]
+    assert zero["ratio_to_reference"] is None and zero["status"] == "difference"
+    assert zero["difference_vs_reference"] == 3
+    # A refactoring reference that removed complexity has no meaningful ratio.
+    negative = rows[("a", "Net cognitive complexity added")]
+    assert negative["ratio_to_reference"] is None and negative["status"] == "difference"
+    assert negative["difference_vs_reference"] == 8
+    unknown = rows[("b", "Functions added")]
+    assert unknown["status"] == "unknown" and unknown["reference"] is None
+    assert unknown["ratio_to_reference"] is None and unknown["difference_vs_reference"] is None
+
+
+def test_reference_aggregates_weight_tasks_equally_and_exclude_ambiguous_tasks() -> None:
+    def comparison(task: str, ratio: float | None) -> dict[str, object]:
+        return {
+            "task": task,
+            "guidance": "workflow",
+            "metric": "Functions added",
+            "ratio_to_reference": ratio,
+        }
+
+    rows = [
+        comparison("a", 1.5),
+        comparison("b", 0.5),
+        comparison("multiple-profiles", 1.0),
+        comparison("multiple-profiles", 3.0),
+        comparison("difference-only", None),
+    ]
+    [aggregate] = _reference_aggregates(rows)
+    assert aggregate["ratio_to_reference"] == 1.0
+    assert aggregate["measured_tasks"] == 2 and aggregate["assigned_tasks"] == 4
+    [unknown] = _reference_aggregates([comparison("difference-only", None)])
+    assert unknown["ratio_to_reference"] is None and unknown["measured_tasks"] == 0
+    # A package that removed complexity on one task keeps that task in the mean.
+    [signed] = _reference_aggregates([comparison("a", 2.0), comparison("b", -0.6)])
+    assert signed["ratio_to_reference"] == pytest.approx(0.7) and signed["measured_tasks"] == 2
+
+
+def test_passing_only_medians_use_passing_attempts_and_matching_profiles() -> None:
+    def row(
+        attempt: str, task: str, value: float | None, correctness: str, **extra: object
+    ) -> dict[str, object]:
+        return {
+            "attempt_id": attempt,
+            "task": task,
+            "arm": "baseline",
+            "metric": "Functions added",
+            "family": "tokens",
+            "value": value,
+            "correctness": correctness,
+            "compatibility": f"{task}-profile",
+            "provenance": {},
+            **extra,
+        }
+
+    observations = [
+        row("1", "a", 2, "pass"),
+        row("2", "a", 9, "fail"),
+        row("3", "a", 4, "pass"),
+        row("4", "b", 5, "unknown"),
+        row("5", "b", None, "pass"),
+    ]
+    attempts = [{"task": task} for task in ("a", "b")]
+    medians, aggregates = _passing_summaries({"attempts": attempts, "observations": observations})
+    assert medians == [
+        {"task": "a", "arm": "baseline", "metric": "Functions added", "value": 3.0, "passing": 2}
+    ]
+    [aggregate] = aggregates
+    assert aggregate["value"] == 3.0 and aggregate["analysis_group"] is None
+    assert aggregate["measured_tasks"] == 1 and aggregate["assigned_tasks"] == 2
+    # Unlike analyzers are reported in separate groups, never averaged together.
+    js = {"family": "cognitive", "provenance": {"tool": "fallow", "tool_version": "3.18.0"}}
+    py = {
+        "family": "cognitive",
+        "provenance": {"language": "python", "analyzers": {"rca": {"version": "rca 0.0.25"}}},
+    }
+    observations = [row("6", "js", 40, "pass", **js), row("7", "py", 4, "pass", **py)]
+    attempts = [{"task": task} for task in ("js", "py")]
+    _, aggregates = _passing_summaries({"attempts": attempts, "observations": observations})
+    assert sorted((row["analysis_group"], row["value"]) for row in aggregates) == [
+        ("Js/Ts · fallow 3.18.0", 40.0),
+        ("Python · rca 0.0.25", 4.0),
+    ]
+    # A task measured by both analyzers has no single analyzer, so no pooled passing value.
+    observations.append(row("8", "js", 5, "pass", **{**py, "compatibility": "js-rca"}))
+    _, aggregates = _passing_summaries({"attempts": attempts, "observations": observations})
+    conflicting = [row for row in aggregates if row["analysis_group"] == "Conflicting analyzers"]
+    assert conflicting and all(row["value"] is None for row in conflicting)
+
+
+def test_cost_uses_uncached_cached_and_output_prices_and_is_unknown_without_a_table() -> None:
+    prices = {
+        "exact-model": {
+            "as_of": "2026-10-01",
+            "input_per_million": 2.0,
+            "cached_input_per_million": 0.5,
+            "output_per_million": 8.0,
+        }
+    }
+    priced = evaluation_data(_report(), {**_config("tokens"), "prices": prices})
+    assert priced["prices"] == prices
+    rows = _rows(priced, "cost")
+    assert [row["attempt_id"] for row in rows] == ["baseline", "candidate"]
+    # 20 uncached, 80 cached and 10 output tokens per attempt.
+    assert all(
+        row["dollars"] == pytest.approx((20 * 2.0 + 80 * 0.5 + 10 * 8.0) / 1_000_000)
+        and row["price_as_of"] == "2026-10-01"
+        and row["reason"] is None
+        for row in rows
+    )
+    unpriced = evaluation_data(_report(), _config("tokens"))
+    assert unpriced["prices"] is None
+    assert all(
+        row["dollars"] is None and row["reason"] == "no price for this model"
+        for row in _rows(unpriced, "cost")
+    )
+    for entry, reason in (
+        ({k: v for k, v in prices["exact-model"].items() if k != "as_of"}, "lacks an as_of date"),
+        (
+            {k: v for k, v in prices["exact-model"].items() if k != "output_per_million"},
+            "lacks a rate",
+        ),
+    ):
+        rows = _rows(
+            evaluation_data(_report(), {**_config("tokens"), "prices": {"exact-model": entry}}),
+            "cost",
+        )
+        assert all(row["dollars"] is None and reason in str(row["reason"]) for row in rows)
+    report = _report()
+    work = _stage(report)["work"]
+    assert isinstance(work, dict) and isinstance(work["tokens"], dict)
+    work["tokens"].pop("cached_input_tokens")
+    missing = next(
+        row
+        for row in _rows(evaluation_data(report, {**_config("tokens"), "prices": prices}), "cost")
+        if row["attempt_id"] == "candidate"
+    )
+    assert missing["dollars"] is None and missing["reason"] == "token counts unavailable"
+
+
+def test_whole_suite_coverage_is_a_diagnostic_kept_out_of_charts() -> None:
+    data = evaluation_data(_report(), _config("coverage"))
+    assert data["diagnostic_panels"] == ["Whole-suite coverage"]
+    # The rows stay in JSON/CSV; the template filters these panels before charting.
+    assert any(row["panel"] == "Whole-suite coverage" for row in _rows(data, "observations"))
+    template = Path("src/pluginbench/assessment-charts.html").read_text()
+    assert "data.diagnostic_panels" in template

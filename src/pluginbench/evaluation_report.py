@@ -3,41 +3,59 @@
 from __future__ import annotations
 
 import json
+import statistics
 from pathlib import Path
 
+from pluginbench.measurement_profiles import REMOVED_TEST_OVERLAP
 from pluginbench.assessment_charts import (
+    DIAGNOSTIC_PANELS,
+    METRICS,
     _map,
+    _net_lines,
     _number,
     _rows,
+    _signed,
     chart_artifacts_from_data,
     chart_data,
     execution_outcome,
 )
 
 MEASUREMENT_METRICS = {
-    "tokens": ("Input tokens", "Output tokens"),
+    "tokens": (
+        "Input tokens",
+        "Cached input tokens",
+        "Uncached input tokens",
+        "Output tokens",
+        "Reasoning output tokens",
+        "Coding time",
+    ),
     "lines": (
         "Source lines added",
         "Source lines removed",
+        "Source lines net",
         "Test lines added",
         "Test lines removed",
+        "Duplicated added test lines",
     ),
     "cyclomatic": (
-        "After changed-function cyclomatic maximum",
-        "New-file function cyclomatic maximum",
+        "Net cyclomatic complexity added",
+        "Functions added",
+        "Source files added",
     ),
     "cognitive": (
-        "After changed-function cognitive maximum",
-        "New-file function cognitive maximum",
+        "Net cognitive complexity added",
+        "Complexity hotspots added",
     ),
-    "dead_code": ("Introduced dead findings",),
+    "dead_code": ("Introduced dead findings", "Introduced clone groups"),
     "coverage": (
+        "Changed-line coverage %",
+        "Changed-branch coverage %",
+        "Redundant added tests",
         "Line coverage %",
         "Statement coverage %",
         "Branch coverage %",
         "Function coverage %",
     ),
-    "test_overlap": ("Zero marginal branch contribution cases",),
     "review": (
         "Total review findings",
         "P0 review findings",
@@ -122,7 +140,6 @@ COMPLETENESS_COUNTS = {
     "cyclomatic": "Complexity population",
     "dead_code": "Introduced dead findings",
     "coverage": "Coverage covered/total counts",
-    "test_overlap": "Test-overlap candidate counts",
 }
 
 
@@ -148,24 +165,14 @@ def _selected_completeness(
                 metric in measured and measured[metric]["value"] is not None for metric in metrics
             )
 
-        def captured_population(metric: str) -> bool:
-            row = measured.get(metric, {})
-            provenance = _map(row.get("provenance"))
-            count = _number(provenance.get("reported_functions"))
-            return (
-                provenance.get("complete_for_declared_scope") is True
-                and count is not None
-                and (
-                    row.get("value") is None
-                    if count == 0
-                    else _number(row.get("value")) is not None
-                )
-            )
-
         counts = {name: _map(record.get("counts")).get(name) is True for name in sorted(required)}
-        for family in ("tokens", "lines"):
+        # Same populations as the collector-backed projection count: totals and line changes only.
+        for family, metrics in (
+            ("tokens", ("Input tokens", "Output tokens")),
+            ("lines", MEASUREMENT_METRICS["lines"][:4]),
+        ):
             if family in selected and not record:
-                counts[COMPLETENESS_COUNTS[family]] = captured(MEASUREMENT_METRICS[family])
+                counts[COMPLETENESS_COUNTS[family]] = captured(metrics)
         complexity_metrics = [
             metric
             for family in ("cognitive", "cyclomatic")
@@ -173,9 +180,8 @@ def _selected_completeness(
             for metric in MEASUREMENT_METRICS[family]
         ]
         if complexity_metrics:
-            counts["Complexity population"] = all(
-                captured_population(metric) for metric in complexity_metrics
-            )
+            # Code-added sums are defined (zero) for complete empty populations; unknown stays None.
+            counts["Complexity population"] = captured(tuple(complexity_metrics))
         if "review" in selected:
             counts["Review findings"] = captured(
                 tuple(
@@ -241,7 +247,8 @@ def _comparison_rows(data: dict[str, object]) -> list[dict[str, object]]:
             absolute / float(baseline_value) * 100
             if absolute is not None
             and isinstance(baseline_value, (int, float))
-            and baseline_value != 0
+            # A percentage of a zero or negative baseline has no meaning.
+            and baseline_value > 0
             else None
         )
         assigned = {
@@ -441,9 +448,230 @@ def _aggregate_rows(data: dict[str, object]) -> list[dict[str, object]]:
     return results
 
 
+REFERENCE_METRICS = (
+    "Net cognitive complexity added",
+    "Net cyclomatic complexity added",
+    "Functions added",
+    "Source files added",
+    "Complexity hotspots added",
+    "Introduced dead findings",
+    "Introduced clone groups",
+    "Source lines added",
+    "Source lines removed",
+    "Source lines net",
+)
+
+
+def _reference_values(report: dict[str, object]) -> list[dict[str, object]]:
+    """Code measures of each task's reference solution, measured like a submission."""
+    specs = {spec[1]: spec for spec in METRICS}
+    rows: list[dict[str, object]] = []
+    for task, value in sorted(_map(report.get("references")).items()):
+        reference = _map(value)
+        comparison = _map(reference.get("comparison"))
+        static = (
+            "analysis"
+            if _map(comparison.get("analysis")).get("status") == "available"
+            else "fallow"
+        )
+        for metric in REFERENCE_METRICS:
+            _, _, kind, key = specs[metric]
+            number = None
+            if reference.get("status") == "available":
+                if kind == "fallow_change":
+                    section, field = key.split(".")
+                    detail = _map(_map(comparison.get(static)).get(section))
+                    number = (
+                        _signed(detail.get(field)) if detail.get("status") == "available" else None
+                    )
+                elif kind == "loc_change":
+                    size = _map(reference.get("code_size"))
+                    number = (
+                        _net_lines(size) if key == "source_lines_net" else _number(size.get(key))
+                    )
+            rows.append(
+                {
+                    "task": task,
+                    "metric": metric,
+                    "value": number,
+                    "status": "measured" if number is not None else "unknown",
+                    "reason": None
+                    if number is not None
+                    else str(reference.get("reason") or "reference measurement unavailable"),
+                }
+            )
+    return rows
+
+
+def _reference_comparisons(data: dict[str, object]) -> list[dict[str, object]]:
+    """Attempt task medians as a ratio to the reference; a zero reference reports a difference."""
+    references = {(row["task"], row["metric"]): row for row in _rows(data["reference_values"])}
+    rows: list[dict[str, object]] = []
+    for median in _rows(data["raw_medians"]):
+        reference = references.get((median.get("task"), median.get("metric")))
+        if median.get("role") != "handoff" or reference is None:
+            continue
+        value, base = _signed(median.get("value")), _signed(reference.get("value"))
+        ratio = difference = None
+        if value is not None and base is not None:
+            difference = value - base
+            # A ratio is only meaningful against a positive reference; otherwise report a difference.
+            ratio = value / base if base > 0 else None
+        rows.append(
+            {
+                "task": median["task"],
+                "guidance": median["arm"],
+                "metric": median["metric"],
+                "value": value,
+                "reference": base,
+                "ratio_to_reference": ratio,
+                "difference_vs_reference": difference,
+                "status": "unknown"
+                if difference is None
+                else "ratio"
+                if ratio is not None
+                else "difference",
+            }
+        )
+    return rows
+
+
+def _reference_aggregates(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Equal-weight mean of per-task ratios; tasks without a defined ratio stay out and are counted."""
+    groups: dict[tuple[str, str], dict[str, list[float | None]]] = {}
+    for row in rows:
+        tasks = groups.setdefault((str(row["guidance"]), str(row["metric"])), {})
+        tasks.setdefault(str(row["task"]), []).append(_signed(row["ratio_to_reference"]))
+    result: list[dict[str, object]] = []
+    for (guidance, metric), tasks in sorted(groups.items()):
+        # A task with several incompatible profiles has no single ratio.
+        ratios = [
+            values[0] for values in tasks.values() if len(values) == 1 and values[0] is not None
+        ]
+        result.append(
+            {
+                "guidance": guidance,
+                "metric": metric,
+                "ratio_to_reference": sum(ratios) / len(ratios) if ratios else None,
+                "measured_tasks": len(ratios),
+                "assigned_tasks": len(tasks),
+                "method": "equal-weight mean of per-task median ÷ reference",
+            }
+        )
+    return result
+
+
+def _passing_summaries(
+    data: dict[str, object],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Task medians over passing attempts only, and equal-weight task means per analyzer group."""
+    groups: dict[tuple[str, str, str], dict[object, list[float]]] = {}
+    arms = sorted({str(row["arm"]) for row in _rows(data["observations"])})
+    for row in _rows(data["observations"]):
+        value = _signed(row.get("value"))
+        if row.get("correctness") != "pass" or value is None or row.get("compatibility") is None:
+            continue
+        key = (str(row["task"]), str(row["arm"]), str(row["metric"]))
+        groups.setdefault(key, {}).setdefault(row["compatibility"], []).append(value)
+    medians: list[dict[str, object]] = []
+    for (task, arm, metric), profiles in sorted(groups.items()):
+        if len(profiles) != 1:
+            continue  # unlike measurement profiles are never pooled
+        [values] = profiles.values()
+        medians.append(
+            {
+                "task": task,
+                "arm": arm,
+                "metric": metric,
+                "value": statistics.median(values),
+                "passing": len(values),
+            }
+        )
+    by_key = {(row["task"], row["arm"], row["metric"]): float(str(row["value"])) for row in medians}
+    aggregates: list[dict[str, object]] = []
+    # Same task partition as the all-attempt aggregates: unlike analyzer scores are never averaged.
+    for metric, group, tasks in _aggregate_groups(data):
+        # Like the all-attempt overview, unresolved analyzer groups get no pooled value.
+        unresolved = group in {"Unknown analyzer", "Conflicting analyzers"}
+        for arm in arms:
+            values = [
+                by_key[(task, arm, metric)]
+                for task in tasks
+                if (task, arm, metric) in by_key and not unresolved
+            ]
+            aggregates.append(
+                {
+                    "arm": arm,
+                    "metric": metric,
+                    "analysis_group": group,
+                    "value": sum(values) / len(values) if values else None,
+                    "measured_tasks": len(values),
+                    "assigned_tasks": len(tasks),
+                    "method": "passing attempts only; equal-weight mean of per-task medians",
+                }
+            )
+    return medians, aggregates
+
+
+def _cost_rows(
+    observations: list[dict[str, object]], prices: dict[str, object]
+) -> list[dict[str, object]]:
+    """Coding dollars per attempt from a dated per-model price table; no table means unknown."""
+    tokens: dict[str, dict[str, object]] = {}
+    for row in observations:
+        if row.get("family") == "tokens":
+            tokens.setdefault(
+                str(row["attempt_id"]),
+                {"task": row["task"], "arm": row["arm"], "model": row["model"]},
+            )[str(row["metric"])] = _number(row.get("value"))
+    rows = []
+    for attempt_id, values in sorted(tokens.items()):
+        price = _map(prices.get(str(values["model"])))
+        parts = [
+            _number(values.get(name))
+            for name in ("Uncached input tokens", "Cached input tokens", "Output tokens")
+        ]
+        rates = [
+            _number(price.get(name))
+            for name in ("input_per_million", "cached_input_per_million", "output_per_million")
+        ]
+        known_parts = [part for part in parts if part is not None]
+        known_rates = [rate for rate in rates if rate is not None]
+        dated = isinstance(price.get("as_of"), str) and bool(price.get("as_of"))
+        known = len(known_parts) == len(known_rates) == 3 and dated
+        rows.append(
+            {
+                "attempt_id": attempt_id,
+                "task": values["task"],
+                "arm": values["arm"],
+                "model": values["model"],
+                "dollars": sum(
+                    part * rate for part, rate in zip(known_parts, known_rates, strict=True)
+                )
+                / 1_000_000
+                if known
+                else None,
+                "price_as_of": price.get("as_of"),
+                "reason": None
+                if known
+                else "no price for this model"
+                if not price
+                else "price table entry lacks an as_of date"
+                if not dated
+                else "price table entry lacks a rate"
+                if len(known_rates) < 3
+                else "token counts unavailable",
+                "limitations": "uncached input is priced at the input rate; Claude cache writes, which cost more, are included there",
+            }
+        )
+    return rows
+
+
 def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dict[str, object]:
     """Select measurements and derive baseline comparisons without scanning or model calls."""
     selected = config.get("measurements")
+    if isinstance(selected, list) and "test_overlap" in selected:
+        raise ValueError(REMOVED_TEST_OVERLAP)
     if (
         not isinstance(selected, list)
         or not selected
@@ -551,11 +779,11 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         )
     if {"cyclomatic", "cognitive"}.intersection(selected):
         limitations.append(
-            "Complexity covers functions touched by changed lines and functions in new files, as separate populations. Empty populations have no maximum."
+            "Complexity counts what each submission added to source code: changed functions after the edit minus the same functions before. Unlike analyzers are reported separately; ratios compare each task with its reference solution."
         )
-    if {"coverage", "test_overlap"}.intersection(selected):
+    if "coverage" in selected:
         limitations.append(
-            "Coverage and test-overlap counts are proxies, not proof of correct assertions or unnecessary tests."
+            "Coverage counts are proxies, not proof of correct assertions or unnecessary tests."
         )
     if "review" in selected:
         limitations.append(
@@ -595,10 +823,18 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         else None,
         "review_findings": projection.get("review_findings") if "review" in selected else [],
         "download_csv": "results.csv",
+        "diagnostic_panels": sorted(DIAGNOSTIC_PANELS),
         "limitations": limitations,
     }
     data["comparisons"] = _comparison_rows(data)
     data["aggregates"] = _aggregate_rows(data)
+    data["passing_medians"], data["passing_aggregates"] = _passing_summaries(data)
+    data["reference_values"] = _reference_values(report)
+    data["reference_comparisons"] = _reference_comparisons(data)
+    data["reference_aggregates"] = _reference_aggregates(_rows(data["reference_comparisons"]))
+    prices = _map(config.get("prices"))
+    data["prices"] = prices or None
+    data["cost"] = _cost_rows(observations, prices) if "tokens" in selected else []
     data["measurement_completeness"] = _selected_completeness(
         data=data, projection=projection, selected=selected
     )

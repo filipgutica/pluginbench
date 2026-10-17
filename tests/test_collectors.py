@@ -15,6 +15,7 @@ from pluginbench.collectors import (
     freeze_collectors,
 )
 from pluginbench.measurement_profiles import prepare_observer
+from pluginbench.processes import run_command
 
 
 def source(root: Path) -> Path:
@@ -707,7 +708,7 @@ def test_native_lcov_dispatch_preserves_runtime_unknown_and_integrity_failure(
             {
                 "native_task_identity": identity,
                 "test_scope": ["test/**"],
-                "implementation": observer_identity("lcov"),
+                "implementation": observer_identity(),
             },
         ),
         scope=["src/**"],
@@ -805,3 +806,49 @@ def test_native_observer_drift_is_rejected_before_command(
     with pytest.raises(ValueError, match="implementation differs"):
         collect_measurements(snapshot, tmp_path / "evidence", [collector])
     assert inspect_snapshot(snapshot)["source_lines"] == 1
+
+
+@pytest.mark.parametrize("mutate_before", [False, True])
+def test_collector_receives_disposable_bound_before_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutate_before: bool
+) -> None:
+    before, after = tmp_path / "before", tmp_path / "after"
+    for root, text in ((before, "before"), (after, "after")):
+        (root / "src").mkdir(parents=True)
+        (root / "src/a.js").write_text(text)
+    script = tmp_path / "measure.py"
+    script.write_text(
+        "import json,pathlib,sys\n"
+        "base=pathlib.Path(sys.argv[1])\n"
+        "assert (base/'src/a.js').read_text() == 'before'\n"
+        + ("(base/'src/a.js').write_text('mutated')\n" if mutate_before else "")
+        + "pathlib.Path(sys.argv[2]).write_text(json.dumps({'files_measured':['src/a.js'],'branches':{'total':[],'covered':[]},'functions':{'total':[],'covered':[]}}))\n"
+    )
+    config = tmp_path / "config.json"
+    config.write_text("{}")
+    collector = Collector(
+        kind="coverage",
+        config=config,
+        command=[sys.executable, str(script), "{before}", "{output}"],
+        tool_version="fixture",
+    )
+    evidence = tmp_path / "evidence"
+    if mutate_before:
+        # Simulate a trusted adapter outside the OS boundary to exercise the
+        # independent post-execution integrity guard; the real boundary denies this write.
+        monkeypatch.setattr(
+            isolation,
+            "run",
+            lambda argv, **kwargs: run_command(
+                argv, **{key: kwargs[key] for key in ("cwd", "env", "timeout")}
+            ),
+        )
+        with pytest.raises(ValueError, match="^collector modified its before snapshot$"):
+            collect_measurements(after, evidence, [collector], before=before)
+        assert (evidence / "coverage/execution.json").is_file()
+        assert not (evidence / "coverage/envelope.json").exists()
+        assert not (evidence / "coverage/failure.json").exists()
+    else:
+        assert "coverage" in collect_measurements(after, evidence, [collector], before=before)
+    assert (before / "src/a.js").read_text() == "before"
+    assert (after / "src/a.js").read_text() == "after"

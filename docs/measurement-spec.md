@@ -42,9 +42,9 @@ Measure only declared source files. Exclude test files, using the existing test 
 | Measure | Definition |
 | --- | --- |
 | Source lines added, removed, net | Existing line-change counts. Net = added − removed. |
-| Net complexity added (cognitive, cyclomatic) | Sum of scores of after-side functions that overlap a changed line, minus the same sum on the before side. New functions count in full. Deleted functions subtract in full. |
+| Net complexity added (cognitive, cyclomatic) | Sum of scores of all source functions in files the attempt changed, after the edit, minus the same sum before. Unchanged functions cancel. New functions count in full; deleted functions subtract. Go closure rows inside a declaration are excluded because that declaration's score already includes them. The value can be negative. |
 | Functions added | After-side functions whose `(path, name)` does not exist before. |
-| Source files added | Source paths absent from the before snapshot. |
+| Source files added | Source paths absent from the before snapshot that contain at least one analyzed function. Files with no functions, such as constants-only modules, and out-of-scope scripts are not counted. |
 | Complexity hotspots | Count of added functions, or functions whose score grew, with a cognitive score above 15. |
 | Unused code introduced | Existing "introduced dead findings". |
 | Duplication introduced | Existing "introduced clone groups" (JavaScript/TypeScript only). |
@@ -55,7 +55,7 @@ Complexity scores come from the language's pinned analyzer. Never pool raw score
 
 - When a task ships `solution/solution.patch`, PluginBench applies it to the frozen before snapshot. It measures the result with the same collectors and settings as the submissions.
 - The reference is not a coding attempt. It has no token, time, or review measures. It does not count in assigned, invocation, or baseline totals.
-- For every R2 measure, report the reference value and each attempt's ratio to it (attempt ÷ reference). When the reference value is zero, report the difference instead and label it as a difference.
+- For every R2 measure, report the reference value and each attempt's ratio to it (attempt ÷ reference). When the reference value is zero or negative, report the difference instead and label it as a difference.
 - Ratios make tasks and languages comparable. Package summaries average per-task median ratios with equal task weight.
 - If a task has no reference patch, or the patch does not apply, report the reference measures as unknown with the reason. Never substitute zero.
 
@@ -66,7 +66,7 @@ Complexity scores come from the language's pinned analyzer. Never pool raw score
 | Test lines added | Existing count. |
 | Changed-line coverage | Share of the attempt's added executable source lines that its submitted visible test suite executes. Branch coverage uses the same population when the report format supplies it. |
 | Redundant added tests | Added test cases whose covered added source lines are all covered by other test cases. One suite run with per-test coverage tracking supplies the data. Equal coverage does not prove equal assertions, so this flags candidates only. |
-| Duplicated test code | Clone groups introduced within test files. |
+| Duplicated test code | Added test lines, in test source files, that belong to a six-line block repeated elsewhere in the added test code. Copies of pre-existing tests are not detected. |
 
 Per-test coverage is available through coverage.py dynamic contexts. JavaScript/TypeScript support depends on G4; until then, report redundant added tests as unknown with a reason for those tasks.
 
@@ -77,7 +77,7 @@ Reference solutions add no tests, so R4 has no reference baseline. Compare attem
 - Report coding input, cached input, uncached input, output, and reasoning-output tokens, root plus descendants.
 - Report coding elapsed time.
 - Report review tokens separately.
-- Report dollars only from an optional, frozen, dated per-model price table in the evaluation settings. Without one, dollars are unknown.
+- Report dollars only from an optional, dated per-model price table in `prices.json` beside the saved evaluation. It is reporting input, not a measurement setting, so it can be added to saved evaluations. Without it, dollars are unknown.
 
 ### R6. Removed measures
 
@@ -107,7 +107,7 @@ Stop emitting these derived metrics from new reports. Saved raw evidence is unch
 
 - R2 and R4 derive from evidence that existing collectors already record: function rows for both sides, changed-line ranges, and per-line coverage populations. No new analyzer is required.
 - R3 adds one measured input per task, the reference snapshot. It flows through the same observer revision as submissions, so saved evaluations can gain it offline.
-- The report shows R2 measures as "× reference" by default, with raw values and the reference value in details.
+- The report's summary tables show each R2 measure with its "× reference" ratio beside the raw value. Task views also show the reference value.
 
 ## Verification
 
@@ -140,7 +140,7 @@ Stop emitting these derived metrics from new reports. Saved raw evidence is unch
 
 ### Assumptions
 
-- `(path, name)` identifies a function well enough for "added" and "grew". Nested functions, overloads, and renames can misclassify. Net complexity added does not depend on matching.
+- `(path, name)`, with Go line numbers removed from names, identifies a function well enough for "added" and "grew". Nested functions, overloads, and renames can misclassify. Net complexity added does not depend on matching.
 - Reference patches are source-only for the current tasks. A future reference that adds tests is measured on source only for R2.
 - Fallow (JavaScript/TypeScript) and rust-code-analysis (Python) define complexity differently. Ratios to a same-analyzer reference remove this difference within a task.
 

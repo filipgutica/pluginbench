@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fnmatch
 import hashlib
 import json
 from pathlib import Path
@@ -26,7 +25,6 @@ from pluginbench.assessment_models import (
     Snapshot,
     Stage,
 )
-from pluginbench.code_diff import _is_test_path
 
 
 def _document(path: Path) -> object:
@@ -37,12 +35,6 @@ def _mapping(value: object) -> dict[str, object]:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         raise ValueError("assessment evidence must be an object")
     return {key: item for key, item in value.items()}
-
-
-def _strings(value: object) -> list[str]:
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise ValueError("assessment paths must be a string list")
-    return [item for item in value]
 
 
 def _artifact(base: Path, reference: ArtifactRef) -> Path:
@@ -237,41 +229,6 @@ def _stage(
         stage.evidence,
         base,
     )
-    contribution = _mapping(
-        _mapping(_mapping(metrics.get("coverage", {})).get("metrics") or {}).get(
-            "test_contribution", {}
-        )
-    )
-    if contribution.get("status") == "available" and (
-        change is None or contribution.get("before_digest") != change["before_digest"]
-    ):
-        raise ValueError(
-            "test-contribution selection does not bind to this attempt's before snapshot"
-        )
-    if contribution.get("status") == "available":
-        assert change is not None
-        coverage = _mapping(_mapping(metrics["coverage"])["metrics"])
-        scope = _strings(coverage["test_scope"])
-        excluded = set(_strings(coverage["excluded_test_files"]))
-        present = set(_mapping(inspect_snapshot(stage.snapshot.root)["files"]))
-        selected = {
-            name
-            for name in _strings(change["changed_paths"])
-            if name in present
-            and name not in excluded
-            and _is_test_path(name)
-            and any(fnmatch.fnmatchcase(name, pattern) for pattern in scope)
-        }
-        if selected != set(_strings(contribution["changed_test_files"])):
-            raise ValueError("test-contribution changed-file selection differs from the bound diff")
-        if coverage.get("selection_policy") == "fixed-reference-plus-all-changed-test-files-v1":
-            required_tests = set(_strings(coverage["reference_test_files"]))
-            if not required_tests or not required_tests <= present - excluded:
-                raise ValueError("required coverage reference files missing or excluded")
-            if set(_strings(coverage["selected_test_files"])) != required_tests | selected:
-                raise ValueError(
-                    "coverage task corpus differs from its fixed reference and bound diff"
-                )
     return {
         "id": stage.id,
         "snapshot_digest": stage.snapshot.digest,

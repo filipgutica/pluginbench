@@ -24,7 +24,7 @@ tasks:
     - happy-dom-abort-pending-body-reads
 
 measurements: [tokens, lines, cyclomatic, cognitive, dead_code, review]
-# Unsupported measurements remain unknown with a reason; test_overlap requires explicit pytest settings.
+# Unsupported measurements remain unknown with a reason.
 # Add coverage after configuring a command and supported coverage output supported by every selected task image:
 # measurement_settings:
 #   coverage:

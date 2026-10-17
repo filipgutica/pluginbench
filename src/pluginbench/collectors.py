@@ -33,18 +33,12 @@ class Collector(BaseModel):
     syntax_command: list[str] | None = None
     timeout_seconds: int = Field(default=120, ge=1, le=7200)
     failure_protocol: Literal["coverage-exit-v1"] | None = None
-    report_format: (
-        Literal["lcov", "coverage-py-json", "go-coverprofile", "pytest-contribution"] | None
-    ) = None
+    report_format: Literal["lcov", "coverage-py-json", "go-coverprofile"] | None = None
     report_path: str | None = None
 
     @model_validator(mode="after")
     def supported_command(self) -> Collector:
-        if (
-            self.kind == "coverage"
-            and self.command is None
-            and self.report_format != "pytest-contribution"
-        ):
+        if self.kind == "coverage" and self.command is None:
             raise ValueError("coverage requires an adapter command")
         if self.kind in {"fallow", "analysis"} and self.command is not None:
             raise ValueError("Source analysis uses the built-in collector, not a custom command")
@@ -173,20 +167,15 @@ class CollectorUnavailable(RuntimeError):
     """A collector could not execute; its output is not a measurement."""
 
 
-def observer_identity(format: str) -> dict[str, str]:
-    names = ["coverage_report.py"]
-    if format == "pytest-contribution":
-        names.append("test_contribution.py")
-    return {
-        name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-        for name in names
-    }
+def observer_identity() -> dict[str, str]:
+    name = "coverage_report.py"
+    return {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()}
 
 
 def _assert_observer(collector: Collector) -> None:
     assert collector.report_format is not None
     expected = json.loads(collector.config.read_text()).get("implementation")
-    if expected != observer_identity(collector.report_format):
+    if expected != observer_identity():
         raise ValueError("coverage observer implementation differs from its frozen profile")
 
 
@@ -419,22 +408,6 @@ def _collect(
             timeout=collector.timeout_seconds,
         )
         return report, version, "language-analysis"
-    if collector.report_format == "pytest-contribution":
-        from pluginbench.test_contribution import collect_pytest_contribution
-
-        config = json.loads(collector.config.read_text())
-        if baseline is None:
-            raise ValueError("test contribution requires a bound before snapshot")
-        report = collect_pytest_contribution(
-            snapshot=root,
-            before_snapshot=baseline,
-            task_identity=config["native_task_identity"],
-            destination=destination,
-            source_scope=collector.scope,
-            test_scope=config["test_scope"],
-            **config["test_contribution"],
-        )
-        return report, str(collector.tool_version), "pytest-coverage"
     if collector.report_format is not None:
         report, version = _native_coverage(root, collector, destination)
         return report, version, str(collector.report_format)
@@ -489,7 +462,7 @@ def collect_measurements(
                     collector.report_format is None
                     and collector.command
                     and any("{before}" in item for item in collector.command)
-                ) or collector.report_format == "pytest-contribution":
+                ):
                     if before is None:
                         raise ValueError("collector command requires a bound before snapshot")
                     baseline = Path(temporary) / "before"

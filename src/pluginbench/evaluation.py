@@ -14,13 +14,14 @@ from typing import Literal
 from collections.abc import Callable
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 from pluginbench import claude, codex, harbor_backend, submissions
 from pluginbench.treatments import Treatment, resolve_treatment, treatment_inventory
 from pluginbench.native_treatments import NativeCapabilities, DELIVERY_POLICY, admit
 from pluginbench.task_sources import Tasks
 from pluginbench.measurement_profiles import (
+    REMOVED_TEST_OVERLAP,
     MeasurementSettings,
     capability_plan,
     prepare_profiles,
@@ -49,7 +50,7 @@ from pluginbench.study_review import (
 )
 
 Measurement = Literal[
-    "tokens", "lines", "cyclomatic", "cognitive", "dead_code", "coverage", "test_overlap", "review"
+    "tokens", "lines", "cyclomatic", "cognitive", "dead_code", "coverage", "review"
 ]
 
 
@@ -103,6 +104,13 @@ class Evaluation(BaseModel):
     def legacy_guidance(cls, value: object) -> object:
         return study.normalize_legacy_guidance(value)
 
+    @field_validator("measurements", mode="before")
+    @classmethod
+    def removed_measurements(cls, value: object) -> object:
+        if isinstance(value, list) and "test_overlap" in value:
+            raise ValueError(REMOVED_TEST_OVERLAP)
+        return value
+
     @model_validator(mode="after")
     def coherent(self) -> Evaluation:
         if self.runner.reasoning == "ultra":
@@ -112,7 +120,8 @@ class Evaluation(BaseModel):
         if ("review" in self.measurements) != (self.reviewer is not None):
             raise ValueError("provide reviewer settings exactly when review is selected")
         if any(
-            not name.strip() or name in {"baseline", "vanilla"}
+            not name.strip()
+            or name in {"baseline", "vanilla"}
             or not (item.guidance or item.skills or item.plugins)
             for name, item in self.treatments.items()
         ):
@@ -272,9 +281,7 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
         "coding_calls": coding,
         "review_calls": coding if config.reviewer else 0,
         "runner": config.runner.model_dump(mode="json"),
-        "treatments": {
-            name: treatment_inventory(item) for name, item in config.treatments.items()
-        },
+        "treatments": {name: treatment_inventory(item) for name, item in config.treatments.items()},
         "delivery": DELIVERY_POLICY,
         "capabilities": config.capabilities.model_dump(mode="json"),
         "tasks": config.tasks.task_ids,
@@ -850,7 +857,9 @@ def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path
     if "treatments" in recipe:
         packages = {
             name: treatment_inventory(
-                resolve_treatment(Treatment.model_validate(item), evidence / "frozen", recipe["harness"])
+                resolve_treatment(
+                    Treatment.model_validate(item), evidence / "frozen", recipe["harness"]
+                )
             )
             for name, item in recipe["treatments"].items()
         }
@@ -944,5 +953,22 @@ def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path
                 scope=TypeAdapter(list[str]).validate_python(scope["test_scope"]),
                 change=stage["change"],
             )
+    for task, value in _object(report.get("references", {})).items():
+        # Reference solutions use the task's declared source scope, like every submission.
+        reference = _object(value)
+        if reference.get("status") != "available":
+            continue
+        reference["code_size"] = scoped_code_size(
+            before=evidence / str(_object(reference["before"])["path"]),
+            after=evidence / str(_object(reference["after"])["path"]),
+            scope=TypeAdapter(list[str]).validate_python(
+                _object(_object(config["task_scopes"])[task])["source_scope"]
+            ),
+            change=_object(reference["change"]),
+        )
+    prices = root / "prices.json"
+    if prices.is_file():
+        # Dated prices are reporting input, not measurement settings, so they stay outside the binding.
+        config["prices"] = _object(json.loads(prices.read_text()))
     config["measurement_collection"] = _measurement_collection(root, config)
     return write_evaluation_report(report, config, output)

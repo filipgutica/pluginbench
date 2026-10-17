@@ -795,6 +795,139 @@ def test_new_complex_function_is_visible_beside_unchanged_inherited_hotspot(tmp_
     )
 
 
+def test_duplicated_added_test_lines_count_repeated_blocks_in_tests_only(tmp_path: Path) -> None:
+    block = "".join(f"    assert parse('{index}') == {index}\n" for index in range(6))
+    tests = "def test_one():\n" + block + "\ndef test_two():\n" + block
+    _write(tmp_path / "before/src/a.py", "x = 1\n")
+    _write(tmp_path / "after/src/a.py", "x = 1\n" + block + block)
+    _write(tmp_path / "after/tests/test_a.py", tests)
+    duplication = _metric(
+        compare_snapshots(tmp_path / "before", tmp_path / "after"), "test_duplication"
+    )
+    assert duplication["window_lines"] == 6
+    assert duplication["added_test_lines"] == 14
+    # Both six-line assertion blocks repeat; the two def lines are unique.
+    assert duplication["duplicated_added_test_lines"] == 12
+
+
+def test_code_added_counts_new_grown_and_deleted_source_functions(tmp_path: Path) -> None:
+    existing = "function existing(x) {\n  if (x) { return 1; }\n  return 2;\n}\n"
+    removed = "function removed() {\n  return 5;\n}\n"
+    grown = existing.replace("  return 2;\n", "  if (!x) { return 3; }\n  return 2;\n")
+    added = "function added(y) {\n  return y ? 4 : 5;\n}\n"
+    before, left = _bound_fallow(
+        tmp_path / "before",
+        {"src/index.ts": existing + removed},
+        [_function("existing", 1, 4, 3), _function("removed", 5, 3, 5)],
+    )
+    after, right = _bound_fallow(
+        tmp_path / "after",
+        {"src/index.ts": grown + added, "src/helper.ts": "function helper() {\n  return 1;\n}\n"},
+        [
+            _function("existing", 1, 5, 18),
+            _function("added", 6, 3, 20),
+            _function("helper", 1, 3, 2, path="src/helper.ts"),
+        ],
+    )
+    comparison = _metric(
+        compare_evidence(left, right, change=compare_snapshots(before, after)), "fallow"
+    )
+    added_code = _metric(comparison, "code_added")
+    assert added_code["status"] == "available"
+    # Growth counts only the increase; deletion subtracts; new functions count in full.
+    assert added_code["net_cognitive"] == (18 + 20 + 2) - (3 + 5)
+    assert added_code["net_cyclomatic"] == (19 + 21 + 3) - (4 + 6)
+    assert added_code["functions_added"] == 2
+    assert added_code["source_files_added"] == 1
+    # Hotspots: new or grown functions above the cognitive threshold.
+    assert added_code["hotspots_added"] == 2
+    assert added_code["hotspot_threshold"] == 15
+
+
+def test_code_added_excludes_test_functions_and_unchanged_hotspots() -> None:
+    def row(name: str, path: str, cognitive: int) -> dict[str, object]:
+        return {**_function(name, 1, 3, cognitive, path=path)}
+
+    result = assessment_metrics._code_added(
+        before_all=[row("legacy", "src/a.py", 40), row("other", "src/b.py", 9)],
+        after_all=[
+            row("legacy", "src/a.py", 30),
+            row("other", "src/b.py", 9),
+            row("test_it", "tests/test_a.py", 50),
+        ],
+        changed_paths={"src/a.py", "tests/test_a.py"},
+        new_paths=["tests/test_a.py"],
+        complete=True,
+    )
+    assert result["net_cognitive"] == -10
+    assert result["functions_added"] == 0
+    assert result["source_files_added"] == 0
+    # A shrinking complex function is not a new hotspot.
+    assert result["hotspots_added"] == 0
+    incomplete = assessment_metrics._code_added(
+        before_all=[], after_all=[], changed_paths=set(), new_paths=[], complete=False
+    )
+    assert incomplete["status"] == "incomplete" and incomplete.get("net_cognitive") is None
+
+
+def test_code_added_counts_only_growth_when_a_python_function_grows_at_its_end() -> None:
+    # RCA spans end at the last statement, so appended lines sit outside the before span.
+    before = [{**_function("parse", 1, 5, 20, path="src/a.py"), "cyclomatic": 6}]
+    after = [{**_function("parse", 1, 7, 21, path="src/a.py"), "cyclomatic": 7}]
+    result = assessment_metrics._code_added(
+        before_all=before, after_all=after, changed_paths={"src/a.py"}, new_paths=[], complete=True
+    )
+    assert result["net_cognitive"] == 1 and result["net_cyclomatic"] == 1
+    assert result["functions_added"] == 0
+    assert result["hotspots_added"] == 1  # grew and is above the threshold
+
+
+def test_code_added_ignores_go_closure_rows_and_line_numbers_in_names() -> None:
+    before = [{**_function("method@10:Parse", 10, 5, 4, path="pkg/a.go")}]
+    after = [
+        # The method moved down and grew; its score already includes the closure's.
+        {**_function("method@14:Parse", 14, 8, 6, path="pkg/a.go")},
+        {**_function("closure@16:5", 16, 3, 2, path="pkg/a.go")},
+    ]
+    result = assessment_metrics._code_added(
+        before_all=before, after_all=after, changed_paths={"pkg/a.go"}, new_paths=[], complete=True
+    )
+    assert result["net_cognitive"] == 2
+    assert result["functions_added"] == 0
+    # A package-level function literal has no enclosing declaration, so it counts.
+    package_level = assessment_metrics._code_added(
+        before_all=[],
+        after_all=[{**_function("closure@3:9", 3, 4, 5, path="pkg/b.go")}],
+        changed_paths={"pkg/b.go"},
+        new_paths=[],
+        complete=True,
+    )
+    assert package_level["net_cognitive"] == 5
+    nested = assessment_metrics._code_added(
+        before_all=[],
+        after_all=[
+            {**_function("closure@3:9", 3, 6, 5, path="pkg/b.go")},
+            {**_function("closure@5:2", 5, 2, 2, path="pkg/b.go")},
+        ],
+        changed_paths={"pkg/b.go"},
+        new_paths=[],
+        complete=True,
+    )
+    # The inner literal is already inside the package-level literal's score.
+    assert nested["net_cognitive"] == 5
+
+
+def test_code_added_counts_new_source_files_only_when_they_contain_analyzed_functions() -> None:
+    result = assessment_metrics._code_added(
+        before_all=[],
+        after_all=[_function("run", 1, 3, 1, path="src/new.py")],
+        changed_paths={"src/new.py", "reproduce.py"},
+        new_paths=["reproduce.py", "src/new.py"],
+        complete=True,
+    )
+    assert result["source_files_added"] == 1 and result["functions_added"] == 1
+
+
 def test_earlier_insertion_only_shifts_function_and_dead_finding_coordinates(
     tmp_path: Path,
 ) -> None:
@@ -1190,6 +1323,87 @@ def test_coverage_units_compare_independently_without_inventing_go_branches(tmp_
     )
     assert _metric(compared, "deltas")["line_covered"] == 1
     assert "statement_covered" not in _metric(compared, "deltas")
+
+
+def test_changed_line_coverage_and_redundant_added_tests(tmp_path: Path) -> None:
+    before_dir, after_dir = tmp_path / "before", tmp_path / "after"
+    _write(before_dir / "src/a.py", "one = 1\ntwo = 2\n")
+    _write(after_dir / "src/a.py", "one = 1\ntwo = 2\nthree = 3\n# note\nfive = 5\n")
+    _write(after_dir / "tests/test_a.py", "def test_new():\n    pass\n")
+    change = compare_snapshots(before_dir, after_dir)
+    files = {"src/a.py"}
+
+    def measured(
+        lines: list[int], covered: list[int], per_test: dict[str, list[int]]
+    ) -> dict[str, object]:
+        report: dict[str, object] = {
+            "lines": {
+                "total": [f"src/a.py:{line}" for line in lines],
+                "covered": [f"src/a.py:{line}" for line in covered],
+            },
+            "per_test_lines": {
+                name: [f"src/a.py:{line}" for line in items] for name, items in per_test.items()
+            },
+            "files_measured": ["src/a.py"],
+        }
+        return assessment_metrics._coverage(report, files, ["src/**"])
+
+    provenance = {
+        "tool": "coverage.py",
+        "tool_version": "7",
+        "config_digest": "c",
+        "scope": ["src/**"],
+    }
+    before = measured([1, 2], [1, 2], {"test_old": [1, 2]})
+    after = measured(
+        [1, 2, 3, 5],
+        [1, 2, 3],
+        {"test_old": [1, 2], "new_a": [3], "new_dup": [3], "new_none": [1]},
+    )
+    compared = _metric(
+        compare_evidence(
+            {
+                "coverage": {"provenance": provenance, "metrics": before},
+                "snapshot_digest": change["before_digest"],
+            },
+            {
+                "coverage": {"provenance": provenance, "metrics": after},
+                "snapshot_digest": change["after_digest"],
+            },
+            change=change,
+        ),
+        "coverage",
+    )
+    changed = _metric(compared, "changed_lines")
+    # Lines 3 and 5 are added and executable; the comment on line 4 is not executable.
+    assert changed["added_executable_lines"] == 2
+    assert changed["added_lines_covered"] == 1
+    assert changed["line_percent"] == 50
+    assert changed["added_tests"] == 3
+    # Of two tests covering exactly line 3, one is flagged: removing every flagged test
+    # together keeps added-line coverage unchanged.
+    assert changed["redundant_added_test_names"] == ["new_a"]
+    assert changed["redundant_added_tests"] == 1
+    # A test that reaches no added line is reported separately, not as redundant.
+    assert changed["added_tests_without_added_lines"] == 1
+
+
+def test_changed_line_coverage_is_incomplete_when_an_added_source_file_is_unmeasured(
+    tmp_path: Path,
+) -> None:
+    _write(tmp_path / "before/src/a.py", "one = 1\n")
+    _write(tmp_path / "after/src/a.py", "one = 1\ntwo = 2\n")
+    _write(tmp_path / "after/src/new.py", "three = 3\n")
+    change = compare_snapshots(tmp_path / "before", tmp_path / "after")
+    report: dict[str, object] = {
+        "lines": {"total": ["src/a.py:1", "src/a.py:2"], "covered": ["src/a.py:1", "src/a.py:2"]},
+        "files_measured": ["src/a.py"],
+    }
+    after = assessment_metrics._coverage(report, {"src/a.py", "src/new.py"}, ["src/**"])
+    result = assessment_metrics._changed_line_coverage({}, after, change)
+    # Leaving the untested new file out of the report must not raise the percentage.
+    assert result["status"] == "incomplete"
+    assert "src/new.py" in str(result["reason"])
 
 
 @pytest.mark.parametrize("complete", [False, None])

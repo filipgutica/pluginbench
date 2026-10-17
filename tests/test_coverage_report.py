@@ -217,6 +217,28 @@ def test_python_coordinates_and_branch_mode(tmp_path: Path, source: Path) -> Non
     assert "branches" not in report
 
 
+def test_python_test_contexts_become_per_test_lines(tmp_path: Path, source: Path) -> None:
+    data = python_data()
+    data["files"]["src/value.py"]["contexts"] = {
+        "1": [""],
+        "2": ["test_a", "test_b"],
+        "3": ["test_a"],
+    }
+    report = python_report(tmp_path, source, data)
+    # The empty context is code run outside any test, such as imports.
+    assert report["per_test_lines"] == {
+        "test_a": ["src/value.py:2", "src/value.py:3"],
+        "test_b": ["src/value.py:2"],
+    }
+    assert "per_test_lines" not in python_report(tmp_path, source, python_data())
+    # Contexts without test names (dynamic contexts off) mean per-test data is unknown, not empty.
+    data["files"]["src/value.py"]["contexts"] = {"1": [""], "2": [""]}
+    assert "per_test_lines" not in python_report(tmp_path, source, data)
+    data["files"]["src/value.py"]["contexts"] = {"4": ["test_a"]}
+    with pytest.raises(ValueError, match="context"):
+        python_report(tmp_path, source, data)
+
+
 def test_python_statement_coordinates_exclude_traced_nonstatements(
     tmp_path: Path, source: Path
 ) -> None:

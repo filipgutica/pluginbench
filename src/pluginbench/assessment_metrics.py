@@ -136,6 +136,50 @@ def _changed_line_ranges(patch: str) -> dict[str, object]:
     return dict(ranges)
 
 
+DUPLICATION_WINDOW = 6
+
+
+def _test_duplication(patch: str) -> dict[str, object]:
+    """Added test lines inside a run of consecutive added lines that repeats elsewhere in added tests."""
+    hunks: list[list[str]] = []
+    new_path: str | None = None
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            new_path = None
+        elif line.startswith("+++ "):
+            new_path = _marker_path(line[4:])
+        elif line.startswith("@@ "):
+            hunks.append([])
+        elif (
+            line.startswith("+")
+            and new_path is not None
+            and _is_test_path(new_path)
+            and Path(new_path).suffix.lower() in _SOURCE_SUFFIXES
+            and hunks
+        ):
+            text = " ".join(line[1:].split())
+            if text:
+                hunks[-1].append(text)
+    windows: Counter[tuple[str, ...]] = Counter(
+        tuple(hunk[index : index + DUPLICATION_WINDOW])
+        for hunk in hunks
+        for index in range(len(hunk) - DUPLICATION_WINDOW + 1)
+    )
+    duplicated = 0
+    for hunk in hunks:
+        marked = [False] * len(hunk)
+        for index in range(len(hunk) - DUPLICATION_WINDOW + 1):
+            if windows[tuple(hunk[index : index + DUPLICATION_WINDOW])] > 1:
+                marked[index : index + DUPLICATION_WINDOW] = [True] * DUPLICATION_WINDOW
+        duplicated += sum(marked)
+    return {
+        "window_lines": DUPLICATION_WINDOW,
+        "added_test_lines": sum(len(hunk) for hunk in hunks),
+        "duplicated_added_test_lines": duplicated,
+        "method": "whitespace-normalized non-blank added lines in test source files (fixture and snapshot data excluded); a line is duplicated when it belongs to a run of consecutive added lines that appears more than once in added test code; copies of existing tests are not detected",
+    }
+
+
 def compare_snapshots(before: Path, after: Path) -> dict[str, object]:
     """Use the existing patch analyzer, with a canonical Git diff of filtered copies."""
     snapshots = [inspect_snapshot(before), inspect_snapshot(after)]
@@ -174,6 +218,7 @@ def compare_snapshots(before: Path, after: Path) -> dict[str, object]:
         patch = result.stdout.decode(errors="surrogateescape")
         metrics: dict[str, object] = dict(analyze_patch(patch))
         metrics["changed_line_ranges"] = _changed_line_ranges(patch)
+        metrics["test_duplication"] = _test_duplication(patch)
     for root, original in zip((before, after), snapshots, strict=True):
         if inspect_snapshot(root)["digest"] != original["digest"]:
             raise ValueError("snapshot changed during analysis")
@@ -347,164 +392,6 @@ def _marginal(value: object, measured: set[str], label: str) -> list[str] | None
     )
 
 
-def _test_contribution(
-    report: dict[str, object],
-    files: set[str],
-    branches: set[str],
-    covered: set[str],
-    functions: set[str],
-    covered_functions: set[str],
-) -> dict[str, object]:
-    if report.get("contribution") is None:
-        return {"status": "unavailable", "reason": "no declared test-contribution collection"}
-    row = _object(report["contribution"], "test contribution")
-    if row.get("method") != "leave-one-out-branches-v1":
-        raise ValueError("unsupported test-contribution method")
-    test_scope = [
-        name.removeprefix("./") for name in _strings(report.get("test_scope"), "test scope")
-    ]
-    if not test_scope or any(
-        Path(pattern).is_absolute() or ".." in Path(pattern).parts or "\\" in pattern
-        for pattern in test_scope
-    ):
-        raise ValueError("test scope requires nonempty relative patterns")
-    excluded = {
-        name.removeprefix("./")
-        for name in _strings(report.get("excluded_test_files", []), "excluded test files")
-    }
-    selected = (
-        set(_strings(report["selected_test_files"], "selected test files"))
-        if report.get("selected_test_files") is not None
-        else None
-    )
-    reference = set(_strings(row.get("reference_ids"), "reference tests"))
-    statuses = _object(row.get("reference_statuses"), "reference test statuses")
-    if set(statuses) != reference or any(
-        status not in {"passed", "pending", "failed"} for status in statuses.values()
-    ):
-        raise ValueError("test-contribution statuses must cover the declared reference population")
-    for test_id in reference:
-        path, delimiter, title = test_id.partition("::")
-        if (
-            not delimiter
-            or not title
-            or path not in files
-            or path in excluded
-            or (selected is not None and path not in selected)
-            or not _is_test_path(path)
-            or not any(fnmatch.fnmatchcase(path, pattern) for pattern in test_scope)
-        ):
-            raise ValueError("test-contribution identity escapes its bound test scope")
-    runnable = {test_id for test_id, status in statuses.items() if status != "pending"}
-    executed = set(_strings(row.get("executed_ids"), "executed reference tests"))
-    passing = set(_strings(row.get("passing_ids"), "passing reference tests"))
-    if (
-        not runnable
-        or executed != runnable
-        or passing != runnable
-        or any(statuses[test_id] != "passed" for test_id in runnable)
-    ):
-        raise ValueError("test contribution requires a completely executed passing reference suite")
-    candidates = set(_strings(row.get("candidate_ids"), "candidate tests"))
-    if (
-        not candidates <= runnable
-        or row.get("selection") != "all runnable cases in added/modified visible test files"
-    ):
-        raise ValueError("candidate tests require a declared runnable selection")
-    changed = set(_strings(row.get("changed_test_files"), "changed visible test files"))
-    expected = {test_id for test_id in runnable if test_id.partition("::")[0] in changed}
-    if candidates != expected:
-        raise ValueError("test-contribution candidate population omits selected runnable cases")
-    runs = row.get("removal_runs")
-    if not isinstance(runs, list):
-        raise ValueError("test contribution requires removal runs")
-    observed: set[str] = set()
-    zero: set[str] = set()
-    semantic_runs: dict[str, object] = {}
-    for value in runs:
-        removal = _object(value, "test removal run")
-        excluded_id = removal.get("excluded_id")
-        if (
-            not isinstance(excluded_id, str)
-            or excluded_id not in candidates
-            or excluded_id in observed
-        ):
-            raise ValueError("test-removal runs must cover each candidate exactly once")
-        observed.add(excluded_id)
-        expected_remaining = runnable - {excluded_id}
-        if (
-            _integer(removal.get("exit_code"), "removal exit code") != 0
-            or set(_strings(removal.get("executed_ids"), "remaining executed tests"))
-            != expected_remaining
-            or set(_strings(removal.get("passing_ids"), "remaining passing tests"))
-            != expected_remaining
-        ):
-            raise ValueError("test-removal run must pass every remaining reference test")
-        remaining_statuses = _object(removal.get("test_statuses"), "remaining test statuses")
-        if excluded_id in remaining_statuses:
-            if remaining_statuses.pop(excluded_id) != "pending":
-                raise ValueError("excluded test must be absent or pending in native statuses")
-        if remaining_statuses != {
-            test_id: status for test_id, status in statuses.items() if test_id != excluded_id
-        }:
-            raise ValueError("test-removal native statuses differ from remaining reference tests")
-        remaining = set(_strings(removal.get("covered_branches"), "remaining branch coverage"))
-        lost = set(_strings(removal.get("unique_branches"), "removed branch contribution"))
-        if not remaining <= branches or lost != covered - remaining:
-            raise ValueError(
-                "test-removal coverage escapes or disagrees with the bound branch population"
-            )
-        if remaining == covered:
-            zero.add(excluded_id)
-        semantic_runs[excluded_id] = {
-            "test_statuses": remaining_statuses,
-            "executed_ids": sorted(expected_remaining),
-            "passing_ids": sorted(expected_remaining),
-            "covered_branches": sorted(remaining),
-            "unique_branches": sorted(lost),
-        }
-    if (
-        observed != candidates
-        or set(_strings(row.get("zero_marginal_ids"), "zero marginal tests")) != zero
-    ):
-        raise ValueError("test-contribution results must cover the complete candidate population")
-    before_digest = report.get("before_digest")
-    if (
-        not isinstance(before_digest, str)
-        or re.fullmatch(r"sha256:[0-9a-f]{64}", before_digest) is None
-    ):
-        raise ValueError("test contribution requires its bound before-snapshot digest")
-    semantic = {
-        "method": row["method"],
-        "branches": {"total": sorted(branches), "covered": sorted(covered)},
-        "functions": {"total": sorted(functions), "covered": sorted(covered_functions)},
-        "reference_statuses": statuses,
-        "candidate_ids": sorted(candidates),
-        "changed_test_files": sorted(changed),
-        "removal_runs": semantic_runs,
-    }
-    return {
-        "status": "available",
-        "method": row["method"],
-        "label": "zero marginal branch contribution",
-        "reference_count": len(runnable),
-        "pending_count": len(reference - runnable),
-        "candidate_count": len(candidates),
-        "tested_count": len(observed),
-        "zero_marginal_count": len(zero),
-        "candidate_ids": sorted(candidates),
-        "zero_marginal_ids": sorted(zero),
-        "reference_ids": sorted(reference),
-        "selection": row["selection"],
-        "changed_test_files": sorted(changed),
-        "before_digest": before_digest,
-        "semantic_digest": _digest(
-            json.dumps(semantic, sort_keys=True, separators=(",", ":")).encode()
-        ),
-        "limitations": "Removing one case leaves the covered branch set unchanged in this declared suite. Equal coverage does not prove equivalent assertions or unnecessary tests; candidates cannot necessarily be removed together.",
-    }
-
-
 def _coverage_limits(
     report: dict[str, object], files: set[str], scope: list[str]
 ) -> dict[str, object]:
@@ -537,8 +424,7 @@ def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> d
     }
     if not populations:
         raise ValueError("coverage requires at least one explicit measured population")
-    branches, covered_branches = populations.get("branches", (set(), set()))
-    functions, covered_functions = populations.get("functions", (set(), set()))
+    covered_branches = populations.get("branches", (set(), set()))[1]
     measured_value = report.get("files_measured")
     measured = (
         set(_strings(measured_value, "files_measured")) if measured_value is not None else set()
@@ -595,8 +481,25 @@ def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> d
                 f"{singular}_population_complete": bool(expected) and expected <= unit_files,
             }
         )
+    lines_total = populations.get("lines", (set(), set()))[0]
+    per_test_lines = None
+    if report.get("per_test_lines") is not None:
+        rows = _object(report["per_test_lines"], "per_test_lines")
+        per_test_lines = {
+            name: sorted(set(_strings(items, f"per_test_lines.{name}")))
+            for name, items in rows.items()
+        }
+        if any(not set(items) <= lines_total for items in per_test_lines.values()):
+            raise ValueError("per_test_lines includes unmeasured line coordinates")
     return {
         **units,
+        # Coordinates support changed-line coverage; per-test lines support redundancy.
+        "coordinates": {
+            unit: {"total": sorted(populations[kind][0]), "covered": sorted(populations[kind][1])}
+            for kind, unit in (("lines", "line"), ("branches", "branch"))
+            if kind in populations
+        },
+        "per_test_lines": per_test_lines,
         "available_units": [
             unit
             for kind, unit in (
@@ -626,9 +529,6 @@ def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> d
         "reference_test_files": report.get("reference_test_files"),
         "selection_policy": report.get("selection_policy"),
         **({"clock": report["clock"]} if "clock" in report else {}),
-        "test_contribution": _test_contribution(
-            report, files, branches, covered_branches, functions, covered_functions
-        ),
     }
 
 
@@ -1394,35 +1294,10 @@ def evaluate_evidence(
         elif kind == "coverage":
             if report.get("clock") != config.get("clock"):
                 raise ValueError("coverage clock differs from its bound configuration")
-            if (
-                report.get("contribution") is not None
-                and report.get("source_digest") != snapshot["digest"]
-            ):
-                raise ValueError("test-contribution report does not bind to this source snapshot")
             if report.get("source_scope") is not None and sorted(
                 _strings(report["source_scope"], "coverage source scope")
             ) != sorted(scope):
                 raise ValueError("coverage source scope differs from its bound envelope")
-            if report.get("contribution") is not None:
-                for key, default in (("test_scope", None), ("excluded_test_files", [])):
-                    declared = _strings(report.get(key, default), f"coverage {key}")
-                    configured = _strings(config.get(key, default), f"coverage config {key}")
-                    if sorted(name.removeprefix("./") for name in declared) != sorted(
-                        name.removeprefix("./") for name in configured
-                    ):
-                        raise ValueError(f"coverage {key} differs from its bound configuration")
-                if config.get("reference_test_files") is not None:
-                    required_tests = _strings(
-                        config["reference_test_files"], "required reference tests"
-                    )
-                    if report.get(
-                        "selection_policy"
-                    ) != "fixed-reference-plus-all-changed-test-files-v1" or sorted(
-                        _strings(report.get("reference_test_files"), "reported reference tests")
-                    ) != sorted(required_tests):
-                        raise ValueError(
-                            "coverage reference selection differs from its bound configuration"
-                        )
             metrics = _coverage(report, files, scope)
         provenance = {
             key: envelope[key] for key in ("tool", "tool_version", "config_digest", "scope")
@@ -1530,12 +1405,98 @@ def _overlaps_change(row: dict[str, object], ranges: object) -> bool:
     return False
 
 
+HOTSPOT_COGNITIVE = 15
+
+
+def _code_added(
+    *,
+    before_all: list[dict[str, object]],
+    after_all: list[dict[str, object]],
+    changed_paths: set[str],
+    new_paths: list[str],
+    complete: bool,
+) -> dict[str, object]:
+    """Net source complexity and structure an attempt added, independent of inherited code."""
+    method = "all source functions in changed files after the edit minus the same files before; unchanged functions cancel, new functions count in full, deleted ones subtract; tests and Go closure rows inside a declaration (already in its score) excluded"
+    limitations = "added and grown functions match on path and name with line numbers removed; nested functions, overloads, renames and Go methods sharing a name on different receivers in one file can misclassify them; net sums do not depend on matching"
+    if not complete:
+        return {
+            "status": "incomplete",
+            "complete_for_declared_scope": False,
+            "reason": "complexity population incomplete on one side",
+            "method": method,
+            "limitations": limitations,
+        }
+
+    def enclosed(row: dict[str, object], rows: list[dict[str, object]]) -> bool:
+        # Go closure rows inside another function are already counted in that function's score.
+        if not str(row["name"]).startswith("closure@"):
+            return False
+        first = _integer(row["line"], "function line")
+        return any(
+            other is not row
+            and other["path"] == row["path"]
+            and _integer(other["line"], "function line")
+            <= first
+            < _integer(other["line"], "function line") + _integer(other["line_count"], "line count")
+            and (other["line"], other["line_count"]) != (row["line"], row["line_count"])
+            for other in rows
+        )
+
+    def source(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+        return [
+            row
+            for row in rows
+            if str(row["path"]) in changed_paths
+            and not _is_test_path(str(row["path"]))
+            and not enclosed(row, rows)
+        ]
+
+    def identity(row: dict[str, object]) -> tuple[str, str]:
+        # Go method names embed their line ("method@47:Name"); moving a method must not rename it.
+        return (str(row["path"]), re.sub(r"@\d+(?::\d+)?:?", "@", str(row["name"])))
+
+    def total(rows: list[dict[str, object]], key: str) -> int:
+        return sum(_integer(row[key], key) for row in rows)
+
+    before_rows, after_rows = source(before_all), source(after_all)
+    previous: dict[tuple[str, str], int] = {}
+    for row in before_rows:
+        previous[identity(row)] = max(
+            previous.get(identity(row), -1), _integer(row["cognitive"], "cognitive")
+        )
+    analyzed_paths = {str(row["path"]) for row in after_rows}
+    return {
+        "status": "available",
+        "net_cognitive": total(after_rows, "cognitive") - total(before_rows, "cognitive"),
+        "net_cyclomatic": total(after_rows, "cyclomatic") - total(before_rows, "cyclomatic"),
+        "functions_added": sum(identity(row) not in previous for row in after_rows),
+        "source_files_added": sum(
+            _is_source_path(path) and path in analyzed_paths for path in new_paths
+        ),
+        "hotspots_added": sum(
+            _integer(row["cognitive"], "cognitive") > HOTSPOT_COGNITIVE
+            and _integer(row["cognitive"], "cognitive") > previous.get(identity(row), -1)
+            for row in after_rows
+        ),
+        "hotspot_threshold": HOTSPOT_COGNITIVE,
+        "function_count_reported": len(after_rows),
+        "complete_for_declared_scope": True,
+        "method": method,
+        "limitations": limitations,
+    }
+
+
 def _function_changes(
     left: dict[str, object], right: dict[str, object], change: dict[str, object] | None
 ) -> dict[str, object]:
     unavailable = {"status": "unavailable", "reason": "bound source diff or function rows missing"}
     if change is None or not all(isinstance(row.get("functions"), list) for row in (left, right)):
-        return {"changed_functions": unavailable, "new_file_functions": unavailable}
+        return {
+            "changed_functions": unavailable,
+            "new_file_functions": unavailable,
+            "code_added": unavailable,
+        }
     ranges = _object(change.get("changed_line_ranges"), "changed-line ranges")
     populations = []
     complete = all(
@@ -1545,17 +1506,16 @@ def _function_changes(
         raw = metrics["functions"]
         assert isinstance(raw, list)
         functions = [_object(row, "function") for row in raw]
+        changed = [
+            row
+            for row in functions
+            if _overlaps_change(
+                row, _object(ranges.get(str(row["path"]), {}), "file ranges").get(side)
+            )
+        ]
         populations.append(
             {
-                **_function_population(
-                    [
-                        row
-                        for row in functions
-                        if _overlaps_change(
-                            row, _object(ranges.get(str(row["path"]), {}), "file ranges").get(side)
-                        )
-                    ]
-                ),
+                **_function_population(changed),
                 "complete_for_declared_scope": metrics.get("complexity_complete_for_declared_scope")
                 is True,
             }
@@ -1569,7 +1529,16 @@ def _function_changes(
         if _object(row, "function")["path"] in new_paths
     ]
     status = "available" if complete else "incomplete"
+    before_all = left["functions"]
+    assert isinstance(before_all, list)
     return {
+        "code_added": _code_added(
+            before_all=[_object(row, "function") for row in before_all],
+            after_all=[_object(row, "function") for row in raw_after],
+            changed_paths=set(ranges),
+            new_paths=sorted(new_paths),
+            complete=complete,
+        ),
         "changed_functions": {
             "status": status,
             "before": populations[0],
@@ -1740,11 +1709,112 @@ def _coverage_unit_comparison(
     }
 
 
+def _added_source_lines(change: dict[str, object]) -> set[str]:
+    ranges = _object(change.get("changed_line_ranges"), "changed-line ranges")
+    lines: set[str] = set()
+    for path, sides in ranges.items():
+        if not _is_source_path(path):
+            continue
+        after = _object(sides, "file ranges").get("after") or []
+        if not isinstance(after, list):
+            raise ValueError("changed-line ranges require a list")
+        for item in after:
+            if not isinstance(item, list) or len(item) != 2:
+                raise ValueError("changed-line range requires start and count")
+            start, count = (_integer(value, "changed-line range") for value in item)
+            lines.update(f"{path}:{line}" for line in range(start, start + count))
+    return lines
+
+
+def _changed_line_coverage(
+    left: dict[str, object], right: dict[str, object], change: dict[str, object] | None
+) -> dict[str, object]:
+    """Coverage of the attempt's own added source lines, and added tests that add no unique coverage."""
+    coordinates = right.get("coordinates")
+    if change is None or not isinstance(coordinates, dict) or "line" not in coordinates:
+        return {"status": "unavailable", "reason": "bound source diff or line coordinates missing"}
+    added = _added_source_lines(change)
+    unmeasured = sorted(
+        set(_strings(right.get("unmeasured_source_files", []), "unmeasured source files"))
+        & {line.rsplit(":", 1)[0] for line in added}
+    )
+    if unmeasured:
+        # Dropping an untested added file from the report would otherwise raise the rate.
+        return {
+            "status": "incomplete",
+            "reason": "added source files missing from the coverage report: "
+            + ", ".join(unmeasured),
+        }
+    result: dict[str, object] = {
+        "status": "available",
+        "method": "added source lines from the bound diff intersected with the submission's executable and executed coordinates; branches belong to the added line they start on",
+        "limitations": "executing a line does not prove its behavior is asserted; redundant tests are candidates: equal coverage does not establish equal assertions",
+    }
+    for unit in ("line", "branch"):
+        population = _object(coordinates.get(unit, {}), unit)
+        if not population:
+            result.update({f"{unit}_total": None, f"{unit}_covered": None, f"{unit}_percent": None})
+            continue
+
+        def on_added_line(coordinate: str) -> bool:
+            path, _, rest = coordinate.partition(":")
+            return f"{path}:{rest.split(':')[0]}" in added
+
+        total = {item for item in _strings(population["total"], unit) if on_added_line(item)}
+        covered = {item for item in _strings(population["covered"], unit) if item in total}
+        result.update(
+            {
+                f"{unit}_total": len(total),
+                f"{unit}_covered": len(covered),
+                f"{unit}_percent": _percent(len(covered), len(total)),
+            }
+        )
+    result["added_executable_lines"] = result.pop("line_total")
+    result["added_lines_covered"] = result.pop("line_covered")
+    before_tests, after_tests = left.get("per_test_lines"), right.get("per_test_lines")
+    if not isinstance(before_tests, dict) or not isinstance(after_tests, dict):
+        result.update(
+            added_tests=None,
+            redundant_added_tests=None,
+            redundant_added_test_names=None,
+            added_tests_without_added_lines=None,
+            redundancy_reason="per-test line coverage was not recorded for both snapshots",
+        )
+        return result
+    reached = {
+        name: set(_strings(items, f"per_test_lines.{name}")) & added
+        for name, items in after_tests.items()
+    }
+    new_tests = sorted(set(after_tests) - set(before_tests))
+    reaching = [name for name in new_tests if reached[name]]
+    # Flag the smallest tests first and drop each flagged test from the pool, so removing every
+    # flagged test together keeps added-line coverage unchanged (one of two duplicates stays).
+    remaining = dict(reached)
+    redundant = []
+    for name in sorted(reaching, key=lambda item: (len(reached[item]), item)):
+        others = set().union(*(lines for other, lines in remaining.items() if other != name))
+        if reached[name] <= others:
+            redundant.append(name)
+            del remaining[name]
+    result.update(
+        added_tests=len(new_tests),
+        redundant_added_tests=len(redundant),
+        redundant_added_test_names=sorted(redundant),
+        added_tests_without_added_lines=len(new_tests) - len(reaching),
+    )
+    return result
+
+
 def compare_evidence(
     before: dict[str, object], after: dict[str, object], *, change: dict[str, object] | None = None
 ) -> dict[str, object]:
     """Compare measurements only with compatible collection and denominator provenance."""
     result: dict[str, object] = {}
+    if change is not None and (
+        change.get("before_digest") != before.get("snapshot_digest")
+        or change.get("after_digest") != after.get("snapshot_digest")
+    ):
+        raise ValueError("changed-line diff does not bind to evidence snapshots")
     for kind in _EVIDENCE_KINDS:
         left = _object(before.get(kind, {}), f"before.{kind}")
         right = _object(after.get(kind, {}), f"after.{kind}")
@@ -1793,7 +1863,11 @@ def compare_evidence(
             "interpretation": "net changes in compatible reported metrics; not identity-grounded newly introduced findings",
         }
         if kind == "coverage":
-            result[kind] = {**_object(result[kind], kind), "units": coverage_units}
+            result[kind] = {
+                **_object(result[kind], kind),
+                "units": coverage_units,
+                "changed_lines": _changed_line_coverage(left_metrics, right_metrics, change),
+            }
             if not any(
                 _object(unit, "coverage unit")["status"] == "available"
                 for unit in coverage_units.values()
@@ -1805,11 +1879,6 @@ def compare_evidence(
                     "deltas": None,
                 }
         if kind in {"fallow", "analysis"}:
-            if change is not None and (
-                change.get("before_digest") != before.get("snapshot_digest")
-                or change.get("after_digest") != after.get("snapshot_digest")
-            ):
-                raise ValueError("changed-function diff does not bind to evidence snapshots")
             comparison = _object(result[kind], "static analysis comparison")
             comparison.update(_function_changes(left_metrics, right_metrics, change))
             comparison["dead_findings"] = _dead_changes(left_metrics, right_metrics)

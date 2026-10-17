@@ -365,6 +365,7 @@ def parse_python_coverage(
         raise CoveragePopulationUnavailable("Python report contains no measured sources")
     records: list[_Record] = []
     populations: dict[str, tuple[set[str], set[str]]] = {}
+    per_test: dict[str, set[str]] | None = None
     for raw_path, raw_file in raw_files.items():
         if ("statement_lines" in _json_object(raw_file, "Python coverage file")) != (
             statement_source is not None
@@ -377,14 +378,33 @@ def parse_python_coverage(
             raise ValueError(f"Python coverage source is duplicated: {path}")
         record = _Record(path, len((snapshot / path).read_text().splitlines()))
         records.append(record)
-        for kind, (total, covered) in _python_file(raw_file, record, branch_coverage).items():
+        file_populations = _python_file(raw_file, record, branch_coverage)
+        for kind, (total, covered) in file_populations.items():
             aggregate = populations.setdefault(kind, (set(), set()))
             aggregate[0].update(f"{path}:{coordinate}" for coordinate in total)
             aggregate[1].update(f"{path}:{coordinate}" for coordinate in covered)
+        contexts = _json_object(raw_file, "Python coverage file").get("contexts")
+        if contexts is not None:
+            # coverage.py dynamic contexts: line -> test names; "" is code run outside tests.
+            per_test = {} if per_test is None else per_test
+            statements, executed = file_populations["lines"]
+            for line, names in _json_object(contexts, "Python coverage contexts").items():
+                record.line(line)
+                if line in statements - executed or not isinstance(names, list):
+                    raise ValueError("Python coverage context names an unexecuted line")
+                if line not in executed:
+                    continue  # traced non-statement lines are outside the line population
+                for name in names:
+                    if not isinstance(name, str):
+                        raise ValueError("Python coverage context names must be strings")
+                    if name:
+                        per_test.setdefault(name, set()).add(f"{path}:{line}")
     result = _metadata("coverage-py-json", records, source_scope, test_scope)
     result["tool_version"] = meta["version"]
     for kind, (total, covered) in populations.items():
         result[kind] = _population(total, covered, [record.path for record in records], kind)
+    if per_test:  # contexts without test names leave per-test coverage unknown
+        result["per_test_lines"] = {name: sorted(lines) for name, lines in sorted(per_test.items())}
     return result
 
 

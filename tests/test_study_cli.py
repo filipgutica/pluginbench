@@ -290,6 +290,51 @@ def test_invalid_contract_rejected_before_calls(
         )
 
 
+@pytest.mark.parametrize(
+    "mutation,remedy",
+    [
+        ({"measurements": ["tokens", "test_overlap"]}, "Remove test_overlap from measurements"),
+        (
+            {
+                "measurement_settings": {
+                    "test_contribution": {"pytest_version": "8.4.2", "coverage_version": "7.10.7"}
+                }
+            },
+            "Omit test_contribution or set it to null",
+        ),
+    ],
+)
+def test_removed_leave_one_out_overlap_is_rejected_with_its_replacement(
+    config: evaluation.Evaluation, mutation: dict[str, Any], remedy: str
+) -> None:
+    with pytest.raises(ValueError) as error:
+        evaluation.resolve_evaluation(
+            {**config.model_dump(mode="json"), **mutation}, config.tasks.resolve().parent.parent
+        )
+    message = str(error.value)
+    assert "leave-one-out test-overlap measure" in message
+    assert "Redundant added tests, measured from per-test coverage, replace it" in message
+    assert remedy in message
+
+
+def test_saved_evaluation_with_null_test_contribution_still_loads(
+    config: evaluation.Evaluation,
+) -> None:
+    # The exact settings recorded by saved evaluations, including comparison identities.
+    saved = {
+        "source_scope": None,
+        "test_scope": None,
+        "fallow_config": None,
+        "coverage": None,
+        "coverage_profiles": {},
+        "test_contribution": None,
+        "require_ready": True,
+    }
+    selection = {**config.model_dump(mode="json"), "measurement_settings": saved}
+    loaded = evaluation._saved_evaluation(selection)
+    assert loaded.measurement_settings.model_dump(mode="json") == saved
+
+
 def test_fixed_reviewer_separate_from_candidate_guidance(config: evaluation.Evaluation) -> None:
     raw = config.model_dump(mode="json")
     raw["measurements"].append("review")
@@ -831,7 +876,8 @@ def test_integrated_evaluation_and_report_regeneration(
             saved_reviewer = saved["reviewer"]
             assert isinstance(saved_reviewer, dict)
             changed_settings["reviewer"] = {
-                **saved_reviewer, "timeout_seconds": expected_review_timeout + 1
+                **saved_reviewer,
+                "timeout_seconds": expected_review_timeout + 1,
             }
         with monkeypatch.context() as changed:
             changed.setattr(evaluation, "_load_selection", lambda _: changed_settings)

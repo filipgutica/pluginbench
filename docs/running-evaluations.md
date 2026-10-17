@@ -76,17 +76,17 @@ Cleanup removes owned containers, networks, sidecars, temporary homes, and job c
 
 ## Measurements
 
-The same frozen settings apply before and after each submission. The dry run reports unsupported measurements before paid calls; preparation freezes observer settings and executes selected collectors twice on the actual starting source. An available collector can still fail during measurement. Those failures are retained separately from missing support.
+[The measurement specification](measurement-spec.md) defines what each measure answers. The same frozen settings apply before and after each submission. The dry run reports unsupported measurements before paid calls; preparation freezes observer settings and executes selected collectors twice on the actual starting source. An available collector can still fail during measurement. Those failures are retained separately from missing support.
 
 | Measurement | Meaning and current support |
 | --- | --- |
-| Tokens | Native root and reachable descendant input/output totals, deduplicated by session. Missing final totals or child logs make totals unknown; observed usage remains a lower bound. Arbitrary hook subprocess usage is unmetered, so hook treatments retain native-session usage separately and report total usage as unknown. Reviewer usage is separate. |
-| Lines | Source/test lines added and removed. Default scope covers the repository, with tests classified separately. |
-| Complexity | Cognitive/cyclomatic maxima for touched functions and new-file functions, separately. Fallow covers JS/TS; pinned language analyzers cover Python, Go, and Rust. |
-| Dead code | Static unused-code warnings introduced since the starting scan. Fallow covers JS/TS; Python, Go, and native Rust analyzers report unused candidates. Warnings can include required public APIs. |
-| Coverage | Independent line/statement/branch/function counts from LCOV, coverage.py JSON, or Go coverprofiles. Go profiles measure statements. |
-| Test overlap | Explicitly selected pytest leave-one-out branch contribution for runnable cases in changed test files. Unchanged coverage does not prove redundant assertions. |
+| Tokens and time | Native root and reachable descendant input, cached input, uncached input, output and reasoning-output totals, plus coding time, deduplicated by session. Missing final totals or child logs make totals unknown; observed usage remains a lower bound. Arbitrary hook subprocess usage is unmetered, so hook treatments retain native-session usage separately and report total usage as unknown. Reviewer usage is separate. |
+| Lines | Source/test lines added and removed, and added test lines that repeat in six-line blocks. Default scope covers the repository, with tests classified separately. |
+| Complexity | Net cognitive/cyclomatic complexity the submission added to source code, functions and source files added, and new or grown functions with a cognitive score above 15. Fallow covers JS/TS; pinned language analyzers cover Python, Go, and Rust. |
+| Dead code | Static unused-code warnings and (JS/TS) duplicate-code groups introduced since the starting scan. Fallow covers JS/TS; Python, Go, and native Rust analyzers report unused candidates. Warnings can include required public APIs. |
+| Coverage | Changed-line and changed-branch coverage: the share of the submission's added source lines its own tests run. Redundant added tests come from per-test coverage. Whole-suite line/statement/branch/function rates stay in JSON/CSV as diagnostics. Inputs: LCOV, coverage.py JSON, or Go coverprofiles. Go coverprofiles supply statements only, so Go changed-line rates are unknown. |
 | Review | Independent AI findings by severity/category, with fixed criteria across vanilla and guidance. |
+| Reference | When a task ships `solution/solution.patch`, each measurement revision applies it to the starting source and measures it with the same complexity, unused-code and line collectors. Reports show code measures as a ratio to the reference. |
 
 JS/TS analysis requires Node, Corepack, and Fallow 3.18.0. PluginBench retains real entrypoint inference and checks discovery/parse completeness. A missing or different tool version makes those measurements unavailable, without blocking tokens, lines, or review.
 
@@ -108,26 +108,17 @@ Coverage.py can trace lines outside its executable-statement population. A trust
 
 A coverage profile's `source_scope` declares its measured package independently of repository-wide LOC and analysis.
 
+Redundant added tests need per-test coverage. For coverage.py, run with `[run] dynamic_context = test_function` in the run configuration and export with `coverage json --show-contexts`. PluginBench reads the per-line contexts; the empty context (code run outside a test) is ignored. Without contexts, redundant added tests are unknown.
+
+Changed-line coverage is incomplete when an added source file is missing from the coverage report. Configure coverage to report every source file, for example coverage.py `--source=<package>` or c8 `--all`.
+
 LCOV callbacks can share names. When mixed hit counts cannot be matched to source lines, function coverage for those files stays unknown, with a reason. Line and branch coverage remain available.
-
-For optional pytest contribution, select `test_overlap` and provide:
-
-```yaml
-measurement_settings:
-  test_contribution:
-    python: python
-    pytest_args: [-q]
-    pytest_version: "8.4.2"
-    coverage_version: "7.10.7"
-```
-
-These exact versions must be installed in the frozen task image. If you also select `coverage`, the pytest reference supplies its line and branch coverage. Omit the ordinary coverage profile for that repository; conflicting profiles are rejected before coding. Each reference and omission gets a fresh container. Candidates are runnable cases in added or modified visible test files. Skipped cases remain distinct. Every remaining reference case must pass; changed discovery or invalid evidence stops collection. Unchanged branch coverage is not proof of equivalent assertions, and candidates cannot necessarily be removed together.
 
 `measurement_settings.require_ready: true` requires a qualified submission source and repeatable selected collectors before any coding call. Selected unused-code measurements also require unambiguous declaration matching in the starting population. Receipts are saved in `measurement-readiness.json`; test-command outcomes remain separate from coverage availability. A preparation/readiness interruption makes no coding calls. Repair its inputs and start a new evaluation. Post-coding resume continues to use frozen submissions.
 
 Optional local analyzer versions are pinned: Mozilla rust-code-analysis CLI 0.0.25, Vulture 2.16, Go 1.26.4, Staticcheck 0.8.2, gocognit 1.3.0, and gocyclo 0.6.0. Install RCA/Vulture/Staticcheck on PATH when selecting these measurements. Rust unused analysis requires Rust/Cargo 1.92.0 inside the frozen task image and a locked offline build. The shipped Go observer builds its pinned scoring libraries in the observer cache during preparation. Analysis does not download project dependencies. Go unused-code collection needs packages to load under the fixed build settings; missing dependencies or excluded files stay unavailable.
 
-Python complexity counts RCA's reported function spaces. Anonymous closures have no separate score; enclosing function scores may include their complexity. Counts and maxima describe this declared population, not all closures.
+Python complexity counts RCA's reported function spaces. Anonymous closures have no separate score; enclosing function scores may include their complexity. Counts and sums describe this declared population, not all closures.
 
 ## Baselines and reports
 
@@ -135,11 +126,13 @@ Vanilla submissions are cached in `.baseline-cache` beside run directories. Reus
 
 A cached cohort includes failures and unknowns. Missing isolation receipts, corrupt entries, or a concurrent reservation stop reuse. Imported submissions retain original usage and timing; current native verification, selected measurements, and reviews run again. Reports disclose reuse. Reused runs are not fresh independent samples.
 
-Open `report/report.html`. `results.json` contains raw observations, capabilities, grading evidence, and baseline deltas. `results.csv` contains individual measurements. Rebuild with `pluginbench report runs/<run>` without model calls.
+Open `report/report.html`. `results.json` contains raw observations, capabilities, grading evidence, baseline deltas, reference values and ratios, and cost rows. `results.csv` contains individual measurements. Rebuild with `pluginbench report runs/<run>` without model calls.
 
 The overview gives each task equal weight by averaging its median. Complexity and unused candidates are grouped by language and analyzer; unlike scores are not pooled. Fractional finding counts are averages; individual reviews have whole-number counts. Drill into a task to see repetitions. A package's delta is its value minus vanilla. Separate evaluations need matching task, runtime, measurement, and review identities before comparing deltas.
 
-Unknown values are never zero. Empty function populations have no complexity maximum. Smaller numbers alone do not establish better work. Coverage cannot prove assertion value, and AI findings do not measure human review churn. Task-supplied checks do not establish preservation of every behavior.
+To report dollars, put a dated price table in `prices.json` beside the saved `evaluation.json`, then run `pluginbench report`. Each model maps to `as_of`, `input_per_million`, `cached_input_per_million`, and `output_per_million`. Without it, dollars are unknown.
+
+Unknown values are never zero. A complete scan of a submission that changed no functions adds zero complexity; a missing scan stays unknown. Smaller numbers alone do not establish better work. Coverage cannot prove assertion value, and AI findings do not measure human review churn. Task-supplied checks do not establish preservation of every behavior.
 
 ## Concurrency and resume
 

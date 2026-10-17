@@ -39,7 +39,7 @@ def test_capabilities_are_per_metric_not_per_task(
     monkeypatch.setattr(language_analysis, "default_tool_paths", lambda _: {})
     result = capability_plan(
         native,
-        ["tokens", "lines", "cyclomatic", "coverage", "test_overlap", "review"],
+        ["tokens", "lines", "cyclomatic", "coverage", "review"],
         MeasurementSettings(),
     )
     assert (
@@ -50,7 +50,6 @@ def test_capabilities_are_per_metric_not_per_task(
     )
     assert result["cyclomatic"]["status"] == "unavailable"
     assert result["coverage"]["status"] == "unavailable"
-    assert "per-test" in str(result["test_overlap"]["reason"])
 
 
 @pytest.mark.parametrize("coverage_scope", [None, ["main.py"]])
@@ -85,9 +84,7 @@ def test_coverage_profile_is_fixed_operator_configuration(
         "workdir": "/app",
         "source_digest": "fixed",
     }
-    collectors = prepare_profiles(
-        source, tmp_path / "profiles", ["coverage", "test_overlap"], settings, identity
-    )
+    collectors = prepare_profiles(source, tmp_path / "profiles", ["coverage"], settings, identity)
     assert len(collectors) == 1
     collector = collectors[0]
     assert settings.coverage is not None
@@ -98,7 +95,6 @@ def test_coverage_profile_is_fixed_operator_configuration(
     provenance = json.loads((tmp_path / "profiles/measurement-provenance.json").read_text())
     assert provenance["starting_source_paths"] == ["main.py"]
     assert provenance["starting_test_paths"] == ["test_main.py"]
-    assert provenance["capabilities"]["test_overlap"]["status"] == "unavailable"
     assert collector.scope == (coverage_scope or ["*"])
     assert frozen["source_scope"] == collector.scope
     assert json.loads(provenance["source_scope"]) == ["*"]
@@ -483,26 +479,3 @@ def test_repository_coverage_profile_overrides_language_default(tmp_path: Path) 
         coverage_profiles={"go": language, "https://github.com/example/repo": repository}
     )
     assert profiles.coverage_settings(native, settings) == repository
-
-
-def test_optional_contribution_does_not_silently_replace_coverage(tmp_path: Path) -> None:
-    native = task(tmp_path, "python")
-    contribution = profiles.TestContributionSettings(
-        pytest_version="8.4.2", coverage_version="7.10.7"
-    )
-    ordinary = CoverageSettings(
-        command=["python", "-m", "coverage"],
-        report_path="coverage.json",
-        format="coverage-py-json",
-        tool_version="7.10.7",
-    )
-    with pytest.raises(ValueError, match="silently replacing"):
-        capability_plan(
-            native,
-            ["coverage", "test_overlap"],
-            MeasurementSettings(coverage=ordinary, test_contribution=contribution),
-        )
-    plan = capability_plan(
-        native, ["coverage", "test_overlap"], MeasurementSettings(test_contribution=contribution)
-    )
-    assert plan["coverage"]["status"] == plan["test_overlap"]["status"] == "available"

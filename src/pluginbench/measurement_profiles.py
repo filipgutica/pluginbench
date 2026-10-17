@@ -13,7 +13,7 @@ import subprocess
 import tomllib
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from pluginbench.assessment_metrics import (
     inspect_snapshot,
@@ -33,9 +33,18 @@ MEASUREMENT_NAMES = frozenset(
         "cognitive",
         "dead_code",
         "coverage",
-        "test_overlap",
         "review",
     }
+)
+REMOVED_TEST_OVERLAP = (
+    "test_overlap was removed: the leave-one-out test-overlap measure is no longer offered. "
+    "Redundant added tests, measured from per-test coverage, replace it. "
+    "Remove test_overlap from measurements."
+)
+REMOVED_TEST_CONTRIBUTION = (
+    "measurement_settings.test_contribution was removed: it configured the leave-one-out "
+    "test-overlap measure, which is no longer offered. Redundant added tests, measured from "
+    "per-test coverage, replace it. Omit test_contribution or set it to null."
 )
 FALLOW_MEASUREMENTS = {"cyclomatic", "cognitive", "dead_code"}
 PROFILE_VERSION = "native-before-after-v2"
@@ -78,16 +87,6 @@ class CoverageSettings(BaseModel):
         return self
 
 
-class TestContributionSettings(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    python: str = Field(default="python", min_length=1)
-    pytest_args: list[str] = Field(default_factory=list)
-    pytest_version: str = Field(min_length=1)
-    coverage_version: str = Field(min_length=1)
-    timeout: int = Field(default=600, ge=1, le=7200)
-
-
 class MeasurementSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -96,8 +95,16 @@ class MeasurementSettings(BaseModel):
     fallow_config: Path | None = None
     coverage: CoverageSettings | None = None
     coverage_profiles: dict[str, CoverageSettings] = Field(default_factory=dict)
-    test_contribution: TestContributionSettings | None = None
+    # Saved evaluations record this removed setting as null; only null is accepted.
+    test_contribution: None = None
     require_ready: bool = False
+
+    @field_validator("test_contribution", mode="before")
+    @classmethod
+    def removed_test_contribution(cls, value: object) -> None:
+        if value is not None:
+            raise ValueError(REMOVED_TEST_CONTRIBUTION)
+        return None
 
     @model_validator(mode="after")
     def safe_scopes(self) -> MeasurementSettings:
@@ -106,7 +113,7 @@ class MeasurementSettings(BaseModel):
 
 
 def selected_measurements(selection: Iterable[str] | None) -> frozenset[str]:
-    selected = MEASUREMENT_NAMES - {"test_overlap"} if selection is None else frozenset(selection)
+    selected = MEASUREMENT_NAMES if selection is None else frozenset(selection)
     unknown = selected - MEASUREMENT_NAMES
     if unknown:
         raise ValueError("unsupported measurements: " + ", ".join(sorted(unknown)))
@@ -131,15 +138,6 @@ def capability_plan(
 
         analysis = language_capability(language)
     coverage = coverage_settings(task_dir, settings)
-    contribution = (
-        "test_overlap" in selected
-        and settings.test_contribution is not None
-        and language == "python"
-    )
-    if contribution and "coverage" in selected and coverage is not None:
-        raise ValueError(
-            "pytest test_overlap supplies its own reference coverage; omit the ordinary coverage profile for this repository rather than silently replacing it"
-        )
     result: dict[str, dict[str, object]] = {}
     for name in sorted(selected):
         reason = None
@@ -149,12 +147,8 @@ def capability_plan(
             reason = fallow_reason if is_fallow else analysis.get(name, {}).get("reason")
         elif name == "coverage":
             collector = "coverage"
-            if coverage is None and not contribution:
+            if coverage is None:
                 reason = "Coverage requires an explicit test command, report format/path and tool version"
-        elif name == "test_overlap":
-            collector = "coverage"
-            if settings.test_contribution is None or language != "python":
-                reason = "Test overlap requires per-test execution evidence; configure pytest test_contribution for Python"
         result[name] = {
             "status": "unavailable" if reason else "available",
             "reason": reason,
@@ -363,35 +357,7 @@ def prepare_profiles(
                 timeout_seconds=7200,
             )
         )
-    contribution = (
-        "test_overlap" in selected and capabilities["test_overlap"]["status"] == "available"
-    )
-    if contribution:
-        configured = settings.test_contribution
-        assert configured is not None
-        coverage_config = output / "coverage.json"
-        _json(
-            coverage_config,
-            {
-                "native_task_identity": native_task_identity,
-                "source_scope": source_scope,
-                "test_scope": test_scope,
-                "test_contribution": configured.model_dump(mode="json"),
-                "implementation": observer_identity("pytest-contribution"),
-            },
-        )
-        collectors.append(
-            Collector(
-                kind="coverage",
-                config=coverage_config,
-                scope=source_scope,
-                report_format="pytest-contribution",
-                report_path=".pluginbench-measure/contribution.json",
-                tool_version=f"pytest-{configured.pytest_version}/coverage-{configured.coverage_version}",
-                timeout_seconds=configured.timeout,
-            )
-        )
-    elif "coverage" in selected and capabilities["coverage"]["status"] == "available":
+    if "coverage" in selected and capabilities["coverage"]["status"] == "available":
         coverage = coverage_settings(Path(task_dir), settings)
         assert coverage is not None
         coverage_scope = coverage.source_scope or source_scope
@@ -403,7 +369,7 @@ def prepare_profiles(
                 "source_scope": coverage_scope,
                 "test_scope": test_scope,
                 "coverage": coverage.model_dump(mode="json"),
-                "implementation": observer_identity(coverage.format),
+                "implementation": observer_identity(),
             },
         )
         collectors.append(
@@ -472,10 +438,6 @@ def _metric_readiness(metric: str, first: dict[str, object]) -> tuple[bool, obje
             for unit in ("line", "statement", "branch", "function")
         )
         reason = None if ready else "no complete supported coverage population"
-    elif metric == "test_overlap":
-        contribution = first.get("test_contribution")
-        ready = isinstance(contribution, dict) and contribution.get("status") == "available"
-        reason = None if ready else "no complete passing contribution reference"
     return ready, reason
 
 
