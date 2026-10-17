@@ -17,6 +17,8 @@ from pluginbench.assessment_metrics import (
 )
 from pluginbench.assessment_models import Attempt, Snapshot, Stage
 from pluginbench.collectors import Collector, collect_measurements
+from pluginbench import isolation
+from pluginbench.processes import run_command
 
 
 def _receipt() -> dict[str, object]:
@@ -249,19 +251,17 @@ def test_changed_candidate_files_are_checked_against_the_bound_diff(
         "fixture",
         Snapshot(before, baseline),
         (stage,),
-        None,
-        tmp_path,
         {},
     )
     if declared == ["test/new.test.ts"]:
-        metrics = _stage(attempt, stage, None, tmp_path, {})["metrics"]
+        metrics = _stage(attempt, stage, tmp_path, {})["metrics"]
         assert isinstance(metrics, dict) and isinstance(metrics["coverage"], dict)
         coverage = metrics["coverage"]["metrics"]
         assert isinstance(coverage, dict) and isinstance(coverage["test_contribution"], dict)
         assert coverage["test_contribution"]["candidate_count"] == 2
     else:
         with pytest.raises(ValueError, match="changed-file selection differs"):
-            _stage(attempt, stage, None, tmp_path, {})
+            _stage(attempt, stage, tmp_path, {})
 
 
 @pytest.mark.parametrize(
@@ -309,7 +309,7 @@ def test_incomplete_or_unbound_contribution_is_not_zero(fault: str) -> None:
 
 @pytest.mark.parametrize("mutate_before", [False, True])
 def test_collector_receives_disposable_bound_before_context(
-    tmp_path: Path, mutate_before: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutate_before: bool
 ) -> None:
     before, after = tmp_path / "before", tmp_path / "after"
     for root, text in ((before, "before"), (after, "after")):
@@ -333,6 +333,15 @@ def test_collector_receives_disposable_bound_before_context(
     )
     evidence = tmp_path / "evidence"
     if mutate_before:
+        # Simulate a trusted adapter outside the OS boundary to exercise the
+        # independent post-execution integrity guard; the real boundary denies this write.
+        monkeypatch.setattr(
+            isolation,
+            "run",
+            lambda argv, **kwargs: run_command(
+                argv, **{key: kwargs[key] for key in ("cwd", "env", "timeout")}
+            ),
+        )
         with pytest.raises(ValueError, match="^collector modified its before snapshot$"):
             collect_measurements(after, evidence, [collector], before=before)
         assert (evidence / "coverage/execution.json").is_file()

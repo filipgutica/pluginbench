@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -140,15 +141,24 @@ def _file_changes(patch: str) -> tuple[FileChange, ...]:
     return tuple(changes)
 
 
+TEST_DIRECTORY_NAMES = frozenset(
+    {"test", "tests", "testing", "spec", "specs", "__tests", "__tests__"}
+)
+TEST_FILENAME_PATTERNS = ("test_*", "*.test.*", "*.spec.*", "*_test.py", "*_test.go")
+TEST_PATH_PATTERNS = tuple(
+    pattern
+    for directory in sorted(TEST_DIRECTORY_NAMES)
+    for pattern in (f"{directory}/**", f"**/{directory}/**")
+) + tuple(
+    pattern for filename in TEST_FILENAME_PATTERNS for pattern in (filename, f"**/{filename}")
+)
+
+
 def _is_test_path(path: str) -> bool:
     parts = Path(path).parts
     name = Path(path).name.lower()
-    return (
-        any(part.lower() in {"test", "tests", "testing", "spec", "specs"} for part in parts)
-        or name.startswith("test_")
-        or ".test." in name
-        or ".spec." in name
-        or name.endswith("_test.py")
+    return any(part.lower() in TEST_DIRECTORY_NAMES for part in parts[:-1]) or any(
+        fnmatch.fnmatchcase(name, pattern) for pattern in TEST_FILENAME_PATTERNS
     )
 
 

@@ -1,8 +1,4 @@
-"""Claude Code capabilities and evidence for the shared native runner.
-
-Treatment guidance is prompt text; safe mode preserves native instructions while
-disabling discovered customizations. Managed policy can still apply.
-"""
+"""Claude Code capabilities and evidence for isolated read-only reviews."""
 
 from __future__ import annotations
 
@@ -32,7 +28,6 @@ REQUIRED_FLAGS = (
     "--permission-mode",
     "--permission-prompts",
     "--json-schema",
-    "--dangerously-skip-permissions",
 )
 AUTH_NAMES = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
 READ_TOOLS = "Read,Glob,Grep"
@@ -64,21 +59,12 @@ def preflight() -> dict[str, Any]:
 
 def command(
     *,
-    host: str = "claude",
     model: str,
-    workspace: Path,
-    plugin: Path | None = None,
     effort: str = "medium",
-    read_only: bool = False,
 ) -> list[str]:
-    if host != "claude":
-        raise ValueError(f"unsupported Claude host: {host}")
-    if plugin is not None:
-        raise ValueError("Claude evaluates text guidance, not native plugin execution")
     if effort not in {"low", "medium", "high", "xhigh", "max"}:
         raise ValueError(f"unsupported Claude effort: {effort}")
     # cwd is set by the shared runner, not a prompt or --add-dir discovery surface.
-    tools = READ_TOOLS if read_only else "Bash,Read,Edit,Write,Glob,Grep"
     return [
         "claude",
         "--print",
@@ -96,12 +82,10 @@ def command(
         '{"disableAllHooks":true,"autoMemoryEnabled":false}',
         "--disable-slash-commands",
         "--tools",
-        tools,
-        *(
-            ["--restricted", "--permission-mode", "dontAsk"]
-            if read_only
-            else ["--dangerously-skip-permissions"]
-        ),
+        READ_TOOLS,
+        "--restricted",
+        "--permission-mode",
+        "dontAsk",
         "--permission-prompts",
         "none",
         "--output-format",
@@ -369,10 +353,3 @@ def parse_events(
         "agent_messages": messages,
         "successful_native_completion": result.get("subtype") == "success" and not errors,
     }
-
-
-def invoke(**kwargs: Any) -> dict[str, Any]:
-    """Use the process, timeout, cleanup, and redaction owner shared with Codex."""
-    from . import codex
-
-    return codex.invoke(**kwargs)

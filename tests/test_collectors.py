@@ -1,15 +1,20 @@
-import hashlib
 import json
 import shutil
 import sys
 from pathlib import Path
-from typing import Literal
 
 import pytest
 
 from pluginbench.assessment_metrics import evaluate_evidence, inspect_snapshot
-from pluginbench.collectors import Collector, _execute, collect_measurements, freeze_collectors
-from pluginbench.task_data.deepswe.measurements import ROOT, observer_cache_root
+from pluginbench import isolation
+from pluginbench.collectors import (
+    observer_identity,
+    Collector,
+    _execute,
+    collect_measurements,
+    freeze_collectors,
+)
+from pluginbench.measurement_profiles import prepare_observer
 
 
 def source(root: Path) -> Path:
@@ -25,16 +30,194 @@ def config(root: Path, value: object) -> Path:
     return path
 
 
-def _syntax_command() -> list[str]:
-    name = "oxc-parser-0.126.0"
-    lock_digest = hashlib.sha256((ROOT / "observers" / name / "package-lock.json").read_bytes())
-    cache = observer_cache_root() / name / lock_digest.hexdigest()
-    if not (cache / "node_modules/oxc-parser").is_dir():
-        pytest.skip("pinned Oxc observer cache unavailable")
+@pytest.mark.parametrize(
+    ("operator_owned", "selected"), [(False, True), (True, False), (True, True)]
+)
+def test_only_operator_json_can_grant_selected_read_paths(
+    tmp_path: Path, operator_owned: bool, selected: bool
+) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    secret = tmp_path / "private.txt"
+    secret.write_text("private")
+    settings = (tmp_path if operator_owned else job) / "settings.json"
+    settings.write_text(json.dumps({"asset": str(secret)}))
+    script = job / "probe.py"
+    script.write_text("""import json, sys
+from pathlib import Path
+asset = Path(json.loads(Path(sys.argv[1]).read_text())['asset'])
+try:
+    asset.read_text()
+    allowed = True
+except OSError:
+    allowed = False
+assert allowed == (sys.argv[2] == 'True')
+""")
+    execution = _execute(
+        [sys.executable, str(script), str(settings), str(operator_owned and selected)],
+        job,
+        10,
+        config=settings if selected else None,
+    )
+    assert execution.returncode == 0, execution.stderr
+
+
+def test_frozen_verifier_dependencies_are_read_only_and_exact(tmp_path: Path) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    dependencies = tmp_path / "dependencies"
+    dependencies.mkdir()
+    asset = dependencies / "value.txt"
+    asset.write_text("42")
+    neighbor = tmp_path / "private.txt"
+    neighbor.write_text("private")
+    script = tmp_path / "verifier.py"
+    script.write_text(
+        "import json\nfrom pathlib import Path\n"
+        f"PAYLOAD = { {'dependencies': str(dependencies)}!r}\n"
+        "asset = Path(PAYLOAD['dependencies']) / 'value.txt'\n"
+        "result = {}\n"
+        "try:\n    result['read'] = asset.read_text()\n"
+        "except OSError:\n    result['read'] = None\n"
+        "try:\n    asset.write_text('changed')\n    result['write'] = True\n"
+        "except OSError:\n    result['write'] = False\n"
+        f"try:\n    Path({str(neighbor)!r}).read_text()\n    result['neighbor'] = True\n"
+        "except OSError:\n    result['neighbor'] = False\n"
+        "print(json.dumps(result))\n"
+    )
+    collector = Collector(
+        kind="coverage",
+        config=config(tmp_path, {}),
+        command=[sys.executable, str(script)],
+        tool_version="test",
+    )
+    frozen = freeze_collectors([collector], tmp_path / "frozen")[0]
+    assert frozen.command is not None
+    result = _execute(frozen.command, job, 10, config=frozen.config)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"read": "42", "write": False, "neighbor": False}
+    assert asset.read_text() == "42"
+
+
+@pytest.mark.parametrize("kind", ["python", "json"])
+@pytest.mark.parametrize(
+    "route",
+    [
+        "submitted",
+        "submitted-link",
+        "outside-link",
+        "round-trip",
+        "declared-submitted-link",
+        "declared-round-trip",
+    ],
+)
+def test_submitted_metadata_and_aliases_cannot_grant_reads(
+    tmp_path: Path, kind: str, route: str
+) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    operator = tmp_path / "operator"
+    operator.mkdir()
+    secret = tmp_path / "private.txt"
+    secret.write_text("private")
+    asset = secret
+    if route == "declared-submitted-link":
+        asset = job / "asset-link"
+        asset.symlink_to(secret)
+    elif route == "declared-round-trip":
+        (tmp_path / "bridge").symlink_to(job / "back", target_is_directory=True)
+        (job / "back").symlink_to(tmp_path, target_is_directory=True)
+        asset = tmp_path / "bridge" / secret.name
+    metadata = operator / ("verifier.py" if kind == "python" else "settings.json")
+    if kind == "python":
+        metadata.write_text(
+            "from pathlib import Path\n"
+            f"PAYLOAD = { {'asset': str(asset)}!r}\n"
+            "try:\n    Path(PAYLOAD['asset']).read_text()\n    allowed = True\n"
+            "except OSError:\n    allowed = False\n"
+            "print(allowed)\n"
+        )
+    else:
+        metadata.write_text(json.dumps({"asset": str(asset)}))
+    if route == "submitted":
+        selected = job / metadata.name
+        shutil.copy2(metadata, selected)
+    elif route == "submitted-link":
+        selected = job / metadata.name
+        selected.symlink_to(metadata)
+    elif route == "outside-link":
+        selected = tmp_path / metadata.name
+        selected.symlink_to(metadata)
+    elif route == "round-trip":
+        (tmp_path / "bridge").symlink_to(job / "back", target_is_directory=True)
+        (job / "back").symlink_to(operator, target_is_directory=True)
+        selected = tmp_path / "bridge" / metadata.name
+    else:
+        selected = metadata
+    if kind == "python":
+        argv = [sys.executable, str(selected)]
+        settings = None
+    else:
+        script = job / "probe.py"
+        script.write_text(
+            "import json, sys\nfrom pathlib import Path\n"
+            "asset = Path(json.loads(Path(sys.argv[1]).read_text())['asset'])\n"
+            "try:\n    asset.read_text()\n    allowed = True\n"
+            "except OSError:\n    allowed = False\n"
+            "print(allowed)\n"
+        )
+        argv = [sys.executable, str(script), str(selected)]
+        settings = selected
+    result = _execute(argv, job, 10, config=settings)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False"
+
+
+def test_canonical_preparation_preserves_trusted_alias_reads(tmp_path: Path) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    operator = tmp_path / "operator"
+    operator.mkdir()
+    alias = tmp_path / "trusted-alias"
+    alias.symlink_to(operator, target_is_directory=True)
+    asset = operator / "value.txt"
+    asset.write_text("42")
+    script = operator / "verifier.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        f"PAYLOAD = { {'asset': str((alias / asset.name).resolve())}!r}\n"
+        "print(Path(PAYLOAD['asset']).read_text())\n"
+    )
+    result = _execute([sys.executable, str((alias / script.name).resolve())], job, 10)
+    assert result.returncode == 0 and result.stdout.strip() == "42", result.stderr
+
+
+def test_dynamic_payload_runs_once_without_granting_reads(tmp_path: Path) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    secret = tmp_path / "private.txt"
+    secret.write_text("private")
+    script = tmp_path / "verifier.py"
+    script.write_text(
+        "import json\nfrom pathlib import Path\n"
+        f"PAYLOAD = json.loads({json.dumps({'asset': str(secret)})!r})\n"
+        "with Path('executions.txt').open('a') as log:\n    log.write('executed\\n')\n"
+        "try:\n    Path(PAYLOAD['asset']).read_text()\n    allowed = True\n"
+        "except OSError:\n    allowed = False\n"
+        "print(allowed)\n"
+    )
+    result = _execute([sys.executable, str(script)], job, 10)
+    assert result.returncode == 0 and result.stdout.strip() == "False", result.stderr
+    assert (job / "executions.txt").read_text() == "executed\n"
+
+
+def _syntax_command(cache: Path) -> list[str]:
+    observer = prepare_observer("oxc-parser-0.126.0", cache)
+    prepared = Path(observer["path"]).parent
     return [
         "node",
         str(Path(__file__).parents[1] / "src/pluginbench/fallow_parse.mjs"),
-        str(cache),
+        str(prepared),
         "{snapshot}",
         "{inputs}",
         "{output}",
@@ -74,7 +257,7 @@ def test_collector_scripts_and_configs_are_frozen(tmp_path: Path) -> None:
     script = tmp_path / "script.py"
     script.write_text("original")
     collector = Collector(
-        kind="mutation",
+        kind="coverage",
         config=config(tmp_path, {}),
         command=[sys.executable, str(script)],
         tool_version="test",
@@ -100,7 +283,7 @@ def test_python_collector_import_does_not_mutate_frozen_scripts(tmp_path: Path) 
         "print(module.value)\n"
     )
     collector = Collector(
-        kind="mutation",
+        kind="coverage",
         config=config(tmp_path, {}),
         command=[sys.executable, str(script), str(helper)],
         tool_version="test",
@@ -123,38 +306,6 @@ def test_python_collector_import_does_not_mutate_frozen_scripts(tmp_path: Path) 
     assert after == before
 
 
-@pytest.mark.skipif(shutil.which("node") is None, reason="Node unavailable")
-def test_node_coverage_keeps_unimported_source_unknown(tmp_path: Path) -> None:
-    snapshot = source(tmp_path)
-    (snapshot / "src/unloaded.ts").write_text("export const neverLoaded = () => false;\n")
-    (snapshot / "package.json").write_text('{"type":"module"}')
-    (snapshot / "test").mkdir()
-    (snapshot / "test/value.test.ts").write_text(
-        "import {test} from 'node:test';\nimport {strict as assert} from 'node:assert';\nimport {value} from '../src/used.ts';\ntest('value', () => assert.equal(value(), 42));\n"
-    )
-    collector = Collector(
-        kind="coverage", config=config(tmp_path, {"test_globs": ["test/*.test.ts"]})
-    )
-    result = collect_measurements(snapshot, tmp_path / "evidence", [collector])
-    assert "coverage" in result, (
-        (tmp_path / "evidence/coverage/failure.json").read_text() if not result else ""
-    )
-    evidence = evaluate_evidence(
-        snapshot,
-        {"coverage": str(result["coverage"])},
-        {"coverage": {"min_function_percent": 90}},
-        tmp_path,
-    )
-    coverage = evidence["coverage"]
-    assert isinstance(coverage, dict)
-    assert coverage["unknown_standards"] == ["min_function_percent"]
-    metrics = coverage["metrics"]
-    assert isinstance(metrics, dict)
-    assert metrics["function_percent"] == 100
-    assert metrics["unmeasured_source_files"] == ["src/unloaded.ts"]
-    assert metrics["population_complete_for_declared_scope"] is False
-
-
 @pytest.mark.skipif(shutil.which("fallow") is None, reason="Fallow unavailable")
 @pytest.mark.parametrize("with_syntax", [False, True])
 def test_fallow_calibration_counts_planted_dead_code_and_type_only_files(
@@ -162,12 +313,16 @@ def test_fallow_calibration_counts_planted_dead_code_and_type_only_files(
 ) -> None:
     snapshot = source(tmp_path)
     (snapshot / "src/types.ts").write_text("export interface Value { value: number }\n")
+    (snapshot / "vitest.config.ts").write_text("export const development = () => 1;\n")
+    (snapshot / ".prettierrc.js").write_text("module.exports = {};\n")
+    (snapshot / "src/app.config.ts").write_text("export const runtime = () => 0;\n")
     (snapshot / "src/used.ts").write_text(
-        "import type {Value} from './types';\nexport const value = (): Value => ({value: 42});\nconst unused = () => 9;\n"
+        "import type {Value} from './types';\nimport {runtime} from './app.config';\nexport const value = (): Value => ({value: 42 + runtime()});\nconst unused = () => 9;\n"
     )
     collector = Collector(
         kind="fallow",
-        syntax_command=_syntax_command() if with_syntax else None,
+        scope=["*"],
+        syntax_command=_syntax_command(tmp_path / "parser-cache") if with_syntax else None,
         config=config(
             tmp_path,
             {
@@ -179,18 +334,19 @@ def test_fallow_calibration_counts_planted_dead_code_and_type_only_files(
     )
     result = collect_measurements(snapshot, tmp_path / "evidence", [collector])
     assert "fallow" in result
-    evidence = evaluate_evidence(snapshot, {"fallow": str(result["fallow"])}, {}, tmp_path)
+    evidence = evaluate_evidence(snapshot, {"fallow": str(result["fallow"])}, tmp_path)
     fallow = evidence["fallow"]
     assert isinstance(fallow, dict)
     metrics = fallow["metrics"]
     assert isinstance(metrics, dict)
     assert metrics["complexity_complete_for_declared_scope"] is with_syntax
     assert metrics["dead_code_complete_for_declared_scope"] is with_syntax
+    assert "src/app.config.ts" in {row["path"] for row in metrics["functions"]}
     # Fallow counts unused exports/files, not arbitrary unexported local variables.
     assert metrics["dead_code"] == 0
     (snapshot / "src/dead.ts").write_text("export const unused = () => 9;\n")
     result = collect_measurements(snapshot, tmp_path / "dead-evidence", [collector])
-    evidence = evaluate_evidence(snapshot, {"fallow": str(result["fallow"])}, {}, tmp_path)
+    evidence = evaluate_evidence(snapshot, {"fallow": str(result["fallow"])}, tmp_path)
     fallow = evidence["fallow"]
     assert isinstance(fallow, dict) and isinstance(fallow["metrics"], dict)
     assert fallow["metrics"]["dead_code"] > 0
@@ -207,7 +363,7 @@ def test_fallow_zero_entry_graph_does_not_prove_clean_scope(tmp_path: Path) -> N
         ),
     )
     result = collect_measurements(snapshot, tmp_path / "evidence", [collector])
-    evidence = evaluate_evidence(snapshot, {"fallow": str(result["fallow"])}, {}, tmp_path)
+    evidence = evaluate_evidence(snapshot, {"fallow": str(result["fallow"])}, tmp_path)
     fallow = evidence["fallow"]
     assert isinstance(fallow, dict) and isinstance(fallow["metrics"], dict)
     assert fallow["metrics"]["dead_code_complete_for_declared_scope"] is False
@@ -224,7 +380,7 @@ def test_same_line_anonymous_functions_have_distinct_column_identities(
     )
     collector = Collector(
         kind="fallow",
-        syntax_command=_syntax_command() if with_syntax else None,
+        syntax_command=_syntax_command(tmp_path / "parser-cache") if with_syntax else None,
         config=config(
             tmp_path,
             {
@@ -235,22 +391,19 @@ def test_same_line_anonymous_functions_have_distinct_column_identities(
         ),
     )
     result = collect_measurements(snapshot, tmp_path / "evidence", [collector])
-    evidence = evaluate_evidence(snapshot, {"fallow": str(result["fallow"])}, {}, tmp_path)
+    evidence = evaluate_evidence(snapshot, {"fallow": str(result["fallow"])}, tmp_path)
     fallow = evidence["fallow"]
     assert isinstance(fallow, dict) and isinstance(fallow["metrics"], dict)
     assert fallow["metrics"]["function_count_reported"] == 3
     assert fallow["metrics"]["complexity_complete_for_declared_scope"] is with_syntax
 
 
-@pytest.mark.parametrize("kind", ["coverage", "mutation"])
-def test_syntax_command_is_only_for_fallow(
-    tmp_path: Path, kind: Literal["coverage", "mutation"]
-) -> None:
+def test_syntax_command_is_only_for_fallow(tmp_path: Path) -> None:
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError, match="optional Fallow parser"):
         Collector(
-            kind=kind,
+            kind="coverage",
             config=config(tmp_path, {}),
             command=["tool"],
             tool_version="1",
@@ -278,7 +431,14 @@ def test_fallow_syntax_validator_is_frozen_and_keeps_builtin_producer(
     assert Path(frozen.syntax_command[1]).read_text() == "original validator"
     calls = []
 
-    def execute(argv: list[str], root: Path, timeout: int) -> subprocess.CompletedProcess[str]:
+    def execute(
+        argv: list[str],
+        root: Path,
+        timeout: int,
+        *,
+        output: Path | None = None,
+        config: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
         if argv[0] == "node":
             assert json.loads(Path(argv[-2]).read_text()) == {
@@ -327,7 +487,7 @@ def test_pinned_oxc_observer_reports_parse_and_utf8_errors(
             arg.replace("{snapshot}", str(snapshot))
             .replace("{inputs}", str(inputs))
             .replace("{output}", str(output))
-            for arg in _syntax_command()
+            for arg in _syntax_command(tmp_path / "parser-cache")
         ],
         tmp_path,
         30,
@@ -341,7 +501,24 @@ def test_pinned_oxc_observer_reports_parse_and_utf8_errors(
 
 
 @pytest.mark.parametrize("target", ["snapshot", "before"])
-def test_nonzero_collector_source_mutation_is_fatal(tmp_path: Path, target: str) -> None:
+def test_nonzero_collector_source_mutation_is_fatal(
+    tmp_path: Path,
+    target: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pluginbench.processes import run_command
+
+    # Keep integrity validation independent of the new OS prevention boundary.
+    monkeypatch.setattr(
+        isolation,
+        "run",
+        lambda argv, **kw: run_command(
+            argv,
+            cwd=kw["cwd"],
+            env=kw["env"],
+            timeout=kw["timeout"],
+        ),
+    )
     snapshot = source(tmp_path)
     before = tmp_path / "before"
     shutil.copytree(snapshot, before)
@@ -380,7 +557,22 @@ def test_successful_invalid_collector_report_is_fatal(tmp_path: Path) -> None:
         collect_measurements(snapshot, tmp_path / "evidence", [collector])
 
 
-def test_nonzero_collector_profile_mutation_is_fatal(tmp_path: Path) -> None:
+def test_nonzero_collector_profile_mutation_is_fatal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pluginbench.processes import run_command
+
+    monkeypatch.setattr(
+        isolation,
+        "run",
+        lambda argv, **kw: run_command(
+            argv,
+            cwd=kw["cwd"],
+            env=kw["env"],
+            timeout=kw["timeout"],
+        ),
+    )
     snapshot = source(tmp_path)
     cfg = config(tmp_path, {})
     collector = Collector(
@@ -410,7 +602,14 @@ def test_timeout_preserves_bound_execution_diagnostics(
         kind="coverage", config=config(tmp_path, {}), command=["coverage-tool"], tool_version="test"
     )
 
-    def timeout(argv: list[str], root: Path, seconds: int) -> subprocess.CompletedProcess[str]:
+    def timeout(
+        argv: list[str],
+        root: Path,
+        seconds: int,
+        *,
+        output: Path | None = None,
+        config: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         raise subprocess.TimeoutExpired(
             argv, seconds, output="partial output", stderr="native error"
         )
@@ -477,7 +676,14 @@ def test_trusted_adapter_outer_timeout_is_unclassified_and_fatal(
         failure_protocol="coverage-exit-v1",
     )
 
-    def timeout(argv: list[str], root: Path, seconds: int) -> subprocess.CompletedProcess[str]:
+    def timeout(
+        argv: list[str],
+        root: Path,
+        seconds: int,
+        *,
+        output: Path | None = None,
+        config: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         raise subprocess.TimeoutExpired(argv, seconds)
 
     monkeypatch.setattr(collectors, "_execute", timeout)
@@ -486,24 +692,116 @@ def test_trusted_adapter_outer_timeout_is_unclassified_and_fatal(
     assert not (tmp_path / "evidence/coverage/failure.json").exists()
 
 
-def test_prepared_coverage_profile_declares_and_freezes_failure_contract(tmp_path: Path) -> None:
-    from pluginbench.task_data.deepswe import measurements
-    from pluginbench.remeasure import load_profiles
-    from test_real_coding_measurements import prepared_task
+@pytest.mark.parametrize("outcome", ["complete", "line-only", "failed", "malformed"])
+def test_native_lcov_dispatch_preserves_runtime_unknown_and_integrity_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    from pluginbench import harbor_backend
 
-    prepared = tmp_path / "prepared"
-    task = "ofetch-per-origin-circuit-breaker"
-    verifier, payload = prepared_task(measurements, prepared, task)
-    collectors = measurements.prepare_measurements(
-        prepared=prepared,
-        task=task,
-        payload={key: value for key, value in payload.items()},
-        verifier=verifier,
-        selection=["coverage"],
-        observer_cache=tmp_path / "cache",
+    snapshot = source(tmp_path)
+    identity: dict[str, object] = {"task_dir": str(tmp_path / "native"), "workdir": "/app"}
+    collector = Collector(
+        kind="coverage",
+        config=config(
+            tmp_path,
+            {
+                "native_task_identity": identity,
+                "test_scope": ["test/**"],
+                "implementation": observer_identity("lcov"),
+            },
+        ),
+        scope=["src/**"],
+        command=["npm", "test"],
+        report_format="lcov",
+        report_path="coverage/lcov.info",
+        tool_version="coverage-tool 1",
     )
-    assert collectors[0].failure_protocol == "coverage-exit-v1"
-    assert load_profiles(prepared / "measurements.json")[task] == collectors
-    assert (
-        freeze_collectors(collectors, tmp_path / "frozen")[0].failure_protocol == "coverage-exit-v1"
+    original = inspect_snapshot(snapshot)
+
+    def execute(
+        *,
+        snapshot: Path,
+        task_identity: dict[str, object],
+        destination: Path,
+        command: list[str],
+        report_path: str,
+        timeout: int,
+    ) -> dict[str, object]:
+        assert task_identity == identity and command == ["npm", "test"]
+        assert report_path == "coverage/lcov.info"
+        assert snapshot != tmp_path / "source"  # The archive is never the execution directory.
+        report = "SF:/app/src/used.ts\nFN:1,value\nFNDA:1,value\nFNF:1\nFNH:1\nBRF:0\nBRH:0\nend_of_record\n"
+        if outcome == "line-only":
+            report = "SF:/app/src/used.ts\nDA:1,1\nend_of_record\n"
+        elif outcome == "malformed":
+            report = report.replace("FNF:1", "FNF:2")
+        receipt: dict[str, object] = {
+            "exit_code": 1 if outcome == "failed" else 0,
+            "timed_out": False,
+            "report_collected": outcome != "failed",
+        }
+        (destination / "execution.json").write_text(json.dumps(receipt))
+        if outcome != "failed":
+            (destination / "report.raw").write_text(report)
+        return receipt
+
+    monkeypatch.setattr(harbor_backend, "run_native_command", execute)
+    evidence = tmp_path / "evidence"
+    if outcome == "malformed":
+        with pytest.raises(ValueError, match="summaries disagree"):
+            collect_measurements(snapshot, evidence, [collector])
+    else:
+        result = collect_measurements(snapshot, evidence, [collector])
+        if outcome in {"complete", "line-only"}:
+            metrics = evaluate_evidence(snapshot, {"coverage": str(result["coverage"])}, evidence)
+            coverage = metrics["coverage"]
+            assert isinstance(coverage, dict)
+            if outcome == "complete":
+                assert coverage["metrics"]["function_total"] == 1
+            else:
+                assert coverage["metrics"]["line_total"] == 1
+                assert coverage["metrics"]["function_total"] is None
+                assert coverage["metrics"]["branch_total"] is None
+        else:
+            assert result == {}
+            failure = json.loads((evidence / "coverage/failure.json").read_text())
+            assert failure["status"] == "unavailable"
+    assert inspect_snapshot(snapshot) == original
+
+
+def test_native_coverage_command_arguments_are_not_host_script_inputs(tmp_path: Path) -> None:
+    script = tmp_path / "project-script.py"
+    script.write_text("print('project test')\n")
+    collector = Collector(
+        kind="coverage",
+        config=config(tmp_path, {}),
+        command=["python", str(script)],
+        report_format="lcov",
+        report_path="coverage.info",
+        tool_version="1",
     )
+    frozen = freeze_collectors([collector], tmp_path / "frozen")[0]
+    assert frozen.command == collector.command
+    assert list((tmp_path / "frozen/0").iterdir()) == [tmp_path / "frozen/0/config.json"]
+
+
+def test_native_observer_drift_is_rejected_before_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pluginbench import collectors
+
+    snapshot = source(tmp_path)
+    collector = Collector(
+        kind="coverage",
+        config=config(tmp_path, {"implementation": {"coverage_report.py": "old"}}),
+        command=["pytest"],
+        report_format="lcov",
+        report_path="coverage/lcov.info",
+        tool_version="1",
+    )
+    monkeypatch.setattr(
+        collectors, "_collect", lambda *args: pytest.fail("must not execute a changed observer")
+    )
+    with pytest.raises(ValueError, match="implementation differs"):
+        collect_measurements(snapshot, tmp_path / "evidence", [collector])
+    assert inspect_snapshot(snapshot)["source_lines"] == 1

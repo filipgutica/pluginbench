@@ -142,14 +142,23 @@ def test_snapshot_diff_counts_source_tests_dependencies_and_binary(tmp_path: Pat
     _write(after / "tests/a.test.ts", "test();\n")
     _write(after / "package.json", "{}\n")
     (after / "asset.bin").write_bytes(b"\x00\xff")
+    (after / "tests/fixture.zip").write_bytes(b"PK\x00\xff")
     fingerprints = inspect_snapshot(before), inspect_snapshot(after)
     result = compare_snapshots(before, after)
-    assert result["files_changed"] == 4
+    assert result["files_changed"] == 5
     assert result["source_lines_added"] == 2
     assert result["source_lines_removed"] == 1
     assert result["test_lines_added"] == 1
     assert result["dependency_manifest_changes"] == ["package.json"]
     assert result["binary_patch"] is True
+    scoped = assessment_metrics.scoped_test_size(
+        before=before, after=after, scope=["*"], change=result
+    )
+    assert scoped["test_lines_added"] == 1
+    assert scoped["after_paths"] == ["tests/a.test.ts"]
+    files = inspect_snapshot(after)["files"]
+    assert isinstance(files, dict)
+    assert "tests/fixture.zip" in files
     assert (inspect_snapshot(before), inspect_snapshot(after)) == fingerprints
 
 
@@ -261,17 +270,24 @@ def test_scoped_code_size_refuses_absent_or_escaping_scope(
         )
 
 
-def test_scoped_code_size_refuses_non_text_source_instead_of_counting_zero(tmp_path: Path) -> None:
+@pytest.mark.parametrize("test_source", [False, True])
+def test_scoped_code_size_refuses_non_text_source_instead_of_counting_zero(
+    tmp_path: Path, test_source: bool
+) -> None:
     before, after = tmp_path / "before", tmp_path / "after"
     before.mkdir()
-    _write(after / "src/index.ts", "temporary\n")
-    (after / "src/index.ts").write_bytes(b"\xff")
+    path = "tests/index.py" if test_source else "src/index.ts"
+    _write(after / path, "temporary\n")
+    (after / path).write_bytes(b"\xff")
     change = compare_snapshots(before, after)
     assert inspect_snapshot(after)["source_lines"] == 0
     with pytest.raises(ValueError, match="UTF-8"):
-        assessment_metrics.scoped_code_size(
-            before=before, after=after, scope=["src/**"], change=change
+        measure = (
+            assessment_metrics.scoped_test_size
+            if test_source
+            else assessment_metrics.scoped_code_size
         )
+        measure(before=before, after=after, scope=["*"], change=change)
 
 
 def test_scoped_code_size_rejects_mutation_after_reading(
@@ -303,43 +319,21 @@ def test_scoped_code_size_rejects_mutation_after_reading(
 
 def test_absent_evidence_is_unknown_not_zero(tmp_path: Path) -> None:
     _write(tmp_path / "index.ts", "x\n")
-    result = _metric(
-        evaluate_evidence(tmp_path, None, {"fallow": {"max_dead_code": 0}}, tmp_path), "fallow"
-    )
+    result = _metric(evaluate_evidence(tmp_path, None, tmp_path), "fallow")
     assert result["status"] == "unavailable"
     assert result["metrics"] is None
-    assert result["unknown_standards"] == ["max_dead_code"]
 
 
-@pytest.mark.parametrize("threshold", [-1, True, float("nan"), 1.2])
-def test_invalid_threshold_rejected_even_without_evidence(
-    tmp_path: Path, threshold: object
-) -> None:
-    with pytest.raises(ValueError):
-        evaluate_evidence(tmp_path, None, {"fallow": {"max_dead_code": threshold}}, tmp_path)
-
-
-def test_fallow_observed_violations_not_artificial_collection_thresholds(tmp_path: Path) -> None:
+def test_fallow_import_retains_raw_complexity_and_unknown_boundaries(tmp_path: Path) -> None:
     snapshot, receipt = _receipt(tmp_path, "fallow", _fallow())
     result = _metric(
         evaluate_evidence(
             snapshot,
             {"fallow": str(receipt)},
-            {
-                "fallow": {
-                    "max_cognitive": 15,
-                    "max_cyclomatic": 20,
-                    "max_dead_code": 0,
-                    "max_clone_groups": 0,
-                    "max_boundary_violations": 0,
-                }
-            },
             tmp_path,
         ),
         "fallow",
     )
-    assert result["violations"] == ["max_cognitive", "max_dead_code", "max_clone_groups"]
-    assert result["unknown_standards"] == ["max_cyclomatic", "max_boundary_violations"]
     metrics = result["metrics"]
     assert isinstance(metrics, dict)
     assert metrics["boundary_violations"] is None
@@ -350,7 +344,7 @@ def test_fallow_observed_violations_not_artificial_collection_thresholds(tmp_pat
     }
 
 
-def test_unresolved_graph_prevents_clean_dead_code_pass(tmp_path: Path) -> None:
+def test_unresolved_graph_keeps_dead_code_population_incomplete(tmp_path: Path) -> None:
     report = _fallow()
     check = report["check"]
     assert isinstance(check, dict)
@@ -358,13 +352,11 @@ def test_unresolved_graph_prevents_clean_dead_code_pass(tmp_path: Path) -> None:
     check["unresolved_imports"] = [{"path": "src/index.ts"}]
     snapshot, receipt = _receipt(tmp_path, "fallow", report)
     result = _metric(
-        evaluate_evidence(
-            snapshot, {"fallow": str(receipt)}, {"fallow": {"max_dead_code": 0}}, tmp_path
-        ),
+        evaluate_evidence(snapshot, {"fallow": str(receipt)}, tmp_path),
         "fallow",
     )
-    assert result["violations"] == []
-    assert result["unknown_standards"] == ["max_dead_code"]
+    assert _metric(result, "metrics")["unresolved_imports"] == 1
+    assert not _metric(result, "metrics")["dead_code_complete_for_declared_scope"]
 
 
 @pytest.mark.parametrize("tamper", ["source", "report", "config", "version"])
@@ -379,7 +371,7 @@ def test_tampered_evidence_rejected(tmp_path: Path, tamper: str) -> None:
     else:
         (tmp_path / f"{tamper}.json").write_text("{}")
     with pytest.raises(ValueError, match="bind|digest|version"):
-        evaluate_evidence(snapshot, {"fallow": str(receipt)}, {}, tmp_path)
+        evaluate_evidence(snapshot, {"fallow": str(receipt)}, tmp_path)
 
 
 def test_coverage_fixed_denominator_and_zero_unique_proxy(tmp_path: Path) -> None:
@@ -397,12 +389,9 @@ def test_coverage_fixed_denominator_and_zero_unique_proxy(tmp_path: Path) -> Non
     }
     snapshot, receipt = _receipt(tmp_path, "coverage", report)
     result = _metric(
-        evaluate_evidence(
-            snapshot, {"coverage": str(receipt)}, {"coverage": {"min_branch_percent": 80}}, tmp_path
-        ),
+        evaluate_evidence(snapshot, {"coverage": str(receipt)}, tmp_path),
         "coverage",
     )
-    assert result["violations"] == ["min_branch_percent"]
     metrics = result["metrics"]
     assert isinstance(metrics, dict)
     assert metrics["branch_percent"] == pytest.approx(200 / 3)
@@ -423,7 +412,7 @@ def test_coverage_rejects_denominator_or_source_scope_escape(
         report["branches"] = {"total": [bad_coordinate], "covered": []}
     snapshot, receipt = _receipt(tmp_path, "coverage", report)
     with pytest.raises(ValueError, match="denominator|scope"):
-        evaluate_evidence(snapshot, {"coverage": str(receipt)}, {}, tmp_path)
+        evaluate_evidence(snapshot, {"coverage": str(receipt)}, tmp_path)
 
 
 def test_empty_coverage_denominator_is_incomplete(tmp_path: Path) -> None:
@@ -432,44 +421,12 @@ def test_empty_coverage_denominator_is_incomplete(tmp_path: Path) -> None:
     }
     snapshot, receipt = _receipt(tmp_path, "coverage", report)
     result = _metric(
-        evaluate_evidence(
-            snapshot, {"coverage": str(receipt)}, {"coverage": {"min_branch_percent": 80}}, tmp_path
-        ),
+        evaluate_evidence(snapshot, {"coverage": str(receipt)}, tmp_path),
         "coverage",
     )
-    assert result["unknown_standards"] == ["min_branch_percent"]
     metrics = result["metrics"]
     assert isinstance(metrics, dict)
     assert metrics["per_test_count"] is None
-
-
-def test_mutation_counts_invalid_and_timeout_with_fixed_mutant_set(tmp_path: Path) -> None:
-    report: dict[str, object] = {
-        "mutants": {
-            key: {"path": "src/index.ts", "status": status}
-            for key, status in {
-                "m1": "killed",
-                "m2": "timeout",
-                "m3": "survived",
-                "m4": "compile_error",
-            }.items()
-        },
-        "per_test": {"one": ["m1"], "duplicate": ["m1"]},
-    }
-    snapshot, receipt = _receipt(tmp_path, "mutation", report)
-    result = _metric(
-        evaluate_evidence(
-            snapshot, {"mutation": str(receipt)}, {"mutation": {"min_score_percent": 70}}, tmp_path
-        ),
-        "mutation",
-    )
-    assert result["violations"] == ["min_score_percent"]
-    metrics = result["metrics"]
-    assert isinstance(metrics, dict)
-    assert metrics["score_percent"] == pytest.approx(200 / 3)
-    assert metrics["invalid"] == 1
-    assert metrics["per_test_count"] == 2
-    assert metrics["zero_unique_mutant_kill_tests"] == ["duplicate", "one"]
 
 
 def test_binding_rejects_unfrozen_extends(tmp_path: Path) -> None:
@@ -518,20 +475,14 @@ def test_fallow_completeness_covers_every_scoped_source_language(
         evaluate_evidence(
             snapshot,
             {"fallow": str(receipt)},
-            {"fallow": {"max_cognitive": 20, "max_clone_groups": 0}},
             tmp_path,
         ),
         "fallow",
     )
-    assert result["violations"] == []
-    if unmeasured_file is None:
-        assert result["unknown_standards"] == []
-        assert result["status"] == "available"
-    else:
-        unknown = result["unknown_standards"]
-        assert isinstance(unknown, list)
-        assert set(unknown) == {"max_cognitive", "max_clone_groups"}
-        assert result["status"] == "incomplete"
+    metrics = result["metrics"]
+    assert isinstance(metrics, dict)
+    assert metrics["complexity_complete_for_declared_scope"] is (unmeasured_file is None)
+    assert metrics["clone_groups_complete_for_declared_scope"] is (unmeasured_file is None)
 
 
 def test_duplicate_function_identity_does_not_claim_complete_complexity(tmp_path: Path) -> None:
@@ -544,15 +495,13 @@ def test_duplicate_function_identity_does_not_claim_complete_complexity(tmp_path
     health["summary"] = {"files_analyzed": 1, "files_scored": 1, "functions_analyzed": 2}
     snapshot, receipt = _receipt(tmp_path, "fallow", report)
     result = _metric(
-        evaluate_evidence(
-            snapshot, {"fallow": str(receipt)}, {"fallow": {"max_cognitive": 20}}, tmp_path
-        ),
+        evaluate_evidence(snapshot, {"fallow": str(receipt)}, tmp_path),
         "fallow",
     )
-    assert result["unknown_standards"] == ["max_cognitive"]
+    assert not _metric(result, "metrics")["complexity_complete_for_declared_scope"]
 
 
-@pytest.mark.parametrize("kind", ["coverage", "mutation", "fallow"])
+@pytest.mark.parametrize("kind", ["coverage", "fallow"])
 def test_metric_delta_rejects_changed_collection_provenance(tmp_path: Path, kind: str) -> None:
     left: dict[str, object] = {
         kind: {
@@ -581,9 +530,7 @@ def test_metric_delta_rejects_changed_collection_provenance(tmp_path: Path, kind
     assert result["deltas"] is None
 
 
-@pytest.mark.parametrize(
-    "kind,key", [("coverage", "branch_denominator_digest"), ("mutation", "mutant_set_digest")]
-)
+@pytest.mark.parametrize("kind,key", [("coverage", "branch_denominator_digest")])
 def test_metric_delta_rejects_changed_denominator(kind: str, key: str) -> None:
     provenance = {
         "tool": "tool",
@@ -623,72 +570,11 @@ def test_boundary_declaration_without_configured_rules_stays_incomplete(tmp_path
     envelope["boundary_rules_declared"] = True
     receipt.write_text(json.dumps(envelope))
     result = _metric(
-        evaluate_evidence(
-            snapshot, {"fallow": str(receipt)}, {"fallow": {"max_boundary_violations": 0}}, tmp_path
-        ),
+        evaluate_evidence(snapshot, {"fallow": str(receipt)}, tmp_path),
         "fallow",
     )
-    assert result["unknown_standards"] == ["max_boundary_violations"]
-    assert result["violations"] == []
-
-
-@pytest.mark.parametrize("change", ["invalid_denominator", "source_identity", "genuine_detection"])
-def test_mutation_score_comparison_requires_stable_eligible_mutants_and_source(
-    tmp_path: Path, change: str
-) -> None:
-    before_mutants = {
-        "m1": {"path": "src/index.ts", "status": "killed"},
-        "m2": {"path": "src/index.ts", "status": "survived"},
-        "m3": {"path": "src/index.ts", "status": "survived"},
-    }
-    after_mutants = {key: dict(row) for key, row in before_mutants.items()}
-    if change == "invalid_denominator":
-        after_mutants["m2"]["status"] = "compile_error"
-        after_mutants["m3"]["status"] = "runtime_error"
-    elif change == "source_identity":
-        after_mutants["m2"]["path"] = "src/other.ts"
-    else:
-        after_mutants["m2"]["status"] = "killed"
-
-    measurements: list[dict[str, object]] = []
-    for name, mutants in (("before", before_mutants), ("after", after_mutants)):
-        directory = tmp_path / name
-        directory.mkdir()
-        snapshot, receipt = _receipt(directory, "mutation", {"mutants": mutants})
-        _write(snapshot / "src/other.ts", "export const other = 2;\n")
-        receipt.write_text(
-            json.dumps(
-                bind_evidence(
-                    EvidenceBinding(
-                        snapshot,
-                        directory / "report.json",
-                        directory / "config.json",
-                        "mutation",
-                        "3.18.0",
-                        ("src/**",),
-                    )
-                )
-            )
-        )
-        measurements.append(evaluate_evidence(snapshot, {"mutation": str(receipt)}, {}, directory))
-
-    result = _metric(compare_evidence(measurements[0], measurements[1]), "mutation")
-    if change == "genuine_detection":
-        assert result["status"] == "available"
-        deltas = result["deltas"]
-        assert isinstance(deltas, dict)
-        assert deltas["score_percent"] == pytest.approx(100 / 3)
-    else:
-        assert result["status"] == "incomplete"
-        assert result["deltas"] is None
-    if change == "invalid_denominator":
-        before = _metric(measurements[0], "mutation")["metrics"]
-        after = _metric(measurements[1], "mutation")["metrics"]
-        assert isinstance(before, dict) and isinstance(after, dict)
-        assert before["score_percent"] == pytest.approx(100 / 3)
-        assert after["score_percent"] == 100
-        assert before["detected"] == after["detected"] == 1
-        assert after["invalid"] == 2
+    assert _metric(result, "metrics")["boundary_rules_declared"] is False
+    assert _metric(result, "metrics")["boundary_violations"] is None
 
 
 @pytest.mark.parametrize("population", ["unsupported_production", "unsupported_test", "empty"])
@@ -737,41 +623,28 @@ def test_fallow_clean_counts_cannot_pass_unsupported_or_empty_analysis_scope(
         evaluate_evidence(
             snapshot,
             {"fallow": str(receipt)},
-            {
-                "fallow": {
-                    "max_dead_code": 0,
-                    "max_clone_groups": 0,
-                    "max_cycles": 0,
-                    "max_cognitive": 15,
-                }
-            },
             tmp_path,
         ),
         "fallow",
     )
-    assert result["status"] == "incomplete"
-    assert result["violations"] == []
-    assert result["unknown_standards"] == [
-        "max_dead_code",
-        "max_clone_groups",
-        "max_cycles",
-        "max_cognitive",
-    ]
+    assert result["status"] == "available"
     metrics = result["metrics"]
     assert isinstance(metrics, dict)
     assert metrics["dead_code"] == metrics["clone_groups"] == metrics["cycles"] == 0
 
 
-@pytest.mark.parametrize("discovered_files,expected", [(2, "incomplete"), (3, "available")])
-def test_fallow_clone_scope_checks_its_own_file_population_including_tests(
-    tmp_path: Path, discovered_files: int, expected: str
+@pytest.mark.parametrize("discovered_files", [2, 3])
+def test_fallow_clone_scope_checks_its_own_production_population(
+    tmp_path: Path, discovered_files: int
 ) -> None:
     snapshot, receipt = _receipt(tmp_path, "fallow", _fallow())
     _write(snapshot / "src/helper.ts", "export const helper = 1;\n")
+    _write(snapshot / "src/app.config.ts", "export const app = 1;\n")
     _write(snapshot / "test/index.test.ts", "test();\n")
     report = _fallow()
     report["dupes"] = {"clone_groups": [], "stats": {"total_files": 2, "clone_groups": 0}}
-    # Two streams qualify, but all three inputs must be discovered and parsed.
+    # All three production inputs must be discovered; native production excludes tests.
+    # The nested app.config.ts remains production code, unlike a root tool config.
     report["health"] = {
         "findings": [],
         "summary": {
@@ -784,7 +657,7 @@ def test_fallow_clone_scope_checks_its_own_file_population_including_tests(
         report,
         snapshot,
         tmp_path / "config.json",
-        ["src/helper.ts", "src/index.ts", "test/index.test.ts"][:discovered_files],
+        ["src/helper.ts", "src/index.ts", "src/app.config.ts"][:discovered_files],
     )
     raw = tmp_path / "report.json"
     raw.write_text(json.dumps(report))
@@ -806,17 +679,10 @@ def test_fallow_clone_scope_checks_its_own_file_population_including_tests(
         evaluate_evidence(
             snapshot,
             {"fallow": str(receipt)},
-            {
-                "fallow": {
-                    "max_clone_groups": 0,
-                }
-            },
             tmp_path,
         ),
         "fallow",
     )
-    assert result["status"] == expected
-    assert result["unknown_standards"] == (["max_clone_groups"] if discovered_files == 2 else [])
     metrics = result["metrics"]
     assert isinstance(metrics, dict)
     assert metrics["complexity_complete_for_declared_scope"] is (discovered_files == 3)
@@ -834,18 +700,12 @@ def test_fallow_zero_graph_findings_do_not_invent_scanned_graph_population(tmp_p
         evaluate_evidence(
             snapshot,
             {"fallow": str(receipt)},
-            {
-                "fallow": {
-                    "max_dead_code": 0,
-                    "max_cycles": 0,
-                }
-            },
             tmp_path,
         ),
         "fallow",
     )
-    assert result["unknown_standards"] == ["max_dead_code", "max_cycles"]
-    assert result["violations"] == []
+    assert not _metric(result, "metrics")["dead_code_complete_for_declared_scope"]
+    assert not _metric(result, "metrics")["cycles_complete_for_declared_scope"]
 
 
 def _bound_fallow(
@@ -888,7 +748,7 @@ def _bound_fallow(
             )
         ),
     )
-    return snapshot, evaluate_evidence(snapshot, {"fallow": "evidence.json"}, {}, directory)
+    return snapshot, evaluate_evidence(snapshot, {"fallow": "evidence.json"}, directory)
 
 
 def _function(
@@ -1186,7 +1046,7 @@ def test_clone_eligibility_is_not_input_population_and_requires_complete_receipt
         report["dupes"] = {"clone_groups": [], "stats": {"total_files": 3, "clone_groups": 0}}
     receipt = _rebind_fallow(tmp_path, snapshot, report)
     metrics = _metric(
-        _metric(evaluate_evidence(snapshot, {"fallow": str(receipt)}, {}, tmp_path), "fallow"),
+        _metric(evaluate_evidence(snapshot, {"fallow": str(receipt)}, tmp_path), "fallow"),
         "metrics",
     )
     assert metrics["clone_groups_complete_for_declared_scope"] is (fault is None)
@@ -1227,7 +1087,7 @@ def test_clone_identity_comparison_tracks_changed_groups_despite_net_zero_and_li
         }
         _syntax_proof(report, snapshot, directory / "config.json", ["src/index.ts", "src/other.ts"])
         receipt = _rebind_fallow(directory, snapshot, report)
-        results.append(evaluate_evidence(snapshot, {"fallow": str(receipt)}, {}, directory))
+        results.append(evaluate_evidence(snapshot, {"fallow": str(receipt)}, directory))
     shifted = _metric(_metric(compare_evidence(results[0], results[1]), "fallow"), "clone_findings")
     assert shifted["introduced_count"] == shifted["resolved_count"] == 0
     changed = _metric(compare_evidence(results[0], results[2]), "fallow")
@@ -1275,5 +1135,266 @@ def test_colliding_dead_context_preserves_raw_crlf_span_offsets(tmp_path: Path) 
         _, result = _bound_fallow(tmp_path / name, {"src/index.ts": source}, [], findings)
         observed.append(result)
     dead = _metric(_metric(compare_evidence(*observed), "fallow"), "dead_findings")
+    assert dead["status"] == "available"
+    assert dead["introduced_count"] == dead["resolved_count"] == 0
+
+
+def test_coverage_units_compare_independently_without_inventing_go_branches(tmp_path: Path) -> None:
+    snapshot = tmp_path / "snapshot"
+    _write(snapshot / "src/main.go", "package main\nfunc main() {}\n")
+    report: dict[str, object] = {
+        "statements": {
+            "unit": "statement",
+            "total": ["src/main.go:2.1:2.15"],
+            "covered": ["src/main.go:2.1:2.15"],
+            "weights": {"src/main.go:2.1:2.15": 3},
+        },
+        "files_measured": ["src/main.go"],
+    }
+    metrics = assessment_metrics._coverage(report, {"src/main.go"}, ["src/**"])
+    assert metrics["statement_total"] == metrics["statement_covered"] == 3
+    assert metrics["statement_percent"] == 100
+    assert metrics["branch_total"] is metrics["function_total"] is None
+    provenance = {"tool": "go", "tool_version": "1", "config_digest": "same", "scope": ["src/**"]}
+    before: dict[str, object] = {
+        "coverage": {
+            "provenance": provenance,
+            "metrics": {**metrics, "statement_covered": 2, "statement_percent": 200 / 3},
+        }
+    }
+    after: dict[str, object] = {"coverage": {"provenance": provenance, "metrics": metrics}}
+    compared = _metric(compare_evidence(before, after), "coverage")
+    assert _metric(compared, "deltas")["statement_covered"] == 1
+    assert _metric(_metric(compared, "units"), "branch")["status"] == "unavailable"
+    changed = {
+        **metrics,
+        "statement_denominator_digest": "different",
+        "line_denominator_digest": "line",
+        "line_population_complete": True,
+        "line_total": 2,
+        "line_covered": 1,
+    }
+    left = {
+        **metrics,
+        "line_denominator_digest": "line",
+        "line_population_complete": True,
+        "line_total": 2,
+        "line_covered": 0,
+    }
+    compared = _metric(
+        compare_evidence(
+            {"coverage": {"provenance": provenance, "metrics": left}},
+            {"coverage": {"provenance": provenance, "metrics": changed}},
+        ),
+        "coverage",
+    )
+    assert _metric(compared, "deltas")["line_covered"] == 1
+    assert "statement_covered" not in _metric(compared, "deltas")
+
+
+@pytest.mark.parametrize("complete", [False, None])
+def test_partial_coverage_cannot_claim_gain_and_preserves_unit_unavailability(
+    complete: bool | None,
+) -> None:
+    reason = "Repeated LCOV function names have mixed hits"
+    metrics = {
+        "format": "lcov",
+        "function_denominator_digest": "same-subset",
+        "function_population_complete": complete,
+        "function_total": 2,
+        "function_covered": 0,
+        "line_denominator_digest": "complete-lines",
+        "line_population_complete": True,
+        "line_total": 5,
+        "line_covered": 4,
+        "unavailable_populations": {"functions": {"reason": reason, "files": ["callbacks.js"]}},
+    }
+    compared = _metric(
+        compare_evidence(
+            {"coverage": {"provenance": {}, "metrics": metrics}},
+            {
+                "coverage": {
+                    "provenance": {},
+                    "metrics": {**metrics, "function_covered": 2, "line_covered": 5},
+                }
+            },
+        ),
+        "coverage",
+    )
+    assert _metric(compared, "deltas")["line_covered"] == 1
+    assert "function_covered" not in _metric(compared, "deltas")
+    units = _metric(compared, "units")
+    assert _metric(units, "function")["status"] == "unavailable"
+    assert reason in str(_metric(units, "function")["reason"])
+    assert "lcov" in str(_metric(units, "statement")["reason"])
+    assert "not supplied" in str(_metric(units, "statement")["reason"])
+
+
+def _python_candidate_evidence(
+    root: Path, source: str, candidates: list[dict[str, object]]
+) -> dict[str, object]:
+    _write(root / "source.py", source)
+    config: dict[str, object] = {
+        "language": "python",
+        "tool_identities": {},
+        "settings": {},
+        "supported_suffixes": [".py"],
+    }
+    report: dict[str, object] = {
+        "version": "language-analysis-v1",
+        "language": "python",
+        "tools": {},
+        "settings": {},
+        "supported_suffixes": [".py"],
+        "analyzed_paths": ["source.py"],
+        "functions": [],
+        "metrics": {
+            key: {"status": "available"} for key in ("cognitive", "cyclomatic", "dead_code")
+        },
+        "unused_candidates": [{"path": "source.py", **row} for row in candidates],
+    }
+    metrics = assessment_metrics._analysis(report, {"source.py"}, ["*"], root, config)
+    return {"analysis": {"provenance": config, "metrics": metrics}}
+
+
+@pytest.mark.parametrize("remove_second", [False, True])
+def test_python_unused_declarations_match_lexical_scopes_after_line_shifts_and_deletion(
+    tmp_path: Path, remove_second: bool
+) -> None:
+    source = "class First:\n    node_id: str\n\nclass Second:\n    node_id: str\n"
+    candidates = [
+        {"category": "vulture-unused-variable", "symbol": "node_id", "line": line}
+        for line in (2, 5)
+    ]
+    before = _python_candidate_evidence(tmp_path / "before", source, candidates)
+    after_source = "\n" + (source.split("class Second:")[0] if remove_second else source)
+    after_candidates = []
+    for row in candidates[: 1 if remove_second else 2]:
+        line = row["line"]
+        assert isinstance(line, int)
+        after_candidates.append({**row, "line": line + 1})
+    after = _python_candidate_evidence(tmp_path / "after", after_source, after_candidates)
+    dead = _metric(_metric(compare_evidence(before, after), "analysis"), "dead_findings")
+    assert dead["status"] == "available"
+    assert dead["introduced_count"] == 0
+    assert dead["resolved_count"] == int(remove_second)
+
+
+@pytest.mark.parametrize(
+    "source,candidate",
+    [
+        (
+            "def duplicate():\n    item = 1\ndef duplicate():\n    item = 1\n",
+            {"category": "vulture-unused-variable", "symbol": "item", "line": 2},
+        ),
+        ("value = 1\n", {"category": "vulture-unused-variable", "symbol": "wrong", "line": 1}),
+        (
+            "def owner():\n    item = 1; item = 2\n",
+            {"category": "vulture-unused-variable", "symbol": "item", "line": 2},
+        ),
+        (
+            "item = 1\nitem = 1\n",
+            {"category": "vulture-unused-variable", "symbol": "item", "line": 1},
+        ),
+        (
+            "@overload\ndef owner(item: str): ...\n@overload\ndef owner(item: str): ...\n",
+            {"category": "vulture-unused-variable", "symbol": "item", "line": 2},
+        ),
+        (
+            "one = lambda item: 1\ntwo = lambda item: 1\n",
+            {"category": "vulture-unused-variable", "symbol": "item", "line": 1},
+        ),
+        (
+            "values = [item for item in ()]\n",
+            {"category": "vulture-unused-variable", "symbol": "item", "line": 1},
+        ),
+    ],
+)
+def test_python_unused_declarations_require_unique_source_binding(
+    tmp_path: Path, source: str, candidate: dict[str, object]
+) -> None:
+    before = _python_candidate_evidence(tmp_path / "before", source, [candidate])
+    after = _python_candidate_evidence(tmp_path / "after", source, [])
+    dead = _metric(_metric(compare_evidence(before, after), "analysis"), "dead_findings")
+    assert dead["status"] == "unavailable"
+    assert dead["resolved_count"] is None
+    assert _metric(_metric(before, "analysis"), "metrics")["dead_code"] == 1
+
+
+def test_python_declaration_roles_bind_parameters_imports_attributes_accessors_and_overloads(
+    tmp_path: Path,
+) -> None:
+    source = (
+        "from pathlib import (\n    Path as Alias,\n)\n\n"
+        "class First:\n    @property\n    def value(self):\n        return 1\n\n"
+        "    @value.setter\n    def value(self, unused):\n        self.unused_attr = unused\n\n"
+        "class Second:\n    def value(self, unused):\n        unused_local = 1\n\n"
+        "@overload\ndef operation(unused: str) -> str: ...\n"
+        "@overload\ndef operation(unused: int) -> int: ...\n\n"
+        "one = lambda ignored: 1\ntwo = lambda ignored: 2\n"
+    )
+    candidates: list[dict[str, object]] = [
+        {"category": f"vulture-unused-{role}", "symbol": symbol, "line": line}
+        for role, symbol, line in (
+            ("import", "Alias", 1),
+            ("class", "First", 5),
+            ("property", "value", 6),
+            ("method", "value", 10),
+            ("variable", "unused", 11),
+            ("attribute", "unused_attr", 12),
+            ("variable", "unused", 15),
+            ("variable", "unused_local", 16),
+            ("function", "operation", 18),
+            ("variable", "unused", 19),
+            ("function", "operation", 20),
+            ("variable", "unused", 21),
+            ("variable", "ignored", 23),
+            ("variable", "ignored", 24),
+        )
+    ]
+    before = _python_candidate_evidence(tmp_path / "before", source, candidates)
+    shifted_candidates = []
+    for row in candidates[1:]:
+        line = row["line"]
+        assert isinstance(line, int)
+        shifted_candidates.append({**row, "line": line + 1})
+    after = _python_candidate_evidence(tmp_path / "after", "\n" + source, shifted_candidates)
+    dead = _metric(_metric(compare_evidence(before, after), "analysis"), "dead_findings")
+    assert dead["status"] == "available"
+    assert dead["introduced_count"] == 0 and dead["resolved_count"] == 1
+    assert dead["before_count"] == 14 and dead["after_count"] == 13
+
+
+def test_python_declaration_matching_uses_full_source_collision_population(tmp_path: Path) -> None:
+    source = "def owner():\n    unused = 1\n    unused = 2\n"
+    candidate = {"category": "vulture-unused-variable", "symbol": "unused"}
+    before = _python_candidate_evidence(tmp_path / "before", source, [{**candidate, "line": 2}])
+    after = _python_candidate_evidence(tmp_path / "after", source, [{**candidate, "line": 3}])
+    dead = _metric(_metric(compare_evidence(before, after), "analysis"), "dead_findings")
+    assert dead["status"] == "available"
+    assert dead["introduced_count"] == dead["resolved_count"] == 1
+    after = _python_candidate_evidence(
+        tmp_path / "deleted",
+        "def owner():\n    unused = 1\n",
+        [{**candidate, "line": 2}],
+    )
+    dead = _metric(_metric(compare_evidence(before, after), "analysis"), "dead_findings")
+    assert dead["status"] == "available"
+    assert dead["introduced_count"] == dead["resolved_count"] == 0
+
+
+def test_python_default_expression_has_outer_lexical_scope(tmp_path: Path) -> None:
+    candidate = {"category": "vulture-unused-variable", "symbol": "ignored", "line": 1}
+    before = _python_candidate_evidence(
+        tmp_path / "before",
+        "def owner(callback=lambda ignored: 1): pass\n",
+        [candidate],
+    )
+    after = _python_candidate_evidence(
+        tmp_path / "after",
+        "def renamed(callback=lambda ignored: 1): pass\n",
+        [candidate],
+    )
+    dead = _metric(_metric(compare_evidence(before, after), "analysis"), "dead_findings")
     assert dead["status"] == "available"
     assert dead["introduced_count"] == dead["resolved_count"] == 0

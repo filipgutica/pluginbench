@@ -11,6 +11,7 @@ from pluginbench.assessment_charts import (
     _rows,
     chart_artifacts_from_data,
     chart_data,
+    execution_outcome,
 )
 
 MEASUREMENT_METRICS = {
@@ -30,7 +31,12 @@ MEASUREMENT_METRICS = {
         "New-file function cognitive maximum",
     ),
     "dead_code": ("Introduced dead findings",),
-    "coverage": ("Branch coverage %", "Function coverage %"),
+    "coverage": (
+        "Line coverage %",
+        "Statement coverage %",
+        "Branch coverage %",
+        "Function coverage %",
+    ),
     "test_overlap": ("Zero marginal branch contribution cases",),
     "review": (
         "Total review findings",
@@ -75,6 +81,9 @@ OBSERVATION_FIELDS = (
     "provenance",
 )
 PROVENANCE_FIELDS = (
+    "language",
+    "analyzers",
+    "metric_settings",
     "tool",
     "tool_version",
     "method",
@@ -91,6 +100,8 @@ PROVENANCE_FIELDS = (
     "selection_policy",
     "branch_denominator_digest",
     "function_denominator_digest",
+    "line_denominator_digest",
+    "statement_denominator_digest",
     "judge_model",
     "judge_harness",
     "judge_reasoning_effort",
@@ -100,6 +111,8 @@ PROVENANCE_FIELDS = (
     "review_stage",
     "criteria_sha256",
     "reasoning_comparison",
+    "execution_status",
+    "execution_reason",
 )
 
 COMPLETENESS_COUNTS = {
@@ -188,8 +201,19 @@ def _selected_completeness(
     return results
 
 
+def _assigned_counts(
+    observations: list[dict[str, object]],
+) -> dict[tuple[object, object, object], int]:
+    attempts: dict[tuple[object, object, object], set[object]] = {}
+    for row in observations:
+        key = (row.get("task"), row.get("metric"), row.get("arm"))
+        attempts.setdefault(key, set()).add(row["attempt_id"])
+    return {key: len(ids) for key, ids in attempts.items()}
+
+
 def _comparison_rows(data: dict[str, object]) -> list[dict[str, object]]:
     observations = _rows(data["observations"])
+    assigned_counts = _assigned_counts(observations)
     medians = _rows(data["medians"])
     lookup = {
         (row.get("task"), row.get("metric"), row.get("compatibility"), row.get("arm")): row
@@ -221,16 +245,7 @@ def _comparison_rows(data: dict[str, object]) -> list[dict[str, object]]:
             else None
         )
         assigned = {
-            group: len(
-                {
-                    row["attempt_id"]
-                    for row in observations
-                    if row.get("task") == task
-                    and row.get("metric") == metric
-                    and row.get("arm") == group
-                }
-            )
-            for group in ("baseline", arm)
+            group: assigned_counts.get((task, metric, group), 0) for group in ("baseline", arm)
         }
         baseline_measured, guided_measured = baseline.get("measured", 0), guided.get("measured", 0)
         complete = baseline_measured == assigned["baseline"] and guided_measured == assigned[arm]
@@ -263,57 +278,106 @@ def _comparison_rows(data: dict[str, object]) -> list[dict[str, object]]:
     return results
 
 
+def _aggregate_groups(data: dict[str, object]) -> list[tuple[str, str | None, list[str]]]:
+    tasks = sorted({str(row["task"]) for row in _rows(data["attempts"])})
+    observations = _rows(data["observations"])
+    groups: dict[tuple[str, str | None], set[str]] = {}
+    task_analyzers: dict[tuple[str, str], set[str]] = {}
+    unbound_values: set[tuple[str, str]] = set()
+    for row in observations:
+        group = None
+        if row.get("family") in {"cognitive", "cyclomatic", "dead_code"}:
+            known = task_analyzers.setdefault((str(row["metric"]), str(row["task"])), set())
+            provenance = _map(row.get("provenance"))
+            analyzers = _map(provenance.get("analyzers"))
+            language = str(
+                provenance.get("language")
+                or ("JS/TS" if provenance.get("tool") == "fallow" else "unknown language")
+            )
+            family = str(row.get("family"))
+            tool_name = (
+                {"python": "vulture", "go": "staticcheck", "rust": "rustc"}.get(language, "fallow")
+                if family == "dead_code"
+                else "go_analysis"
+                if language == "go"
+                else "rca"
+            )
+            tool = _map(analyzers.get(tool_name))
+            version = tool.get("version", provenance.get("tool_version"))
+            if not version or version == "unknown" or (not tool and not provenance.get("tool")):
+                if row.get("value") is not None:
+                    unbound_values.add((str(row["metric"]), str(row["task"])))
+                continue
+            version = str(version)
+            if tool_name == "go_analysis" and "gocognit=" in version:
+                part = "gocognit=" if family == "cognitive" else "gocyclo="
+                name = part[:-1] + " " + version.split(part)[-1].split()[0]
+            else:
+                name = (
+                    version
+                    if tool
+                    else str(provenance.get("tool", "unknown analyzer")) + " " + version
+                )
+            group = f"{language.title()} · {name}"
+            known.add(group)
+            continue
+        groups.setdefault((str(row["metric"]), group), set()).add(str(row["task"]))
+    for (metric, task), known in task_analyzers.items():
+        group = (
+            "Conflicting analyzers"
+            if len(known) > 1
+            else next(iter(known))
+            if known and (metric, task) not in unbound_values
+            else "Unknown analyzer"
+        )
+        groups.setdefault((metric, group), set()).add(task)
+    return [
+        (metric, group, sorted(members) if group else tasks)
+        for (metric, group), members in sorted(groups.items(), key=str)
+    ]
+
+
 def _aggregate_rows(data: dict[str, object]) -> list[dict[str, object]]:
     """Give each assigned task one median, independent of its repeat count."""
     observations = _rows(data["observations"])
+    assigned_counts = _assigned_counts(observations)
     medians = _rows(data["medians"])
     raw_medians = _rows(data["raw_medians"])
     comparisons = _rows(data["comparisons"])
-    tasks = sorted({str(row["task"]) for row in _rows(data["attempts"])})
+    median_rows: dict[tuple[object, object, object], list[dict[str, object]]] = {}
+    raw_rows: dict[tuple[object, object, object], list[dict[str, object]]] = {}
+    comparison_rows: dict[tuple[object, object, object], list[dict[str, object]]] = {}
+    for row in medians:
+        median_rows.setdefault((row["task"], row["metric"], row["arm"]), []).append(row)
+    for row in raw_medians:
+        raw_rows.setdefault((row["task"], row["metric"], row["arm"]), []).append(row)
+    for row in comparisons:
+        if row["absolute_delta_vs_vanilla"] is not None:
+            comparison_rows.setdefault((row["task"], row["metric"], row["guidance"]), []).append(
+                row
+            )
     arms = sorted(
         {str(row["arm"]) for row in observations}, key=lambda arm: (arm != "baseline", arm)
     )
-    metrics = sorted({str(row["metric"]) for row in observations})
     results = []
-    for metric in metrics:
-        baseline_values = {
-            task: [
-                row
-                for row in medians
-                if row["task"] == task and row["metric"] == metric and row["arm"] == "baseline"
-            ]
-            for task in tasks
-        }
+    for metric, analysis_group, tasks in _aggregate_groups(data):
+        unresolved_analyzer = analysis_group in {"Unknown analyzer", "Conflicting analyzers"}
+        baseline_values = {task: median_rows.get((task, metric, "baseline"), []) for task in tasks}
         for arm in arms:
             task_values = []
             task_statuses = []
             comparison_statuses = []
             matching_baselines = []
             for task in tasks:
-                rows = [
-                    row
-                    for row in raw_medians
-                    if row["task"] == task and row["metric"] == metric and row["arm"] == arm
-                ]
+                rows = [] if unresolved_analyzer else raw_rows.get((task, metric, arm), [])
                 value = rows[0].get("value") if len(rows) == 1 else None
                 task_values.append({"task": task, "value": value})
-                matches = [
-                    row
-                    for row in comparisons
-                    if row["task"] == task
-                    and row["metric"] == metric
-                    and row["guidance"] == arm
-                    and row["absolute_delta_vs_vanilla"] is not None
-                ]
+                matches = (
+                    [] if unresolved_analyzer else comparison_rows.get((task, metric, arm), [])
+                )
                 baseline = baseline_values[task]
                 measured = rows[0].get("measured", 0) if len(rows) == 1 else 0
-                assigned = len(
-                    {
-                        row["attempt_id"]
-                        for row in observations
-                        if row["task"] == task and row["metric"] == metric and row["arm"] == arm
-                    }
-                )
+                assigned = assigned_counts.get((task, metric, arm), 0)
                 raw_status = "complete" if value is not None and measured == assigned else "partial"
                 task_statuses.append(raw_status)
                 if arm == "baseline":
@@ -341,6 +405,7 @@ def _aggregate_rows(data: dict[str, object]) -> list[dict[str, object]]:
             results.append(
                 {
                     "metric": metric,
+                    "analysis_group": analysis_group,
                     "guidance": arm,
                     "value": value,
                     "unit": guide.get("unit"),
@@ -368,7 +433,9 @@ def _aggregate_rows(data: dict[str, object]) -> list[dict[str, object]]:
                     "absolute_delta_unit": "percentage points"
                     if guide.get("unit") == "% covered"
                     else guide.get("unit"),
-                    "reason": "Each task has equal weight, regardless of repetitions. Deltas require matching vanilla and guidance medians for every assigned task. Partial raw averages describe the measured tasks only.",
+                    "reason": "Analyzer provenance is missing or conflicting; overview values are unavailable. Raw observations and task medians remain separate."
+                    if unresolved_analyzer
+                    else "Each task has equal weight, regardless of repetitions. Deltas require matching vanilla and guidance medians for every assigned task. Partial raw averages describe the measured tasks only.",
                 }
             )
     return results
@@ -393,11 +460,18 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
     guide = _map(projection["metric_guide"])
     observations = []
     for source in _rows(projection["observations"]):
-        if source.get("role") != "handoff" or source.get("metric") not in families:
+        if source.get("metric") not in families:
             continue
         metric = str(source["metric"])
         row = {field: source.get(field) for field in OBSERVATION_FIELDS}
         row.update(family=families[metric], unit=_map(guide.get(metric)).get("unit"))
+        capability = _map(
+            _map(_map(config.get("measurement_capabilities")).get(str(row.get("task")))).get(
+                families[metric]
+            )
+        )
+        if row.get("value") is None and capability.get("status") == "unavailable":
+            row.update(status="unavailable", reason=capability.get("reason"))
         row["provenance"] = {
             key: value
             for key, value in _map(source.get("provenance")).items()
@@ -405,18 +479,46 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         }
         observations.append(row)
     attempts = []
+    origins = _map(report.get("baseline_origin"))
     for attempt in _rows(report.get("attempts")):
         stage = next(
             row for row in _rows(attempt.get("stages")) if row.get("id") == attempt.get("handoff")
         )
         provenance = _map(attempt.get("provenance"))
+        execution = _map(stage.get("execution_provenance"))
         attempts.append(
             {
                 "id": attempt.get("id"),
                 "repeat": attempt.get("attempt"),
                 "task": attempt.get("task_id"),
                 "guidance": attempt.get("arm"),
+                "baseline_origin": {
+                    key: _map(origins.get(str(attempt.get("id")))).get(key)
+                    for key in ("cache_key", "origin_run", "origin_attempt", "evidence")
+                }
+                if str(attempt.get("id")) in origins
+                else None,
                 "correctness": _map(stage.get("correctness")).get("status", "unknown"),
+                "native_grading": stage.get("task_result"),
+                "execution": {
+                    **execution_outcome(execution),
+                    **{
+                        key: execution.get(key)
+                        for key in (
+                            "successful_native_completion",
+                            "timed_out",
+                            "exit_code",
+                            "stream_errors",
+                            "partial_usage",
+                            "usage_accounting",
+                            "actual_descendant_models",
+                            "native_treatment",
+                            "native_session_usage",
+                            "error",
+                            "attempt_status",
+                        )
+                    },
+                },
                 "actual_model": attempt.get("model"),
                 "runtime": {
                     name: provenance.get(name)
@@ -440,9 +542,13 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
             }
         )
     limitations = [
-        "Each guidance set is compared with this evaluation's vanilla runs. Separate evaluations have separate baseline samples.",
+        "Each guidance set is compared with the same vanilla cohort. Compare separate evaluations through compatible baseline deltas.",
         "Deltas are differences in observed medians, not a winner or composite quality score. A negative delta is not automatically better.",
     ]
+    if origins:
+        limitations.append(
+            f"{len(origins)} vanilla attempts were reused from earlier evaluations. Their tokens and time are original observations, not fresh independent samples. Grading, measurements, and reviews run again."
+        )
     if {"cyclomatic", "cognitive"}.intersection(selected):
         limitations.append(
             "Complexity covers functions touched by changed lines and functions in new files, as separate populations. Empty populations have no maximum."
@@ -454,6 +560,10 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
     if "review" in selected:
         limitations.append(
             "AI review findings are judgments, not deterministic defect counts. The reviewer is not calibrated against human judgments; recorded reviews do not measure human review churn."
+        )
+    if config.get("review_projection") is not None:
+        limitations.append(
+            "This report selects a separate review revision. Judge charts show that revision's usage; bound prior review receipts retain earlier calls, failures, and usage."
         )
     data = {
         "schema_version": 1,
@@ -467,27 +577,23 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         "reviewer": config.get("reviewer") if "review" in selected else None,
         "measurements": selected,
         "measurement_collection": config.get("measurement_collection"),
+        "measurement_capabilities": config.get("measurement_capabilities", {}),
+        "measurement_readiness": config.get("measurement_readiness", {}),
         "assigned": len(attempts),
+        "coding_invocations": _map(report.get("study_progress")).get("native_invocations"),
+        "reused_baseline_attempts": len(origins),
         "attempts": attempts,
         "observations": observations,
         "observation_fields": list(OBSERVATION_FIELDS),
-        "medians": [
-            row
-            for row in _rows(projection["medians"])
-            if row.get("role") == "handoff" and row.get("metric") in families
-        ],
+        "medians": [row for row in _rows(projection["medians"]) if row.get("metric") in families],
         "raw_medians": [
-            row
-            for row in _rows(projection["raw_medians"])
-            if row.get("role") == "handoff" and row.get("metric") in families
+            row for row in _rows(projection["raw_medians"]) if row.get("metric") in families
         ],
         "metric_guide": {metric: guide[metric] for metric in families},
         "independent_review": projection.get("independent_review")
         if "review" in selected
         else None,
         "review_findings": projection.get("review_findings") if "review" in selected else [],
-        "distinct_final": False,
-        "single_stage_attempts": [row["id"] for row in attempts],
         "download_csv": "results.csv",
         "limitations": limitations,
     }
@@ -496,6 +602,8 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
     data["measurement_completeness"] = _selected_completeness(
         data=data, projection=projection, selected=selected
     )
+    if config.get("review_projection") is not None:
+        data["review_projection"] = config["review_projection"]
     return data
 
 

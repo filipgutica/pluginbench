@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from pluginbench import codex
+from pluginbench import codex, processes, isolation
 
 
 def test_codex_final_message_excludes_earlier_progress_for_structured_review() -> None:
@@ -261,6 +262,169 @@ def test_missing_auth_removes_private_runtime(tmp_path: Path) -> None:
     assert json.loads((area / "artifacts/execution.json").read_text())["private_runtime_removed"]
 
 
+@pytest.mark.parametrize("link_kind", ["file", "sessions", "codex"])
+def test_native_session_links_never_copy_host_data_and_still_remove_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_kind: str
+) -> None:
+    area = tmp_path / "trial"
+    (area / "workspace").mkdir(parents=True)
+    outside = tmp_path / "operator-private"
+    (outside / "sessions").mkdir(parents=True)
+    secret = outside / "sessions/private.jsonl"
+    secret.write_text("outside-job-secret must not be read by the host launcher")
+    token = "fake-token-that-must-not-be-archived"
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({"token": token}))
+    setup = {
+        "file": f"sessions.mkdir(); (sessions/'trace.jsonl').symlink_to({str(secret)!r})",
+        "sessions": f"sessions.symlink_to({str(outside / 'sessions')!r})",
+        "codex": f"shutil.rmtree(home); home.symlink_to({str(outside)!r})",
+    }[link_kind]
+    script = (
+        "import os,pathlib,shutil; "
+        "home=pathlib.Path(os.environ['CODEX_HOME']); sessions=home/'sessions'; " + setup
+    )
+    monkeypatch.setattr(codex, "command", lambda **kwargs: [sys.executable, "-c", script])
+    with pytest.raises(ValueError, match="artifact|session"):
+        codex.invoke(
+            area=area,
+            entry={"host": "codex", "arm": "baseline"},
+            protocol={"models": {"codex": "test"}, "auth_file": str(auth)},
+            prompt="task",
+            timeout=5,
+        )
+    assert not (area / "private").exists()
+    assert secret.read_text() == "outside-job-secret must not be read by the host launcher"
+    receipt = json.loads((area / "artifacts/execution.json").read_text())
+    assert receipt["private_runtime_removed"]
+    for artifact in (area / "artifacts").rglob("*"):
+        if artifact.is_file() and not artifact.is_symlink():
+            assert secret.read_bytes() not in artifact.read_bytes()
+            assert token.encode() not in artifact.read_bytes()
+
+
+@pytest.mark.parametrize("native_failure", [False, True])
+def test_cleanup_failure_still_removes_auth_scrubs_evidence_and_preserves_original_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, native_failure: bool
+) -> None:
+    area = tmp_path / "trial"
+    (area / "workspace").mkdir(parents=True)
+    token = "fake-credential-on-cleanup-error"
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({"token": token}))
+    script = "import os; from pathlib import Path; print(Path(os.environ['CODEX_HOME'], 'auth.json').read_text())"
+    monkeypatch.setattr(codex, "command", lambda **kwargs: [sys.executable, "-c", script])
+    cleanup = processes.terminate_process_group
+
+    def failed_cleanup(proc: subprocess.Popen[str]) -> None:
+        cleanup(proc)
+        raise PermissionError("cleanup probe")
+
+    monkeypatch.setattr(codex, "terminate_process_group", failed_cleanup)
+    if native_failure:
+        communicate = subprocess.Popen.communicate
+
+        def failed_native(
+            proc: subprocess.Popen[str], input: str | None = None, timeout: float | None = None
+        ) -> tuple[str, str]:
+            communicate(proc, input, timeout)
+            raise OSError("native probe")
+
+        monkeypatch.setattr(subprocess.Popen, "communicate", failed_native)
+    expected = "native probe" if native_failure else "cleanup probe"
+    with pytest.raises(OSError, match=expected) as failure:
+        codex.invoke(
+            area=area,
+            entry={"host": "codex", "arm": "baseline"},
+            protocol={"models": {"codex": "test"}, "auth_file": str(auth)},
+            prompt="task",
+            timeout=5,
+        )
+    if native_failure:
+        assert any("Process-group cleanup failed" in note for note in failure.value.__notes__)
+    receipt = json.loads((area / "artifacts/execution.json").read_text())
+    assert receipt["cleanup_error"] == "cleanup probe"
+    assert receipt["private_runtime_removed"] and not (area / "private").exists()
+    assert auth.is_file()
+    assert all(token not in path.read_text() for path in (area / "artifacts").iterdir())
+
+
+def test_changed_runtime_is_fatal_before_native_process_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    area = tmp_path / "trial"
+    (area / "workspace").mkdir(parents=True)
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"token":"fake-auth"}')
+    expected = {**isolation.runtime_identity(), "os_release": "different-runtime"}
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: pytest.fail("cannot launch"))
+    with pytest.raises(isolation.RuntimeDriftError, match="runtime changed"):
+        codex.invoke(
+            area=area,
+            entry={"host": "codex", "arm": "candidate"},
+            protocol={"models": {"codex": "test"}, "auth_file": str(auth), "isolation": expected},
+            prompt="task",
+            timeout=5,
+        )
+    assert not (area / "private").exists()
+    assert json.loads((area / "artifacts/execution.json").read_text())["exit_code"] is None
+
+
+@pytest.mark.skipif(shutil.which("codex") is None, reason="native Codex sandbox probe requires CLI")
+def test_readonly_invocation_uses_one_sandbox_and_cannot_escape_packet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    area = tmp_path / "trial"
+    packet = area / "workspace"
+    packet.mkdir(parents=True)
+    source = packet / "packet.txt"
+    source.write_text("bounded packet")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside packet")
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"token":"fake-auth"}')
+    script = f"""import json, os
+from pathlib import Path
+p = Path({str(source)!r}); assert p.read_text() == 'bounded packet'
+for path, operation in ((p, 'write'), (Path({str(outside)!r}), 'read'), (Path({str(outside)!r}), 'write')):
+    try:
+        path.read_text() if operation == 'read' else path.write_text('changed')
+    except OSError:
+        continue
+    raise AssertionError('escaped packet boundary')
+Path(os.environ['TMPDIR'], 'scratch.txt').write_text('private storage allowed')
+print(json.dumps({{'type':'turn.completed','usage':{{'input_tokens':0,'output_tokens':0}}}}))
+"""
+
+    def probe(**kwargs: object) -> list[str]:
+        # Exercise the CLI's actual sandbox entry without invoking any model.
+        return [
+            "codex",
+            "sandbox",
+            "-P",
+            ":danger-full-access",
+            "-C",
+            str(packet),
+            "--",
+            sys.executable,
+            "-c",
+            script,
+        ]
+
+    monkeypatch.setattr(codex, "command", probe)
+    result = codex.invoke(
+        area=area,
+        entry={"host": "codex", "arm": "baseline"},
+        protocol={"models": {"codex": "setup-only"}, "auth_file": str(auth)},
+        prompt="No model calls: sandbox boundary probe only.",
+        timeout=15,
+    )
+    assert result["exit_code"] == 0, (area / "artifacts/stderr.log").read_text()
+    assert source.read_text() == "bounded packet"
+    assert outside.read_text() == "outside packet"
+    assert result["private_runtime_removed"] and not (area / "private").exists()
+
+
 def test_invocation_cannot_overwrite_existing_execution_evidence(tmp_path: Path) -> None:
     area = tmp_path / "trial"
     artifacts = area / "artifacts"
@@ -303,3 +467,446 @@ def test_truncated_trace_reports_usage_lower_bound_without_completed_usage() -> 
     assert not parsed["successful_native_completion"]
     assert parsed["partial_usage"][0]["tokens"] == {"input_tokens": 15, "output_tokens": 5}
     assert parsed["partial_usage"][0]["trace_sha256"].startswith("sha256:")
+
+
+def native_session(
+    identity: str,
+    totals: list[dict[str, int]],
+    *,
+    parent: str | None = None,
+    completed: bool = True,
+    extra: list[dict[str, object]] | None = None,
+) -> str:
+    # Shapes come from Codex rust-v0.162.1 protocol/src/protocol.rs.
+    metadata: dict[str, object] = {"id": identity, "cli_version": "0.162.1", "source": "exec"}
+    if parent is not None:
+        metadata["source"] = {
+            "subagent": {"thread_spawn": {"parent_thread_id": parent, "depth": 1}}
+        }
+    events: list[dict[str, object]] = [
+        {"type": "session_meta", "payload": metadata},
+        {
+            "type": "turn_context",
+            "payload": {
+                "model": "primary" if parent is None else "child-model",
+                "effort": "high" if parent is None else "low",
+            },
+        },
+    ]
+    events.extend(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": total},
+            },
+        }
+        for total in totals
+    )
+    events.extend(extra or [])
+    if completed:
+        events.append({"type": "event_msg", "payload": {"type": "task_complete"}})
+    return stream(*events)
+
+
+def test_native_descendant_usage_counts_session_totals_once_and_keeps_primary_identity() -> None:
+    root = native_session(
+        "root",
+        [
+            {"input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 3},
+            {"input_tokens": 30, "cached_input_tokens": 5, "output_tokens": 8},
+        ],
+    )
+    child = native_session(
+        "child",
+        [
+            {"input_tokens": 7, "cached_input_tokens": 2, "output_tokens": 4},
+        ],
+        parent="root",
+    )
+    stdout = stream(
+        {"type": "thread.started", "thread_id": "root"},
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 30,
+                "cached_input_tokens": 5,
+                "output_tokens": 8,
+            },
+        },
+    )
+    parsed = codex.parse_events(
+        stdout, [root, child, child, child.rsplit("\n", 1)[0]], "codex", include_descendants=True
+    )
+    assert parsed["usage"] == {"input_tokens": 37, "cached_input_tokens": 7, "output_tokens": 12}
+    assert parsed["actual_primary_models"] == ["primary"]
+    assert parsed["actual_descendant_models"] == ["child-model"]
+    assert parsed["runtime_effort_evidence"] == ["high"]
+    assert parsed["usage_accounting"]["status"] == "complete"
+    assert len(parsed["usage_accounting"]["sessions"]) == 2
+    assert parsed["successful_native_completion"]
+
+
+@pytest.mark.parametrize("spawn_evidence", ["trace", "stdout"])
+def test_native_missing_descendant_keeps_observed_root_as_lower_bound(spawn_evidence: str) -> None:
+    spawn: dict[str, object] = {
+        "type": "event_msg",
+        "payload": {
+            "type": "collab_agent_spawn_end",
+            "sender_thread_id": "root",
+            "new_thread_id": "missing",
+        },
+    }
+    stdout: list[dict[str, object]] = [
+        {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 3}}
+    ]
+    if spawn_evidence == "stdout":
+        stdout.append(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "collab_tool_call",
+                    "tool": "spawn_agent",
+                    "receiver_thread_ids": ["missing"],
+                },
+            }
+        )
+    root = native_session(
+        "root",
+        [{"input_tokens": 10, "output_tokens": 3}],
+        extra=[spawn] if spawn_evidence == "trace" else [],
+    )
+    parsed = codex.parse_events(stream(*stdout), [root], "codex", include_descendants=True)
+    assert parsed["usage"] is None
+    accounting = parsed["usage_accounting"]
+    assert accounting["observed_usage_lower_bound"] == {"input_tokens": 10, "output_tokens": 3}
+    assert "missing descendant session missing" in accounting["reasons"]
+    assert accounting["status"] == "incomplete"
+
+
+def test_native_failed_descendant_keeps_partial_tokens_without_claiming_complete_usage() -> None:
+    root = native_session("root", [{"input_tokens": 10, "output_tokens": 3}])
+    child = native_session(
+        "child",
+        [{"input_tokens": 8, "output_tokens": 2}],
+        parent="root",
+        completed=False,
+        extra=[
+            {"type": "event_msg", "payload": {"type": "turn_aborted", "reason": "interrupted"}},
+        ],
+    )
+    parsed = codex.parse_events(
+        stream({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 3}}),
+        [root, child],
+        "codex",
+        include_descendants=True,
+    )
+    assert parsed["usage"] is None
+    accounting = parsed["usage_accounting"]
+    assert accounting["observed_usage_lower_bound"] == {"input_tokens": 18, "output_tokens": 5}
+    assert "incomplete or failed session child" in accounting["reasons"]
+    assert accounting["sessions"][0]["status"] == "incomplete"
+
+
+def test_native_multiple_roots_and_conflicting_session_copies_are_not_complete() -> None:
+    root = native_session("root", [{"input_tokens": 10, "output_tokens": 3}])
+    other = native_session("other", [{"input_tokens": 20, "output_tokens": 5}])
+    conflict = native_session("root", [{"input_tokens": 11, "output_tokens": 3}])
+    parsed = codex.parse_events("", [root, other, conflict], "codex", include_descendants=True)
+    assert parsed["usage"] is None
+    assert parsed["actual_primary_models"] == []
+    assert "expected exactly one root session" in parsed["usage_accounting"]["reasons"]
+    assert "conflicting traces for session root" in parsed["usage_accounting"]["reasons"]
+
+
+def test_native_completed_child_without_usage_is_unknown_instead_of_zero() -> None:
+    root = native_session("root", [{"input_tokens": 10, "output_tokens": 3}])
+    child = native_session("child", [], parent="root")
+    parsed = codex.parse_events("", [root, child], "codex", include_descendants=True)
+    assert parsed["usage"] is None
+    assert "missing usage for session child" in parsed["usage_accounting"]["reasons"]
+    assert parsed["usage_accounting"]["sessions"][0]["observed_usage"] is None
+
+
+@pytest.mark.parametrize(
+    "extra, reason",
+    [
+        ([{"type": "event_msg", "payload": {"type": "task_started"}}], "incomplete or failed"),
+        (
+            [
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "collab_agent_spawn_begin",
+                        "call_id": "unresolved",
+                    },
+                }
+            ],
+            "unresolved spawns",
+        ),
+        (
+            [
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"input_tokens": -1}},
+                    },
+                }
+            ],
+            "invalid cumulative usage",
+        ),
+    ],
+)
+def test_native_incomplete_activity_after_completion_is_not_complete_usage(
+    extra: list[dict[str, object]], reason: str
+) -> None:
+    root = native_session("root", [{"input_tokens": 10, "output_tokens": 3}])
+    parsed = codex.parse_events(
+        "", [root + "\n" + stream(*extra)], "codex", include_descendants=True
+    )
+    assert parsed["usage"] is None
+    assert any(reason in message for message in parsed["usage_accounting"]["reasons"])
+
+
+def test_native_stdout_identity_mismatch_and_inherited_history_cannot_supply_lower_bound() -> None:
+    root = native_session("root", [{"input_tokens": 10, "output_tokens": 3}])
+    events = [json.loads(line) for line in root.splitlines()]
+    events[0]["payload"]["forked_from_id"] = "previous-session"
+    parsed = codex.parse_events(
+        stream({"type": "thread.started", "thread_id": {"invalid": "identity"}}),
+        [stream(*events)],
+        "codex",
+        include_descendants=True,
+    )
+    assert parsed["usage"] is None
+    assert parsed["usage_accounting"]["observed_usage_lower_bound"] is None
+    assert (
+        "inherited history is unsupported for session root" in parsed["usage_accounting"]["reasons"]
+    )
+    assert "invalid stdout root identity" in parsed["usage_accounting"]["reasons"]
+
+
+def inherited_native_child() -> list[dict[str, object]]:
+    """Minimal 0.162.1 paginated child history, with an explicit own-history boundary."""
+    events: list[dict[str, object]] = [
+        {
+            "type": "session_meta",
+            "payload": {
+                "id": "child",
+                "session_id": "root",
+                "cli_version": "0.162.1",
+                "history_mode": "paginated",
+                "forked_from_id": "root",
+                "parent_thread_id": "root",
+                "subagent_history_start_ordinal": 4,
+                "agent_path": "/root/check",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": "root",
+                            "depth": 1,
+                            "agent_path": "/root/check",
+                        }
+                    }
+                },
+            },
+        },
+        {"type": "session_meta", "payload": {"id": "root"}},
+        {"type": "turn_context", "payload": {"model": "inherited-model", "effort": "low"}},
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {"input_tokens": 9000, "output_tokens": 100},
+                },
+            },
+        },
+        {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "child-turn"}},
+        {
+            "type": "turn_context",
+            "payload": {
+                "model": "child-model",
+                "effort": "low",
+                "turn_id": "child-turn",
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {"input_tokens": 7, "output_tokens": 2},
+                    "last_token_usage": {"input_tokens": 7, "output_tokens": 2},
+                },
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {"input_tokens": 11, "output_tokens": 3},
+                    "last_token_usage": {"input_tokens": 4, "output_tokens": 1},
+                },
+            },
+        },
+        {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "child-turn"}},
+    ]
+    return [{**event, "ordinal": ordinal} for ordinal, event in enumerate(events)]
+
+
+def named_native_spawn() -> list[dict[str, object]]:
+    return [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "namespace": "collaboration",
+                "name": "spawn_agent",
+                "call_id": "spawn-call",
+                "arguments": "{}",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "spawn-call",
+                "output": '{"task_name":"/root/check"}',
+            },
+        },
+    ]
+
+
+def test_native_inherited_child_counts_only_own_history_and_deduplicates_copies() -> None:
+    root = native_session(
+        "root", [{"input_tokens": 20, "output_tokens": 5}], extra=named_native_spawn()
+    )
+    events = inherited_native_child()
+    child = stream(*events)
+    parsed = codex.parse_events(
+        "", [root, child, child, stream(*events[:-1])], "codex", include_descendants=True
+    )
+    assert parsed["usage"] == {"input_tokens": 31, "output_tokens": 8}
+    assert parsed["actual_primary_models"] == ["primary"]
+    assert parsed["actual_descendant_models"] == ["child-model"]
+    assert parsed["usage_accounting"]["status"] == "complete"
+    assert len(parsed["usage_accounting"]["sessions"]) == 2
+
+
+def test_native_named_spawn_requires_captured_child_even_without_legacy_spawn_events() -> None:
+    root = native_session(
+        "root", [{"input_tokens": 20, "output_tokens": 5}], extra=named_native_spawn()
+    )
+    parsed = codex.parse_events("", [root], "codex", include_descendants=True)
+    assert parsed["usage"] is None
+    assert (
+        "missing descendant agent /root/check from session root"
+        in parsed["usage_accounting"]["reasons"]
+    )
+
+
+@pytest.mark.parametrize("boundary", [None, True, -1, 0, 2, 5, 99])
+def test_native_inherited_child_rejects_missing_or_invalid_own_history_boundary(
+    boundary: object,
+) -> None:
+    child = inherited_native_child()
+    metadata = child[0]["payload"]
+    assert isinstance(metadata, dict)
+    metadata["subagent_history_start_ordinal"] = boundary
+    root = native_session(
+        "root", [{"input_tokens": 20, "output_tokens": 5}], extra=named_native_spawn()
+    )
+    parsed = codex.parse_events("", [root, stream(*child)], "codex", include_descendants=True)
+    assert parsed["usage"] is None
+    assert parsed["usage_accounting"]["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("forked_from_id", "other"),
+        ("parent_thread_id", "other"),
+        ("agent_path", "/root/other"),
+        ("session_id", "other-root"),
+        ("cli_version", "0.162.2"),
+    ],
+)
+def test_native_inherited_child_requires_consistent_native_metadata(field: str, value: str) -> None:
+    child = inherited_native_child()
+    metadata = child[0]["payload"]
+    assert isinstance(metadata, dict)
+    metadata[field] = value
+    root = native_session(
+        "root", [{"input_tokens": 20, "output_tokens": 5}], extra=named_native_spawn()
+    )
+    parsed = codex.parse_events("", [root, stream(*child)], "codex", include_descendants=True)
+    assert parsed["usage"] is None
+    assert parsed["usage_accounting"]["status"] == "incomplete"
+
+
+def test_native_named_spawn_conflicting_result_cannot_claim_complete_usage() -> None:
+    spawn = named_native_spawn()
+    spawn.append(
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "spawn-call",
+                "output": '{"task_name":"/root/other"}',
+            },
+        }
+    )
+    root = native_session("root", [{"input_tokens": 20, "output_tokens": 5}], extra=spawn)
+    parsed = codex.parse_events(
+        "", [root, stream(*inherited_native_child())], "codex", include_descendants=True
+    )
+    assert parsed["usage"] is None
+    assert parsed["usage_accounting"]["status"] == "incomplete"
+
+
+@pytest.mark.parametrize(
+    "corruption", ["extra_header", "ordinal_gap", "inherited_counter", "wrong_turn"]
+)
+def test_native_inherited_child_rejects_ambiguous_own_suffix(corruption: str) -> None:
+    child = inherited_native_child()
+    if corruption == "extra_header":
+        child.append({"type": "session_meta", "payload": {"id": "other"}, "ordinal": len(child)})
+    elif corruption == "ordinal_gap":
+        child[-1]["ordinal"] = 50
+    else:
+        payload = child[6 if corruption == "inherited_counter" else 8]["payload"]
+        assert isinstance(payload, dict)
+        if corruption == "inherited_counter":
+            info = payload["info"]
+            assert isinstance(info, dict)
+            info["last_token_usage"] = {"input_tokens": 2, "output_tokens": 1}
+        else:
+            payload["turn_id"] = "inherited-turn"
+    root = native_session(
+        "root", [{"input_tokens": 20, "output_tokens": 5}], extra=named_native_spawn()
+    )
+    parsed = codex.parse_events("", [root, stream(*child)], "codex", include_descendants=True)
+    assert parsed["usage"] is None
+    assert parsed["usage_accounting"]["observed_usage_lower_bound"] is None
+
+
+def test_native_named_spawn_rejects_two_session_identities_for_one_child_path() -> None:
+    child = inherited_native_child()
+    second = inherited_native_child()
+    metadata = second[0]["payload"]
+    assert isinstance(metadata, dict)
+    metadata["id"] = "second-child"
+    root = native_session(
+        "root", [{"input_tokens": 20, "output_tokens": 5}], extra=named_native_spawn()
+    )
+    parsed = codex.parse_events(
+        "", [root, stream(*child), stream(*second)], "codex", include_descendants=True
+    )
+    assert parsed["usage"] is None
+    assert (
+        "conflicting descendant identities for agent /root/check from session root"
+        in parsed["usage_accounting"]["reasons"]
+    )

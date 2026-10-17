@@ -1,39 +1,23 @@
 from __future__ import annotations
 
 import json
-import sys
+import tarfile
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
 
-from pluginbench import codex, study
-from pluginbench.datasets import TaskSpec
+from pluginbench import codex, study, isolation, harbor_backend, submissions
+from pluginbench.assessment_metrics import inspect_snapshot
+from pluginbench.datasets import native_identity
+from native_support import task_entry, execution as native_execution, synthetic_contract
 
 
-def _recipe(tmp_path: Path, *, max_repairs: int = 0) -> Path:
+def _recipe(tmp_path: Path) -> Path:
     suite = tmp_path / "suite"
     suite.mkdir()
-    tasks = []
-    for name in ("first", "second"):
-        fixture = suite / "fixtures" / name
-        (fixture / "src").mkdir(parents=True)
-        (fixture / "src/answer.py").write_text("answer = 0\n")
-        tasks.append(
-            {
-                "id": name,
-                "prompt": f"Set the answer to one for {name}.",
-                "fixture": f"fixtures/{name}",
-                "verifier": {"command": [sys.executable], "script": "verify.py"},
-            }
-        )
-    (suite / "verify.py").write_text(
-        "import json, pathlib, sys\n"
-        "passed = pathlib.Path('src/answer.py').read_text() == 'answer = 1\\n'\n"
-        "print(json.dumps({'pass': passed}))\n"
-        "sys.exit(0 if passed else 1)\n"
-    )
+    tasks = [task_entry(suite, name) for name in ("first", "second")]
     (suite / "tasks.yaml").write_text(yaml.safe_dump({"schema_version": 1, "tasks": tasks}))
     (tmp_path / "guidance.md").write_text("Reuse the existing helper.\nKeep the change small.\n")
     path = tmp_path / "recipe.yaml"
@@ -44,31 +28,34 @@ def _recipe(tmp_path: Path, *, max_repairs: int = 0) -> Path:
                 "name": "Offline smoke study",
                 "tasks": "suite/tasks.yaml",
                 "guidance": {"candidate": ["guidance.md"]},
-                "max_repairs": max_repairs,
+                "harness_version": "1.2.3",
             }
         )
     )
     return path
 
 
-def test_pier_python_keeps_venv_symlink(tmp_path: Path) -> None:
-    recipe = _recipe(tmp_path)
-    executable = tmp_path / "venv/bin/python"
-    executable.parent.mkdir(parents=True)
-    executable.symlink_to(sys.executable)
-    document = yaml.safe_load(recipe.read_text())
-    document["pier_python"] = "venv/bin/python"
-    recipe.write_text(yaml.safe_dump(document))
-    loaded = study.load_study(recipe)
-    assert loaded.recipe.pier_python == executable
-    assert loaded.recipe.pier_python.is_symlink()
+def _offline_harbor(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Native preparation/admission is tested separately; retain real reconstruction here.
+    monkeypatch.setattr(submissions, "reviewed_contract", synthetic_contract)
+    identity = {"resources": {"cpus": 1, "memory_mb": 2048}, "offline": True}
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: identity)
+    monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
+
+
+@pytest.fixture(autouse=True)
+def offline_harbor(monkeypatch: pytest.MonkeyPatch) -> None:
+    _offline_harbor(monkeypatch)
 
 
 def _fake_runtime(
     monkeypatch: pytest.MonkeyPatch, *, fail_call: int | None = None
 ) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli test"})
+    _offline_harbor(monkeypatch)
+    monkeypatch.setattr(
+        harbor_backend, "preflight", lambda **kwargs: {"harness_version": "codex-cli test"}
+    )
 
     def invoke(**kwargs: Any) -> dict[str, Any]:
         calls.append(kwargs)
@@ -76,25 +63,18 @@ def _fake_runtime(
         assert not list((area / "workspace").rglob("guidance.md"))
         if len(calls) != fail_call:
             (area / "workspace/src/answer.py").write_text("answer = 1\n")
-        artifacts = area / "artifacts"
-        artifacts.mkdir()
-        (artifacts / "prompt.txt").write_text(kwargs["prompt"])
-        return {
-            "successful_native_completion": True,
-            "elapsed_seconds": 1.0,
-            "usage": None
-            if len(calls) == fail_call
-            else {
-                "input_tokens": 10,
-                "output_tokens": 5,
-                "total_tokens": 15,
-            },
-            "actual_primary_models": ["gpt-6.1-sol"],
-            "runtime_effort_evidence": ["medium"],
-            "startup": [{"type": "session_meta", "payload": {"cli_version": "observed-1"}}],
-        }
+        result = native_execution(
+            area,
+            kwargs["protocol"]["native_task_identity"],
+            reward=0 if len(calls) == fail_call else 1,
+        )
+        (area / "artifacts/prompt.txt").write_text(kwargs["prompt"])
+        if len(calls) == fail_call:
+            result["usage"] = None
+        result["startup"] = [{"type": "session_meta", "payload": {"cli_version": "observed-1"}}]
+        return result
 
-    monkeypatch.setattr(codex, "invoke", invoke)
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
     return calls
 
 
@@ -121,28 +101,168 @@ def test_full_study_keeps_all_twelve_attempts_and_reports_failure(
     assert len(report["attempts"]) == 12
     assert report["attempts"][0]["stages"][0]["correctness"]["status"] == "fail"
     assert report["attempts"][0]["stages"][0]["work"]["tokens"] is None
-    assert report["attempts"][0]["correction_burden"]["status"] == "unavailable"
-    assert (root / "report/assessment-charts.html").exists()
     assert not any(
         "guidance.md" in str(path)
         for call in calls
         for path in (call["area"] / "workspace").glob("**/*")
     )
     for call in calls:
+        assert "Set the answer to one for" not in call["prompt"]
+        assert call["prompt"] == ""
+        selected = call["protocol"]["treatment"]
         if call["entry"]["arm"] == "baseline":
-            assert "Reuse the existing helper" not in call["prompt"]
+            assert selected == {"guidance": [], "skills": [], "plugins": []}
         else:
-            assert "Reuse the existing helper.\nKeep the change small.\n" in call["prompt"]
+            assert len(selected["guidance"]) == 1
+            assert Path(selected["guidance"][0]).read_text() == "Reuse the existing helper.\nKeep the change small.\n"
     assert not (root / "frozen/auth.json").exists()
 
 
-def test_plan_is_fixed_balanced_and_counts_maximum_repair_calls(tmp_path: Path) -> None:
-    recipe = study.load_study(_recipe(tmp_path, max_repairs=2))
+def test_harbor_submissions_use_trusted_grading_and_keep_missing_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _recipe(tmp_path)
+    document = yaml.safe_load(path.read_text())
+    document.update(backend="harbor", harness_version="1.2.3", repeats=1)
+    document["guidance"]["second-package"] = ["guidance.md"]
+    path.write_text(yaml.safe_dump(document))
+    runtime = {"protocol": "offline-harbor-fixture"}
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: runtime)
+    monkeypatch.setattr(harbor_backend, "assert_runtime", lambda expected: None)
+    monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
+    monkeypatch.setattr(
+        harbor_backend, "invoke_native", lambda **kwargs: pytest.fail("coding must use Harbor")
+    )
+    calls = []
+
+    def invoke(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        assert kwargs["protocol"]["harness_version"] == "1.2.3"
+        workspace = kwargs["area"] / "workspace"
+        assert (workspace / "src/answer.py").read_text() == "answer = 0\n"
+        if len(calls) != 1:
+            (workspace / "src/answer.py").write_text("answer = 1\n")
+        execution: dict[str, Any] = {
+            **native_execution(
+                kwargs["area"],
+                kwargs["protocol"]["native_task_identity"],
+                reward=0 if len(calls) == 1 else 1,
+            ),
+            "submission_collected": len(calls) != 1,
+            "successful_native_completion": len(calls) > 2,
+            "usage": None,
+            "actual_primary_models": ["gpt-6.1-sol"],
+            "runtime_effort_evidence": ["medium"],
+            "launch_harness_version": "1.2.3",
+        }
+        if len(calls) == 1:
+            execution.pop("submission_export_digest", None)
+        if len(calls) == 3:
+            execution.update(
+                submission_collected=False,
+                submission_export_digest=inspect_snapshot(workspace)["digest"],
+            )
+            codex.write_json(kwargs["area"] / "artifacts/execution.json", execution)
+            raise ValueError("stopped export completed but cleanup failed")
+        return execution
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
+    root = study.run_study(study.load_study(path), tmp_path / "results")
+    report = json.loads((root / "report/assessment-report.json").read_text())
+    stages = [attempt["stages"][0] for attempt in report["attempts"]]
+    assert len(calls) == len(stages) == 6
+    assert stages[0]["snapshot_digest"] is None
+    assert stages[0]["correctness"]["status"] == "unknown"
+    assert stages[1]["correctness"]["status"] == "fail"
+    assert stages[2]["snapshot_digest"] is None
+    assert stages[2]["correctness"]["status"] == "unknown"
+    ungraded = list(root.glob("attempts/*/handoff/ungraded-submission/src/answer.py"))
+    assert len(ungraded) == 1 and ungraded[0].read_text() == "answer = 1\n"
+    assert all(stage["correctness"]["status"] == "pass" for stage in stages[3:])
+    assert all(stage["work"]["tokens"] is None for stage in stages)
+    assert json.loads((root / "run.json").read_text())["actual_calls"] == 6
+
+
+def test_runtime_drift_stops_new_calls_and_preserves_completed_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _recipe(tmp_path)
+    recipe = study.load_study(path)
+    calls = _fake_runtime(monkeypatch)
+    native = harbor_backend.invoke_native
+    runtime = harbor_backend
+    identity = {"resources": {"cpus": 1, "memory_mb": 2048}, "offline": True}
+    monkeypatch.setattr(runtime, "runtime_identity", lambda **kwargs: identity)
+
+    def changed_runtime(**kwargs: Any) -> dict[str, Any]:
+        result = native(**kwargs)
+        result["submission_collected"] = True
+        monkeypatch.setattr(
+            runtime, "runtime_identity", lambda **kwargs: {**identity, "os_release": "changed"}
+        )
+        return result
+
+    monkeypatch.setattr(runtime, "invoke_native", changed_runtime)
+    root = tmp_path / "results"
+    with pytest.raises(isolation.RuntimeDriftError, match="runtime changed"):
+        study.run_study(recipe, root)
+    run = json.loads((root / "run.json").read_text())
+    assert len(calls) == run["actual_calls"] == 1
+    assert run["status"] == "interrupted"
+    assert list(root.glob("attempts/*/handoff/snapshot/src/answer.py"))
+    manifest = json.loads((root / "assessment-input.json").read_text())
+    assert len(manifest["records"]) == 12
+    assert (root / "report/assessment-report.json").is_file()
+
+
+@pytest.mark.parametrize("directory_link", [False, True])
+def test_artifact_links_are_retained_without_reading_external_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, directory_link: bool
+) -> None:
+    path = _recipe(tmp_path)
+    document = yaml.safe_load(path.read_text())
+    document["repeats"] = 1
+    path.write_text(yaml.safe_dump(document))
+    private = tmp_path / "operator-private"
+    private.mkdir()
+    secret = private / "private.txt"
+    secret.write_text("operator content must never enter submission evidence")
+    calls = _fake_runtime(monkeypatch)
+    native = harbor_backend.invoke_native
+
+    def linked_artifacts(**kwargs: Any) -> dict[str, Any]:
+        execution = native(**kwargs)
+        logs = kwargs["area"] / "artifacts/harbor/trial/agent"
+        logs.mkdir(parents=True)
+        (logs / "not-native-log").symlink_to(private if directory_link else secret)
+        return execution
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", linked_artifacts)
+    root = study.run_study(study.load_study(path), tmp_path / "results")
+    assert len(calls) == 4
+    for file in root.rglob("*"):
+        if file.is_file() and not file.is_symlink():
+            assert secret.read_bytes() not in file.read_bytes()
+    archives = list(root.glob("attempts/*/handoff/artifacts/unsupported-artifacts.tar"))
+    assert len(archives) == 4
+    with tarfile.open(archives[0]) as archive:
+        link = archive.getmember("artifacts/harbor/trial/agent/not-native-log")
+        assert link.issym()
+        assert link.linkname == str(private if directory_link else secret)
+    report = json.loads((root / "report/assessment-report.json").read_text())
+    assert all(
+        attempt["stages"][0]["snapshot_digest"] is None
+        and attempt["stages"][0]["correctness"]["status"] == "unknown"
+        for attempt in report["attempts"]
+    )
+
+
+def test_plan_is_fixed_balanced_and_single_attempt(tmp_path: Path) -> None:
+    recipe = study.load_study(_recipe(tmp_path))
     first = study.plan_study(recipe)
     assert first == study.plan_study(recipe)
     assert first["initial_calls"] == 12
-    assert first["maximum_calls"] == 36
-    assert first["delivery"].startswith("forced text")
+    assert first["delivery"] == "native-instructions-skills-plugins-v1"
 
 
 def test_report_derives_each_attempt_harness_version_from_bound_session_metadata(
@@ -150,86 +270,24 @@ def test_report_derives_each_attempt_harness_version_from_bound_session_metadata
 ) -> None:
     recipe = study.load_study(_recipe(tmp_path))
     calls = _fake_runtime(monkeypatch)
-    invoke = codex.invoke
+    invoke = harbor_backend.invoke_native
 
     def changing_cli(**kwargs: Any) -> dict[str, Any]:
         execution = invoke(**kwargs)
-        execution["startup"][0]["payload"]["cli_version"] = f"observed-{len(calls)}"
+        execution["startup"] = [
+            {"type": "session_meta", "payload": {"cli_version": f"observed-{len(calls)}"}}
+        ]
         return execution
 
-    monkeypatch.setattr(codex, "invoke", changing_cli)
+    monkeypatch.setattr(harbor_backend, "invoke_native", changing_cli)
     root = study.run_study(recipe, tmp_path / "results")
     report = json.loads((root / "report/assessment-report.json").read_text())
     assert [row["provenance"]["harness_version"] for row in report["attempts"]] == [
         f"observed-{index}" for index in range(1, 13)
     ]
-    assert {row["provenance"]["assigned_harness_version"] for row in report["attempts"]} == {"test"}
-
-
-@pytest.mark.parametrize("repair_version", [None, "different"])
-def test_missing_or_conflicting_session_versions_stay_unknown(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repair_version: str | None
-) -> None:
-    recipe = study.load_study(_recipe(tmp_path, max_repairs=1))
-    calls = _fake_runtime(monkeypatch, fail_call=1)
-    invoke = codex.invoke
-
-    def changing_cli(**kwargs: Any) -> dict[str, Any]:
-        execution = invoke(**kwargs)
-        if len(calls) == 2:
-            execution["startup"][0]["payload"]["cli_version"] = repair_version
-        return execution
-
-    monkeypatch.setattr(codex, "invoke", changing_cli)
-    root = study.run_study(recipe, tmp_path / "results")
-    report = json.loads((root / "report/assessment-report.json").read_text())
-    assert report["attempts"][0]["provenance"]["harness_version"] is None
-
-
-def test_deterministic_feedback_repairs_are_stages_not_fresh_attempts(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    recipe = study.load_study(_recipe(tmp_path, max_repairs=1))
-    calls = _fake_runtime(monkeypatch, fail_call=1)
-    root = study.run_study(recipe, tmp_path / "results")
-    manifest = json.loads((root / "assessment-input.json").read_text())
-    assert len(manifest["records"]) == 12
-    assert len(calls) == 13
-    assert [stage["id"] for stage in manifest["records"][0]["stages"]] == ["handoff", "repair-1"]
-    assert calls[0]["area"] != calls[1]["area"]
-    assert "external verifier rejected" in calls[1]["prompt"]
-    report = json.loads((root / "report/assessment-report.json").read_text())
-    assert report["attempts"][0]["stages"][0]["correctness"]["status"] == "fail"
-    assert report["attempts"][0]["stages"][1]["correctness"]["status"] == "pass"
-    assert report["attempts"][0]["correction_burden"]["verified_issue_count"] is None
-
-
-@pytest.mark.parametrize("key", ["actual_primary_models", "runtime_effort_evidence"])
-def test_repair_runtime_mismatch_does_not_relabel_earlier_stages(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    key: str,
-) -> None:
-    recipe = study.load_study(_recipe(tmp_path, max_repairs=1))
-    calls = _fake_runtime(monkeypatch, fail_call=1)
-    invoke = codex.invoke
-
-    def changed_runtime(**kwargs: Any) -> dict[str, Any]:
-        execution = invoke(**kwargs)
-        if len(calls) == 2:
-            execution[key] = ["different"]
-        return execution
-
-    monkeypatch.setattr(codex, "invoke", changed_runtime)
-    root = study.run_study(recipe, tmp_path / "results")
-    record = json.loads((root / "assessment-input.json").read_text())["records"][0]
-    assert (
-        record["model"] is None
-        if key == "actual_primary_models"
-        else record["runtime"]["reasoning_effort"] is None
-    )
-    assert record["stages"][0]["work"]["tokens"] is None
+    assert {row["provenance"]["assigned_harness_version"] for row in report["attempts"]} == {
+        "1.2.3"
+    }
 
 
 def test_frozen_guidance_tampering_is_rejected_on_report(
@@ -239,79 +297,55 @@ def test_frozen_guidance_tampering_is_rejected_on_report(
     recipe = study.load_study(_recipe(tmp_path))
     _fake_runtime(monkeypatch)
     root = study.run_study(recipe, tmp_path / "results")
-    next((root / "frozen/guidance").rglob("*.md")).write_text("changed")
+    next((root / "frozen/treatments").rglob("*.md")).write_text("changed")
     with pytest.raises(ValueError, match="frozen study inputs changed"):
         study.report_study(root)
 
 
-@pytest.mark.parametrize("tamper", ["verifier", "archived_report"])
-def test_observer_revision_preserves_original_evidence_binding(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str
-) -> None:
-    _fake_runtime(monkeypatch)
-    root = study.run_study(study.load_study(_recipe(tmp_path)), tmp_path / "results")
-    run = json.loads((root / "run.json").read_text())
-    manifest = study._bound_document(root, run["assessment_input"])
-    record = manifest["records"][0]
-    stage = record["stages"][0]
-    archive = root / "observer-revision/original"
-    archive.mkdir(parents=True)
-    (archive / "run.json").write_text(json.dumps(run))
-    (archive / "assessment.json").write_text(json.dumps(manifest))
-    archived_report = archive / "report.json"
-    archived_report.write_text((root / "report/assessment-report.json").read_text())
-    corrected = root / "observer-revision/corrected-result.json"
-    corrected.write_text(json.dumps({"observer": "corrected"}))
-    revision = {
-        "original_run": study._reference(root, archive / "run.json"),
-        "original_assessment": study._reference(root, archive / "assessment.json"),
-        "original_reports": {"report.json": study._reference(root, archived_report)},
-        "observations": [
-            {
-                "attempt_id": record["id"],
-                "stage": stage["id"],
-                "snapshot_digest": stage["snapshot"]["sha256"],
-                "before_digest": record["before"]["sha256"],
-                "old_correctness_ref": stage["correctness"],
-                "new_correctness_ref": stage["correctness"],
-                "result_ref": study._reference(root, corrected),
-            }
-        ],
-    }
-    protocol = root / "observer-revision/protocol.json"
-    protocol.write_text(json.dumps(revision))
-    run["observer_revision"] = study._reference(root, protocol)
-    (root / "run.json").write_text(json.dumps(run))
-    study.report_study(root)
-    report = json.loads((root / "report/assessment-report.json").read_text())
-    assert report["attempts"][0]["stages"][0]["task_result"] == {"observer": "corrected"}
-    original = root / run["verifier_results"][record["id"]][stage["id"]]["path"]
-    (original if tamper == "verifier" else archived_report).write_text("tampered")
-    with pytest.raises(ValueError, match="run artifact changed"):
-        study.report_study(root)
-
-
+@pytest.mark.parametrize("cause", ["timeout", "provider"])
 def test_native_failure_is_retained_even_if_workspace_checks_pass(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cause: str,
 ) -> None:
     recipe = study.load_study(_recipe(tmp_path))
     calls = _fake_runtime(monkeypatch)
-    invoke = codex.invoke
+    invoke = harbor_backend.invoke_native
+    stream_errors = (
+        [
+            {
+                "type": "turn.failed",
+                "error": {
+                    "message": "Selected model is at capacity. Please try a different model."
+                },
+            }
+        ]
+        if cause == "provider"
+        else []
+    )
+    partial_usage = [
+        {
+            "status": "incomplete usage lower bound",
+            "tokens": {"input_tokens": 9, "output_tokens": 2},
+        }
+    ]
 
     def incomplete(**kwargs: Any) -> dict[str, Any]:
         execution = invoke(**kwargs)
         if len(calls) == 1:
             execution.update(
                 successful_native_completion=False,
-                timed_out=True,
+                timed_out=cause == "timeout",
+                stream_errors=stream_errors,
+                partial_usage=partial_usage,
+                error={"exception_type": "ApiOverloadedError"} if cause == "provider" else None,
                 usage=None,
                 actual_primary_models=[],
                 runtime_effort_evidence=[],
             )
         return execution
 
-    monkeypatch.setattr(codex, "invoke", incomplete)
+    monkeypatch.setattr(harbor_backend, "invoke_native", incomplete)
     root = study.run_study(recipe, tmp_path / "results")
     report = json.loads((root / "report/assessment-report.json").read_text())
     assert len(report["attempts"]) == 12
@@ -320,35 +354,16 @@ def test_native_failure_is_retained_even_if_workspace_checks_pass(
     assert failed["correctness"]["checks"]["native_completion"] is False
     assert failed["correctness"]["status"] == "fail"
     assert failed["work"]["tokens"] is None
+    execution = failed["execution_provenance"]
+    assert execution["stream_errors"] == stream_errors
+    assert execution["partial_usage"] == partial_usage
+    assert execution["successful_native_completion"] is False
+    assert execution["timed_out"] is (cause == "timeout")
     provenance = report["attempts"][0]["provenance"]
     assert provenance["assigned_model"] == "gpt-6.1-sol"
     assert provenance["assigned_reasoning_effort"] == "medium"
     assert report["attempts"][0]["model"] is None
     assert provenance["reasoning_effort"] is None
-
-
-def test_exhausted_repairs_keep_failed_terminal_stage(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    recipe = study.load_study(_recipe(tmp_path, max_repairs=1))
-    calls = _fake_runtime(monkeypatch)
-    invoke = codex.invoke
-
-    def never_fixed(**kwargs: Any) -> dict[str, Any]:
-        execution = invoke(**kwargs)
-        (kwargs["area"] / "workspace/src/answer.py").write_text("answer = 0\n")
-        return execution
-
-    monkeypatch.setattr(codex, "invoke", never_fixed)
-    root = study.run_study(recipe, tmp_path / "results")
-    assert len(calls) == 24
-    report = json.loads((root / "report/assessment-report.json").read_text())
-    assert len(report["attempts"]) == 12
-    assert all(attempt["stages"][-1]["accepted"] is False for attempt in report["attempts"])
-    assert all(
-        attempt["stages"][-1]["correctness"]["status"] == "fail" for attempt in report["attempts"]
-    )
 
 
 @pytest.mark.parametrize(
@@ -359,41 +374,70 @@ def test_fixture_contamination_is_rejected(tmp_path: Path, filename: str) -> Non
     contaminated = tmp_path / "suite/fixtures/first" / filename
     contaminated.parent.mkdir(parents=True, exist_ok=True)
     contaminated.write_text("custom instruction")
-    with pytest.raises(ValueError, match="custom guidance"):
+    with pytest.raises(ValueError, match="custom guidance|native source changed"):
         study.load_study(path)
 
 
-def test_plugin_bundle_selects_text_without_tools_and_rejects_symlinks(tmp_path: Path) -> None:
+def test_directory_cannot_be_silently_flattened_into_guidance(tmp_path: Path) -> None:
     path = _recipe(tmp_path)
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     (bundle / "SKILL.md").write_text("Useful instruction.")
-    (bundle / "hook.sh").write_text("echo external tool")
     value = yaml.safe_load(path.read_text())
     value["guidance"] = {"plugin": ["bundle"]}
     path.write_text(yaml.safe_dump(value))
-    resolved = study.load_study(path)
-    assert list(resolved.guidance["plugin"]) == [bundle / "SKILL.md"]
-    (bundle / "linked.md").symlink_to(tmp_path / "guidance.md")
-    with pytest.raises(ValueError, match="symlink"):
+    with pytest.raises(ValueError, match="guidance must select regular"):
         study.load_study(path)
 
 
-def test_plugin_root_selects_only_skill_text(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mutation", [None, "directory-mode", "empty-directory", "special-file-mode", "pre-freeze"])
+def test_native_plugin_freezing_preserves_package_and_leaves_task_prompt_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str | None,
+) -> None:
     path = _recipe(tmp_path)
     plugin = tmp_path / "plugin"
     skill = plugin / "skills/one"
     (skill / "references").mkdir(parents=True)
-    (skill / "agents").mkdir()
-    (skill / "SKILL.md").write_text("Entrypoint")
+    (skill / "empty-resource").mkdir()
+    (plugin / ".codex-plugin").mkdir()
+    (plugin / ".codex-plugin/plugin.json").write_text(json.dumps({
+        "name": "fixture", "skills": "./skills", "hooks": {},
+    }))
+    (skill / "SKILL.md").write_text("---\nname: one\ndescription: Native skill.\n---\nRead references/help.md.\n")
     (skill / "references/help.md").write_text("Reference")
-    (skill / "agents/openai.yaml").write_text("interface: {}")
-    (plugin / "README.md").write_text("Marketing is not guidance")
+    (skill / "run.sh").write_text("#!/bin/sh\necho proof\n")
+    (skill / "run.sh").chmod(0o755)
     value = yaml.safe_load(path.read_text())
-    value["guidance"] = {"plugin": ["plugin"]}
+    value.pop("guidance")
+    value["treatments"] = {"plugin": {"plugins": ["plugin"]}}
+    value["repeats"] = 1
     path.write_text(yaml.safe_dump(value))
-    loaded = study.load_study(path)
-    assert {file.name for file in loaded.guidance["plugin"]} == {"SKILL.md", "help.md"}
+    calls = _fake_runtime(monkeypatch)
+    resolved = study.load_study(path)
+    if mutation == "pre-freeze":
+        (skill / "empty-resource").rmdir()
+        with pytest.raises(ValueError, match="frozen.*treatment.*changed"):
+            study.run_study(resolved, tmp_path / "results")
+        assert not calls
+        return
+    root = study.run_study(resolved, tmp_path / "results")
+    assert len(calls) == 4
+    assert all(call["prompt"] == "" for call in calls)
+    selected = next(call["protocol"]["treatment"] for call in calls if call["entry"]["arm"] == "plugin")
+    frozen = Path(selected["plugins"][0])
+    assert frozen.is_relative_to(root / "frozen/treatments")
+    assert (frozen / "skills/one/references/help.md").read_text() == "Reference"
+    assert (frozen / "skills/one/run.sh").stat().st_mode & 0o777 == 0o755
+    assert (frozen / ".codex-plugin/plugin.json").read_bytes() == (plugin / ".codex-plugin/plugin.json").read_bytes()
+    if mutation == "directory-mode":
+        frozen.chmod(0o700 if frozen.stat().st_mode & 0o777 != 0o700 else 0o755)
+    elif mutation == "empty-directory":
+        (frozen / "skills/one/empty-resource").rmdir()
+    elif mutation == "special-file-mode":
+        (frozen / "skills/one/run.sh").chmod(0o4755)
+    if mutation:
+        with pytest.raises(ValueError, match="frozen.*treatment.*changed"):
+            study.report_study(root)
 
 
 def test_guidance_file_symlink_is_rejected_before_resolution(tmp_path: Path) -> None:
@@ -407,107 +451,160 @@ def test_guidance_file_symlink_is_rejected_before_resolution(tmp_path: Path) -> 
         study.load_study(path)
 
 
-def test_supplied_smoke_example_is_a_complete_exit_code_verifier_run(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "reward, auxiliary, expected",
+    [
+        (0, False, False),
+        (1, False, True),
+        (0.5, False, None),
+        (0, True, False),
+        (1, True, True),
+        (0.5, True, None),
+        (True, True, None),
+    ],
+)
+def test_native_grade_requires_binary_reward_and_bound_measured_source(
+    tmp_path: Path, reward: float, auxiliary: bool, expected: bool | None
 ) -> None:
-    examples = Path(__file__).resolve().parents[1] / "tests/fixtures/native-study"
-    recipe = study.load_study(examples / "study.yaml")
-    calls = []
-    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli test"})
+    task = study.load_study(_recipe(tmp_path)).tasks[0]
+    area = tmp_path / "area"
+    import shutil
 
-    def invoke(**kwargs: Any) -> dict[str, Any]:
-        calls.append(kwargs)
-        (kwargs["area"] / "workspace/summary.json").write_text(
-            json.dumps(
-                {
-                    "total": 5,
-                    "successful": 2,
-                    "errors": 2,
-                    "cancelled": 1,
-                }
-            )
-        )
-        return {
-            "successful_native_completion": True,
-            "usage": None,
-            "actual_primary_models": ["gpt-6.1-sol"],
-            "runtime_effort_evidence": ["medium"],
-        }
-
-    monkeypatch.setattr(codex, "invoke", invoke)
-    root = study.run_study(recipe, tmp_path / "results")
-    report = json.loads((root / "report/assessment-report.json").read_text())
-    assert len(calls) == len(report["attempts"]) == 2
-    for attempt in report["attempts"]:
-        assert attempt["stages"][0]["correctness"]["status"] == "pass"
-        assert attempt["stages"][0]["selected_checks_pass"] is True
-        assert attempt["stages"][0]["accepted"] is None
-        assert attempt["provenance"]["host"] == "codex"
-        assert attempt["provenance"]["input"] == "codex-study"
-        assert "automatic activation is not measured" in attempt["provenance"]["guidance_delivery"]
-
-
-@pytest.mark.parametrize("exit_code, expected", [(0, True), (1, False), (2, None)])
-def test_exit_code_verifier_contract(tmp_path: Path, exit_code: int, expected: bool | None) -> None:
-    recipe = study.load_study(_recipe(tmp_path))
-    task = recipe.tasks[0]
-    assert isinstance(task, TaskSpec)
-    assert task.verifier is not None and task.fixture is not None
-    task.verifier.script.write_text(f"raise SystemExit({exit_code})\n")
-    result = study._grade(task.fixture, task, tmp_path / "grader")
-    assert result["pass"] is expected
-
-
-def test_mutating_grader_and_contradictory_json_cannot_pass(tmp_path: Path) -> None:
-    recipe = study.load_study(_recipe(tmp_path))
-    task = recipe.tasks[0]
-    assert isinstance(task, TaskSpec)
-    assert task.verifier is not None and task.fixture is not None
-    task.verifier.script.write_text(
-        "from pathlib import Path\nPath('src/answer.py').write_text('changed')\n"
+    shutil.copytree(task.fixture, area / "workspace")
+    (area / "workspace/src/answer.py").write_text("answer = 1\n")
+    result = native_execution(area, native_identity(task))
+    rewards = {"reward": reward}
+    result["native_verifier_result"] = {"rewards": rewards}
+    if auxiliary:
+        rewards.update(f2p=1.0, p2p=1.0)
+    bound = study._native_grade_binding(
+        snapshot=area / "workspace", task=task, artifacts=area / "artifacts", execution=result
     )
-    result = study._grade(task.fixture, task, tmp_path / "mutating")
-    assert result["pass"] is False
-    assert result["grader_immutable"] is False
-    assert (task.fixture / "src/answer.py").read_text() == "answer = 0\n"
-    task.verifier.script.write_text("print('{\"pass\": true}')\nraise SystemExit(1)\n")
-    assert study._grade(task.fixture, task, tmp_path / "contradictory")["pass"] is None
+    assert bound["pass"] is expected
+    assert bound["graded_source_digest"] == bound["measured_source_digest"]
+    (area / "workspace/src/uncommitted.py").write_text("extra = 1\n")
+    with pytest.raises(ValueError, match="canonical graded source changed"):
+        study._native_grade_binding(
+            snapshot=area / "workspace", task=task, artifacts=area / "artifacts", execution=result
+        )
 
 
-def test_unsupported_symlink_submission_is_retained_and_remaining_attempts_run(
+def test_native_graded_patch_tampering_is_rejected(tmp_path: Path) -> None:
+    import shutil
+
+    task = study.load_study(_recipe(tmp_path)).tasks[0]
+    area = tmp_path / "area"
+    shutil.copytree(task.fixture, area / "workspace")
+    (area / "workspace/src/answer.py").write_text("answer = 1\n")
+    result = native_execution(area, native_identity(task))
+    (area / "artifacts/harbor/trial/artifacts/logs/artifacts/model.patch").write_text(
+        "foreign patch"
+    )
+    with pytest.raises(ValueError, match="graded patch changed"):
+        study._native_grade_binding(
+            snapshot=area / "workspace", task=task, artifacts=area / "artifacts", execution=result
+        )
+
+
+@pytest.mark.parametrize("fault", ["escape", "mode", "multi-reward"])
+def test_native_source_binding_keeps_unsupported_grade_unknown(tmp_path: Path, fault: str) -> None:
+    import shutil
+
+    task = study.load_study(_recipe(tmp_path)).tasks[0]
+    area = tmp_path / "area"
+    shutil.copytree(task.fixture, area / "workspace")
+    (area / "workspace/src/answer.py").write_text("answer = 1\n")
+    result = native_execution(area, native_identity(task))
+    if fault == "escape":
+        result["native_artifact_hashes"] = {"../model.patch": "a" * 64}
+        with pytest.raises(ValueError, match="graded patch hash unavailable"):
+            study._native_grade_binding(
+                snapshot=area / "workspace",
+                task=task,
+                artifacts=area / "artifacts",
+                execution=result,
+            )
+        return
+    if fault == "mode":
+        (area / "workspace/src/answer.py").chmod(0o755)
+        with pytest.raises(ValueError, match="canonical graded source changed"):
+            study._native_grade_binding(
+                snapshot=area / "workspace",
+                task=task,
+                artifacts=area / "artifacts",
+                execution=result,
+            )
+        return
+    else:
+        result["native_verifier_result"] = {"rewards": {"a": 1, "b": 1}}
+    bound = study._native_grade_binding(
+        snapshot=area / "workspace", task=task, artifacts=area / "artifacts", execution=result
+    )
+    assert bound["pass"] is None
+    assert bound["native_verifier_result"] == result["native_verifier_result"]
+
+
+@pytest.mark.parametrize("failure", ["symlink", "patch", "export"])
+def test_unsupported_submission_is_retained_and_remaining_attempts_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failure: str,
 ) -> None:
-    recipe = study.load_study(_recipe(tmp_path, max_repairs=1))
+    recipe = study.load_study(_recipe(tmp_path))
     calls = _fake_runtime(monkeypatch)
-    invoke = codex.invoke
+    invoke = harbor_backend.invoke_native
     outside = tmp_path / "outside.txt"
     outside.write_text("Must not be read as submitted source")
 
     def unsupported(**kwargs: Any) -> dict[str, Any]:
         execution = invoke(**kwargs)
         if len(calls) == 1:
-            (kwargs["area"] / "workspace/src/link.py").symlink_to(outside)
+            artifacts = kwargs["area"] / "artifacts"
+            if failure == "symlink":
+                (kwargs["area"] / "workspace/src/link.py").symlink_to(outside)
+            elif failure == "patch":
+                patch = artifacts / "harbor/trial/artifacts/logs/artifacts/model.patch"
+                patch.write_text("invalid patch\n")
+                execution["native_artifact_hashes"] = harbor_backend._native_artifact_hashes(
+                    artifacts / "harbor/trial/artifacts"
+                )
+            else:
+                receipt = artifacts / "submission-source.json"
+                exported = json.loads(receipt.read_text())
+                exported["source_metadata_digest"] = "unproven export metadata"
+                receipt.write_text(json.dumps(exported))
         return execution
 
-    monkeypatch.setattr(codex, "invoke", unsupported)
+    monkeypatch.setattr(harbor_backend, "invoke_native", unsupported)
     root = study.run_study(recipe, tmp_path / "results")
     assert len(calls) == 12
     report = json.loads((root / "report/assessment-report.json").read_text())
     assert len(report["attempts"]) == 12
     stage = report["attempts"][0]["stages"][0]
     assert stage["snapshot_digest"] is None
-    assert stage["accepted"] is None
-    assert stage["submission_error"]["symlinks"] == {"src/link.py": str(outside)}
-    forensic = (
-        root
-        / "attempts"
-        / report["attempts"][0]["id"]
-        / "handoff/unsupported-submission/src/link.py"
-    )
-    assert forensic.is_symlink()
-    assert "outside.txt" not in stage["submission_error"]["error"]
+    target = root / "attempts" / report["attempts"][0]["id"] / "handoff"
+    if failure == "symlink":
+        assert stage["submission_error"]["symlinks"] == {"src/link.py": str(outside)}
+        assert (target / "unsupported-submission/src/link.py").is_symlink()
+        assert "outside.txt" not in stage["submission_error"]["error"]
+        return
+    source = target / "diagnostic-source/src/answer.py"
+    patch = target / "artifacts/harbor/trial/artifacts/logs/artifacts/model.patch"
+    for artifact in (source, patch):
+        original = artifact.read_bytes()
+        artifact.write_bytes(original + b"changed\n")
+        with pytest.raises(ValueError, match="unsupported submission diagnostics changed"):
+            study.report_study(root)
+        artifact.write_bytes(original)
+        mode = artifact.stat().st_mode
+        artifact.chmod(0o755)
+        with pytest.raises(ValueError, match="unsupported submission diagnostics changed"):
+            study.report_study(root)
+        artifact.chmod(mode)
+    source.unlink()
+    with pytest.raises(ValueError, match="unsupported submission diagnostics changed"):
+        study.report_study(root)
+    assert len(calls) == 12
 
 
 def test_execution_receipt_tamper_is_rejected_on_report(
@@ -540,14 +637,14 @@ def test_interrupted_study_is_reportable_and_retains_every_assignment(
 ) -> None:
     resolved = study.load_study(_recipe(tmp_path))
     calls = _fake_runtime(monkeypatch)
-    original = codex.invoke
+    original = harbor_backend.invoke_native
 
     def interrupted(**kwargs: Any) -> dict[str, Any]:
         if calls:
             raise failure
         return original(**kwargs)
 
-    monkeypatch.setattr(codex, "invoke", interrupted)
+    monkeypatch.setattr(harbor_backend, "invoke_native", interrupted)
     root = tmp_path / "run"
     with pytest.raises(type(failure)):
         study.run_study(resolved, root)
@@ -566,22 +663,31 @@ def test_interrupted_study_is_reportable_and_retains_every_assignment(
     assert report["attempts"][1]["stages"][0]["execution_provenance"]["artifact"]
     from pluginbench.assessment_charts import chart_data
 
-    outcomes = chart_data(report)["outcomes"]
-    assert isinstance(outcomes, list)
-    assert all(row["assignment_bound"] for row in outcomes)
+    rows = chart_data(report)["observations"]
+    assert isinstance(rows, list)
+    observations = [row for row in rows if row["metric"] == "Input tokens"]
+    assert len(observations) == 12
+    assert {row["attempt_id"] for row in observations} == {
+        attempt["id"] for attempt in report["attempts"]
+    }
+    assert [row["correctness"] for row in observations].count("pass") == 1
+    assert [row["correctness"] for row in observations].count("unknown") == 11
+    assert observations[0]["value"] == 10
+    assert all(row["value"] is None and row["status"] == "unknown" for row in observations[1:])
     for task_id in ("first", "second"):
         for arm in ("baseline", "candidate"):
-            assert (
-                sum(
-                    row["assigned"]
-                    for row in outcomes
-                    if row["task"] == task_id and row["arm"] == arm
-                )
-                == 3
-            )
+            assert sum(row["task"] == task_id and row["arm"] == arm for row in observations) == 3
+            assert sorted(
+                attempt["attempt"]
+                for attempt in report["attempts"]
+                if attempt["task_id"] == task_id and attempt["arm"] == arm
+            ) == [1, 2, 3]
     assert all(
-        row["reasoning_effort"] == row["requested_reasoning_effort"] == "medium" for row in outcomes
+        attempt["provenance"]["assigned_reasoning_effort"] == "medium"
+        for attempt in report["attempts"]
     )
+    assert observations[0]["reasoning_effort"] == "medium"
+    assert all(row["reasoning_effort"] == row["model"] == "unknown" for row in observations[1:])
 
 
 def test_preflight_failure_is_reportable_without_model_calls(
@@ -589,10 +695,10 @@ def test_preflight_failure_is_reportable_without_model_calls(
 ) -> None:
     resolved = study.load_study(_recipe(tmp_path))
 
-    def unavailable() -> dict[str, Any]:
+    def unavailable(**kwargs: Any) -> dict[str, Any]:
         raise ValueError("native CLI unavailable")
 
-    monkeypatch.setattr(codex, "preflight", unavailable)
+    monkeypatch.setattr(harbor_backend, "preflight", unavailable)
     root = tmp_path / "run"
     with pytest.raises(ValueError, match="native CLI unavailable"):
         study.run_study(resolved, root)
@@ -605,100 +711,97 @@ def test_preflight_failure_is_reportable_without_model_calls(
     from pluginbench.assessment_charts import chart_data
 
     charts = chart_data(report)
-    outcomes = charts["outcomes"]
-    assert isinstance(outcomes, list)
-    assert sum(row["assigned"] for row in outcomes) == 12
-    assert all(row["assignment_bound"] for row in outcomes)
-    assert all(row["actual_runtime_unknown"] == row["assigned"] for row in outcomes)
+    rows = charts["observations"]
+    assert isinstance(rows, list)
+    observations = [row for row in rows if row["metric"] == "Input tokens"]
+    assert charts["assigned"] == len(observations) == 12
+    assert {row["attempt_id"] for row in observations} == set(run["attempt_states"])
+    assert all(
+        row["value"] is None and row["status"] == row["correctness"] == "unknown"
+        for row in observations
+    )
+    assert all(
+        row["reasoning_effort"] == row["model"] == row["harness_version"] == "unknown"
+        for row in observations
+    )
+    assert all(
+        attempt["provenance"]["assigned_model"] == "gpt-6.1-sol"
+        and attempt["provenance"]["assigned_reasoning_effort"] == "medium"
+        for attempt in report["attempts"]
+    )
 
 
-def test_local_provenance_is_frozen_and_bound_in_report(
+def test_task_provenance_is_frozen_and_bound_in_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = _recipe(tmp_path)
     catalog = tmp_path / "suite/tasks.yaml"
     data = yaml.safe_load(catalog.read_text())
-    data["tasks"][0]["provenance"] = {
-        "repository": "https://example.com/package",
-        "base_commit": "a" * 40,
-        "preparation": "source-only snapshot",
-    }
+    data["tasks"][0]["provenance"].update(
+        {
+            "repository": "https://example.com/package",
+            "base_commit": "a" * 40,
+            "preparation": "source-only snapshot",
+        }
+    )
     catalog.write_text(yaml.safe_dump(data))
     _fake_runtime(monkeypatch)
     root = study.run_study(study.load_study(path), tmp_path / "run")
     frozen = json.loads((root / "frozen/tasks.json").read_text())
-    assert frozen["tasks"][0]["provenance"] == data["tasks"][0]["provenance"]
+    assert {
+        key: value
+        for key, value in frozen["tasks"][0]["provenance"].items()
+        if key != "native_task_identity"
+    } == {
+        key: value
+        for key, value in data["tasks"][0]["provenance"].items()
+        if key != "native_task_identity"
+    }
     report = json.loads((root / "report/assessment-report.json").read_text())
     first = next(attempt for attempt in report["attempts"] if attempt["task_id"] == "first")
-    assert first["provenance"]["task"] == data["tasks"][0]["provenance"]
+    assert first["provenance"]["task"] == frozen["tasks"][0]["provenance"]
 
 
-def test_local_submission_omits_dependency_and_git_artifacts(
+def test_submission_keeps_patch_files_and_retains_generated_export_only_as_diagnostics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = _recipe(tmp_path)
     _fake_runtime(monkeypatch)
-    original = codex.invoke
+    original = harbor_backend.invoke_native
 
     def with_dependencies(**kwargs: Any) -> dict[str, Any]:
-        result = original(**kwargs)
         workspace = kwargs["area"] / "workspace"
+        (workspace / "dist").mkdir()
+        (workspace / "dist/retained.js").write_text("export const answer = 1;\n")
+        result = original(**kwargs)
+        (workspace / "dist/transient.js").write_text("generated after patch collection\n")
+        artifacts = kwargs["area"] / "artifacts"
+        export = json.loads((artifacts / "submission-source.json").read_text())
+        export["snapshot_digest"] = inspect_snapshot(workspace)["digest"]
+        export["source_metadata_digest"] = harbor_backend.native_task_assets(workspace)
+        (artifacts / "submission-source.json").write_text(json.dumps(export))
+        runtime = json.loads((artifacts / "runtime-isolation.json").read_text())
+        runtime["export"] = export
+        (artifacts / "runtime-isolation.json").write_text(json.dumps(runtime))
+        result["submission_export_digest"] = export["snapshot_digest"]
         (workspace / "node_modules/.bin").mkdir(parents=True)
         (workspace / "node_modules/.bin/tool").symlink_to("../package/tool")
         (workspace / ".git").mkdir()
         (workspace / ".git/object").write_bytes(b"temporary git data")
         return result
 
-    monkeypatch.setattr(codex, "invoke", with_dependencies)
+    monkeypatch.setattr(harbor_backend, "invoke_native", with_dependencies)
     root = study.run_study(study.load_study(path), tmp_path / "run")
     record = json.loads((root / "assessment-input.json").read_text())["records"][0]
     snapshot = root / record["stages"][0]["snapshot"]["path"]
     assert not (snapshot / "node_modules").exists()
     assert not (snapshot / ".git").exists()
     assert (snapshot / "src/answer.py").read_text() == "answer = 1\n"
-
-
-def test_interrupted_repair_stays_in_cost_and_progress_report(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    resolved = study.load_study(_recipe(tmp_path, max_repairs=1))
-    calls = _fake_runtime(monkeypatch, fail_call=1)
-    original = codex.invoke
-
-    def interrupted_repair(**kwargs: Any) -> dict[str, Any]:
-        if calls:
-            artifacts = kwargs["area"] / "artifacts"
-            artifacts.mkdir()
-            (artifacts / "stdout.jsonl").write_text(
-                json.dumps(
-                    {"type": "turn.completed", "usage": {"input_tokens": 4, "output_tokens": 2}}
-                )
-            )
-            (artifacts / "execution.json").write_text(
-                json.dumps({"exit_code": -9, "elapsed_seconds": 3.0})
-            )
-            raise KeyboardInterrupt()
-        return original(**kwargs)
-
-    monkeypatch.setattr(codex, "invoke", interrupted_repair)
-    root = tmp_path / "run"
-    with pytest.raises(KeyboardInterrupt):
-        study.run_study(resolved, root)
-    report = json.loads((root / "report/assessment-report.json").read_text())
-    first = report["attempts"][0]
-    assert [stage["id"] for stage in first["stages"]] == ["handoff", "repair-1"]
-    assert first["stages"][1]["work"]["tokens"] == {"input_tokens": 4, "output_tokens": 2}
-    assert first["stages"][1]["snapshot_digest"] is None
-    assert first["provenance"]["attempt_status"] == "interrupted"
-    assert report["study_progress"]["native_invocations"] == 2
-    assert (
-        "Study interrupted: 0/12 attempts finished"
-        in (root / "report/assessment-report.md").read_text()
-    )
-    assert (
-        '"attempt_states": {"interrupted": 1}'
-        in (root / "report/assessment-charts.html").read_text()
-    )
+    assert (snapshot / "dist/retained.js").read_text() == "export const answer = 1;\n"
+    assert not (snapshot / "dist/transient.js").exists()
+    diagnostic = snapshot.parent / "diagnostic-source"
+    assert (diagnostic / "dist/transient.js").read_text() == "generated after patch collection\n"
+    assert inspect_snapshot(diagnostic)["digest"] != inspect_snapshot(snapshot)["digest"]
 
 
 def test_parallel_coding_overlaps_keeps_seeded_order_and_bound_native_counts(
@@ -718,7 +821,9 @@ def test_parallel_coding_overlaps_keeps_seeded_order_and_bound_native_counts(
     released[3].set()
     completed: list[int] = []
     active = maximum = 0
-    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "offline fixture"})
+    monkeypatch.setattr(
+        harbor_backend, "preflight", lambda **kwargs: {"harness_version": "offline fixture"}
+    )
 
     def invoke(*, area: Path, entry: dict[str, object], **kwargs: object) -> dict[str, object]:
         nonlocal active, maximum
@@ -737,13 +842,14 @@ def test_parallel_coding_overlaps_keeps_seeded_order_and_bound_native_counts(
         if index:
             released[index - 1].set()
         return {
+            "submission_collected": True,
             "successful_native_completion": True,
             "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
             "actual_primary_models": ["gpt-6.1-sol"],
             "runtime_effort_evidence": ["medium"],
         }
 
-    monkeypatch.setattr(codex, "invoke", invoke)
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
     root = study.run_study(resolved, tmp_path / "parallel-results")
     run = json.loads((root / "run.json").read_text())
     records = json.loads((root / "assessment-input.json").read_text())["records"]
@@ -791,20 +897,22 @@ def test_parallel_preparation_failure_has_no_native_invocation(
     assert run["status"] == "interrupted" and len(run["attempt_states"]) == 4
 
 
-def test_parallel_interrupt_drains_active_cost_and_stops_queued_attempts_and_repairs(
+def test_parallel_interrupt_drains_active_cost_and_stops_queued_attempts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from threading import Barrier, Event, Lock
 
     from pluginbench import parallel
 
-    recipe_path = _recipe(tmp_path, max_repairs=1)
+    recipe_path = _recipe(tmp_path)
     document = yaml.safe_load(recipe_path.read_text())
     document.update(repeats=1, jobs=2)
     recipe_path.write_text(yaml.safe_dump(document))
     gate, lock = Barrier(2), Lock()
     calls: list[str] = []
-    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "offline fixture"})
+    monkeypatch.setattr(
+        harbor_backend, "preflight", lambda **kwargs: {"harness_version": "offline fixture"}
+    )
     cancellation = Event()
     monkeypatch.setattr(parallel, "Event", lambda: cancellation)
 
@@ -822,13 +930,14 @@ def test_parallel_interrupt_drains_active_cost_and_stops_queued_attempts_and_rep
             raise KeyboardInterrupt("offline concurrent interrupt")
         assert cancellation.wait(timeout=5)
         return {
+            "submission_collected": True,
             "successful_native_completion": True,
             "usage": usage,
             "actual_primary_models": ["gpt-6.1-sol"],
             "runtime_effort_evidence": ["medium"],
         }
 
-    monkeypatch.setattr(codex, "invoke", invoke)
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
     with pytest.raises(KeyboardInterrupt, match="offline concurrent interrupt"):
         study.run_study(study.load_study(recipe_path), tmp_path / "results")
     run = json.loads((tmp_path / "results/run.json").read_text())
@@ -838,4 +947,3 @@ def test_parallel_interrupt_drains_active_cost_and_stops_queued_attempts_and_rep
     assert all(len(record["stages"]) == 1 for record in records)
     observed = [record for record in records if record["id"] in calls]
     assert all(record["stages"][0]["work"]["tokens"]["output_tokens"] == 5 for record in observed)
-    assert not list((tmp_path / "results/attempts").glob("*/repair-*"))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import fnmatch
 import hashlib
 import math
@@ -236,6 +237,8 @@ def _scoped_lines(
             try:
                 lines[path] = len(data.decode("utf-8").splitlines())
             except UnicodeDecodeError as error:
+                if kind == "test" and Path(path).suffix.lower() not in _SOURCE_SUFFIXES:
+                    continue
                 raise ValueError(f"scoped source must be UTF-8 text: {path}") from error
         populations.append(lines)
     added = removed = 0
@@ -307,7 +310,13 @@ def _coordinates(
     value: object, label: str, files: set[str], scope: list[str]
 ) -> tuple[set[str], set[str]]:
     row = _object(value, label)
-    if set(row) != {"total", "covered"}:
+    if not {"total", "covered"} <= set(row) or set(row) - {
+        "total",
+        "covered",
+        "unit",
+        "weights",
+        "files_measured",
+    }:
         raise ValueError(f"{label} requires total and covered coordinate lists")
     total = set(_strings(row["total"], f"{label}.total"))
     covered = set(_strings(row["covered"], f"{label}.covered"))
@@ -496,6 +505,21 @@ def _test_contribution(
     }
 
 
+def _coverage_limits(
+    report: dict[str, object], files: set[str], scope: list[str]
+) -> dict[str, object]:
+    limits = _object(report.get("unavailable_populations", {}), "unavailable populations")
+    for kind, value in limits.items():
+        row = _object(value, "unavailable population")
+        if kind not in {"lines", "statements", "branches", "functions"} or not isinstance(
+            row.get("reason"), str
+        ):
+            raise ValueError("Unavailable coverage requires a known unit and reason")
+        for path in _strings(row.get("files"), "unavailable coverage files"):
+            _source_path(path, files, scope)
+    return limits
+
+
 def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> dict[str, object]:
     test_scope = (
         [name.removeprefix("./") for name in _strings(report["test_scope"], "test scope")]
@@ -506,8 +530,15 @@ def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> d
         name.removeprefix("./")
         for name in _strings(report.get("excluded_test_files", []), "excluded test files")
     ]
-    branches, covered_branches = _coordinates(report.get("branches"), "branches", files, scope)
-    functions, covered_functions = _coordinates(report.get("functions"), "functions", files, scope)
+    populations = {
+        kind: _coordinates(report[kind], kind, files, scope)
+        for kind in ("lines", "statements", "branches", "functions")
+        if kind in report
+    }
+    if not populations:
+        raise ValueError("coverage requires at least one explicit measured population")
+    branches, covered_branches = populations.get("branches", (set(), set()))
+    functions, covered_functions = populations.get("functions", (set(), set()))
     measured_value = report.get("files_measured")
     measured = (
         set(_strings(measured_value, "files_measured")) if measured_value is not None else set()
@@ -518,21 +549,70 @@ def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> d
         path
         for path in files
         if any(fnmatch.fnmatchcase(path, pattern) for pattern in scope)
+        and _is_source_path(path)
         and Path(path).suffix.lower() in _SOURCE_SUFFIXES
         and not path.endswith((".d.ts", ".d.mts", ".d.cts"))
     }
+    units: dict[str, object] = {}
+    for kind, singular in (
+        ("lines", "line"),
+        ("statements", "statement"),
+        ("branches", "branch"),
+        ("functions", "function"),
+    ):
+        if kind not in populations:
+            units.update(
+                {
+                    f"{singular}_{suffix}": None
+                    for suffix in ("total", "covered", "percent", "denominator_digest")
+                }
+            )
+            units[f"{singular}_population_complete"] = False
+            continue
+        total, covered = populations[kind]
+        row = _object(report[kind], kind)
+        if row.get("unit", singular) != singular:
+            raise ValueError(f"coverage {kind} uses an incompatible unit")
+        weights = _object(row.get("weights", {key: 1 for key in total}), f"{kind}.weights")
+        if set(weights) != total:
+            raise ValueError("coverage weights must cover the complete coordinate population")
+        counts = {key: _integer(value, "coverage weight") for key, value in weights.items()}
+        denominator = sum(counts.values())
+        numerator = sum(counts[key] for key in covered)
+        unit_files = set(
+            _strings(row.get("files_measured", sorted(measured)), f"{kind}.files_measured")
+        )
+        for path in unit_files:
+            _source_path(path, files, scope)
+        units.update(
+            {
+                f"{singular}_total": denominator,
+                f"{singular}_covered": numerator,
+                f"{singular}_percent": _percent(numerator, denominator),
+                f"{singular}_denominator_digest": _digest(
+                    json.dumps(sorted(counts.items())).encode()
+                ),
+                f"{singular}_population_complete": bool(expected) and expected <= unit_files,
+            }
+        )
     return {
-        "branch_total": len(branches),
-        "branch_covered": len(covered_branches),
-        "branch_percent": _percent(len(covered_branches), len(branches)),
-        "function_total": len(functions),
-        "function_covered": len(covered_functions),
-        "function_percent": _percent(len(covered_functions), len(functions)),
+        **units,
+        "available_units": [
+            unit
+            for kind, unit in (
+                ("lines", "line"),
+                ("statements", "statement"),
+                ("branches", "branch"),
+                ("functions", "function"),
+            )
+            if kind in populations
+        ],
+        "unavailable_populations": _coverage_limits(report, files, scope),
+        "format": report.get("format"),
+        "test_command_exit_code": report.get("test_command_exit_code"),
         "population_complete_for_declared_scope": bool(expected) and expected <= measured,
         "files_measured": sorted(measured),
         "unmeasured_source_files": sorted(expected - measured),
-        "branch_denominator_digest": _digest(json.dumps(sorted(branches)).encode()),
-        "function_denominator_digest": _digest(json.dumps(sorted(functions)).encode()),
         "per_test_detection": "unique contribution among supplied tests only; not proof of redundancy",
         "per_test_count": len(_object(report["per_test"], "per_test"))
         if report.get("per_test") is not None
@@ -549,42 +629,6 @@ def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> d
         "test_contribution": _test_contribution(
             report, files, branches, covered_branches, functions, covered_functions
         ),
-    }
-
-
-def _mutation(report: dict[str, object], files: set[str], scope: list[str]) -> dict[str, object]:
-    mutant_rows = _object(report.get("mutants"), "mutants")
-    mutants: dict[str, object] = {}
-    source_identity: dict[str, str] = {}
-    for identifier, value in mutant_rows.items():
-        row = _object(value, f"mutant {identifier}")
-        if set(row) != {"status", "path"} or not isinstance(row["path"], str):
-            raise ValueError("mutants require status and path")
-        _source_path(row["path"], files, scope)
-        mutants[identifier] = row["status"]
-        source_identity[identifier] = row["path"]
-    allowed = {"killed", "survived", "no_coverage", "timeout", "compile_error", "runtime_error"}
-    if any(not isinstance(status, str) or status not in allowed for status in mutants.values()):
-        raise ValueError("mutation report contains an unsupported mutant status")
-    detected = {key for key, status in mutants.items() if status in {"killed", "timeout"}}
-    undetected = {key for key, status in mutants.items() if status in {"survived", "no_coverage"}}
-    killed = {key for key, status in mutants.items() if status == "killed"}
-    return {
-        "mutant_total": len(mutants),
-        "detected": len(detected),
-        "undetected": len(undetected),
-        "invalid": len(mutants) - len(detected) - len(undetected),
-        "score_percent": _percent(len(detected), len(detected) + len(undetected)),
-        "mutant_set_digest": _digest(json.dumps(sorted(mutants)).encode()),
-        "eligible_mutant_set_digest": _digest(json.dumps(sorted(detected | undetected)).encode()),
-        "mutant_source_digest": _digest(
-            json.dumps(source_identity, sort_keys=True, separators=(",", ":")).encode()
-        ),
-        "per_test_detection": "unique contribution among supplied tests only; not proof of redundancy",
-        "per_test_count": len(_object(report["per_test"], "per_test"))
-        if report.get("per_test") is not None
-        else None,
-        "zero_unique_mutant_kill_tests": _marginal(report.get("per_test"), killed, "per_test"),
     }
 
 
@@ -818,6 +862,286 @@ def _clone_identities(dupes: dict[str, object], files: set[str], root: Path) -> 
     return identities if len(identities) == len(set(identities)) else None
 
 
+def _analysis_functions(
+    report: dict[str, object], *, analyzed: set[str], root: Path, complete: dict[str, bool]
+) -> list[dict[str, object]]:
+    raw = report.get("functions")
+    if not isinstance(raw, list):
+        raise ValueError("analysis requires function rows")
+    functions = []
+    seen = set()
+    for value in raw:
+        row = _object(value, "analysis function")
+        path = row.get("path")
+        if (
+            not isinstance(path, str)
+            or path not in analyzed
+            or not isinstance(row.get("name"), str)
+        ):
+            raise ValueError("analysis function escapes analyzed source")
+        first = _integer(row.get("line"), "function line")
+        last = _integer(row.get("end_line"), "function end line")
+        if (
+            not 1 <= first <= last <= len((root / path).read_text().splitlines())
+            or row.get("line_count") != last - first + 1
+        ):
+            raise ValueError("analysis function span escapes source")
+        identity = (path, first, row.get("col"), row["name"])
+        if identity in seen:
+            raise ValueError("duplicate analysis function")
+        seen.add(identity)
+        for key in ("cognitive", "cyclomatic"):
+            if complete[key]:
+                _integer(row.get(key), key)
+            elif row.get(key) is not None:
+                raise ValueError("unavailable analysis metric must not provide scores")
+        functions.append(row)
+    return functions
+
+
+def _python_declarations(source: str) -> dict[tuple[int, str], list[dict[str, object]]]:
+    """Bind declarations to lexical scope and structure, never occurrence ordinals."""
+    declarations: dict[tuple[int, str], list[dict[str, object]]] = {}
+    scopes: Counter[tuple[str, ...]] = Counter()
+
+    def visit(node: ast.AST, scope: tuple[str, ...]) -> None:
+        symbol = None
+        role = None
+        line = getattr(node, "lineno", None)
+        outer_scope = scope
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            overload_signature = None
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+                (isinstance(item, ast.Name) and item.id == "overload")
+                or (isinstance(item, ast.Attribute) and item.attr == "overload")
+                for item in node.decorator_list
+            ):
+                overload_signature = [
+                    ast.dump(node.args),
+                    ast.dump(node.returns) if node.returns else None,
+                ]
+            token = json.dumps(
+                [
+                    type(node).__name__,
+                    node.name,
+                    [ast.dump(item) for item in node.decorator_list],
+                    overload_signature,
+                ]
+            )
+            scope = (*scope, token)
+            scopes[scope] += 1
+            symbol, role = node.name, "class" if isinstance(node, ast.ClassDef) else "function"
+            if node.decorator_list:
+                line = node.decorator_list[0].lineno
+        elif isinstance(node, ast.Lambda):
+            scope = (*scope, "Lambda:" + _digest(ast.dump(node).encode()))
+            scopes[scope] += 1
+        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            scope = (*scope, "unsupported:" + type(node).__name__)
+        elif isinstance(node, ast.arg):
+            symbol, role = node.arg, "parameter"
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            symbol, role = node.id, "variable"
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store):
+            symbol, role = node.attr, "attribute"
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                declarations.setdefault(
+                    (node.lineno, alias.asname or alias.name.split(".")[0]), []
+                ).append({"declaration_scope": list(scope), "declaration_role": "import"})
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            symbol, role = node.name, "variable"
+        if symbol is not None:
+            assert isinstance(line, int)
+            declarations.setdefault((line, symbol), []).append(
+                {"declaration_scope": list(scope), "declaration_role": role}
+            )
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            arguments = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+            arguments += [item for item in (node.args.vararg, node.args.kwarg) if item is not None]
+            for argument in arguments:
+                visit(argument, scope)
+                if argument.annotation is not None:
+                    visit(argument.annotation, outer_scope)
+            for expression in [*node.args.defaults, *node.args.kw_defaults]:
+                if expression is not None:
+                    visit(expression, outer_scope)
+            if isinstance(node, ast.Lambda):
+                visit(node.body, scope)
+            else:
+                for decorator in node.decorator_list:
+                    visit(decorator, outer_scope)
+                if node.returns is not None:
+                    visit(node.returns, outer_scope)
+                for statement in node.body:
+                    visit(statement, scope)
+        elif isinstance(node, ast.ClassDef):
+            for class_child in [*node.bases, *node.keywords, *node.decorator_list]:
+                visit(class_child, outer_scope)
+            for statement in node.body:
+                visit(statement, scope)
+        elif not isinstance(node, ast.arg):
+            for child in ast.iter_child_nodes(node):
+                visit(child, scope)
+
+    visit(ast.parse(source), ())
+    lines = source.splitlines()
+    contexts = Counter(
+        json.dumps(
+            [row["declaration_scope"], row["declaration_role"], symbol, lines[line - 1].strip()]
+        )
+        for (line, symbol), rows in declarations.items()
+        for row in rows
+    )
+    bindings = Counter(
+        json.dumps([row["declaration_scope"], row["declaration_role"], symbol])
+        for (_, symbol), rows in declarations.items()
+        for row in rows
+    )
+    for (line, symbol), rows in declarations.items():
+        for row in rows:
+            scope = row["declaration_scope"]
+            assert isinstance(scope, list)
+            row["declaration_context_required"] = (
+                bindings[json.dumps([scope, row["declaration_role"], symbol])] > 1
+            )
+            row["declaration_bound"] = contexts[
+                json.dumps([scope, row["declaration_role"], symbol, lines[line - 1].strip()])
+            ] == 1 and not any(
+                token.startswith("unsupported:") or scopes[tuple(scope[: index + 1])] > 1
+                for index, token in enumerate(scope)
+            )
+    return declarations
+
+
+def _analysis_candidates(
+    report: dict[str, object], *, analyzed: set[str], root: Path
+) -> tuple[list[object], list[dict[str, object]]]:
+    candidates = report.get("unused_candidates")
+    if not isinstance(candidates, list):
+        raise ValueError("analysis requires unused candidate rows")
+    identities = []
+    python_sources: dict[str, dict[tuple[int, str], list[dict[str, object]]]] = {}
+    for value in candidates:
+        row = _object(value, "unused candidate")
+        path = row.get("path")
+        if not isinstance(path, str) or path not in analyzed:
+            raise ValueError("unused candidate escapes analyzed source")
+        line = _integer(row.get("line"), "candidate line")
+        lines = (root / path).read_text().splitlines()
+        if not 1 <= line <= len(lines):
+            raise ValueError("unused candidate line escapes source")
+        if not all(isinstance(row.get(key), str) and row[key] for key in ("category", "symbol")):
+            raise ValueError("unused candidate requires rule and symbol")
+        identity = {
+            "category": row["category"],
+            "path": path,
+            "symbol": row["symbol"],
+            "declaration_context": lines[line - 1].strip(),
+        }
+        if report.get("language") == "python":
+            if path not in python_sources:
+                try:
+                    python_sources[path] = _python_declarations((root / path).read_text())
+                except SyntaxError:
+                    python_sources[path] = {}
+            roles = {
+                "vulture-unused-variable": {"variable", "parameter"},
+                "vulture-unused-attribute": {"attribute"},
+                "vulture-unused-import": {"import"},
+                "vulture-unused-class": {"class"},
+                "vulture-unused-function": {"function"},
+                "vulture-unused-method": {"function"},
+                "vulture-unused-property": {"function"},
+            }.get(str(row["category"]), set())
+            bindings = [
+                item
+                for item in python_sources[path].get((line, str(row["symbol"])), [])
+                if item["declaration_role"] in roles
+            ]
+            identity.update(bindings[0] if len(bindings) == 1 else {"declaration_bound": False})
+        identities.append(identity)
+    return candidates, identities
+
+
+def _analysis(
+    report: dict[str, object],
+    files: set[str],
+    scope: list[str],
+    root: Path,
+    config: dict[str, object],
+) -> dict[str, object]:
+    if report.get("version") != "language-analysis-v1" or report.get("language") != config.get(
+        "language"
+    ):
+        raise ValueError("language analysis version or language differs from frozen configuration")
+    if report.get("tools") != config.get("tool_identities"):
+        raise ValueError("analysis tools differ from frozen configuration")
+    if report.get("settings") != config.get("settings") or report.get(
+        "supported_suffixes"
+    ) != config.get("supported_suffixes"):
+        raise ValueError("analysis settings or source language differ from frozen configuration")
+    suffixes = _strings(report.get("supported_suffixes"), "analysis suffixes")
+    expected = {
+        path
+        for path in files
+        if Path(path).suffix in suffixes
+        and not _is_test_path(path)
+        and any(fnmatch.fnmatchcase(path, pattern) for pattern in scope)
+    }
+    analyzed = set(_strings(report.get("analyzed_paths"), "analyzed paths"))
+    if analyzed != expected:
+        raise ValueError("analysis paths differ from the declared source population")
+    statuses = _object(report.get("metrics"), "analysis metrics")
+    complete = {
+        key: _object(statuses.get(key), key).get("status") == "available"
+        for key in ("cognitive", "cyclomatic", "dead_code")
+    }
+    functions = _analysis_functions(report, analyzed=analyzed, root=root, complete=complete)
+    candidates, identities = _analysis_candidates(report, analyzed=analyzed, root=root)
+    return {
+        **_function_population(functions),
+        "complexity_complete_for_declared_scope": complete["cognitive"] and complete["cyclomatic"],
+        "metric_statuses": statuses,
+        "dead_code": len(candidates) if complete["dead_code"] else None,
+        "dead_finding_identities": identities if complete["dead_code"] else None,
+        "dead_code_complete_for_declared_scope": complete["dead_code"],
+        "dead_code_detection": "unused candidates under the named analyzer and build settings; not semantic deadness or absence proof",
+        "analyzed_paths": sorted(analyzed),
+        "unused_candidates": candidates,
+        "language": report["language"],
+        "tools": report["tools"],
+        "settings": report.get("settings"),
+    }
+
+
+def _fallow_production_excluded(path: str) -> bool:
+    # Pinned Fallow 3.18.0 discover/walk.rs uses literal directory separators.
+    parts = Path(path).parts
+    if any(
+        part in {"__tests__", "__mocks__", "__snapshots__", "__fixtures__", "test", "tests"}
+        for part in parts[:-1]
+    ):
+        return True
+    patterns = (
+        "*.test.*",
+        "*.spec.*",
+        "*.e2e.*",
+        "*.e2e-spec.*",
+        "*.bench.*",
+        "*.fixture.*",
+        "*.stories.*",
+        "*.story.*",
+        ".*.js",
+        ".*.ts",
+        ".*.mjs",
+        ".*.cjs",
+    )
+    return any(fnmatch.fnmatchcase(parts[-1], pattern) for pattern in patterns) or (
+        len(parts) == 1 and fnmatch.fnmatchcase(parts[-1], "*.config.*")
+    )
+
+
 def _fallow(
     report: dict[str, object],
     boundary_rules: bool,
@@ -857,7 +1181,14 @@ def _fallow(
     summary_value = health.get("summary", {})
     summary = _object(summary_value, "fallow.health.summary")
     scoped_files = {
-        path for path in files if any(fnmatch.fnmatchcase(path, pattern) for pattern in scope)
+        path
+        for path in files
+        if any(fnmatch.fnmatchcase(path, pattern) for pattern in scope)
+        and not any(
+            fnmatch.fnmatchcase(path, pattern)
+            for pattern in _strings(config.get("ignorePatterns", []), "Fallow ignored paths")
+        )
+        and (config.get("production") is not True or not _fallow_production_excluded(path))
     }
     supported_suffixes = {".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"}
     scoped_source_files = {
@@ -965,98 +1296,27 @@ def _fallow(
     }
 
 
-_THRESHOLDS = {
-    "fallow": {
-        "max_cognitive": "cognitive",
-        "max_cyclomatic": "cyclomatic",
-        "max_unit_size": "line_count",
-        "max_dead_code": "dead_code",
-        "max_clone_groups": "clone_groups",
-        "max_cycles": "cycles",
-        "max_boundary_violations": "boundary_violations",
-    },
-    "coverage": {
-        "min_branch_percent": "branch_percent",
-        "min_function_percent": "function_percent",
-    },
-    "mutation": {"min_score_percent": "score_percent"},
-}
-
-
-def _validate_thresholds(kind: str, standards: dict[str, object]) -> None:
-    for key, limit in standards.items():
-        if key not in _THRESHOLDS[kind]:
-            raise ValueError(f"unsupported {kind} threshold: {key}")
-        threshold = _number(limit, key)
-        if threshold < 0 or (key.startswith("min_") and threshold > 100):
-            raise ValueError(f"invalid threshold: {key}")
-        if kind == "fallow":
-            _integer(limit, key)
-            if key in {"max_cyclomatic", "max_unit_size"} and threshold < 1:
-                raise ValueError(f"invalid threshold: {key}")
-
-
-def _violations(
-    kind: str, metrics: dict[str, object], standards: dict[str, object]
-) -> tuple[list[str], list[str]]:
-    violations: list[str] = []
-    unknown: list[str] = []
-    for key, limit in standards.items():
-        threshold = _number(limit, key)
-        metric = _THRESHOLDS[kind][key]
-        if kind == "fallow" and metric in {"cognitive", "cyclomatic", "line_count"}:
-            rows = metrics["functions"]
-            assert isinstance(rows, list)
-            exceeded = any(
-                _number(_object(row, "function")[metric], metric) > threshold for row in rows
-            )
-            if exceeded:
-                violations.append(key)
-            elif not metrics.get("complexity_complete_for_declared_scope"):
-                unknown.append(key)
-        else:
-            value = metrics[metric]
-            if value is None:
-                unknown.append(key)
-            elif (
-                _number(value, metric) < threshold
-                if key.startswith("min_")
-                else _number(value, metric) > threshold
-            ):
-                violations.append(key)
-            elif kind == "fallow" and (
-                metrics.get("unresolved_imports") != 0
-                or not metrics.get(f"{metric}_complete_for_declared_scope")
-            ):
-                unknown.append(key)
-            elif kind == "coverage" and not metrics.get("population_complete_for_declared_scope"):
-                unknown.append(key)
-    return violations, unknown
+_EVIDENCE_KINDS = ("fallow", "analysis", "coverage")
 
 
 def evaluate_evidence(
     snapshot_root: Path,
     evidence_refs: dict[str, str] | None,
-    standards: dict[str, object],
     base_dir: Path,
 ) -> dict[str, object]:
     """Import bound reports, without running analyzers or mutating submitted source."""
     snapshot = inspect_snapshot(snapshot_root)
     refs = evidence_refs or {}
     files = set(_object(snapshot["files"], "snapshot files"))
-    if set(refs) - set(_THRESHOLDS) or set(standards) - set(_THRESHOLDS):
+    if set(refs) - set(_EVIDENCE_KINDS):
         raise ValueError("unsupported evidence kind")
     result: dict[str, object] = {"snapshot_digest": snapshot["digest"]}
-    for kind in _THRESHOLDS:
-        limits = _object(standards.get(kind, {}), f"standards.{kind}")
-        _validate_thresholds(kind, limits)
+    for kind in _EVIDENCE_KINDS:
         if kind not in refs:
             result[kind] = {
                 "status": "unavailable",
                 "reason": "no source-bound report",
                 "metrics": None,
-                "violations": [],
-                "unknown_standards": sorted(limits),
             }
             continue
         envelope_path = base_dir / refs[kind]
@@ -1125,6 +1385,12 @@ def evaluate_evidence(
                 config,
                 str(envelope["config_digest"]),
             )
+        elif kind == "analysis":
+            if envelope["tool"] != "language-analysis" or envelope["tool_version"] != report.get(
+                "version"
+            ):
+                raise ValueError("language analysis envelope disagrees with report")
+            metrics = _analysis(report, files, scope, snapshot_root, config)
         elif kind == "coverage":
             if report.get("clock") != config.get("clock"):
                 raise ValueError("coverage clock differs from its bound configuration")
@@ -1158,12 +1424,15 @@ def evaluate_evidence(
                             "coverage reference selection differs from its bound configuration"
                         )
             metrics = _coverage(report, files, scope)
-        else:
-            metrics = _mutation(report, files, scope)
-        violations, unknown = _violations(kind, metrics, limits)
         provenance = {
             key: envelope[key] for key in ("tool", "tool_version", "config_digest", "scope")
         }
+        if kind == "analysis":
+            provenance.update(
+                language=report.get("language"),
+                analyzers=report.get("tools"),
+                metric_settings=report.get("settings"),
+            )
         if kind == "fallow" and isinstance(report.get("syntax_validation"), dict):
             validation = _object(report["syntax_validation"], "syntax validation")
             provenance["syntax_observer"] = {
@@ -1179,11 +1448,9 @@ def evaluate_evidence(
                 )
             }
         result[kind] = {
-            "status": "incomplete" if unknown else "available",
+            "status": "available",
             "provenance": provenance,
             "metrics": metrics,
-            "violations": violations,
-            "unknown_standards": unknown,
             "evidence_basis": "externally supplied source-bound report; execution not independently attested",
         }
     return result
@@ -1226,13 +1493,16 @@ def _function_population(functions: list[dict[str, object]]) -> dict[str, object
         "functions": functions,
         "function_count_reported": len(functions),
         "complexity_distribution": {
-            key: sorted(_integer(row[key], key) for row in functions)
+            key: sorted(_integer(row[key], key) for row in functions if row.get(key) is not None)
             for key in ("cognitive", "cyclomatic", "line_count")
         },
         **{
             f"max_{name}_reported": max(
-                (_integer(row[field], field) for row in functions), default=None
+                (_integer(row[field], field) for row in functions if row.get(field) is not None),
+                default=None,
             )
+            if all(row.get(field) is not None for row in functions)
+            else None
             for name, field in (
                 ("cognitive", "cognitive"),
                 ("cyclomatic", "cyclomatic"),
@@ -1336,12 +1606,19 @@ def _dead_changes(left: dict[str, object], right: dict[str, object]) -> dict[str
     bases = []
     for items in identities:
         assert isinstance(items, list)
+        if any(_object(row, "dead identity").get("declaration_bound") is False for row in items):
+            return {
+                "status": "unavailable",
+                "reason": "Python candidates lack unique source-bound lexical declarations",
+                "introduced_count": None,
+                "resolved_count": None,
+            }
         bases.append(
             [
                 {
                     key: value
                     for key, value in _object(row, "dead identity").items()
-                    if key != "declaration_context"
+                    if key not in {"declaration_context", "declaration_context_required"}
                 }
                 for row in items
             ]
@@ -1352,6 +1629,13 @@ def _dead_changes(left: dict[str, object], right: dict[str, object]) -> dict[str
         for identity, count in Counter(json.dumps(row, sort_keys=True) for row in group).items()
         if count > 1
     }
+    for items, group in zip(identities, bases, strict=True):
+        assert isinstance(items, list)
+        collisions.update(
+            json.dumps(base, sort_keys=True)
+            for row, base in zip(items, group, strict=True)
+            if _object(row, "dead identity").get("declaration_context_required") is True
+        )
     sets = []
     for items, group in zip(identities, bases, strict=True):
         assert isinstance(items, list)
@@ -1388,7 +1672,7 @@ def _dead_changes(left: dict[str, object], right: dict[str, object]) -> dict[str
         "resolved_count": len(resolved),
         "before_count": len(sets[0]),
         "after_count": len(sets[1]),
-        "method": "category plus declaration path/symbol fields; colliding identities in either snapshot additionally use unique bound declaration-line context, excluding coordinates/actions; matching tool/version/config/scope and complete static graph populations required",
+        "method": "category plus declaration path/symbol fields; Python uses AST-bound lexical scopes, structural overload/lambda identities, and declaration roles; colliding identities in either snapshot or Python source additionally use unique bound declaration-line context, excluding coordinates/actions; matching tool/version/config/scope and complete static graph populations required",
         "limitations": "static finding changes only, not semantic deadness; moves/renames and changed colliding declaration-line content change identity; identical collision contexts remain unknown; externally used APIs and runtime-only references are outside this evidence",
     }
 
@@ -1420,12 +1704,48 @@ def _clone_changes(left: dict[str, object], right: dict[str, object]) -> dict[st
     }
 
 
+def _coverage_unit_comparison(
+    left: dict[str, object], right: dict[str, object], unit: str
+) -> dict[str, object]:
+    kind = {
+        "line": "lines",
+        "statement": "statements",
+        "branch": "branches",
+        "function": "functions",
+    }[unit]
+    reasons = []
+    for side, metrics in (("before", left), ("after", right)):
+        limits = _object(metrics.get("unavailable_populations", {}), "unavailable populations")
+        limit = _object(limits.get(kind, {}), "coverage unit limit")
+        complete = metrics.get(
+            f"{unit}_population_complete", metrics.get("population_complete_for_declared_scope")
+        )
+        reason = None
+        if complete is not True and limit.get("reason"):
+            reason = limit["reason"]
+        elif metrics.get(f"{unit}_denominator_digest") is None:
+            reason = (
+                f"{unit} population not supplied by {metrics.get('format') or 'this report format'}"
+            )
+        elif complete is not True:
+            reason = f"{unit} declared source population is partial or completeness is unproven"
+        if reason is not None:
+            reasons.append(f"{side}: {reason}")
+    key = f"{unit}_denominator_digest"
+    if not reasons and (not isinstance(left.get(key), str) or left.get(key) != right.get(key)):
+        reasons.append("fixed denominator differs or is unbound")
+    return {
+        "status": "unavailable" if reasons else "available",
+        "reason": "; ".join(reasons) if reasons else None,
+    }
+
+
 def compare_evidence(
     before: dict[str, object], after: dict[str, object], *, change: dict[str, object] | None = None
 ) -> dict[str, object]:
     """Compare measurements only with compatible collection and denominator provenance."""
     result: dict[str, object] = {}
-    for kind in _THRESHOLDS:
+    for kind in _EVIDENCE_KINDS:
         left = _object(before.get(kind, {}), f"before.{kind}")
         right = _object(after.get(kind, {}), f"after.{kind}")
         if not isinstance(left.get("metrics"), dict) or not isinstance(right.get("metrics"), dict):
@@ -1446,27 +1766,19 @@ def compare_evidence(
             continue
         left_metrics = _object(left["metrics"], "before metrics")
         right_metrics = _object(right["metrics"], "after metrics")
-        denominator_keys = (
-            ("branch_denominator_digest", "function_denominator_digest")
-            if kind == "coverage"
-            else ("mutant_set_digest", "eligible_mutant_set_digest", "mutant_source_digest")
-            if kind == "mutation"
-            else ()
-        )
-        if any(
-            not isinstance(left_metrics.get(key), str)
-            or not isinstance(right_metrics.get(key), str)
-            or left_metrics.get(key) != right_metrics.get(key)
-            for key in denominator_keys
-        ):
-            result[kind] = {
-                "status": "incomplete",
-                "reason": "fixed denominator or mutant source identity differs or is unbound",
-                "deltas": None,
-            }
-            continue
         deltas: dict[str, float] = {}
+        coverage_units: dict[str, object] = {}
+        if kind == "coverage":
+            for unit in ("line", "statement", "branch", "function"):
+                coverage_units[unit] = _coverage_unit_comparison(left_metrics, right_metrics, unit)
         for key, left_value in left_metrics.items():
+            if kind == "coverage":
+                unit = key.partition("_")[0]
+                if (
+                    unit not in coverage_units
+                    or _object(coverage_units[unit], unit)["status"] != "available"
+                ):
+                    continue
             right_value = right_metrics.get(key)
             if (
                 isinstance(left_value, (int, float))
@@ -1480,15 +1792,34 @@ def compare_evidence(
             "deltas": deltas,
             "interpretation": "net changes in compatible reported metrics; not identity-grounded newly introduced findings",
         }
-        if kind == "fallow":
+        if kind == "coverage":
+            result[kind] = {**_object(result[kind], kind), "units": coverage_units}
+            if not any(
+                _object(unit, "coverage unit")["status"] == "available"
+                for unit in coverage_units.values()
+            ):
+                result[kind] = {
+                    **_object(result[kind], kind),
+                    "status": "incomplete",
+                    "reason": "no compatible complete coverage populations; see per-unit reasons",
+                    "deltas": None,
+                }
+        if kind in {"fallow", "analysis"}:
             if change is not None and (
                 change.get("before_digest") != before.get("snapshot_digest")
                 or change.get("after_digest") != after.get("snapshot_digest")
             ):
                 raise ValueError("changed-function diff does not bind to evidence snapshots")
-            comparison = _object(result[kind], "fallow comparison")
+            comparison = _object(result[kind], "static analysis comparison")
             comparison.update(_function_changes(left_metrics, right_metrics, change))
             comparison["dead_findings"] = _dead_changes(left_metrics, right_metrics)
-            comparison["clone_findings"] = _clone_changes(left_metrics, right_metrics)
+            if kind == "analysis":
+                dead = _object(comparison["dead_findings"], "unused candidate comparison")
+                dead["limitations"] = (
+                    "candidate changes under the fixed named analyzer/build settings; not proof of semantic deadness or absence; renamed symbols/scopes, changed decorators/overload signatures/lambda expressions, and changed collision contexts can change identity; indistinguishable redefinitions, same-line declarations, and comprehension scopes remain unknown"
+                )
+                comparison["dead_findings"] = dead
+            if kind == "fallow":
+                comparison["clone_findings"] = _clone_changes(left_metrics, right_metrics)
             result[kind] = comparison
     return result

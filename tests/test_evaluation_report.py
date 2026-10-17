@@ -4,6 +4,7 @@ import copy
 import csv
 import io
 import json
+import os
 import re
 from pathlib import Path
 import subprocess
@@ -105,6 +106,27 @@ def test_each_guidance_set_has_its_own_delta_against_the_same_evaluation_baselin
     assert raw == [80, 100, 120]
     assert data["comparison_identity"] == _config()["comparison_identity"]
     assert "winner" not in data and "score" not in data
+
+
+def test_reused_baseline_is_disclosed_without_recounting_original_calls() -> None:
+    report = _token_report()
+    report["baseline_origin"] = {
+        "baseline-0": {"cache_key": "key", "origin_run": "earlier", "origin_attempt": "old"}
+    }
+    report["study_progress"] = {"native_invocations": 8}
+    data = evaluation_data(report, _config())
+    assert data["coding_invocations"] == 8
+    assert data["reused_baseline_attempts"] == 1
+    limitations = data["limitations"]
+    assert isinstance(limitations, list)
+    assert "reused" in " ".join(str(row) for row in limitations)
+    row = next(row for row in _rows(data, "attempts") if row["id"] == "baseline-0")
+    assert row["baseline_origin"] == {
+        "cache_key": "key",
+        "origin_run": "earlier",
+        "origin_attempt": "old",
+        "evidence": None,
+    }
 
 
 def test_report_records_jobs_without_changing_attempts_or_metric_values() -> None:
@@ -215,15 +237,15 @@ def test_complete_all_function_scan_does_not_capture_missing_selected_changed_po
         metrics = _stage(report, index)["metrics"]
         assert isinstance(metrics, dict)
         metrics["fallow"]["metrics"]["function_count_reported"] = 3
-    legacy = chart_data(report)["measurement_completeness"]
-    assert isinstance(legacy, list)
-    assert all(row["counts"]["Complexity population"] for row in legacy)
+    measured = chart_data(report)["measurement_completeness"]
+    assert isinstance(measured, list)
+    assert all(row["counts"]["Complexity population"] for row in measured)
     data = evaluation_data(report, _config(family))
     assert all(
         row["counts"] == {"Complexity population": False} and not row["complete"]
         for row in _rows(data, "measurement_completeness")
     )
-    assert chart_data(report)["measurement_completeness"] == legacy
+    assert chart_data(report)["measurement_completeness"] == measured
 
 
 def test_selected_token_completeness_preserves_missing_output_counts() -> None:
@@ -239,7 +261,11 @@ def test_selected_token_completeness_preserves_missing_output_counts() -> None:
 
 def test_selected_coverage_requires_collected_denominators_not_just_numeric_rates() -> None:
     data = evaluation_data(_report(), _config("coverage"))
-    assert all(row["value"] is not None for row in _rows(data, "observations"))
+    assert all(
+        row["value"] is not None
+        for row in _rows(data, "observations")
+        if row["metric"] in {"Branch coverage %", "Function coverage %"}
+    )
     assert all(
         row["counts"] == {"Coverage covered/total counts": False} and not row["complete"]
         for row in _rows(data, "measurement_completeness")
@@ -389,6 +415,73 @@ def test_overview_does_not_average_incompatible_raw_repeat_profiles() -> None:
     assert overview["absolute_delta_vs_vanilla"] is None
 
 
+@pytest.mark.parametrize(
+    "provenance_state",
+    ["missing_repeat", "unknown", "mixed_unknown", "unknown_version", "conflicting"],
+)
+def test_overview_resolves_analyzers_from_unambiguous_task_peers_only(
+    provenance_state: str,
+) -> None:
+    report = _empty_baseline_population_report()
+    attempts = _rows(report, "attempts")
+    for index in (0, 1):
+        metrics = _stage(report, index)["metrics"]
+        assert isinstance(metrics, dict)
+        metrics["fallow"]["provenance"] = (
+            {}
+            if provenance_state == "unknown" or (index and provenance_state == "mixed_unknown")
+            else {
+                "language": "python",
+                "analyzers": {
+                    "rca": {
+                        "version": "unknown"
+                        if provenance_state == "unknown_version"
+                        else "RCA 0.0.26"
+                        if index and provenance_state == "conflicting"
+                        else "RCA 0.0.25"
+                    }
+                },
+            }
+        )
+    missing = copy.deepcopy(_attempt(report, 1))
+    missing["id"] = "missing-repeat"
+    missing_stage = _rows(missing, "stages")[0]
+    missing_stage["metrics"] = {}
+    missing_stage["metric_comparison"] = {}
+    attempts.append(missing)
+
+    data = evaluation_data(report, _config("cognitive"))
+    metric = "New-file function cognitive maximum"
+    overview = [
+        row
+        for row in _rows(data, "aggregates")
+        if row["metric"] == metric and row["guidance"] == "candidate"
+    ]
+    assert len(overview) == 1
+    expected_group = {
+        "missing_repeat": "Python · RCA 0.0.25",
+        "unknown": "Unknown analyzer",
+        "mixed_unknown": "Unknown analyzer",
+        "unknown_version": "Unknown analyzer",
+        "conflicting": "Conflicting analyzers",
+    }[provenance_state]
+    assert overview[0]["analysis_group"] == expected_group
+    assert overview[0]["value"] == (14 if provenance_state == "missing_repeat" else None)
+    assert overview[0]["status"] == (
+        "partial" if provenance_state == "missing_repeat" else "unknown"
+    )
+    assert overview[0]["absolute_delta_vs_vanilla"] is None
+    assert data["assigned"] == 3 and overview[0]["assigned_tasks"] == 1
+    observations = [row for row in _rows(data, "observations") if row["metric"] == metric]
+    assert {row["attempt_id"]: row["value"] for row in observations} == {
+        "baseline": None,
+        "candidate": 14,
+        "missing-repeat": None,
+    }
+    raw = [row for row in _rows(data, "raw_medians") if row["metric"] == metric]
+    assert len(raw) == 1 and raw[0]["value"] == 14
+
+
 def test_partial_measurements_keep_assigned_counts_and_unknown_raw_observations() -> None:
     report = _token_report()
     attempt = _attempt(report, 4)
@@ -453,8 +546,160 @@ def test_only_selected_families_and_compact_runtime_evidence_are_exported() -> N
     assert report == original
 
 
-def test_writer_json_csv_and_echarts_share_exact_selected_values(tmp_path: Path) -> None:
-    result = write_evaluation_report(_token_report(), _config("tokens"), tmp_path)
+def _shared_helpers(controller: str) -> str:
+    """Return the template's own ordering and formatting helpers for extracted functions."""
+    names = (
+        "formatCompact",
+        "formatSigned",
+        "packageNames",
+        "armRank",
+        "byArm",
+        "seriesVariable",
+        "formatLimited",
+        "KEY_METRICS",
+    )
+    lines = [re.search(rf"^const {name} = .*$", controller, re.M) for name in names]
+    assert all(lines)
+    return "".join(line.group(0) + "\n" for line in lines if line)
+
+
+def test_summary_numbers_keep_small_nonzero_differences(tmp_path: Path) -> None:
+    controller = Path("src/pluginbench/assessment-charts.html").read_text().rsplit("<script>", 1)[1]
+    script = tmp_path / "format.js"
+    script.write_text(
+        "const data={attempts:[]},observations=[],unique=items=>[...new Set(items)];\n"
+        + _shared_helpers(controller)
+        + "console.log(JSON.stringify([0.014,-0.004,0,2133.5,1281072.25].map(formatSigned)));\n"
+    )
+    # The template formats with the reader's locale; pin one for a deterministic expectation.
+    locale = {**os.environ, "LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"}
+    result = subprocess.run(["node", str(script)], capture_output=True, text=True, env=locale)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["+0.014", "-0.004", "0", "+2,133.5", "+1.28M"]
+
+
+def _outcome_text(
+    data: dict[str, object], tmp_path: Path, *, package: bool = False, task: str = ""
+) -> list[str]:
+    controller = Path("src/pluginbench/assessment-charts.html").read_text().rsplit("<script>", 1)[1]
+    name = "showPackageSummary" if package else "showOutcomes"
+    function = re.search(r"function " + name + r"\(\) \{.*?\n\}", controller, re.S)
+    assert function is not None
+    summary = re.search(r"function taskCheckSummary\(attempts\) \{.*?\n\}", controller, re.S)
+    script = tmp_path / "outcomes.js"
+    script.write_text(
+        "const data=" + json.dumps(data) + ";\n"
+        "const texts=[];const element=()=>({replaceChildren(){},querySelector(){return null},setAttribute(){},append(){},prepend(){},style:{setProperty(){}},cloneNode(){return element()},addEventListener(){},firstChild:{}});\n"
+        "const document={getElementById:element},packageSummary=element(),taskSelect={value:"
+        + json.dumps(task)
+        + "},observations=data.observations,metricSelect={value:''};\n"
+        "const unique=items=>[...new Set(items)],armLabel=arm=>arm==='baseline'?'Vanilla':arm;\n"
+        "const emptyFunctionMaximum=()=>false,format=value=>String(value);\n"
+        "const create=(tag,text,parent)=>{if(text!==undefined)texts.push(String(text));return element();};\n"
+        + _shared_helpers(controller)
+        + (summary.group(0) if summary else "")
+        + function.group(0)
+        + "\n"
+        + name
+        + "();console.log(JSON.stringify(texts));\n"
+    )
+    result = subprocess.run(["node", str(script)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    texts = json.loads(result.stdout)
+    assert isinstance(texts, list) and all(isinstance(text, str) for text in texts)
+    return texts
+
+
+@pytest.mark.parametrize("execution_state", ["failed", "timed_out"])
+def test_writer_headlines_separate_task_check_failures_from_execution_failures(
+    tmp_path: Path,
+    execution_state: str,
+) -> None:
+    report = _token_report()
+    attempts: list[dict[str, object]] = []
+    for index, (correctness, execution, task) in enumerate(
+        (
+            ("pass", "complete", "fixture-task"),
+            ("fail", "complete", "fixture-task"),
+            ("fail", execution_state, "fixture-task"),
+            ("unknown", "complete", "fixture-task"),
+            ("pass", "complete", "second-task"),
+        )
+    ):
+        attempt = copy.deepcopy(_attempt(report, 0))
+        attempt.update(id=f"run-{index}", task_id=task)
+        stages = attempt["stages"]
+        assert isinstance(stages, list) and isinstance(stages[0], dict)
+        stage = stages[0]
+        stage["correctness"] = {"status": correctness}
+        provenance = stage["execution_provenance"]
+        assert isinstance(provenance, dict)
+        provenance.update(
+            successful_native_completion=execution == "complete",
+            timed_out=execution == "timed_out",
+            exit_code=0 if execution == "complete" else 1,
+        )
+        attempts.append(attempt)
+    report["attempts"] = attempts
+    original = copy.deepcopy(report)
+    result = write_evaluation_report(report, _config("tokens"), tmp_path)
+    data = json.loads(result.read_text())
+    assert data["assigned"] == 5
+    assert [row["correctness"] for row in data["attempts"]] == [
+        "pass",
+        "fail",
+        "fail",
+        "unknown",
+        "pass",
+    ]
+    assert data["attempts"][2]["execution"]["status"] == execution_state
+    for package in (False, True):
+        for task in ("", "fixture-task"):
+            visible = _outcome_text(data, tmp_path, package=package, task=task)
+            assert "1 failed task check · 1 execution failure · 1 unknown" in visible
+            assert (
+                "2/5 attempts passed" if package and not task else "1/4 attempts passed"
+            ) in visible
+    assert report == original
+
+
+@pytest.mark.parametrize("execution_state", ["provider", "timeout", "complete", "missing"])
+@pytest.mark.parametrize("measurement", ["tokens", "lines"])
+def test_writer_json_csv_and_echarts_share_exact_selected_values(
+    tmp_path: Path,
+    execution_state: str,
+    measurement: str,
+) -> None:
+    report = _token_report()
+    stage = _stage(report, 0)
+    message = "Selected model is at capacity. <provider detail>"
+    partial_usage = [
+        {
+            "status": "incomplete usage lower bound",
+            "tokens": {"input_tokens": 40, "output_tokens": 3},
+        }
+    ]
+    if execution_state != "missing":
+        execution = stage["execution_provenance"]
+        assert isinstance(execution, dict)
+        execution.update(
+            successful_native_completion=execution_state == "complete",
+            timed_out=execution_state == "timeout",
+            exit_code=0 if execution_state == "complete" else 1,
+            stream_errors=[{"type": "turn.failed", "error": {"message": message}}]
+            if execution_state == "provider"
+            else [],
+            error={"exception_type": "ApiOverloadedError"}
+            if execution_state == "provider"
+            else None,
+            partial_usage=partial_usage if execution_state != "complete" else [],
+        )
+        stage["correctness"] = {"status": "fail"}
+        if execution_state != "complete":
+            work = stage["work"]
+            assert isinstance(work, dict)
+            work["tokens"] = None
+    result = write_evaluation_report(report, _config(measurement), tmp_path)
     data = json.loads(result.read_text())
     html = (tmp_path / "report.html").read_text()
     payload = re.search(
@@ -463,11 +708,56 @@ def test_writer_json_csv_and_echarts_share_exact_selected_values(tmp_path: Path)
     assert payload is not None and json.loads(payload.group(1)) == data
     csv_rows = list(csv.DictReader(io.StringIO((tmp_path / "results.csv").read_text())))
     assert len(csv_rows) == len(data["observations"])
-    assert [float(row["value"]) for row in csv_rows] == [
+    assert [float(row["value"]) if row["value"] else None for row in csv_rows] == [
         row["value"] for row in data["observations"]
     ]
-    assert {row["family"] for row in csv_rows} == {"tokens"}
+    assert {row["family"] for row in csv_rows} == {measurement}
     assert "data.download_csv" in html and "Delta vs vanilla" in html
+    attempt = data["attempts"][0]
+    execution = attempt["execution"]
+    expected_status = {
+        "provider": "failed",
+        "timeout": "timed_out",
+        "complete": "complete",
+        "missing": "unknown",
+    }[execution_state]
+    assert execution["status"] == expected_status
+    visible = _outcome_text(data, tmp_path)
+    selected_rows = [row for row in csv_rows if row["attempt_id"] == "baseline-0"]
+    for row in selected_rows:
+        provenance = json.loads(row["provenance"])
+        assert provenance["execution_status"] == expected_status
+        assert provenance["execution_reason"] == execution["reason"]
+    if execution_state in {"provider", "timeout"}:
+        reason = execution["reason"]
+        assert reason in visible
+        assert message in reason if execution_state == "provider" else "timed out" in reason
+        assert execution["partial_usage"] == partial_usage
+        assert measurement != "tokens" or all(
+            not row["value"]
+            and row["status"] == "unknown"
+            and reason in row["reason"]
+            and "lower bounds" in row["reason"]
+            for row in selected_rows
+        )
+    else:
+        assert execution["reason"] is None
+        assert "Native execution failures" not in visible
+        if measurement == "tokens":
+            assert [float(row["value"]) for row in selected_rows] == [80, 10]
+        if execution_state == "complete":
+            assert attempt["correctness"] == "fail"
+    if measurement == "lines":
+        assert [float(row["value"]) for row in selected_rows] == [2, 1, 5, 0]
+        peers = {row["metric"]: row for row in csv_rows if row["attempt_id"] == "baseline-1"}
+        assert all(
+            row["status"] == peers[row["metric"]]["status"] == "measured"
+            and row["compatibility"] == peers[row["metric"]]["compatibility"]
+            and row["compatibility"]
+            for row in selected_rows
+        )
+    controller = html.rsplit("<script>", 1)[1].split("</script>", 1)[0]
+    assert "innerHTML" not in controller and "textContent" in controller
 
 
 @pytest.mark.parametrize("proof", [True, False])
@@ -688,3 +978,103 @@ def test_compact_report_preserves_collection_outcomes_and_repeat_labels() -> Non
     assert [attempt["repeat"] for attempt in _rows(data, "attempts")] == list(
         range(1, len(_rows(report, "attempts")) + 1)
     )
+
+
+def test_report_explains_unsupported_metrics_and_preserves_native_grade_binding() -> None:
+    report = _token_report()
+    grade = {
+        "pass": None,
+        "native_verifier_result": {"rewards": {"reward": 1}},
+        "binding": "unknown",
+        "reason": "native graded patch and measured working tree differ",
+    }
+    _stage(report, 0)["task_result"] = grade
+    config = _config("tokens", "coverage")
+    capabilities = {
+        "fixture-task": {
+            "coverage": {"status": "unavailable", "reason": "No coverage command configured"}
+        }
+    }
+    config["measurement_capabilities"] = capabilities
+    # Missing scan evidence remains unknown even when a native reward says pass.
+    for attempt in _rows(report, "attempts"):
+        for stage in _rows(attempt, "stages"):
+            metrics = stage["metrics"]
+            assert isinstance(metrics, dict)
+            metrics.pop("coverage", None)
+    data = evaluation_data(report, config)
+    assert data["measurement_capabilities"] == capabilities
+    assert _rows(data, "attempts")[0]["native_grading"] == grade
+    missing = [row for row in _rows(data, "observations") if row["family"] == "coverage"]
+    assert missing and all(
+        row["value"] is None
+        and row["status"] == "unavailable"
+        and row["reason"] == "No coverage command configured"
+        for row in missing
+    )
+    assert all(
+        row["value"] is not None for row in _rows(data, "observations") if row["family"] == "tokens"
+    )
+
+
+def test_overview_keeps_language_analyzers_separate() -> None:
+    data = {
+        "attempts": [{"task": "py"}, {"task": "go"}],
+        "observations": [
+            {
+                "task": "py",
+                "metric": "After changed-function cognitive maximum",
+                "family": "cognitive",
+                "provenance": {
+                    "language": "python",
+                    "analyzers": {
+                        "rca": {"status": "available", "version": "rust-code-analysis-cli 0.0.25"}
+                    },
+                },
+            },
+            {
+                "task": "go",
+                "metric": "After changed-function cognitive maximum",
+                "family": "cognitive",
+                "provenance": {
+                    "language": "go",
+                    "analyzers": {
+                        "go_analysis": {
+                            "status": "available",
+                            "version": "go-analysis-v1 gocognit=1.3.0 gocyclo=0.6.0",
+                        }
+                    },
+                },
+            },
+        ],
+    }
+    from pluginbench.evaluation_report import _aggregate_groups
+
+    groups = _aggregate_groups(data)
+    assert len(groups) == 2
+    assert {tuple(group[2]) for group in groups} == {("py",), ("go",)}
+    assert any("gocognit 1.3.0" in str(group[1]) for group in groups)
+
+
+def test_rust_unused_aggregate_names_rustc_not_complexity_analyzer() -> None:
+    from pluginbench.evaluation_report import _aggregate_groups
+
+    data = {
+        "attempts": [{"task": "rust"}],
+        "observations": [
+            {
+                "task": "rust",
+                "metric": "Introduced dead findings",
+                "family": "dead_code",
+                "provenance": {
+                    "language": "rust",
+                    "analyzers": {
+                        "rca": {"version": "RCA 0.0.25"},
+                        "rustc": {"version": "rustc 1.92.0"},
+                    },
+                },
+            }
+        ],
+    }
+    groups = _aggregate_groups(data)
+    assert groups[0][1] == "Rust · rustc 1.92.0"

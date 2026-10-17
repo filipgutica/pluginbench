@@ -89,3 +89,23 @@ def test_plain_unified_diff_is_not_silently_measured_as_zero() -> None:
 
     with pytest.raises(ValueError, match="Git diff"):
         analyze_patch(patch)
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("pkg/counter_test.go", 1),
+        ("pkg/counter.go", 0),
+        ("TESTS/check.go", 1),
+        ("lib/__tests__/lexer-match.js", 1),
+        ("lib/__tests/lexer-match-atrule-prelude.js", 1),
+        ("src/example.test.dir/value.ts", 0),
+    ],
+)
+def test_shared_classifier_recognizes_go_tests_without_matching_parent_filename(
+    path: str, expected: int
+) -> None:
+    patch = f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new\n"
+    metrics = analyze_patch(patch)
+    assert metrics["test_files_changed"] == expected
+    assert metrics["source_files_changed"] == 1 - expected

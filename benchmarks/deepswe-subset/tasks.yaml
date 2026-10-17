@@ -1,9 +1,0 @@
-schema_version: 1
-source:
-  repository_url: https://github.com/datacurve-ai/deep-swe
-  revision: 0b9fabbb63b9104d678fe965e1632f2dd9eaa2ea
-tasks:
-  - id: ts-pattern-match-each
-    path: tasks/ts-pattern-match-each
-  - id: ink-grid-box-layout
-    path: tasks/ink-grid-box-layout

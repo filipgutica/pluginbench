@@ -12,7 +12,7 @@ from functools import partial
 from threading import Event
 from pathlib import Path
 
-from pluginbench import study
+from pluginbench import harbor_backend, study
 from pluginbench.parallel import run_jobs, validate_jobs
 from pluginbench.assessment import _load_manifest, build_assessment
 from pluginbench.assessment_metrics import evaluate_evidence, inspect_snapshot
@@ -51,8 +51,7 @@ def _normalized(measurement: dict[str, object]) -> dict[str, object]:
     # limitations. Raw execution paths/timing are intentionally not compared.
     return {
         kind: {
-            key: _canonical(_object(value).get(key))
-            for key in ("status", "provenance", "metrics", "violations", "unknown_standards")
+            key: _canonical(_object(value).get(key)) for key in ("status", "provenance", "metrics")
         }
         for kind, value in measurement.items()
         if kind != "snapshot_digest"
@@ -168,8 +167,8 @@ def _verify_native_references(root: Path, value: object, seen: set[Path]) -> Non
             seen.add(path)
             if path.suffix == ".json":
                 document = json.loads(path.read_text())
-                # Assessment refs belong to that manifest, and include directories
-                # and locally rooted ledger proofs. Their loader checks them below.
+                # Assessment references belong to that manifest and include source
+                # directories. The manifest loader checks them below.
                 if isinstance(document, dict) and "name" in document and "records" in document:
                     return
                 _verify_native_references(root, document, seen)
@@ -191,6 +190,7 @@ def _native_state(root: Path) -> tuple[dict[str, object], AssessmentInput, Path]
     original = study._bound_path(root, run["assessment_input"])
     manifest = AssessmentInput.model_validate_json(original.read_text())
     plan = study._bound_document(root, run["plan"])
+    study._assert_saved_sources(root=root, run=run, plan=plan)
     entries = {entry["id"]: entry for entry in plan["entries"]}
     if set(states) != {record.id for record in manifest.records} or set(entries) != set(states):
         raise ValueError("native attempt identities differ from their frozen plan")
@@ -207,19 +207,27 @@ def _native_state(root: Path) -> tuple[dict[str, object], AssessmentInput, Path]
     study._bound_document(root, run["runtime_preflight"])
     if run.get("calibration"):
         study._bound_document(root, run["calibration"])
-    if (root / "review").exists():
-        state_path = root / "review/review-state.json"
-        if run.get("review") is None or not state_path.is_file():
-            raise ValueError("staged native review must finish before remeasurement")
-        staged = _object(json.loads(state_path.read_text()))
-        if staged.get("status") not in {"complete", "incomplete", "interrupted"}:
-            raise ValueError("staged native review is active")
-    if run.get("review"):
-        review = study._bound_document(root, run["review"])
-        if review.get("status") not in {"complete", "incomplete", "interrupted"}:
-            raise ValueError("native review is active")
-    _verify_native_references(root, run, set())
-    # Validate old source, correctness, metric-envelope and ledger bindings too.
+    seen: set[Path] = set()
+    for value in _object(run.get("baseline_origin", {})).values():
+        origin = _object(value)
+        if study._bound_document(root, origin["evidence"]) != {
+            key: item for key, item in origin.items() if key != "evidence"
+        }:
+            raise ValueError("baseline origin differs from its bound evidence")
+        # original_record retains origin_run's namespace, including snapshots.
+        # Other provenance references belong to the imported run.
+        history = origin.get("historical_evidence")
+        if not isinstance(history, list):
+            raise ValueError("baseline origin requires historical evidence references")
+        _verify_native_references(
+            root,
+            {key: item for key, item in origin.items() if key not in {"original_record", "evidence"}},
+            seen,
+        )
+    _verify_native_references(
+        root, {key: value for key, value in run.items() if key != "baseline_origin"}, seen
+    )
+    # Validate source, correctness and metric-envelope bindings too.
     _load_manifest(original)
     build_assessment(original)
     return run, manifest, original
@@ -228,7 +236,7 @@ def _native_state(root: Path) -> tuple[dict[str, object], AssessmentInput, Path]
 def _preserved_inventory(root: Path, manifest: AssessmentInput, base: Path) -> dict[str, object]:
     files: dict[str, str] = {}
     snapshots: dict[str, str] = {}
-    for name in ("frozen", "review", "observer-revision", "report"):
+    for name in ("frozen", "report"):
         directory = root / name
         if directory.exists():
             files.update(
@@ -236,11 +244,6 @@ def _preserved_inventory(root: Path, manifest: AssessmentInput, base: Path) -> d
             )
     for name in ("run.json", "frozen-inventory.json"):
         files[name] = study._digest(root / name)
-    for standards_path in [manifest.standards] if manifest.standards else []:
-        path = (base / standards_path).resolve()
-        if not path.is_relative_to(root):
-            raise ValueError("standards must remain inside the native study")
-        files[path.relative_to(root).as_posix()] = study._digest(path)
     for record in manifest.records:
         for reference in (record.before, *(stage.snapshot for stage in record.stages)):
             if reference is None:
@@ -249,7 +252,7 @@ def _preserved_inventory(root: Path, manifest: AssessmentInput, base: Path) -> d
             if not path.is_relative_to(root):
                 raise ValueError("snapshot must remain inside the native study")
             snapshots[path.relative_to(root).as_posix()] = str(inspect_snapshot(path)["digest"])
-        references = [record.correction_ledger, *(stage.correctness for stage in record.stages)]
+        references = [stage.correctness for stage in record.stages]
         references += list((record.before_evidence or {}).values())
         for stage in record.stages:
             references += list((stage.evidence or {}).values())
@@ -271,13 +274,19 @@ def _preserved_inventory(root: Path, manifest: AssessmentInput, base: Path) -> d
         "plan",
         "runtime_preflight",
         "calibration",
-        "review",
-        "observer_revision",
     ):
         if run.get(key):
             path = study._bound_path(root, run[key])
             files[path.relative_to(root).as_posix()] = study._digest(path)
-    return {"files": files, "snapshots": snapshots}
+    diagnostics = {
+        path.relative_to(root).as_posix(): harbor_backend.native_task_assets(path)
+        for path in sorted(root.glob("attempts/*/*/diagnostic-source"))
+    }
+    return {
+        "files": files,
+        "snapshots": snapshots,
+        **({"diagnostics": diagnostics} if diagnostics else {}),
+    }
 
 
 def _rebased(manifest: AssessmentInput, base: Path, destination: Path) -> AssessmentInput:
@@ -288,13 +297,8 @@ def _rebased(manifest: AssessmentInput, base: Path, destination: Path) -> Assess
             update={"path": Path(os.path.relpath((base / reference.path).resolve(), destination))}
         )
 
-    if revised.standards:
-        revised.standards = Path(os.path.relpath((base / revised.standards).resolve(), destination))
     for record in revised.records:
         record.before = rebase(record.before) if record.before else None
-        record.correction_ledger = (
-            rebase(record.correction_ledger) if record.correction_ledger else None
-        )
         record.before_evidence = (
             {kind: rebase(ref) for kind, ref in record.before_evidence.items()}
             if record.before_evidence
@@ -336,7 +340,6 @@ def propose_remeasurement(
     profiles: dict[str, list[Collector]],
     revision: str,
     progress: Callable[[str], None] | None = None,
-    allow_partial: bool = False,
     jobs: int = 1,
 ) -> Path:
     """Write a separate proposal; exceptions retain diagnostics and never promote it."""
@@ -365,7 +368,7 @@ def propose_remeasurement(
     directory = parent / revision
     directory.mkdir(parents=True, exist_ok=False)
     state: dict[str, object] = {
-        "schema_version": 2 if allow_partial else 1,
+        "schema_version": 2,
         "status": "collecting",
         "jobs": jobs,
         "revision": revision,
@@ -414,15 +417,10 @@ def propose_remeasurement(
                 ),
             ]:
                 assert snapshot_ref is not None
-                uses_before = any(
-                    "{before}" in argument
-                    for collector in frozen[record.task_id]
-                    for argument in collector.command or []
-                )
                 key = (
                     record.task_id,
                     snapshot_ref.sha256,
-                    record.before.sha256 if uses_before or allow_partial else "",
+                    record.before.sha256,
                 )
                 if key not in input_indices:
                     index = len(inputs)
@@ -479,16 +477,9 @@ def propose_remeasurement(
                     paths = collect_measurements(
                         item.snapshot, evidence, frozen[item.key[0]], before=item.before
                     )
-                    if not allow_partial and set(paths) != {
-                        collector.kind for collector in frozen[item.key[0]]
-                    }:
-                        raise ValueError(
-                            f"partial observer collection: {item.key[0]}/{item.stage}, repeat {repeat + 1}"
-                        )
                     result = evaluate_evidence(
                         item.snapshot,
                         {kind: str(path.resolve()) for kind, path in paths.items()},
-                        {},
                         evidence.resolve(),
                     )
                     normalized.append(_normalized(result))
@@ -513,12 +504,6 @@ def propose_remeasurement(
                         )
                     repeats.append(refs)
                 outcomes = _family_outcomes(normalized, repeats)
-                if not allow_partial and any(
-                    _object(value)["status"] != "available" for value in outcomes.values()
-                ):
-                    raise ValueError(
-                        f"observer measurements are not repeatable: {item.key[0]}/{item.stage}"
-                    )
                 emit(partial(accept, item, CollectedInput(repeats=repeats, outcomes=outcomes)))
             except BaseException:
                 emit(partial(update_input, item, "failed"))
@@ -536,7 +521,7 @@ def propose_remeasurement(
                     "stage": stage_id,
                     "snapshot_digest": snapshot_digest,
                     "before_digest": before_digest,
-                    **({"outcomes": collected.outcomes} if allow_partial else {}),
+                    "outcomes": collected.outcomes,
                     "repeats": [
                         {
                             kind: study._reference(root, directory / reference.path)
@@ -594,7 +579,6 @@ def propose_remeasurement(
             if (previous / "report").is_dir()
             else {},
             preserved=protected,
-            native_review=run.get("review"),
             frozen_profiles=study._reference(root, profile_path),
             profile_inventory=profile_inventory,
             measurement_inventory=study._inventory(directory / "measurements"),
@@ -631,17 +615,14 @@ def validate_remeasurement(root: Path, directory: Path) -> Path:
         or protocol.get("revision") != directory.name
     ):
         raise ValueError("measurement revision is incomplete")
-    validate_jobs(protocol.get("jobs", 1))
-    partial = protocol.get("schema_version") == 2
-    if protocol.get("schema_version") not in (1, 2):
+    validate_jobs(protocol.get("jobs"))
+    if protocol.get("schema_version") != 2:
         raise ValueError("unsupported measurement revision protocol")
     run, original, original_path = _native_state(root)
     if _preserved_inventory(root, original, original_path.parent) != protocol.get("preserved"):
         raise ValueError("native evidence changed after observer collection")
     if study._bound_document(root, protocol["original_run"]) != run:
         raise ValueError("saved native run differs from the current study")
-    if protocol.get("native_review") != run.get("review"):
-        raise ValueError("native review differs from the observer proposal")
     if study._bound_path(root, protocol["original_assessment"]) != original_path:
         raise ValueError("original assessment differs from the observer proposal")
     saved = study._bound_path(root, protocol["saved_assessment"])
@@ -694,7 +675,7 @@ def validate_remeasurement(root: Path, directory: Path) -> Path:
                 raise ValueError("observer proposal changed unsupplied measurements")
             stage.evidence = old_stage.evidence
     if without_metrics.model_dump() != expected.model_dump():
-        raise ValueError("observer proposal changed native source/correctness/work/ledger fields")
+        raise ValueError("observer proposal changed native source/correctness/work fields")
     observations = protocol.get("observations")
     if not isinstance(observations, list):
         raise ValueError("measurement observations missing")
@@ -731,15 +712,10 @@ def validate_remeasurement(root: Path, directory: Path) -> Path:
             repeats = observation.get("repeats")
             if not isinstance(repeats, list) or len(repeats) != 2:
                 raise ValueError("measurement repeat missing")
-            uses_before = any(
-                "{before}" in argument
-                for collector in profiles[record.task_id]
-                for argument in collector.command or []
-            )
             context = (
                 record.task_id,
                 snapshot_ref.sha256,
-                record.before.sha256 if uses_before or partial else "",
+                record.before.sha256,
             )
             input_index: str | None = None
             normalized = []
@@ -763,8 +739,7 @@ def validate_remeasurement(root: Path, directory: Path) -> Path:
                         or parts[0] != "measurements"
                         or not parts[1].isdigit()
                         or parts[2:4] != (str(index), collector.kind)
-                        or parts[4]
-                        not in ({"envelope.json", "failure.json"} if partial else {"envelope.json"})
+                        or parts[4] not in {"envelope.json", "failure.json"}
                     ):
                         raise ValueError("repeat artifact does not bind a distinct recorded repeat")
                     if input_index is None:
@@ -779,10 +754,6 @@ def validate_remeasurement(root: Path, directory: Path) -> Path:
                         )
                     input_contexts[parts[1]] = context
                     context_inputs[context] = parts[1]
-                    # Both repeats and all supplied families must use one input directory.
-                    first = study._bound_path(root, _object(repeats[0])[collector.kind])
-                    if path.parent.parent.parent != first.parent.parent.parent:
-                        raise ValueError("measurement repeats bind different input contexts")
                     bound_refs[collector.kind] = ArtifactRef.model_validate(
                         study._reference(directory, path)
                     )
@@ -812,17 +783,13 @@ def validate_remeasurement(root: Path, directory: Path) -> Path:
                         evaluate_evidence(
                             (proposed_path.parent / snapshot_ref.path).resolve(),
                             valid_paths,
-                            {},
                             directory,
                         )
                     )
                 )
             outcomes = _family_outcomes(normalized, bound_repeats)
-            if partial:
-                if observation.get("outcomes") != outcomes:
-                    raise ValueError("recorded family outcome differs from bound repeats")
-            elif normalized[0] != normalized[1]:
-                raise ValueError("observer measurements are not repeatable")
+            if observation.get("outcomes") != outcomes:
+                raise ValueError("recorded family outcome differs from bound repeats")
             for collector in profiles[record.task_id]:
                 available = _object(outcomes[collector.kind])["status"] == "available"
                 reference = (evidence or {}).get(collector.kind)

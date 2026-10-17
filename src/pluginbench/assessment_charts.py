@@ -9,7 +9,6 @@ import json
 import math
 from dataclasses import asdict, dataclass
 from importlib.resources import files
-from pathlib import Path
 from statistics import median
 
 from pluginbench import codex
@@ -83,6 +82,8 @@ METRICS = (
             ("unit-size maximum", "max_unit_size_reported"),
         )
     ),
+    ("Coverage", "Line coverage %", "coverage", "line_percent"),
+    ("Coverage", "Statement coverage %", "coverage", "statement_percent"),
     ("Coverage", "Branch coverage %", "coverage", "branch_percent"),
     ("Coverage", "Function coverage %", "coverage", "function_percent"),
     ("LOC", "Source LOC", "loc", "source_lines"),
@@ -129,17 +130,21 @@ METRICS = (
         "coverage",
         "zero_unique_branch_contribution_tests",
     ),
-    (
-        "Tests with zero unique contribution",
-        "Mutant-kill contribution",
-        "mutation",
-        "zero_unique_mutant_kill_tests",
-    ),
 )
 
 # Display copy stays separate from the metric identities used in evidence and CSVs.
 # Each entry supplies a title, axis unit, and a brief explanation beside the plot.
 METRIC_GUIDE = {
+    "Line coverage %": (
+        "Line coverage",
+        "% covered",
+        "Executable source lines reached by the selected tests. Unsupported units remain unknown; coverage alone does not establish useful assertions.",
+    ),
+    "Statement coverage %": (
+        "Statement coverage",
+        "% covered",
+        "Source statements reached by the selected tests. Go counts statements within measured blocks; this is not branch or function coverage.",
+    ),
     "Input tokens": (
         "Input tokens",
         "tokens",
@@ -245,12 +250,6 @@ METRIC_GUIDE = {
         "tests",
         "Supplied tests whose covered branches are also covered by other supplied tests. "
         "Shared coverage does not mean shared assertions or unnecessary tests.",
-    ),
-    "Mutant-kill contribution": (
-        "Tests with no unique mutation detection",
-        "tests",
-        "Supplied tests that detect no deliberately changed code missed by the other supplied tests. "
-        "This measures overlap in mutation detection, not whether a test is useful.",
     ),
 }
 
@@ -372,6 +371,49 @@ def _number(value: object) -> float | None:
     return None
 
 
+def execution_outcome(provenance: object) -> dict[str, object]:
+    """Explain bound native completion independently of source/task grading."""
+    evidence = _map(provenance)
+    if evidence.get("successful_native_completion") is True:
+        return {"status": "complete", "reason": None}
+    if evidence.get("timed_out") is True:
+        return {"status": "timed_out", "reason": "Native execution timed out."}
+    exit_code = evidence.get("exit_code")
+    if evidence.get("successful_native_completion") is not False and not (
+        type(exit_code) is int and exit_code != 0
+    ):
+        return {"status": "unknown", "reason": None}
+    error = _map(evidence.get("error"))
+    error_type = error.get("exception_type")
+    cause = None
+    stream_errors = evidence.get("stream_errors")
+    if isinstance(stream_errors, list):
+        for event in reversed(stream_errors):
+            row = _map(event)
+            message = _map(row.get("error")).get("message", row.get("message"))
+            if isinstance(message, str) and message.strip():
+                cause = message.strip()
+                break
+    if cause is None:
+        message = error.get("message")
+        if not message and not error_type:
+            message = error.get("exception_message")
+        if not message and isinstance(evidence.get("error"), str):
+            message = evidence["error"]
+        if isinstance(message, str) and message.strip():
+            cause = message.strip().splitlines()[0]
+    label = "Native execution failed"
+    if isinstance(error_type, str) and error_type:
+        label += " (" + error_type + ")"
+    if cause:
+        reason = label + ": " + cause
+    elif type(exit_code) is int and exit_code != 0:
+        reason = label + f" (exit {exit_code})."
+    else:
+        reason = label + "."
+    return {"status": "failed", "reason": reason}
+
+
 def _fingerprint(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
@@ -408,8 +450,6 @@ def _runtime(attempt: dict[str, object]) -> dict[str, str]:
     } | {
         "runtime_source": _text(provenance.get("runtime_source"))
         if provenance.get("runtime_source")
-        else "native runtime evidence"
-        if provenance.get("input") == "workflow-matrix"
         else "manifest declaration"
     }
 
@@ -433,118 +473,6 @@ def _assigned_runtime(attempt: dict[str, object]) -> dict[str, object]:
         else runtime["harness_version"],
         "assignment_bound": bound,
     }
-
-
-def _total_work(stages: list[dict[str, object]]) -> dict[str, object]:
-    work = [_map(stage.get("work")) for stage in stages]
-    formats = [_text(row.get("token_format")) for row in work]
-    matching = bool(work) and "unknown" not in formats and len(set(formats)) == 1
-    tokens: dict[str, float | None] = {}
-    for key in ("input_tokens", "output_tokens"):
-        values = [_number(_map(row.get("tokens")).get(key)) for row in work]
-        tokens[key] = (
-            sum(value for value in values if value is not None)
-            if matching and all(value is not None for value in values)
-            else None
-        )
-    elapsed = [_number(row.get("elapsed_seconds")) for row in work]
-    return {
-        "tokens": tokens,
-        "token_format": formats[0] if matching else None,
-        "elapsed_seconds": sum(value for value in elapsed if value is not None)
-        if all(value is not None for value in elapsed)
-        else None,
-    }
-
-
-def _outcomes(attempts: list[dict[str, object]]) -> list[dict[str, object]]:
-    groups: dict[str, list[dict[str, object]]] = {}
-    for attempt in attempts:
-        identity = {
-            "task": _text(attempt.get("task_id")),
-            "arm": _text(attempt.get("arm")),
-            "before_digest": _text(attempt.get("before_digest")),
-            **_assigned_runtime(attempt),
-        }
-        groups.setdefault(json.dumps(identity, sort_keys=True), []).append(attempt)
-    outcomes = []
-    for identity_key, members in groups.items():
-        row = json.loads(identity_key)
-        row["assigned"] = len(members)
-        states: dict[str, int] = {}
-        for attempt in members:
-            state = _text(_map(attempt.get("provenance")).get("attempt_status"))
-            states[state] = states.get(state, 0) + 1
-        row["attempt_states"] = states
-        for role in ("handoff", "final"):
-            counts = {"pass": 0, "fail": 0, "unknown": 0}
-            for attempt in members:
-                stage = next(
-                    (
-                        stage
-                        for stage in _rows(attempt.get("stages"))
-                        if stage.get("id") == attempt.get(role)
-                    ),
-                    {},
-                )
-                status = _text(_map(stage.get("correctness")).get("status"))
-                counts[status if status in counts else "unknown"] += 1
-            row[role] = counts
-        burdens = [_map(attempt.get("correction_burden")) for attempt in members]
-        for key in ("verified_issue_count", "external_rounds"):
-            values = [_number(burden.get(key)) for burden in burdens]
-            row[key] = (
-                sum(value for value in values if value is not None)
-                if all(burden.get("status") == "available" for burden in burdens)
-                and all(value is not None for value in values)
-                else None
-            )
-        reviews = [_map(attempt.get("independent_review")) for attempt in members]
-        values = [_number(review.get("finding_count")) for review in reviews]
-        row["selected_review_findings"] = (
-            sum(value for value in values if value is not None)
-            if all(review.get("status") == "reviewed" for review in reviews)
-            and all(value is not None for value in values)
-            else None
-        )
-        row["selected_review_stages"] = sorted(
-            {_text(review.get("stage")) for review in reviews if review}
-        )
-        rounds = [_number(burden.get("external_rounds")) for burden in burdens]
-        row["recorded_review_rounds"] = (
-            sum(value for value in rounds if value is not None)
-            if all(value is not None for value in rounds)
-            else None
-        )
-        row["guidance_delivery"] = sorted(
-            {_text(_map(attempt.get("provenance")).get("guidance_delivery")) for attempt in members}
-        )
-        actual_runtimes = []
-        for attempt in members:
-            actual = {"model": _text(attempt.get("model")), **_runtime(attempt)}
-            unknown = any(
-                actual[key] == "unknown"
-                for key in ("model", "reasoning_effort", "harness", "harness_version")
-            )
-            mismatch = bool(row["assignment_bound"]) and any(
-                actual[key] != "unknown" and row[key] != "unknown" and actual[key] != row[key]
-                for key in ("model", "reasoning_effort", "harness_version")
-            )
-            actual_runtimes.append(
-                {
-                    "attempt_id": _text(attempt.get("id")),
-                    **actual,
-                    "unknown": unknown,
-                    "mismatch": mismatch,
-                }
-            )
-        row["actual_runtimes"] = actual_runtimes
-        row["actual_runtime_unknown"] = sum(actual["unknown"] is True for actual in actual_runtimes)
-        row["actual_runtime_mismatch"] = sum(
-            actual["mismatch"] is True for actual in actual_runtimes
-        )
-        outcomes.append(row)
-    return outcomes
 
 
 @dataclass
@@ -584,8 +512,17 @@ def _observation(
     attempt: dict[str, object], stage: dict[str, object], role: str, spec: tuple[str, str, str, str]
 ) -> Observation:
     panel, label, kind, key = spec
+    static_kind = (
+        "analysis"
+        if "analysis" in _map(stage.get("metrics"))
+        and _map(_map(stage.get("metrics")).get("analysis")).get("status") == "available"
+        else "fallow"
+    )
     work = _map(stage.get("work"))
-    evidence = _map(_map(stage.get("metrics")).get("fallow" if kind == "fallow_change" else kind))
+    native_outcome = execution_outcome(stage.get("execution_provenance"))
+    evidence = _map(
+        _map(stage.get("metrics")).get(static_kind if kind in {"fallow", "fallow_change"} else kind)
+    )
     metrics = _map(evidence.get("metrics"))
     provenance = _map(evidence.get("provenance"))
     settings = _runtime(attempt)
@@ -611,7 +548,7 @@ def _observation(
             (
                 row
                 for row in _rows(attempt.get("stages"))
-                if row.get("id") == review.get("stage_id", attempt.get("handoff"))
+                if row.get("id") == review.get("stage_id")
             ),
             {},
         )
@@ -625,7 +562,7 @@ def _observation(
             ),
             "judge_reasoning_effort": execution.get("runtime_effort_evidence"),
             "judge_harness_version": codex.observed_cli_version(execution.get("startup")),
-            "review_stage": review.get("stage", "handoff"),
+            "review_stage": review.get("stage"),
         }
         judge_effort = provenance["judge_reasoning_effort"]
         if codex.validated_claude_launch(
@@ -659,10 +596,9 @@ def _observation(
         criteria_valid = len(digest) == 64 and all(
             character in "0123456789abcdef" for character in digest
         )
-        if criteria is not None:
-            provenance["criteria_sha256"] = criteria
-            identity["criteria_sha256"] = digest
-            eligible = eligible and criteria_valid
+        provenance["criteria_sha256"] = criteria
+        identity["criteria_sha256"] = digest
+        eligible = eligible and criteria_valid
         if kind == "review_findings":
             provenance.pop("token_format")
             identity.pop("token_format")
@@ -682,7 +618,7 @@ def _observation(
             value = _review_count(review, key) if eligible else None
             reason = (
                 "independent AI judgment under fixed review criteria; counts are not deterministic "
-                "defects, repair rounds, or human review churn"
+                "defects or human review effort"
                 if value is not None
                 else "valid fixed-criteria review, runtime identity, or explicit finding counts unavailable"
             )
@@ -691,11 +627,7 @@ def _observation(
         provenance = {"token_format": work.get("token_format")}
         eligible = isinstance(work.get("token_format"), str) and bool(work["token_format"])
         identity.update(provenance)
-        reason = (
-            "total native tokens across all calls through final"
-            if role == "final"
-            else "first-call native tokens at handoff"
-        ) + "; cached input and reasoning output subsets are not added"
+        reason = "native tokens at handoff; cached input and reasoning output subsets are not added"
     elif kind in {"loc", "loc_change"}:
         classification = "source" if key.startswith("source_") else "test"
         code_size = _map(stage.get("code_size" if classification == "source" else "test_code_size"))
@@ -739,7 +671,7 @@ def _observation(
             identity.update(provenance)
             reason = "extension-classified LOC, including generated files; shared source/test classification"
     elif kind == "fallow_change":
-        comparison = _map(_map(stage.get("metric_comparison")).get("fallow"))
+        comparison = _map(_map(stage.get("metric_comparison")).get(static_kind))
         path = key.split(".")
         detail = _map(comparison.get(path[0]))
         population_metrics = _map(detail.get(path[1])) if len(path) == 3 else detail
@@ -799,50 +731,59 @@ def _observation(
                 if key == "clone_groups"
                 else "reported function maximum across declared scope, including tests when scoped; partial reporting is not a complete maximum"
             )
-        if kind in {"coverage", "mutation"}:
-            denominator = (
-                "mutant_set_digest"
-                if kind == "mutation"
-                else (
-                    "function_denominator_digest"
-                    if key == "function_percent"
-                    else "branch_denominator_digest"
+            if static_kind == "analysis":
+                reason = (
+                    str(metrics.get("dead_code_detection"))
+                    if key == "dead_code"
+                    else "function scores under the named language analyzer; unlike analyzer definitions are not interchangeable"
                 )
-            )
-            if kind != "coverage":
-                identity[denominator] = metrics.get(denominator)
+                if key != "dead_code" and metrics.get("language") == "python":
+                    reason += "; " + str(_map(metrics.get("settings")).get("python_rca_population"))
+        if kind == "coverage":
+            unit = key.partition("_")[0] if key.endswith("_percent") else "branch"
+            denominator = f"{unit}_denominator_digest"
             provenance = {**provenance, denominator: metrics.get(denominator)}
             eligible = eligible and isinstance(metrics.get(denominator), str)
-            reason = "fixed denominator and matching analyzer/config/scope required for comparison"
-            if kind == "coverage":
-                eligible = (
-                    eligible and metrics.get("population_complete_for_declared_scope") is True
+            complete = metrics.get(
+                f"{unit}_population_complete", metrics.get("population_complete_for_declared_scope")
+            )
+            eligible = eligible and complete is True
+            if metrics.get(denominator) is None:
+                reason = f"{unit} coverage is not supplied by {metrics.get('format') or 'this report format'}"
+            elif complete is not True:
+                reason = (
+                    "reported coverage only; declared source population completeness is unproven"
                 )
-                if metrics.get("population_complete_for_declared_scope") is not True:
-                    reason = "reported coverage only; declared source population completeness is unproven"
-                else:
-                    reason = "coverage of each submission's source; populations may differ; descriptive per-submission rates, no fixed-denominator gain claim"
-                provenance.update(
-                    {
-                        name: metrics.get(name)
-                        for name in (
-                            "test_scope",
-                            "selected_test_files",
-                            "reference_test_files",
-                            "selection_policy",
-                        )
-                    }
-                )
-                provenance.update(
-                    {
-                        "covered": metrics.get(
-                            "function_covered" if key == "function_percent" else "branch_covered"
-                        ),
-                        "total": metrics.get(
-                            "function_total" if key == "function_percent" else "branch_total"
-                        ),
-                    }
-                )
+            else:
+                reason = "coverage of each submission's source; populations may differ; descriptive per-submission rates, no fixed-denominator gain claim"
+            plural = {
+                "line": "lines",
+                "statement": "statements",
+                "branch": "branches",
+                "function": "functions",
+            }
+            limit = _map(_map(metrics.get("unavailable_populations")).get(plural[unit]))
+            if limit.get("reason") and (metrics.get(denominator) is None or complete is not True):
+                reason = str(limit["reason"])
+            if metrics.get(f"{unit}_total") == 0 and complete is True:
+                reason = f"measured {unit} population is empty; percentage is undefined"
+            provenance.update(
+                {
+                    name: metrics.get(name)
+                    for name in (
+                        "test_scope",
+                        "selected_test_files",
+                        "reference_test_files",
+                        "selection_policy",
+                    )
+                }
+            )
+            provenance.update(
+                {
+                    "covered": metrics.get(f"{unit}_covered"),
+                    "total": metrics.get(f"{unit}_total"),
+                }
+            )
         if key == "zero_marginal_count":
             contribution = _map(metrics.get("test_contribution"))
             value = _number(contribution.get("zero_marginal_count"))
@@ -934,94 +875,99 @@ def _observation(
     compatibility = (
         _fingerprint(identity) if eligible and identity_known and value is not None else None
     )
+    provenance.update(
+        execution_status=native_outcome["status"], execution_reason=native_outcome["reason"]
+    )
     if value is None:
-        status, reason = (
-            "unknown",
-            reason + "; unknown is not zero"
-            if kind in {"fallow_change", "loc", "loc_change", "review_findings"}
-            or key == "zero_marginal_count"
-            else _text(evidence.get("reason"))
-            if evidence.get("reason")
-            else "measurement unavailable; unknown is not zero",
-        )
+        if kind == "work" and isinstance(provenance.get("execution_reason"), str):
+            reason = (
+                str(provenance["execution_reason"])
+                + "; final token usage unavailable; unknown is not zero"
+            )
+            partial = _map(stage.get("execution_provenance")).get("partial_usage")
+            if isinstance(partial, list) and partial:
+                reason += "; partial usage receipts are lower bounds, not totals"
+            status = "unknown"
+        else:
+            status, reason = (
+                "unknown",
+                reason + "; unknown is not zero"
+                if kind in {"fallow_change", "loc", "loc_change", "review_findings"}
+                or key == "zero_marginal_count"
+                or (kind == "coverage" and metrics)
+                else _text(evidence.get("reason"))
+                if evidence.get("reason")
+                else "measurement unavailable; unknown is not zero",
+            )
     else:
         status = "measured" if compatibility else "not comparable"
     change = _map(stage.get("change"))
-    code_size = _map(stage.get("code_size"))
-    source_change = (
-        code_size
-        if code_size.get("status") == "available"
-        else {}
-        if code_size.get("status") == "unavailable"
-        else change
-    )
-    test_size = _map(stage.get("test_code_size"))
-    test_change = (
-        test_size
-        if test_size.get("status") == "available"
-        else {}
-        if test_size.get("status") == "unavailable"
-        else change
-    )
-    change_provenance: dict[str, object] = {
-        "source": {
-            "status": code_size.get("status", "not configured"),
-            "scope": code_size.get("scope"),
-            "method": code_size.get("method")
-            if code_size.get("status") == "unavailable"
-            else code_size.get("method", "extension-classified LOC, including generated files"),
-            "reason": code_size.get("reason"),
-        },
-        "tests": {
-            "status": test_size.get("status", "not configured"),
-            "scope": test_size.get("scope"),
-            "method": test_size.get("method")
-            if test_size.get("status") == "unavailable"
-            else test_size.get(
-                "method", "extension-classified test LOC, including generated files"
-            ),
-            "reason": test_size.get("reason"),
-        },
-        "raw_extension_classified_counts": {
-            name: change.get(name)
-            for name in (
-                "source_lines_added",
-                "source_lines_removed",
-                "test_lines_added",
-                "test_lines_removed",
-            )
-        },
+    line_changes: dict[str, float | None] = {}
+    change_provenance: dict[str, object] = {}
+    for classification, size_field, section, default_method in (
+        ("source", "code_size", "source", "extension-classified LOC, including generated files"),
+        (
+            "test",
+            "test_code_size",
+            "tests",
+            "extension-classified test LOC, including generated files",
+        ),
+    ):
+        size = _map(stage.get(size_field))
+        size_status = size.get("status")
+        measured_change = (
+            size if size_status == "available" else {} if size_status == "unavailable" else change
+        )
+        for action in ("added", "removed"):
+            field = f"{classification}_lines_{action}"
+            line_changes[field] = _number(measured_change.get(field))
+        change_provenance[section] = {
+            "status": size.get("status", "not configured"),
+            "scope": size.get("scope"),
+            "method": size.get("method")
+            if size_status == "unavailable"
+            else size.get("method", default_method),
+            "reason": size.get("reason"),
+        }
+    change_provenance["raw_extension_classified_counts"] = {
+        name: change.get(name)
+        for name in (
+            "source_lines_added",
+            "source_lines_removed",
+            "test_lines_added",
+            "test_lines_removed",
+        )
     }
     return Observation(
-        _text(attempt.get("id")),
-        _text(attempt.get("task_id")),
-        _text(attempt.get("arm")),
-        _text(attempt.get("model")),
-        host,
-        settings["harness"],
-        settings["harness_version"],
-        settings["reasoning_effort"],
-        settings["requested_reasoning_effort"],
-        runtime_source,
-        role,
-        _text(stage.get("id")),
-        panel,
-        label,
-        value,
-        _text(_map(stage.get("correctness")).get("status")),
-        status,
-        reason,
-        compatibility,
-        _chart_provenance(provenance),
-        _text(stage.get("snapshot_digest")),
-        _text(attempt.get("before_digest")),
-        population,
-        _number(work.get("elapsed_seconds")),
-        _number(source_change.get("source_lines_added")),
-        _number(source_change.get("source_lines_removed")),
-        _number(test_change.get("test_lines_added")),
-        _number(test_change.get("test_lines_removed")),
-        change_provenance,
+        attempt_id=_text(attempt.get("id")),
+        task=_text(attempt.get("task_id")),
+        arm=_text(attempt.get("arm")),
+        model=_text(attempt.get("model")),
+        host=host,
+        harness=settings["harness"],
+        harness_version=settings["harness_version"],
+        reasoning_effort=settings["reasoning_effort"],
+        requested_reasoning_effort=settings["requested_reasoning_effort"],
+        runtime_source=runtime_source,
+        role=role,
+        stage=_text(stage.get("id")),
+        panel=panel,
+        metric=label,
+        value=value,
+        correctness=_text(_map(stage.get("correctness")).get("status")),
+        status=status,
+        reason=reason,
+        compatibility=compatibility,
+        provenance=_chart_provenance(provenance),
+        snapshot_digest=_text(stage.get("snapshot_digest")),
+        before_digest=_text(attempt.get("before_digest")),
+        per_test_count=population,
+        elapsed_seconds=_number(work.get("elapsed_seconds")),
+        source_lines_added=line_changes["source_lines_added"],
+        source_lines_removed=line_changes["source_lines_removed"],
+        test_lines_added=line_changes["test_lines_added"],
+        test_lines_removed=line_changes["test_lines_removed"],
+        change_loc_provenance=change_provenance,
     )
 
 
@@ -1050,34 +996,20 @@ def chart_data(report: dict[str, object]) -> dict[str, object]:
     if report.get("schema_version") != 1 or "snapshot_roots" not in report:
         raise ValueError("charts require a canonical version-1 assessment report")
     observations: list[Observation] = []
-    distinct_final = False
-    single_stage_attempts: list[str] = []
     attempts = _rows(report.get("attempts"))
     for attempt in attempts:
         stages = _rows(attempt.get("stages"))
         if not stages:
             raise ValueError("canonical attempt requires a handoff stage")
-        distinct_final |= attempt.get("handoff") != attempt.get("final")
-        if attempt.get("handoff") == attempt.get("final"):
-            single_stage_attempts.append(_text(attempt.get("id")))
-        for role, identifier in (
-            ("handoff", attempt.get("handoff")),
-            ("final", attempt.get("final")),
-        ):
-            if role == "final" and attempt.get("handoff") == attempt.get("final"):
-                continue
-            stage = next((row for row in stages if row.get("id") == identifier), None)
-            if stage is None:
-                raise ValueError("canonical stage identity is missing")
-            if role == "final":
-                final_index = stages.index(stage)
-                stage = {**stage, "work": _total_work(stages[: final_index + 1])}
-            observations.extend(
-                _observation(attempt, stage, role, spec)
-                for spec in METRICS
-                if spec[2] not in {"review_work", "review_findings"}
-                or report.get("independent_review")
-            )
+        if len(stages) != 1 or stages[0].get("id") != "handoff":
+            raise ValueError("canonical attempt requires exactly one handoff submission")
+        stage = stages[0]
+        role = "handoff"
+        observations.extend(
+            _observation(attempt, stage, role, spec)
+            for spec in METRICS
+            if spec[2] not in {"review_work", "review_findings"} or report.get("independent_review")
+        )
     groups: dict[tuple[str, str, str], list[Observation]] = {}
     raw_groups: dict[tuple[str, str, str], list[Observation]] = {}
     for row in observations:
@@ -1088,13 +1020,9 @@ def chart_data(report: dict[str, object]) -> dict[str, object]:
             if row.compatibility and row.arm != "unknown"
             else _fingerprint((row.task, row.metric, row.attempt_id))
         )
-        roles = [row.role]
-        if distinct_final and row.attempt_id in single_stage_attempts:
-            roles.append("final")
-        for role in roles:
-            raw_groups.setdefault((role, identity, row.arm), []).append(row)
-            if row.compatibility and row.arm != "unknown":
-                groups.setdefault((role, row.compatibility, row.arm), []).append(row)
+        raw_groups.setdefault((row.role, identity, row.arm), []).append(row)
+        if row.compatibility and row.arm != "unknown":
+            groups.setdefault((row.role, row.compatibility, row.arm), []).append(row)
     for row in observations:
         if row.compatibility and not groups.get((row.role, row.compatibility, "baseline")):
             row.status = "not comparable"
@@ -1156,10 +1084,7 @@ def chart_data(report: dict[str, object]) -> dict[str, object]:
             if report.get("independent_review")
         ],
         "limitations": report.get("limitations", []),
-        "assigned": len(_rows(report.get("attempts"))),
-        "distinct_final": distinct_final,
-        "single_stage_attempts": single_stage_attempts,
-        "outcomes": _outcomes(attempts),
+        "assigned": len(attempts),
         "metric_guide": {
             metric: {"title": title, "unit": unit, "explanation": explanation}
             for metric, (title, unit, explanation) in METRIC_GUIDE.items()
@@ -1178,7 +1103,7 @@ def _measurement_completeness(attempts: list[dict[str, object]]) -> list[dict[st
         for attempt in attempts
         if (
             isinstance(configured := attempt.get("configured_metrics"), list)
-            and any(kind in configured for kind in ("coverage", "fallow"))
+            and any(kind in configured for kind in ("coverage", "fallow", "analysis"))
         )
         or any(
             _map(evidence.get(kind)).get("metrics")
@@ -1186,80 +1111,82 @@ def _measurement_completeness(attempts: list[dict[str, object]]) -> list[dict[st
                 _map(attempt.get("before_metrics")),
                 *(_map(stage.get("metrics")) for stage in _rows(attempt.get("stages"))),
             )
-            for kind in ("coverage", "fallow")
+            for kind in ("coverage", "fallow", "analysis")
         )
     }
     rows = []
     for attempt in attempts:
         if attempt.get("task_id") not in measured_tasks:
             continue
-        for role in ("handoff", "final"):
-            stages = _rows(attempt.get("stages"))
-            stage = next(row for row in stages if row["id"] == attempt.get(role))
-            evidence = _map(stage.get("metrics"))
-            static = _map(_map(evidence.get("fallow")).get("metrics"))
-            coverage = _map(_map(evidence.get("coverage")).get("metrics"))
-            overlap = _map(coverage.get("test_contribution"))
-            comparison = _map(_map(stage.get("metric_comparison")).get("fallow"))
-            work = (
-                stage.get("work")
-                if role == "handoff"
-                else _total_work(stages[: stages.index(stage) + 1])
+        stages = _rows(attempt.get("stages"))
+        stage = stages[0]
+        evidence = _map(stage.get("metrics"))
+        static_kind = (
+            "analysis" if _map(evidence.get("analysis")).get("status") == "available" else "fallow"
+        )
+        static = _map(_map(evidence.get(static_kind)).get("metrics"))
+        coverage = _map(_map(evidence.get("coverage")).get("metrics"))
+        overlap = _map(coverage.get("test_contribution"))
+        comparison = _map(_map(stage.get("metric_comparison")).get(static_kind))
+        work = stage.get("work")
+        tokens = _map(_map(work).get("tokens"))
+        coverage_units = [
+            unit
+            for unit in ("line", "statement", "branch", "function")
+            if any(
+                coverage.get(f"{unit}_{key}") is not None
+                for key in ("total", "covered", "percent", "denominator_digest")
             )
-            tokens = _map(_map(work).get("tokens"))
-            captured = {
-                "Input/output tokens": all(
-                    _number(tokens.get(key)) is not None
-                    for key in ("input_tokens", "output_tokens")
-                ),
-                "Source/test lines added/removed": all(
-                    _map(stage.get(key)).get("status") == "available"
-                    and all(
-                        _number(_map(stage.get(key)).get(f"{kind}_lines_{side}")) is not None
-                        for side in ("added", "removed")
-                    )
-                    for key, kind in (("code_size", "source"), ("test_code_size", "test"))
-                ),
-                "Complexity population": static.get("complexity_complete_for_declared_scope")
-                is True
-                and _number(static.get("function_count_reported")) is not None,
-                "Coverage covered/total counts": coverage.get(
-                    "population_complete_for_declared_scope"
+        ]
+        captured = {
+            "Input/output tokens": all(
+                _number(tokens.get(key)) is not None for key in ("input_tokens", "output_tokens")
+            ),
+            "Source/test lines added/removed": all(
+                _map(stage.get(key)).get("status") == "available"
+                and all(
+                    _number(_map(stage.get(key)).get(f"{kind}_lines_{side}")) is not None
+                    for side in ("added", "removed")
+                )
+                for key, kind in (("code_size", "source"), ("test_code_size", "test"))
+            ),
+            "Complexity population": static.get("complexity_complete_for_declared_scope") is True
+            and _number(static.get("function_count_reported")) is not None,
+            "Coverage covered/total counts": bool(coverage_units)
+            and all(
+                coverage.get(
+                    f"{unit}_population_complete",
+                    coverage.get("population_complete_for_declared_scope"),
                 )
                 is True
                 and all(
-                    _number(coverage.get(key)) is not None
-                    for key in (
-                        "branch_total",
-                        "branch_covered",
-                        "function_total",
-                        "function_covered",
-                    )
-                ),
-                "Introduced dead findings": _map(comparison.get("dead_findings")).get("status")
-                == "available"
-                and _number(_map(comparison.get("dead_findings")).get("introduced_count"))
-                is not None,
-                "Introduced clone groups": _map(comparison.get("clone_findings")).get("status")
-                == "available"
-                and _number(_map(comparison.get("clone_findings")).get("introduced_count"))
-                is not None,
-                "Test-overlap candidate counts": overlap.get("status") == "available"
-                and _number(overlap.get("candidate_count")) is not None
-                and overlap.get("tested_count") == overlap.get("candidate_count")
-                and _number(overlap.get("zero_marginal_count")) is not None,
+                    _number(coverage.get(f"{unit}_{key}")) is not None
+                    for key in ("total", "covered")
+                )
+                for unit in coverage_units
+            ),
+            "Introduced dead findings": _map(comparison.get("dead_findings")).get("status")
+            == "available"
+            and _number(_map(comparison.get("dead_findings")).get("introduced_count")) is not None,
+            "Introduced clone groups": _map(comparison.get("clone_findings")).get("status")
+            == "available"
+            and _number(_map(comparison.get("clone_findings")).get("introduced_count")) is not None,
+            "Test-overlap candidate counts": overlap.get("status") == "available"
+            and _number(overlap.get("candidate_count")) is not None
+            and overlap.get("tested_count") == overlap.get("candidate_count")
+            and _number(overlap.get("zero_marginal_count")) is not None,
+        }
+        rows.append(
+            {
+                "attempt_id": attempt["id"],
+                "task": attempt["task_id"],
+                "arm": attempt.get("arm"),
+                "role": "handoff",
+                **_assigned_runtime(attempt),
+                "counts": captured,
+                "complete": all(captured.values()),
             }
-            rows.append(
-                {
-                    "attempt_id": attempt["id"],
-                    "task": attempt["task_id"],
-                    "arm": attempt.get("arm"),
-                    "role": role,
-                    **_assigned_runtime(attempt),
-                    "counts": captured,
-                    "complete": all(captured.values()),
-                }
-            )
+        )
     return rows
 
 
@@ -1276,10 +1203,6 @@ def _csv_cell(value: object) -> str:
         if text.lstrip().startswith(("=", "+", "-", "@")) or text.startswith(("\t", "\r", "\n"))
         else text
     )
-
-
-def chart_artifacts(report: dict[str, object]) -> tuple[str, str]:
-    return chart_artifacts_from_data(chart_data(report))
 
 
 def chart_artifacts_from_data(data: dict[str, object]) -> tuple[str, str]:
@@ -1307,7 +1230,3 @@ def chart_artifacts_from_data(data: dict[str, object]) -> tuple[str, str]:
     for row in rows:
         writer.writerow([_csv_cell(row.get(key)) for key in fields])
     return html, stream.getvalue()
-
-
-def chart_paths(out_dir: Path) -> tuple[Path, Path]:
-    return out_dir / "assessment-charts.html", out_dir / "assessment-charts.csv"

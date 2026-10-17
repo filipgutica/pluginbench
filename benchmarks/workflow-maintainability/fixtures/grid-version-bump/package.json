@@ -1,8 +1,0 @@
-{
-  "name": "dashboard-workspaces",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "workspaces": ["packages/*"],
-  "scripts": {"test": "node --experimental-strip-types --test test/*.test.ts"}
-}
