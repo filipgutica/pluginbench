@@ -10,6 +10,7 @@ import pytest
 from fallow_fixture import syntax_proof as _syntax_proof
 
 from pluginbench import assessment_metrics
+from pluginbench.coverage_report import lines_to_numbits
 from pluginbench.assessment_metrics import (
     EvidenceBinding,
     bind_evidence,
@@ -1341,8 +1342,8 @@ def test_changed_line_coverage_and_redundant_added_tests(tmp_path: Path) -> None
                 "total": [f"src/a.py:{line}" for line in lines],
                 "covered": [f"src/a.py:{line}" for line in covered],
             },
-            "per_test_lines": {
-                name: [f"src/a.py:{line}" for line in items] for name, items in per_test.items()
+            "per_test_numbits": {
+                name: {"src/a.py": lines_to_numbits(items)} for name, items in per_test.items()
             },
             "files_measured": ["src/a.py"],
         }

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import fnmatch
+import base64
 import json
+from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 import re
 
@@ -365,7 +367,7 @@ def parse_python_coverage(
         raise CoveragePopulationUnavailable("Python report contains no measured sources")
     records: list[_Record] = []
     populations: dict[str, tuple[set[str], set[str]]] = {}
-    per_test: dict[str, set[str]] | None = None
+    executed_by_path: dict[str, tuple[set[str], set[str], int]] = {}
     for raw_path, raw_file in raw_files.items():
         if ("statement_lines" in _json_object(raw_file, "Python coverage file")) != (
             statement_source is not None
@@ -383,29 +385,65 @@ def parse_python_coverage(
             aggregate = populations.setdefault(kind, (set(), set()))
             aggregate[0].update(f"{path}:{coordinate}" for coordinate in total)
             aggregate[1].update(f"{path}:{coordinate}" for coordinate in covered)
-        contexts = _json_object(raw_file, "Python coverage file").get("contexts")
-        if contexts is not None:
-            # coverage.py dynamic contexts: line -> test names; "" is code run outside tests.
-            per_test = {} if per_test is None else per_test
-            statements, executed = file_populations["lines"]
-            for line, names in _json_object(contexts, "Python coverage contexts").items():
-                record.line(line)
-                if line in statements - executed or not isinstance(names, list):
-                    raise ValueError("Python coverage context names an unexecuted line")
-                if line not in executed:
-                    continue  # traced non-statement lines are outside the line population
-                for name in names:
-                    if not isinstance(name, str):
-                        raise ValueError("Python coverage context names must be strings")
-                    if name:
-                        per_test.setdefault(name, set()).add(f"{path}:{line}")
+        executed_by_path[path] = (*file_populations["lines"], record.line_count)
     result = _metadata("coverage-py-json", records, source_scope, test_scope)
     result["tool_version"] = meta["version"]
     for kind, (total, covered) in populations.items():
         result[kind] = _population(total, covered, [record.path for record in records], kind)
+    per_test = _python_per_test(
+        data.get("per_test_numbits"), inventory, source_scope, workdir, executed_by_path
+    )
     if per_test:  # contexts without test names leave per-test coverage unknown
-        result["per_test_lines"] = {name: sorted(lines) for name, lines in sorted(per_test.items())}
+        result["per_test_numbits"] = per_test
     return result
+
+
+def lines_to_numbits(lines: Iterable[int]) -> str:
+    """coverage.py numbits layout (bit n = line n), base64-encoded."""
+    values = sorted(set(lines))
+    bits = bytearray(values[-1] // 8 + 1 if values else 0)
+    for line in values:
+        bits[line // 8] |= 1 << (line % 8)
+    return base64.b64encode(bytes(bits)).decode()
+
+
+def numbits_to_lines(value: str) -> set[int]:
+    bits = base64.b64decode(value, validate=True)
+    return {
+        index * 8 + bit for index, byte in enumerate(bits) for bit in range(8) if byte >> bit & 1
+    }
+
+
+def _python_per_test(
+    value: object,
+    inventory: dict[str, object],
+    source_scope: list[str],
+    workdir: str,
+    executed_by_path: dict[str, tuple[set[str], set[str], int]],
+) -> dict[str, dict[str, str]]:
+    """Per-test executed lines from dynamic contexts, kept as compact numbits per file."""
+    if value is None:
+        return {}
+    per_test: dict[str, dict[str, str]] = {}
+    for raw_path, contexts in _json_object(value, "Python per-test numbits").items():
+        path = _source_path(raw_path, set(inventory), source_scope, workdir)
+        if path not in executed_by_path:
+            raise ValueError(f"Python per-test coverage names an unmeasured source: {path}")
+        total, covered, line_count = executed_by_path[path]
+        executed = {int(line) for line in covered}
+        missing = {int(line) for line in total} - executed
+        for name, encoded in _json_object(contexts, "Python per-test contexts").items():
+            if not isinstance(encoded, str):
+                raise ValueError("Python per-test numbits must be base64 strings")
+            lines = numbits_to_lines(encoded)
+            # Traced non-statement lines (decorators, docstrings) stay outside the population;
+            # a statement the report calls missing, or a line outside the file, is an error.
+            if lines & missing or any(not 1 <= line <= line_count for line in lines):
+                raise ValueError("Python per-test coverage names an unexecuted line")
+            statements = lines & executed
+            if name and statements:
+                per_test.setdefault(name, {})[path] = lines_to_numbits(statements)
+    return dict(sorted(per_test.items()))
 
 
 def _go_modules(snapshot: Path, files: set[str]) -> dict[str, list[PurePosixPath]]:

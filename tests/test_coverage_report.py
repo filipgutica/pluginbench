@@ -4,7 +4,12 @@ from typing import NotRequired, TypedDict
 
 import pytest
 
-from pluginbench.coverage_report import parse_coverage, parse_lcov
+from pluginbench.coverage_report import (
+    parse_coverage,
+    parse_lcov,
+    lines_to_numbits,
+    numbits_to_lines,
+)
 
 
 class PythonFileData(TypedDict):
@@ -217,26 +222,32 @@ def test_python_coordinates_and_branch_mode(tmp_path: Path, source: Path) -> Non
     assert "branches" not in report
 
 
-def test_python_test_contexts_become_per_test_lines(tmp_path: Path, source: Path) -> None:
+def test_python_per_test_numbits_are_validated_and_kept_compact(
+    tmp_path: Path, source: Path
+) -> None:
     data = python_data()
-    data["files"]["src/value.py"]["contexts"] = {
-        "1": [""],
-        "2": ["test_a", "test_b"],
-        "3": ["test_a"],
+    # coverage.py numbits: one bit per line, as written by the enrichment step from contexts.
+    data["per_test_numbits"] = {
+        "src/value.py": {
+            "": lines_to_numbits({1}),
+            "test_a": lines_to_numbits({2, 3}),
+            "test_b": lines_to_numbits({2}),
+        }
     }
     report = python_report(tmp_path, source, data)
     # The empty context is code run outside any test, such as imports.
-    assert report["per_test_lines"] == {
-        "test_a": ["src/value.py:2", "src/value.py:3"],
-        "test_b": ["src/value.py:2"],
-    }
-    assert "per_test_lines" not in python_report(tmp_path, source, python_data())
+    per_test = report["per_test_numbits"]
+    assert isinstance(per_test, dict) and set(per_test) == {"test_a", "test_b"}
+    assert numbits_to_lines(per_test["test_a"]["src/value.py"]) == {2, 3}
+    assert "per_test_numbits" not in python_report(tmp_path, source, python_data())
     # Contexts without test names (dynamic contexts off) mean per-test data is unknown, not empty.
-    data["files"]["src/value.py"]["contexts"] = {"1": [""], "2": [""]}
-    assert "per_test_lines" not in python_report(tmp_path, source, data)
-    data["files"]["src/value.py"]["contexts"] = {"4": ["test_a"]}
-    with pytest.raises(ValueError, match="context"):
-        python_report(tmp_path, source, data)
+    data["per_test_numbits"] = {"src/value.py": {"": lines_to_numbits({1, 2})}}
+    assert "per_test_numbits" not in python_report(tmp_path, source, data)
+    # Line 4 is a statement the report calls missing; line 9 is outside the file.
+    for bad in ({4}, {9}):
+        data["per_test_numbits"] = {"src/value.py": {"test_a": lines_to_numbits(bad)}}
+        with pytest.raises(ValueError, match="unexecuted"):
+            python_report(tmp_path, source, data)
 
 
 def test_python_statement_coordinates_exclude_traced_nonstatements(

@@ -108,7 +108,7 @@ Coverage.py can trace lines outside its executable-statement population. A trust
 
 A coverage profile's `source_scope` declares its measured package independently of repository-wide LOC and analysis.
 
-Redundant added tests need per-test coverage. For coverage.py, run with `[run] dynamic_context = test_function` in the run configuration and export with `coverage json --show-contexts`. PluginBench reads the per-line contexts; the empty context (code run outside a test) is ignored. Without contexts, redundant added tests are unknown.
+Redundant added tests need per-test coverage. For coverage.py, run with `[run] dynamic_context = test_function`, then have the reporting step add `per_test_numbits` to the JSON report: for each measured file, map each context name to its executed lines in coverage.py numbits form (base64), using `CoverageData.contexts_by_lineno`. Do not use `coverage json --show-contexts`; on large suites its output can reach hundreds of megabytes. PluginBench ignores the empty context (code run outside a test). Parametrized cases share one test-function context, so redundancy is per test function. Without per-test data, redundant added tests are unknown.
 
 Changed-line coverage is incomplete when an added source file is missing from the coverage report. Configure coverage to report every source file, for example coverage.py `--source=<package>` or c8 `--all`.
 

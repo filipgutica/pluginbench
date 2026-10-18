@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -482,15 +483,19 @@ def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> d
             }
         )
     lines_total = populations.get("lines", (set(), set()))[0]
-    per_test_lines = None
-    if report.get("per_test_lines") is not None:
-        rows = _object(report["per_test_lines"], "per_test_lines")
-        per_test_lines = {
-            name: sorted(set(_strings(items, f"per_test_lines.{name}")))
-            for name, items in rows.items()
+    per_test_numbits = None
+    if report.get("per_test_numbits") is not None:
+        per_test_numbits = {
+            name: {
+                path: str(encoded)
+                for path, encoded in _object(files, f"per_test_numbits.{name}").items()
+            }
+            for name, files in _object(report["per_test_numbits"], "per_test_numbits").items()
         }
-        if any(not set(items) <= lines_total for items in per_test_lines.values()):
-            raise ValueError("per_test_lines includes unmeasured line coordinates")
+        if any(
+            not _numbit_coordinates(files) <= lines_total for files in per_test_numbits.values()
+        ):
+            raise ValueError("per_test_numbits includes unmeasured line coordinates")
     return {
         **units,
         # Coordinates support changed-line coverage; per-test lines support redundancy.
@@ -499,7 +504,8 @@ def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> d
             for kind, unit in (("lines", "line"), ("branches", "branch"))
             if kind in populations
         },
-        "per_test_lines": per_test_lines,
+        # Compact per-test lines (coverage.py numbits per file); decoded only where needed.
+        "per_test_numbits": per_test_numbits,
         "available_units": [
             unit
             for kind, unit in (
@@ -1709,6 +1715,16 @@ def _coverage_unit_comparison(
     }
 
 
+def _numbit_coordinates(files: Mapping[str, object]) -> set[str]:
+    from pluginbench.coverage_report import numbits_to_lines
+
+    return {
+        f"{path}:{line}"
+        for path, encoded in files.items()
+        for line in numbits_to_lines(str(encoded))
+    }
+
+
 def _added_source_lines(change: dict[str, object]) -> set[str]:
     ranges = _object(change.get("changed_line_ranges"), "changed-line ranges")
     lines: set[str] = set()
@@ -1771,7 +1787,7 @@ def _changed_line_coverage(
         )
     result["added_executable_lines"] = result.pop("line_total")
     result["added_lines_covered"] = result.pop("line_covered")
-    before_tests, after_tests = left.get("per_test_lines"), right.get("per_test_lines")
+    before_tests, after_tests = left.get("per_test_numbits"), right.get("per_test_numbits")
     if not isinstance(before_tests, dict) or not isinstance(after_tests, dict):
         result.update(
             added_tests=None,
@@ -1782,8 +1798,8 @@ def _changed_line_coverage(
         )
         return result
     reached = {
-        name: set(_strings(items, f"per_test_lines.{name}")) & added
-        for name, items in after_tests.items()
+        name: _numbit_coordinates(_object(files, f"per_test_numbits.{name}")) & added
+        for name, files in after_tests.items()
     }
     new_tests = sorted(set(after_tests) - set(before_tests))
     reaching = [name for name in new_tests if reached[name]]
