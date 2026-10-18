@@ -943,7 +943,9 @@ def test_reference_record_compares_like_a_submission_and_requires_repeatability(
     change = compare_snapshots(before, after)
     record = remeasure._reference_record([right, right], change)
     assert record["status"] == "available" and "comparison" not in record
-    code_added = compare_evidence(left, right, change=change)["fallow"]["code_added"]
+    fallow = compare_evidence(left, right, change=change)["fallow"]
+    assert isinstance(fallow, dict)
+    code_added = fallow["code_added"]
     assert code_added["net_cognitive"] == 7 and code_added["functions_added"] == 1
     _, other = _bound_fallow(
         tmp_path / "other",
@@ -977,7 +979,9 @@ def test_reference_comparison_reextracts_stored_raw_evidence(tmp_path: Path) -> 
             after=(after, "ref/after", {"fallow": "evidence.json"}),
         ),
     }
-    code_added = remeasure.reference_comparison(root, reference)["fallow"]["code_added"]
+    fallow = remeasure.reference_comparison(root, reference)["fallow"]
+    assert isinstance(fallow, dict)
+    code_added = fallow["code_added"]
     assert code_added["net_cognitive"] == 7 and code_added["functions_added"] == 1
     (after / "src/index.ts").write_text("changed\n")
     with pytest.raises(ValueError, match="reference snapshot changed"):

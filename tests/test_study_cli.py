@@ -321,7 +321,7 @@ def test_saved_evaluation_with_null_test_contribution_still_loads(
     config: evaluation.Evaluation,
 ) -> None:
     # The exact settings recorded by saved evaluations, including comparison identities.
-    saved = {
+    saved: dict[str, object] = {
         "source_scope": None,
         "test_scope": None,
         "fallow_config": None,

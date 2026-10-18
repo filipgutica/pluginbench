@@ -1134,7 +1134,7 @@ def test_reference_values_measure_the_reference_like_a_submission_and_keep_unkno
     comparison = analysis["comparison"]
     assert isinstance(comparison, dict)
     comparison["analysis"] = {"status": "available", "code_added": _code_added(net_cognitive=5)}
-    report = {
+    report: dict[str, object] = {
         "references": {
             "fallow-task": _reference(net_cognitive=7, functions_added=2),
             "analysis-task": analysis,

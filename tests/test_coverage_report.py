@@ -25,6 +25,7 @@ class PythonFileData(TypedDict):
 class PythonCoverageData(TypedDict):
     meta: dict[str, object]
     files: dict[str, PythonFileData]
+    per_test_numbits: NotRequired[dict[str, dict[str, str]]]
 
 
 @pytest.fixture
