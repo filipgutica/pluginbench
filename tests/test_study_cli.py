@@ -77,7 +77,7 @@ def test_public_commands_cover_evaluations_reports_and_task_selection() -> None:
     assert result.exit_code == 0
     assert set(get_group(cli.app).commands) == {"run", "report", "tasks"}
     assert set(get_group(cli.tasks_app).commands) == {"pick"}
-    assert CliRunner().invoke(cli.app, ["--version"]).stdout.strip() == "0.3.0"
+    assert CliRunner().invoke(cli.app, ["--version"]).stdout.strip() == "0.4.0"
 
 
 def test_config_dry_run_includes_fresh_vanilla_and_every_package(
