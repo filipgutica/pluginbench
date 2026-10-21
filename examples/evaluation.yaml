@@ -1,23 +1,36 @@
 name: Workflow versus Superpowers
 runner:
-  harness: codex                # codex or claude
+  harness: codex                # Native treatment coding currently requires Codex.
   model: gpt-6.1-sol
   reasoning: medium
 
-guidance:
-  workflow: [/path/to/workflow/skills]
-  superpowers: [/path/to/superpowers/skills]
-  # Each named package can combine skills and global instruction files.
-  # Vanilla is included automatically.
+treatments:
+  workflow:
+    plugins: [/path/to/workflow-plugin]
+  superpowers:
+    skills: [/path/to/superpowers/skills]
+  # Optional guidance: [/path/to/core.md] uses native global instructions.
+  # Vanilla is included automatically; every arm keeps the same task prompt.
+capabilities:
+  subagents: true
+  max_threads: 4                # Concurrent children, not a lifetime call/spend cap.
 
 tasks:
-  source: /tmp/deep-swe/tasks
+  dataset: datacurve/deep-swe-1-1
+  version: sha256:5affcd534fd90ac85d202d4c63f8b35ddc942140afdd5d60014a21365440a2f5
   ids:
     - ofetch-per-origin-circuit-breaker
     - testem-per-launcher-reports
     - happy-dom-abort-pending-body-reads
 
-measurements: [tokens, lines, cyclomatic, cognitive, dead_code, coverage, test_overlap, review]
+measurements: [tokens, lines, cyclomatic, cognitive, dead_code, review]
+# Unsupported measurements remain unknown with a reason.
+# Add coverage after configuring a command and supported coverage output supported by every selected task image:
+# measurement_settings:
+#   coverage:
+#     command: [npm, run, coverage]
+#     report_path: coverage/lcov.info
+#     tool_version: "the exact installed coverage tool version"
 reviewer:
   harness: codex
   model: gpt-6-astra
@@ -25,4 +38,8 @@ reviewer:
   guidance: [/path/to/fixed-review-standards.md]  # Same criteria for all outputs.
 
 repeats: 3
-# jobs: 2  # Optional override; default is up to four CPU cores.
+# jobs: 2  # Optional request; capped by Docker CPU and memory capacity.
+# CPU and memory default to task.toml; Docker must fit them before any model call.
+# container_cpus: 2
+# container_memory_mb: 8192
+# timeout_seconds: 1800  # Separate agent budget; shorter than these tasks declare.

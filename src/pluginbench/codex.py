@@ -1,4 +1,4 @@
-"""Isolated native execution and evidence shared by study and legacy runners."""
+"""Native CLI execution and evidence for isolated reviews and Harbor submissions."""
 
 from __future__ import annotations
 
@@ -6,11 +6,15 @@ import hashlib
 import json
 import os
 import shutil
-import signal
+import stat
 import subprocess
+import tarfile
 import time
 from pathlib import Path
 from typing import Any
+
+from pluginbench import isolation
+from pluginbench.processes import terminate_process_group
 
 
 GUIDANCE_NAMES = {
@@ -27,7 +31,7 @@ GUIDANCE_NAMES = {
 def reject_guidance(
     workspace: Path, *, include_ancestors: bool = True, reject_git: bool = False
 ) -> None:
-    """Reject custom instruction discovery surfaces before staging treatment text."""
+    """Reject undeclared instruction discovery surfaces in task source."""
     root = workspace.resolve()
     if not root.is_dir():
         raise ValueError(f"workspace is not a directory: {workspace}")
@@ -110,15 +114,70 @@ def credential_values(auth_file: Path) -> tuple[str, ...]:
     return tuple(values)
 
 
+def validate_artifacts(directory: Path) -> None:
+    """Accept only ordinary directories and files before reading native evidence."""
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("native artifact root must be an ordinary directory")
+
+    def failed(error: OSError) -> None:
+        raise error
+
+    for root, names, files in os.walk(directory, followlinks=False, onerror=failed):
+        for name in [*names, *files]:
+            path = Path(root) / name
+            mode = path.lstat().st_mode
+            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                raise ValueError(f"unsupported native artifact: {path.relative_to(directory)}")
+
+
+def copy_artifacts(source: Path, target: Path) -> str | None:
+    """Preserve unsupported evidence as an inert archive, without following links."""
+    try:
+        validate_artifacts(source)
+    except (OSError, ValueError) as error:
+        target.mkdir(parents=True)
+        with tarfile.open(target / "unsupported-artifacts.tar", "w", dereference=False) as archive:
+            archive.add(source, arcname="artifacts")
+        write_json(target / "unsupported-artifacts.json", {"error": str(error)})
+        return str(error)
+    shutil.copytree(source, target, symlinks=True)
+    return None
+
+
 def scrub_artifacts(directory: Path, secrets: tuple[str, ...]) -> None:
-    for path in directory.rglob("*"):
-        if path.is_file() and not path.is_symlink():
+    if directory.is_symlink() or not directory.is_dir():
+        return
+    for root, names, files in os.walk(directory, followlinks=False):
+        names[:] = [name for name in names if not (Path(root) / name).is_symlink()]
+        for name in files:
+            path = Path(root) / name
+            if not stat.S_ISREG(path.lstat().st_mode):
+                continue
             original = path.read_bytes()
             content = original
             for secret in secrets:
                 content = content.replace(secret.encode(), b"<redacted-credential>")
             if content != original:
                 path.write_bytes(content)
+
+
+def _native_traces(private: Path, artifacts: Path, secrets: tuple[str, ...]) -> list[str]:
+    sessions = private / "codex/sessions"
+    for path in (private, private / "codex", sessions):
+        if path.is_symlink():
+            copy_artifacts(path, artifacts / "unsupported-native-traces")
+            raise ValueError("unsupported native session ancestor link")
+        if path.exists() and not path.is_dir():
+            raise ValueError("native session ancestors must be ordinary directories")
+    if not sessions.exists():
+        return []
+    try:
+        validate_artifacts(sessions)
+    except (OSError, ValueError):
+        scrub_artifacts(sessions, secrets)
+        copy_artifacts(sessions, artifacts / "unsupported-native-traces")
+        raise
+    return [path.read_text() for path in sorted(sessions.rglob("*.jsonl"))]
 
 
 def runtime_environment(
@@ -172,16 +231,12 @@ def command(
     host: str,
     model: str,
     workspace: Path,
-    plugin: Path | None,
     effort: str = "medium",
-    read_only: bool = False,
 ) -> list[str]:
     if host == "claude":
         from pluginbench import claude
 
-        return claude.command(
-            model=model, workspace=workspace, plugin=plugin, effort=effort, read_only=read_only
-        )
+        return claude.command(model=model, effort=effort)
     if host == "codex":
         return [
             "codex",
@@ -197,11 +252,12 @@ def command(
             'web_search="disabled"',
             "-c",
             "features.multi_agent=false",
-            *(
-                ["--sandbox", "read-only", "-c", 'approval_policy="never"']
-                if read_only
-                else ["--dangerously-bypass-approvals-and-sandbox"]
-            ),
+            "--enable",
+            "code_mode",
+            "--enable",
+            "code_mode_only",
+            # The mandatory outer OS wrapper owns read-only scope. Nested Seatbelt fails.
+            "--dangerously-bypass-approvals-and-sandbox",
             "--skip-git-repo-check",
             "-C",
             str(workspace),
@@ -233,7 +289,12 @@ def observed_cli_version(startup: object, *, host: str = "codex") -> str | None:
 
 
 def parse_events(
-    stdout: str, traces: list[str], host: str, *, requested_effort: str = "medium"
+    stdout: str,
+    traces: list[str],
+    host: str,
+    *,
+    requested_effort: str = "medium",
+    include_descendants: bool = False,
 ) -> dict[str, Any]:
     if host == "claude":
         from pluginbench import claude
@@ -250,6 +311,7 @@ def parse_events(
     final = []
     successful_completion = False
     turn_usage: list[dict[str, int]] = []
+    stdout_events: list[dict[str, Any]] = []
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
@@ -259,6 +321,7 @@ def parse_events(
         if not isinstance(event, dict):
             errors.append("stdout JSONL event is not an object")
             continue
+        stdout_events.append(event)
         item = event.get("item", {})
         if not isinstance(item, dict):
             errors.append("stdout item is not an object")
@@ -287,8 +350,10 @@ def parse_events(
             tools.append(item)
     effort = set()
     partial_usage = []
+    trace_events: list[list[dict[str, Any]]] = []
     for trace in traces:
         last_observed_usage = None
+        decoded_trace = []
         for line in trace.splitlines():
             try:
                 event = json.loads(line)
@@ -298,6 +363,7 @@ def parse_events(
             if not isinstance(event, dict):
                 errors.append("trace JSONL event is not an object")
                 continue
+            decoded_trace.append(event)
             if event.get("type") == "event_msg":
                 payload = event.get("payload", {})
                 info = payload.get("info") if isinstance(payload, dict) else None
@@ -327,6 +393,7 @@ def parse_events(
                         effort.add(payload["effort"])
                     elif payload.get("effort") is not None:
                         errors.append("invalid trace effort")
+        trace_events.append(decoded_trace)
         if last_observed_usage is not None:
             partial_usage.append(
                 {
@@ -339,7 +406,7 @@ def parse_events(
         # Missing usage fields stay unknown instead of being silently undercounted.
         common_keys = set.intersection(*(set(turn) for turn in turn_usage))
         usage = {key: sum(turn[key] for turn in turn_usage) for key in sorted(common_keys)}
-    return {
+    result = {
         "command_items": commands,
         "actual_primary_models": sorted(models),
         "usage": usage,
@@ -355,6 +422,385 @@ def parse_events(
         "final": final[-1] if final else "",
         "agent_messages": final,
         "successful_native_completion": successful_completion and not errors,
+    }
+    if include_descendants:
+        accounting = _descendant_usage(stdout_events, trace_events, errors)
+        result.update(accounting)
+    return result
+
+
+def _sum_usage(totals: list[dict[str, int]]) -> dict[str, int] | None:
+    if not totals:
+        return None
+    common_keys = set.intersection(*(set(total) for total in totals))
+    return {key: sum(total[key] for total in totals) for key in sorted(common_keys)}
+
+
+def _token_usage(value: object) -> dict[str, int] | None:
+    if (
+        not isinstance(value, dict)
+        or not value
+        or not all(
+            isinstance(count, int) and not isinstance(count, bool) and count >= 0
+            for count in value.values()
+        )
+    ):
+        return None
+    return value
+
+
+def _session_history(
+    events: list[dict[str, Any]], reasons: set[str]
+) -> tuple[dict[str, Any], list[dict[str, Any]], bool] | None:
+    metadata = [event.get("payload") for event in events if event.get("type") == "session_meta"]
+    first = events[0].get("payload") if events and events[0].get("type") == "session_meta" else None
+    inherited = isinstance(first, dict) and (
+        first.get("forked_from_id") is not None
+        or first.get("history_base") is not None
+        or first.get("subagent_history_start_ordinal") is not None
+    )
+    if not inherited:
+        if len(metadata) != 1 or not isinstance(metadata[0], dict):
+            reasons.add("trace lacks one unambiguous session identity")
+            return None
+        return metadata[0], events, False
+
+    # 0.162.1 protocol.rs defines this ordinal as the first own-history record.
+    # Earlier records are inherited model context, including other session headers.
+    assert isinstance(first, dict)
+    boundary = first.get("subagent_history_start_ordinal")
+    source = first.get("source")
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    spawned = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    parent = first.get("parent_thread_id")
+    path = first.get("agent_path")
+    valid = (
+        first.get("cli_version") == "0.162.1"
+        and first.get("history_mode") == "paginated"
+        and first.get("history_base") is None
+        and isinstance(parent, str)
+        and bool(parent)
+        and first.get("forked_from_id") == parent
+        and isinstance(first.get("session_id"), str)
+        and isinstance(path, str)
+        and bool(path)
+        and isinstance(spawned, dict)
+        and spawned.get("parent_thread_id") == parent
+        and spawned.get("agent_path") == path
+        and isinstance(boundary, int)
+        and not isinstance(boundary, bool)
+        and 1 <= boundary < len(events)
+        and all(
+            isinstance(event.get("ordinal"), int)
+            and not isinstance(event.get("ordinal"), bool)
+            and event["ordinal"] == ordinal
+            for ordinal, event in enumerate(events)
+        )
+        and not any(event.get("type") == "session_meta" for event in events[boundary:])
+    )
+    if not valid:
+        reasons.add(f"inherited history is unsupported for session {first.get('id')}")
+        return None
+    return first, [events[0], *events[boundary:]], True
+
+
+def _descendant_usage(
+    stdout: list[dict[str, Any]],
+    traces: list[list[dict[str, Any]]],
+    stream_errors: list[Any],
+) -> dict[str, Any]:
+    """Account once per native thread; unproven coverage remains a lower bound.
+
+    Codex 0.162.1 protocol.rs defines session_meta.id as the thread identity,
+    source.subagent.thread_spawn as lineage, and token_count as cumulative usage.
+    A successful task_complete closes a turn, not a delta to add to that usage.
+    """
+    reasons: set[str] = set()
+    sessions: dict[str, dict[str, Any]] = {}
+    for events in traces:
+        history = _session_history(events, reasons)
+        if history is None:
+            continue
+        meta, events, inherited = history
+        identity = meta.get("id")
+        if not isinstance(identity, str) or not identity:
+            reasons.add("trace lacks one unambiguous session identity")
+            continue
+        previous = sessions.get(identity)
+        if previous is not None:
+            old_events = previous["events"]
+            if events[: len(old_events)] == old_events:
+                previous["events"] = events
+            elif old_events[: len(events)] != events:
+                reasons.add(f"conflicting traces for session {identity}")
+            continue
+        source = meta.get("source")
+        subagent = source.get("subagent") if isinstance(source, dict) else None
+        spawned = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+        source_parent = spawned.get("parent_thread_id") if isinstance(spawned, dict) else None
+        parent = meta.get("parent_thread_id", source_parent)
+        if parent is None:
+            parent = source_parent
+        if source_parent is not None and parent != source_parent:
+            reasons.add(f"conflicting parent identity for session {identity}")
+        if parent is not None and (not isinstance(parent, str) or not parent):
+            reasons.add(f"invalid parent identity for session {identity}")
+            parent = None
+        if subagent is not None and parent is None:
+            reasons.add(f"unresolved subagent lineage for session {identity}")
+        sessions[identity] = {
+            "events": events,
+            "parent_thread_id": parent,
+            "inherited": inherited,
+            "agent_path": meta.get("agent_path"),
+            "root_session_id": meta.get("session_id"),
+        }
+
+    identity_safe = not reasons
+    roots = sorted(
+        identity for identity, session in sessions.items() if session["parent_thread_id"] is None
+    )
+    root = roots[0] if len(roots) == 1 else None
+    if root is None:
+        reasons.add("expected exactly one root session")
+        identity_safe = False
+    stdout_roots = set()
+    for event in stdout:
+        if event.get("type") == "thread.started":
+            if isinstance(event.get("thread_id"), str):
+                stdout_roots.add(event["thread_id"])
+            else:
+                reasons.add("invalid stdout root identity")
+                identity_safe = False
+    if stdout_roots and stdout_roots != {root}:
+        reasons.add("stdout root identity does not match captured sessions")
+        identity_safe = False
+
+    expected_children: set[str] = set()
+    expected_agent_paths: set[tuple[str, str]] = set()
+    models: set[str] = set()
+    child_models: set[str] = set()
+    effort: set[str] = set()
+    records = []
+    for identity, session in sorted(sessions.items()):
+        prior_reasons = set(reasons)
+        parent = session["parent_thread_id"]
+        ancestors = {identity}
+        while parent is not None and parent in sessions and parent not in ancestors:
+            ancestors.add(parent)
+            parent = sessions[parent]["parent_thread_id"]
+        if parent is not None or root not in ancestors:
+            reasons.add(f"session {identity} is not linked to the root")
+            identity_safe = False
+        if session["inherited"] and session["root_session_id"] != root:
+            reasons.add(f"inherited root identity does not match session {identity}")
+            identity_safe = False
+        total: dict[str, int] | None = None
+        complete = False
+        failed = False
+        pending_spawns: set[str] = set()
+        named_spawns: dict[str, str | None] = {}
+        own_turn: str | None = None
+        for event in session["events"]:
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            kind = payload.get("type") if event.get("type") == "event_msg" else None
+            if event.get("type") == "response_item":
+                call_id = payload.get("call_id")
+                if (
+                    payload.get("type") == "function_call"
+                    and payload.get("namespace") == "collaboration"
+                    and payload.get("name") == "spawn_agent"
+                ):
+                    if isinstance(call_id, str) and call_id:
+                        if call_id in named_spawns:
+                            reasons.add(f"duplicate named spawn for session {identity}")
+                        named_spawns[call_id] = None
+                    else:
+                        reasons.add(f"unidentified named spawn for session {identity}")
+                if (
+                    payload.get("type") == "function_call_output"
+                    and isinstance(call_id, str)
+                    and call_id in named_spawns
+                ):
+                    try:
+                        output = (
+                            json.loads(payload["output"])
+                            if isinstance(payload.get("output"), str)
+                            else None
+                        )
+                    except ValueError:
+                        output = None
+                    path = output.get("task_name") if isinstance(output, dict) else None
+                    if not isinstance(path, str) or not path:
+                        reasons.add(f"unresolved named spawn for session {identity}")
+                    else:
+                        if named_spawns[call_id] not in (None, path):
+                            reasons.add(f"conflicting named spawn result for session {identity}")
+                        named_spawns[call_id] = path
+                        expected_agent_paths.add((identity, path))
+            if event.get("type") == "turn_context":
+                complete = False
+                if session["inherited"] and (
+                    own_turn is None or payload.get("turn_id") != own_turn
+                ):
+                    reasons.add(f"unverified own turn for session {identity}")
+                    identity_safe = False
+                model = payload.get("model")
+                if isinstance(model, str):
+                    if identity == root:
+                        models.add(model)
+                    elif session["parent_thread_id"] is not None:
+                        child_models.add(model)
+                if identity == root and isinstance(payload.get("effort"), str):
+                    effort.add(payload["effort"])
+            if kind in {"task_started", "turn_started"}:
+                complete = False
+                own_turn = (
+                    payload.get("turn_id") if isinstance(payload.get("turn_id"), str) else None
+                )
+            if kind in {"task_complete", "turn_complete"}:
+                complete = True
+                if session["inherited"] and (
+                    own_turn is None or payload.get("turn_id") != own_turn
+                ):
+                    reasons.add(f"unverified own turn for session {identity}")
+                    identity_safe = False
+            if kind in {"error", "turn_aborted", "turn_failed"}:
+                failed = True
+            if kind == "token_count":
+                info = payload.get("info")
+                observed = (
+                    _token_usage(info.get("total_token_usage")) if isinstance(info, dict) else None
+                )
+                if observed is not None:
+                    if session["inherited"] and own_turn is None:
+                        reasons.add(f"unverified own turn for session {identity}")
+                        identity_safe = False
+                    if session["inherited"] and observed != total:
+                        last = (
+                            _token_usage(info.get("last_token_usage"))
+                            if isinstance(info, dict)
+                            else None
+                        )
+                        if last is None or any(
+                            last.get(key) != value - (total.get(key, 0) if total else 0)
+                            for key, value in observed.items()
+                        ):
+                            reasons.add(f"unverified cumulative origin for session {identity}")
+                            identity_safe = False
+                    if total is not None and any(
+                        key not in observed or observed[key] < value for key, value in total.items()
+                    ):
+                        reasons.add(f"nonmonotonic cumulative usage for session {identity}")
+                    total = observed
+                elif isinstance(info, dict):
+                    reasons.add(f"invalid cumulative usage for session {identity}")
+            if kind == "collab_agent_spawn_begin":
+                call_id = payload.get("call_id")
+                if isinstance(call_id, str):
+                    pending_spawns.add(call_id)
+                else:
+                    reasons.add(f"unidentified spawn for session {identity}")
+            if kind == "collab_agent_spawn_end":
+                call_id = payload.get("call_id")
+                if isinstance(call_id, str):
+                    pending_spawns.discard(call_id)
+                child = payload.get("new_thread_id")
+                if isinstance(child, str) and child:
+                    expected_children.add(child)
+                    if isinstance(payload.get("model"), str):
+                        child_models.add(payload["model"])
+                    if child in sessions and sessions[child]["parent_thread_id"] != identity:
+                        reasons.add(f"spawn lineage does not match session {child}")
+                        identity_safe = False
+        has_usage = total is not None and {"input_tokens", "output_tokens"}.issubset(total)
+        if not has_usage:
+            reasons.add(f"missing usage for session {identity}")
+        if pending_spawns:
+            reasons.add(f"unresolved spawns for session {identity}")
+        if any(path is None for path in named_spawns.values()):
+            reasons.add(f"unresolved named spawn for session {identity}")
+        if not complete or failed:
+            reasons.add(f"incomplete or failed session {identity}")
+        session_reasons = reasons - prior_reasons
+        records.append(
+            {
+                "session_id": identity,
+                "parent_thread_id": session["parent_thread_id"],
+                "observed_usage": total,
+                "status": "complete"
+                if complete and not failed and has_usage and not session_reasons
+                else "incomplete",
+                "reasons": sorted(session_reasons),
+            }
+        )
+
+    # exec's stdout exposes collab tool receivers even if a child rollout was lost.
+    for event in stdout:
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "collab_tool_call":
+            receivers = item.get("receiver_thread_ids")
+            if isinstance(receivers, list):
+                expected_children.update(value for value in receivers if isinstance(value, str))
+    for child in sorted(expected_children - sessions.keys()):
+        reasons.add(f"missing descendant session {child}")
+    for parent, path in sorted(expected_agent_paths):
+        matching = [
+            identity
+            for identity, session in sessions.items()
+            if session["parent_thread_id"] == parent and session["agent_path"] == path
+        ]
+        if not matching:
+            reasons.add(f"missing descendant agent {path} from session {parent}")
+        elif len(matching) != 1:
+            reasons.add(f"conflicting descendant identities for agent {path} from session {parent}")
+            identity_safe = False
+    if stream_errors:
+        reasons.add("native event stream contains errors")
+    root_turns = [
+        reported
+        for event in stdout
+        if event.get("type") == "turn.completed"
+        if (reported := _token_usage(event.get("usage"))) is not None
+    ]
+    root_usage = _sum_usage(root_turns)
+    if root is not None and root_usage is not None:
+        captured = next(
+            record["observed_usage"] for record in records if record["session_id"] == root
+        )
+        if captured is None or any(captured.get(key) != value for key, value in root_usage.items()):
+            reasons.add("root stdout usage does not match cumulative session usage")
+    observed_totals = [
+        record["observed_usage"] for record in records if record["observed_usage"] is not None
+    ]
+    observed_usage = _sum_usage(observed_totals)
+    # An ambiguous identity/history can include the same work more than once.
+    # Retain individual observations, but do not label their sum a lower bound.
+    complete = not reasons
+    return {
+        "usage": observed_usage if complete else None,
+        "partial_usage": [
+            {
+                "session_id": record["session_id"],
+                "tokens": record["observed_usage"],
+                "status": "last observed session total; incomplete usage lower bound",
+            }
+            for record in records
+            if not complete and identity_safe and record["observed_usage"] is not None
+        ],
+        "actual_primary_models": sorted(models),
+        "actual_descendant_models": sorted(child_models),
+        "runtime_effort_evidence": sorted(effort),
+        "usage_accounting": {
+            "status": "complete" if complete else "incomplete",
+            "scope": "root_and_descendants",
+            "root_session_id": root,
+            "reasons": sorted(reasons),
+            "sessions": records,
+            "observed_usage_lower_bound": observed_usage if identity_safe else None,
+        },
     }
 
 
@@ -388,9 +834,9 @@ def invoke(
     protocol: dict[str, Any],
     prompt: str,
     timeout: int,
-    read_only: bool = False,
     output_schema: Path | None = None,
 ) -> dict[str, Any]:
+    """Invoke a local reviewer with an OS-enforced read-only source packet."""
     artifacts = area / "artifacts"
     artifacts.mkdir(exist_ok=True)
     if any((artifacts / name).exists() for name in ("invocation.json", "execution.json")):
@@ -403,9 +849,7 @@ def invoke(
         host=entry["host"],
         model=protocol["models"][entry["host"]],
         workspace=area / "workspace",
-        plugin=None,
         effort=effort,
-        read_only=read_only,
     )
     if output_schema is not None:
         if entry["host"] == "claude":
@@ -432,12 +876,19 @@ def invoke(
     timed_out = False
     proc = None
     traces = []
+    failure: BaseException | None = None
     try:
         auth_file = protocol.get("auth_file")
         env, secrets = runtime_environment(
             private,
             entry["host"],
             **({"auth_file": Path(auth_file).expanduser()} if auth_file is not None else {}),
+        )
+        argv, filesystem = isolation.command(
+            argv,
+            writable=[private],
+            readable=[area / "workspace", *([output_schema] if output_schema else [])],
+            expected=protocol.get("isolation"),
         )
         write_json(
             artifacts / "runtime-isolation.json",
@@ -451,6 +902,7 @@ def invoke(
                 else None,
                 "configuration_source": "private auth only; user/project setting sources disabled",
                 "native_builtin_instructions": "retained",
+                "filesystem": filesystem,
             },
         )
         with (
@@ -471,32 +923,58 @@ def invoke(
                 proc.communicate(prompt, timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                os.killpg(proc.pid, signal.SIGTERM)
-                try:
-                    proc.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    proc.communicate()
+    except BaseException as error:
+        failure = error
+        raise
     finally:
-        if proc is not None and proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.communicate()
-        for path in sorted((private / "codex/sessions").rglob("*.jsonl")):
-            traces.append(path.read_text())
-        for index, trace in enumerate(traces):
-            (artifacts / f"host-trace-{index}.jsonl").write_text(trace)
-        if private.exists():
-            shutil.rmtree(private)
-        scrub_artifacts(artifacts, secrets)
-        write_json(
-            artifacts / "execution.json",
-            {
-                "exit_code": proc.returncode if proc is not None else None,
-                "timed_out": timed_out,
-                "elapsed_seconds": time.monotonic() - started,
-                "private_runtime_removed": not private.exists(),
-            },
-        )
+        cleanup_error: OSError | subprocess.TimeoutExpired | None = None
+        trace_error: OSError | ValueError | None = None
+        try:
+            if proc is not None:
+                terminate_process_group(proc)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            cleanup_error = error
+            if failure is not None:
+                failure.add_note(f"Process-group cleanup failed: {error}")
+        try:
+            traces = _native_traces(private, artifacts, secrets)
+            for index, trace in enumerate(traces):
+                (artifacts / f"host-trace-{index}.jsonl").write_text(trace)
+        except (OSError, ValueError) as error:
+            trace_error = error
+            if failure is not None:
+                failure.add_note(f"Native session evidence rejected: {error}")
+        finally:
+            try:
+                if private.is_symlink():
+                    private.unlink()
+                elif private.exists():
+                    shutil.rmtree(private)
+            finally:
+                try:
+                    scrub_artifacts(artifacts, secrets)
+                finally:
+                    write_json(
+                        artifacts / "execution.json",
+                        {
+                            "exit_code": proc.returncode if proc is not None else None,
+                            "timed_out": timed_out,
+                            "elapsed_seconds": time.monotonic() - started,
+                            "private_runtime_removed": not private.exists(),
+                            "cleanup_error": str(cleanup_error)
+                            if cleanup_error is not None
+                            else None,
+                            "trace_error": str(trace_error) if trace_error is not None else None,
+                            "successful_native_completion": False
+                            if trace_error is not None
+                            else not timed_out and proc is not None and proc.returncode == 0,
+                        },
+                    )
+        if cleanup_error is not None and failure is None:
+            raise cleanup_error
+        if trace_error is not None and failure is None:
+            raise trace_error
+    validate_artifacts(artifacts)
     traces = [p.read_text() for p in sorted(artifacts.glob("host-trace-*.jsonl"))]
     parsed = parse_events(
         (artifacts / "stdout.jsonl").read_text(), traces, entry["host"], requested_effort=effort

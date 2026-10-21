@@ -9,6 +9,7 @@ from typing import IO, Literal, TypedDict, Unpack
 import pytest
 
 import pluginbench.claude as claude
+from pluginbench import codex
 
 
 class NativeProcessArguments(TypedDict):
@@ -82,17 +83,13 @@ def test_preflight_checks_local_capabilities_without_authentication(
         claude.preflight()
 
 
-def test_read_only_command_removes_shell_writes_and_delegation(tmp_path: Path) -> None:
-    argv = claude.command(
-        model="claude-sonnet-5-5", effort="high", workspace=tmp_path, read_only=True
-    )
+def test_review_command_removes_shell_writes_and_delegation() -> None:
+    argv = claude.command(model="claude-sonnet-5-5", effort="high")
     assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep"
     assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
     assert "--restricted" in argv and "--safe-mode" in argv
     assert "--dangerously-skip-permissions" not in argv
     assert not any(flag in argv for flag in ("--plugin-dir", "--agents", "--system-prompt"))
-    with pytest.raises(ValueError, match="text guidance"):
-        claude.command(model="test", workspace=tmp_path, plugin=tmp_path)
 
 
 def test_selected_auth_file_ignores_inherited_auth_guidance_and_model_settings(
@@ -414,7 +411,7 @@ def test_shared_invoke_forwards_schema_isolates_and_redacts_credentials(
         return native_popen([sys.executable, "-c", script], **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", launch)
-    execution = claude.invoke(
+    execution = codex.invoke(
         area=area,
         entry={"host": "claude", "arm": "baseline"},
         protocol={
@@ -424,7 +421,6 @@ def test_shared_invoke_forwards_schema_isolates_and_redacts_credentials(
         },
         prompt="review task",
         timeout=5,
-        read_only=True,
         output_schema=schema,
     )
     argv = launches[0]["argv"]
@@ -478,7 +474,7 @@ def test_shared_invoke_timeout_overrides_completed_stream_and_cleans_private_run
         return native_popen([sys.executable, "-c", script], **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", launch)
-    execution = claude.invoke(
+    execution = codex.invoke(
         area=area,
         entry={"host": "claude", "arm": "baseline"},
         protocol={"models": {"claude": "requested-model"}},
@@ -497,7 +493,7 @@ def test_shared_invoke_missing_selected_auth_preserves_failure_receipt(
     (area / "workspace").mkdir(parents=True)
     monkeypatch.setattr(claude, "preflight", lambda: {"harness_version": "fixture-version"})
     with pytest.raises(FileNotFoundError):
-        claude.invoke(
+        codex.invoke(
             area=area,
             entry={"host": "claude", "arm": "baseline"},
             protocol={

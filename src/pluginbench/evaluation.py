@@ -3,23 +3,32 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import re
 import shutil
-import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from typing import Literal
 from collections.abc import Callable
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
-from pluginbench import claude, codex
+from pluginbench import claude, codex, harbor_backend, submissions
+from pluginbench.treatments import Treatment, resolve_treatment, treatment_inventory
+from pluginbench.native_treatments import NativeCapabilities, DELIVERY_POLICY, admit
+from pluginbench.task_sources import Tasks
+from pluginbench.measurement_profiles import (
+    REMOVED_TEST_OVERLAP,
+    MeasurementSettings,
+    capability_plan,
+    prepare_profiles,
+    probe_measurements,
+)
 from pluginbench.assessment_metrics import scoped_code_size, scoped_test_size
-from pluginbench.datasets import TaskCatalog, TaskEntry
+from pluginbench.datasets import TaskCatalog, TaskEntry, portable_native_identity
 from pluginbench.collectors import Collector
 from pluginbench.evaluation_report import write_evaluation_report
 from pluginbench.remeasure import (
@@ -40,17 +49,8 @@ from pluginbench.study_review import (
     validate_review_revision,
 )
 
-ADAPTER = Path(__file__).parent / "task_data/deepswe"
-SUPPORTED_TASKS = (
-    "ofetch-per-origin-circuit-breaker",
-    "testem-per-launcher-reports",
-    "happy-dom-abort-pending-body-reads",
-    "true-myth-iterable-collection-combinators",
-    "happy-dom-deterministic-intersectionobserver",
-)
-SUITE_SHA = "0b9fabbb63b9104d678fe965e1632f2dd9eaa2ea"
 Measurement = Literal[
-    "tokens", "lines", "cyclomatic", "cognitive", "dead_code", "coverage", "test_overlap", "review"
+    "tokens", "lines", "cyclomatic", "cognitive", "dead_code", "coverage", "review"
 ]
 
 
@@ -78,50 +78,54 @@ class Runner(BaseModel):
 
 
 class Reviewer(Runner):
+    timeout_seconds: int | None = Field(default=None, strict=True, ge=1)
     guidance: list[Path] = Field(default_factory=list)
-
-
-class Tasks(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    source: Path
-    ids: list[str] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def supported(self) -> Tasks:
-        if len(set(self.ids)) != len(self.ids):
-            raise ValueError("task IDs must be unique")
-        unsupported = set(self.ids) - set(SUPPORTED_TASKS)
-        if unsupported:
-            raise ValueError(
-                f"No calibrated adapter for: {', '.join(sorted(unsupported))}. Supported DeepSWE tasks: {', '.join(SUPPORTED_TASKS)}"
-            )
-        return self
 
 
 class Evaluation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(default="evaluation", min_length=1)
     runner: Runner
-    guidance: dict[str, list[Path]] = Field(min_length=1)
+    treatments: dict[str, Treatment] = Field(min_length=1)
+    capabilities: NativeCapabilities = Field(default_factory=NativeCapabilities)
     tasks: Tasks
     measurements: list[Measurement] = Field(min_length=1)
+    measurement_settings: MeasurementSettings = Field(default_factory=MeasurementSettings)
     reviewer: Reviewer | None = None
     repeats: int = Field(default=3, strict=True, ge=1)
     seed: int = Field(default=42, strict=True)
     timeout_seconds: int = Field(default=1800, strict=True, ge=1)
     jobs: int = Field(default_factory=lambda: min(4, os.cpu_count() or 1), strict=True, ge=1, le=16)
+    container_cpus: int | None = Field(default=None, strict=True, ge=1)
+    container_memory_mb: int | None = Field(default=None, strict=True, ge=256)
+
+    @model_validator(mode="before")
+    @classmethod
+    def legacy_guidance(cls, value: object) -> object:
+        return study.normalize_legacy_guidance(value)
+
+    @field_validator("measurements", mode="before")
+    @classmethod
+    def removed_measurements(cls, value: object) -> object:
+        if isinstance(value, list) and "test_overlap" in value:
+            raise ValueError(REMOVED_TEST_OVERLAP)
+        return value
 
     @model_validator(mode="after")
     def coherent(self) -> Evaluation:
+        if self.runner.reasoning == "ultra":
+            raise ValueError("Harbor does not support ultra reasoning; select a supported effort")
         if len(set(self.measurements)) != len(self.measurements):
             raise ValueError("measurements must be unique")
         if ("review" in self.measurements) != (self.reviewer is not None):
             raise ValueError("provide reviewer settings exactly when review is selected")
         if any(
-            not name.strip() or name in {"baseline", "vanilla"} or not paths
-            for name, paths in self.guidance.items()
+            not name.strip()
+            or name in {"baseline", "vanilla"}
+            or not (item.guidance or item.skills or item.plugins)
+            for name, item in self.treatments.items()
         ):
-            raise ValueError("guidance needs nonempty named sets; vanilla is automatic")
+            raise ValueError("treatments need nonempty named sets; vanilla is automatic")
         return self
 
 
@@ -132,12 +136,16 @@ def _resolve(base: Path, path: Path) -> Path:
 
 def resolve_evaluation(raw: object, base: Path) -> Evaluation:
     config = Evaluation.model_validate(raw)
-    config.tasks.source = _resolve(base, config.tasks.source)
-    for name, paths in config.guidance.items():
-        files = [file for path in paths for file in _text_files(_resolve(base, path))]
-        if len(set(files)) != len(files):
-            raise ValueError(f"guidance supplies the same text twice: {name}")
-        config.guidance[name] = files
+    if config.tasks.source is not None:
+        config.tasks.source = _resolve(base, config.tasks.source)
+    if config.measurement_settings.fallow_config is not None:
+        config.measurement_settings.fallow_config = _resolve(
+            base, config.measurement_settings.fallow_config
+        )
+    config.treatments = {
+        name: resolve_treatment(item, base, config.runner.harness)
+        for name, item in config.treatments.items()
+    }
     if config.reviewer:
         files = [
             file for path in config.reviewer.guidance for file in _text_files(_resolve(base, path))
@@ -153,68 +161,138 @@ def load_evaluation(path: Path) -> Evaluation:
     return resolve_evaluation(yaml.safe_load(source.read_text()), source.parent)
 
 
-def _tree_hash(path: Path) -> str:
-    digest = hashlib.sha256()
-    for file in sorted(path.rglob("*")):
-        if "__pycache__" in file.parts:
-            continue
-        if file.is_symlink():
-            raise ValueError(f"task input contains a symlink: {file}")
-        if file.is_file():
-            digest.update(str(file.relative_to(path)).encode() + b"\0" + file.read_bytes() + b"\0")
-    return digest.hexdigest()
+def _task_limits(configuration: dict[str, object]) -> dict[str, int]:
+    fields = {
+        "cpus": ("environment", "cpus"),
+        "memory_mb": ("environment", "memory_mb"),
+        "build_timeout_seconds": ("environment", "build_timeout_sec"),
+        "agent_timeout_seconds": ("agent", "timeout_sec"),
+    }
+    limits = {}
+    for name, (section, key) in fields.items():
+        value = _object(configuration[section]).get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or value <= 0
+            or int(value) != value
+        ):
+            raise ValueError(f"{section}.{key} must be a positive whole number")
+        limits[name] = int(value)
+    return limits
+
+
+def _container_limits(config: Evaluation, declared: dict[str, dict[str, int]]) -> dict[str, int]:
+    limits = {}
+    for key, field, fallback in (
+        ("cpus", "container_cpus", 1),
+        ("memory_mb", "container_memory_mb", 2048),
+    ):
+        value = getattr(config, field)
+        requested = {row[key] for row in declared.values()}
+        if value is None:
+            if len(requested) > 1:
+                raise ValueError(
+                    f"Selected tasks declare different {key}; provide an explicit common {field}"
+                )
+            value = next(iter(requested), fallback)
+        for task, row in declared.items():
+            if value < row[key]:
+                raise ValueError(
+                    f"{field}={value} is below {row[key]} requested by task {task}; reduced resources require native fitness validation and are currently unsupported"
+                )
+        limits[key] = value
+    return limits
 
 
 def plan_evaluation(config: Evaluation) -> dict[str, object]:
-    source = config.tasks.source
+    for treatment in config.treatments.values():
+        admit(treatment, config.runner.harness)
+    source = config.tasks.resolve()
     suite = source.parent if source.name == "tasks" else source
-    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=suite, text=True).strip()
-    if revision != SUITE_SHA:
-        raise ValueError(f"DeepSWE tasks must be checked out at {SUITE_SHA}; found {revision}")
     identities = {}
-    for task in config.tasks.ids:
+    declared = {}
+    capabilities = {}
+    submission_sources: dict[str, dict[str, object]] = {}
+    for task in config.tasks.task_ids:
         path = suite / "tasks" / task
-        for required in ("task.toml", "instruction.md", "environment", "tests", "solution"):
-            if not (path / required).exists():
-                raise ValueError(f"missing Harbor task input: {path / required}")
-        dirty = subprocess.check_output(
-            ["git", "status", "--porcelain", "--", f"tasks/{task}"], cwd=suite, text=True
-        )
-        if dirty:
-            raise ValueError(f"selected DeepSWE task has uncommitted changes: {task}")
-        identities[task] = _tree_hash(path)
-    preset = json.loads((ADAPTER / "measurement-presets.json").read_text())
-    methods = {task: preset[task] for task in config.tasks.ids}
+        admission = harbor_backend.validate_native_task(path)
+        identities[task] = admission["task_assets_sha256"]
+        task_limits = _task_limits(_object(admission["configuration"]))
+        verifier = _object(admission["verifier_configuration"])
+        for key in ("cpus", "memory_mb"):
+            native_value = verifier.get(key)
+            if type(native_value) is not int or native_value <= 0:
+                raise ValueError(f"verifier.{key} must be a positive whole number")
+            task_limits[key] = max(task_limits[key], native_value)
+        declared[task] = task_limits
+        capabilities[task] = capability_plan(path, config.measurements, config.measurement_settings)
+        try:
+            contract = submissions.reviewed_contract(path)
+        except (OSError, ValueError) as error:
+            submission_sources[task] = {"status": "unsupported", "reason": str(error)}
+        else:
+            submission_sources[task] = {
+                "status": "requires_preparation",
+                "contract": contract,
+                "reason": "grader baseline and frozen fixture must be qualified before coding",
+            }
+    limits = _container_limits(config, declared)
+    jobs = min(config.jobs, harbor_backend.capacity_jobs(**limits))
     criteria = (
-        _fixed_criteria([file.read_text() for file in config.reviewer.guidance], "handoff")
+        _fixed_criteria([file.read_text() for file in config.reviewer.guidance])
         if config.reviewer
         else None
     )
-    comparison = {
+    comparison: dict[str, object] = {
         "tasks": identities,
-        "suite_revision": revision,
         "runner": config.runner.model_dump(mode="json"),
-        "measurement_profiles": methods,
-        "measurement_adapter_sha256": _tree_hash(ADAPTER),
+        "delivery": DELIVERY_POLICY,
+        "capabilities": config.capabilities.model_dump(mode="json"),
+        "measurement_settings": config.measurement_settings.model_dump(mode="json"),
+        "fallow_config_sha256": hashlib.sha256(
+            config.measurement_settings.fallow_config.read_bytes()
+        ).hexdigest()
+        if config.measurement_settings.fallow_config is not None
+        else None,
         "measurements": sorted(config.measurements),
         "reviewer": config.reviewer.model_dump(mode="json", exclude={"guidance"})
         if config.reviewer
         else None,
         "review_criteria_sha256": _criteria_digest(criteria) if criteria else None,
-        "jobs": config.jobs,
+        "jobs": jobs,
+        "backend": "harbor-native",
+        "source_policy": submissions.SOURCE_POLICY,
+        "task_limits": {
+            task: {
+                "declared": row,
+                "effective": {**row, **limits, "agent_timeout_seconds": config.timeout_seconds},
+                "adapted_agent_budget": config.timeout_seconds != row["agent_timeout_seconds"],
+            }
+            for task, row in declared.items()
+        },
+        "isolation": harbor_backend.runtime_identity(**limits),
     }
-    coding = len(config.tasks.ids) * (1 + len(config.guidance)) * config.repeats
+    if config.tasks.references:
+        comparison["task_sources"] = config.tasks.references
+    coding = len(config.tasks.task_ids) * (1 + len(config.treatments)) * config.repeats
     return {
         "name": config.name,
         "coding_calls": coding,
         "review_calls": coding if config.reviewer else 0,
         "runner": config.runner.model_dump(mode="json"),
-        "guidance": list(config.guidance),
-        "tasks": config.tasks.ids,
+        "treatments": {name: treatment_inventory(item) for name, item in config.treatments.items()},
+        "delivery": DELIVERY_POLICY,
+        "capabilities": config.capabilities.model_dump(mode="json"),
+        "tasks": config.tasks.task_ids,
         "measurements": config.measurements,
+        "measurement_capabilities": capabilities,
+        "submission_sources": submission_sources,
         "repeats": config.repeats,
-        "jobs": config.jobs,
-        "baseline": "fresh vanilla attempts, no supplied text guidance; native built-in instructions remain",
+        "jobs": jobs,
+        "container_limits": limits,
+        "baseline": "reuse a verified isolated vanilla cohort when available; otherwise fresh vanilla attempts; native built-in instructions remain",
+        "call_estimate": "maximum new root attempts; native subagent turns are additional and metered from session traces; baseline hits resolve before coding",
         "comparison_identity": comparison,
     }
 
@@ -227,113 +305,150 @@ def run_evaluation(
     config: Evaluation, output: Path, *, progress: Callable[[str], None] | None = None
 ) -> Path:
     plan = plan_evaluation(config)
-    comparison = plan["comparison_identity"]
-    if not isinstance(comparison, dict):
-        raise ValueError("evaluation comparison identity is malformed")
+    source = config.tasks.resolve()
+    suite = source.parent if source.name == "tasks" else source
+    limits = TypeAdapter(dict[str, int]).validate_python(plan["container_limits"])
+    config = config.model_copy(
+        update={
+            "jobs": plan["jobs"],
+            "container_cpus": limits["cpus"],
+            "container_memory_mb": limits["memory_mb"],
+        }
+    )
+    comparison = _object(plan["comparison_identity"])
     root = output.expanduser().absolute()
     if root.exists():
         raise ValueError(f"output must be a new directory: {root}")
-    # Both runtimes are checked before any task calls; preparation validates selected observers too.
+    harbor_backend.preflight(jobs=config.jobs, **limits)
+    harness_versions = {}
     for harness in {config.runner.harness, *([config.reviewer.harness] if config.reviewer else [])}:
-        (claude.preflight if harness == "claude" else codex.preflight)()
+        native = (claude.preflight if harness == "claude" else codex.preflight)()
+        version = str(native.get("harness_version", ""))
+        match = re.search(r"(?<![\w.+-])\d+\.\d+\.\d+(?![\w.+-])", version)
+        if match is None:
+            raise ValueError(f"cannot pin {harness} CLI version: {version}")
+        harness_versions[harness] = match.group()
         with tempfile.TemporaryDirectory(prefix="pluginbench-auth-check-") as temporary:
             codex.runtime_environment(Path(temporary) / "private", harness)
     root.mkdir(parents=True)
     prepared = root / "inputs"
     prepared.mkdir()
     evidence = root / "evidence"
-    entries: list[TaskEntry] = []
-    profiles: dict[str, list[Collector]] = {}
+    entries = []
+    profiles = {}
     scopes = {}
     task_environment = {}
-    for task in config.tasks.ids:
+    capabilities = {}
+    for task in config.tasks.task_ids:
         if progress:
-            progress(f"Preparing and calibrating {task}")
+            progress(f"Preparing native Harbor task {task}")
         destination = prepared / task
-        subprocess.run(
-            [
-                sys.executable,
-                str(ADAPTER / "prepare.py"),
-                "--suite",
-                str(config.tasks.source),
-                "--task",
-                task,
-                "--output",
-                str(destination),
-                *[
-                    arg
-                    for measurement in config.measurements
-                    for arg in ("--measurement", measurement)
-                ],
-            ],
-            check=True,
+        effective = TypeAdapter(dict[str, int]).validate_python(
+            _object(_object(comparison["task_limits"])[task])["effective"]
         )
-        task_catalog = TaskCatalog.model_validate_json((destination / "tasks.json").read_text())
-        for item in task_catalog.tasks:
-            item.fixture = Path(task) / item.fixture
-            item.verifier.script = Path(task) / item.verifier.script
-            entries.append(item)
-        profiles.update(load_profiles(destination / "measurements.json"))
-        suite = (
-            config.tasks.source.parent
-            if config.tasks.source.name == "tasks"
-            else config.tasks.source
+        identity = harbor_backend.prepare_native_task(
+            task_dir=suite / "tasks" / task,
+            destination=destination,
+            harness=config.runner.harness,
+            version=harness_versions[config.runner.harness],
+            limits={**limits, "setup_timeout": effective["build_timeout_seconds"]},
+            cache=root.parent / ".prepared-images/native",
         )
-        subprocess.run(
-            [
-                sys.executable,
-                str(ADAPTER / "calibrate.py"),
-                "--suite",
-                str(suite),
-                "--prepared",
-                str(destination),
-            ],
-            check=True,
+        native_task = Path(str(identity["task_dir"]))
+        fixture = Path(str(identity["fixture_dir"]))
+        if identity["original_task_assets_sha256"] != _object(comparison["tasks"])[task]:
+            raise ValueError("native task assets changed after planning")
+        model = importlib.import_module("harbor.models.task.task").Task(native_task)
+        entries.append(
+            TaskEntry(
+                id=task,
+                prompt=model.instruction,
+                fixture=fixture.relative_to(prepared),
+                native_task=native_task.relative_to(prepared),
+                provenance={"native_task_identity": json.dumps(identity, sort_keys=True)},
+            )
         )
-        provenance = json.loads((destination / "provenance.json").read_text())
+        profiles[task] = prepare_profiles(
+            fixture,
+            destination / "measurements",
+            config.measurements,
+            config.measurement_settings,
+            identity,
+        )
+        provenance = json.loads(
+            (destination / "measurements/measurement-provenance.json").read_text()
+        )
         scopes[task] = {
             "source_scope": json.loads(provenance["source_scope"]),
             "test_scope": json.loads(provenance["test_scope"]),
             "version": provenance["measurement_profile_version"],
         }
-        task_environment[task] = {
-            key: provenance.get(key)
-            for key in (
-                "base_commit",
-                "node",
-                "package_manager",
-                "lock_sha256",
-                "dependency_sha256",
-                "test_patch_sha256",
-                "instruction_sha256",
-            )
+        capabilities[task] = provenance["capabilities"]
+        capabilities[task] = probe_measurements(
+            fixture,
+            destination / "measurement-readiness",
+            profiles[task],
+            config.measurements,
+            _object(capabilities[task]),
+        )
+        qualification = _object(identity.get("source_qualification", {}))
+        qualified = (
+            identity.get("source_policy") == submissions.SOURCE_POLICY
+            and qualification.get("status") == "complete"
+        )
+        capabilities[task]["submission_source"] = {
+            "status": "available" if qualified else "unavailable",
+            "source_policy": submissions.SOURCE_POLICY,
+            "reason": None
+            if qualified
+            else qualification.get(
+                "reason", "canonical submission source has no compatible preparation proof"
+            ),
         }
+        task_environment[task] = portable_native_identity(identity)
+        if progress:
+            for metric, capability in _object(capabilities[task]).items():
+                row = _object(capability)
+                if row["status"] == "unavailable":
+                    progress(f"{task}: {metric} unavailable — {row['reason']}")
     _write(
         prepared / "tasks.json",
         TaskCatalog(schema_version=1, tasks=entries).model_dump(mode="json"),
     )
-    # Freeze fixed review criteria before coding; candidates never receive this separate packet.
+    _write(root / "measurement-readiness.json", capabilities)
+    if config.measurement_settings.require_ready and any(
+        row.get("status") == "unavailable"
+        for task in capabilities.values()
+        for row in _object(task).values()
+        if isinstance(row, dict)
+    ):
+        raise ValueError(
+            "Selected measurements or submission sources are not ready; no coding calls were made. See measurement-readiness.json. Repair the inputs and start a new evaluation."
+        )
     fixed_guidance = []
     if config.reviewer:
-        for index, source in enumerate(config.reviewer.guidance):
+        for index, original in enumerate(config.reviewer.guidance):
             target = prepared / f"review-{index}.md"
-            shutil.copy2(source, target)
+            shutil.copy2(original, target)
             fixed_guidance.append(target)
         if (
-            _criteria_digest(
-                _fixed_criteria([file.read_text() for file in fixed_guidance], "handoff")
-            )
+            _criteria_digest(_fixed_criteria([file.read_text() for file in fixed_guidance]))
             != comparison["review_criteria_sha256"]
         ):
-            raise ValueError("fixed review guidance changed during preparation")
+            raise ValueError("fixed review criteria changed during preparation")
     recipe = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "backend": "harbor",
+        "harness_version": harness_versions[config.runner.harness],
+        "container_cpus": config.container_cpus,
+        "container_memory_mb": config.container_memory_mb,
         "name": config.name,
         "harness": config.runner.harness,
         "tasks": str(prepared / "tasks.json"),
-        "guidance": {
-            name: [str(file) for file in files] for name, files in config.guidance.items()
+        "treatments": {
+            name: item.model_dump(mode="json") for name, item in config.treatments.items()
         },
+        "capabilities": config.capabilities.model_dump(mode="json"),
         "model": config.runner.model,
         "reasoning": config.runner.reasoning,
         "repeats": config.repeats,
@@ -342,34 +457,80 @@ def run_evaluation(
         "jobs": config.jobs,
     }
     _write(prepared / "study.json", recipe)
+    comparison.update(
+        task_environment=task_environment,
+        harness_version=harness_versions[config.runner.harness],
+        measurement_capabilities=capabilities,
+    )
     selection = {
         **config.model_dump(mode="json"),
-        "comparison_identity": plan["comparison_identity"],
+        "comparison_identity": comparison,
         "task_scopes": scopes,
+        "measurement_capabilities": capabilities,
+        "measurement_readiness": capabilities,
         "artifact_base": "evidence",
+        "measurement_required": any(profiles.values()),
         "measurement_revision": None,
         "review_revision": None,
     }
-    comparison["task_environment"] = task_environment
     _save_selection(root, selection)
-    run_study(load_study(prepared / "study.json"), evidence, progress=progress)
-    selected_profiles = {task: collectors for task, collectors in profiles.items() if collectors}
+    coding_identity = {
+        "delivery": DELIVERY_POLICY,
+        "capabilities": config.capabilities.model_dump(mode="json"),
+        "task_assets": comparison["tasks"],
+        "task_environment": task_environment,
+        "runner": comparison["runner"],
+        "harness_version": harness_versions[config.runner.harness],
+        "isolation": comparison["isolation"],
+        "timeout_seconds": config.timeout_seconds,
+        "jobs": config.jobs,
+        "seed": config.seed,
+        "launcher_sha256": {
+            name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
+            for name in (
+                "codex.py",
+                "harbor_backend.py",
+                "processes.py",
+                "native_treatments.py",
+                "native_treatment_runtime.js",
+                "treatments.py",
+                *(["claude.py"] if config.runner.harness == "claude" else []),
+            )
+        },
+    }
+    run_study(
+        load_study(prepared / "study.json"),
+        evidence,
+        progress=progress,
+        baseline_cache=root.parent / ".baseline-cache",
+        baseline_identity=coding_identity,
+    )
+    # Measurement contexts refer to the same run-owned frozen task assets as grading/review.
+    frozen_catalog = TaskCatalog.model_validate_json((evidence / "frozen/tasks.json").read_text())
+    frozen_tasks = {
+        entry.id: evidence / "frozen" / entry.native_task for entry in frozen_catalog.tasks
+    }
+    for task, collectors in profiles.items():
+        for collector in collectors:
+            if collector.kind == "analysis" or (
+                collector.kind == "coverage" and collector.report_format is not None
+            ):
+                payload = json.loads(collector.config.read_text())
+                payload["native_task_identity"]["task_dir"] = str(frozen_tasks[task])
+                _write(collector.config, payload)
     return _finish_evaluation(
         root,
         selection=selection,
-        profiles=selected_profiles,
+        profiles={task: collectors for task, collectors in profiles.items() if collectors},
         guidance=fixed_guidance,
         progress=progress,
     )
 
 
 def _saved_evaluation(selection: dict[str, object]) -> Evaluation:
-    # Runs created before jobs existed used sequential execution.
+    normalized = _object(study.normalize_legacy_guidance(selection))
     return Evaluation.model_validate(
-        {
-            key: selection.get(key, 1) if key == "jobs" else selection[key]
-            for key in Evaluation.model_fields
-        }
+        {key: normalized[key] for key in Evaluation.model_fields if key in normalized}
     )
 
 
@@ -398,7 +559,6 @@ def _finish_evaluation(
             profiles=profiles,
             revision=revision,
             progress=progress,
-            allow_partial=True,
             jobs=config.jobs,
         )
         _adopt_measurement_revision(root, selection, revision)
@@ -411,7 +571,7 @@ def _finish_evaluation(
             harness=config.reviewer.harness,
             model=config.reviewer.model,
             effort=config.reviewer.reasoning,
-            timeout=config.timeout_seconds,
+            timeout=config.reviewer.timeout_seconds or config.timeout_seconds,
             seed=config.seed,
             revision="review",
             guidance=guidance,
@@ -488,13 +648,7 @@ def _resume_inputs(
         validate_remeasurement(
             evidence, evidence / "observer-revisions" / str(selection["measurement_revision"])
         )
-    elif set(config.measurements) & {
-        "coverage",
-        "test_overlap",
-        "cognitive",
-        "cyclomatic",
-        "dead_code",
-    }:
+    elif selection["measurement_required"]:
         candidates = (
             selection.get("pending_measurement_revision", "measurements"),
             selection.get("recovery_measurement_revision"),
@@ -532,17 +686,6 @@ def _resume_inputs(
             if study._inventory(directory / "profiles") != state["profile_inventory"]:
                 raise ValueError("frozen observer profiles changed")
             profiles = load_profiles(study._bound_path(evidence, state["frozen_profiles"]))
-            # The calibrated coverage adapter is the only script refreshed on recovery.
-            # Its exact bytes are frozen and recorded in the new observer revision.
-            for collectors in profiles.values():
-                for collector in collectors:
-                    if (
-                        collector.kind == "coverage"
-                        and collector.command
-                        and "--before" in collector.command
-                    ):
-                        collector.command[1] = str(ADAPTER / "coverage.py")
-                        collector.failure_protocol = "coverage-exit-v1"
         else:
             raise ValueError("observer collection is still marked active; cannot replay it")
     guidance = []
@@ -557,7 +700,7 @@ def _resume_inputs(
                 root / "inputs" / f"review-{index}.md"
                 for index in range(len(config.reviewer.guidance))
             ]
-            criteria = _fixed_criteria([file.read_text() for file in guidance], "handoff")
+            criteria = _fixed_criteria([file.read_text() for file in guidance])
             if (
                 _criteria_digest(criteria)
                 != _object(selection["comparison_identity"])["review_criteria_sha256"]
@@ -574,7 +717,7 @@ def plan_resume(root: Path) -> dict[str, object]:
         "coding_calls": 0,
         "review_calls": calls,
         "collect_measurements": bool(profiles),
-        "jobs": selection.get("jobs", 1),
+        "jobs": selection["jobs"],
         "baseline": "reuse immutable saved submissions; no coding replay",
     }
 
@@ -613,10 +756,7 @@ def _measurement_collection(root: Path, selection: dict[str, object]) -> dict[st
     available = 0
     failures = []
     for observation in state["observations"]:
-        outcomes = observation.get("outcomes")
-        if outcomes is None:  # Validated v1 revisions require every family to match.
-            available += len(observation["repeats"][0])
-            continue
+        outcomes = observation["outcomes"]
         for family, outcome in outcomes.items():
             if outcome["status"] == "available":
                 available += 1
@@ -660,15 +800,53 @@ def _measurement_collection(root: Path, selection: dict[str, object]) -> dict[st
     }
 
 
-def regenerate_report(root: Path) -> Path:
+def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path:
     root = root.expanduser().absolute()
     config = _load_selection(root)
-    config.setdefault("jobs", 1)
     comparison = _object(config["comparison_identity"])
-    comparison.setdefault("jobs", config["jobs"])
     config["comparison_identity"] = comparison
     evidence = root / "evidence"
-    report_path, _ = report_study(
+    output = root / "report"
+    if review_revision is not None:
+        review_path = validate_review_revision(evidence, review_revision)
+        state = study._bound_document(evidence, study._reference(evidence, review_path))
+        protocol = study._bound_document(evidence, state["protocol"])
+        reviewer = _object(config["reviewer"])
+        expected = {
+            "harness": reviewer["harness"],
+            "model": reviewer["model"],
+            "effort": reviewer["reasoning"],
+            "criteria_sha256": comparison["review_criteria_sha256"],
+            "seed": config["seed"],
+            "jobs": config["jobs"],
+            "timeout_seconds": reviewer.get("timeout_seconds") or config["timeout_seconds"],
+            "stage": "handoff",
+        }
+        if any(protocol.get(key) != value for key, value in expected.items()):
+            raise ValueError("review projection differs from the fixed comparison settings")
+        original_revision = _selected_revision(config, "review_revision")
+        previous_path = (
+            validate_review_revision(evidence, original_revision) if original_revision else None
+        )
+        states = {review_path}
+        if previous_path is not None:
+            states.add(previous_path)
+        starts = {
+            study._bound_path(evidence, row["native_start"]).resolve()
+            for path in states
+            for row in study._bound_document(evidence, study._reference(evidence, path))["records"]
+            if row.get("native_start") is not None
+        }
+        config["review_projection"] = {
+            "original_revision": original_revision,
+            "selected_revision": review_revision,
+            "revision_receipts": [study._reference(evidence, path) for path in sorted(states)],
+            "native_invocations_in_these_revisions": len(starts),
+            "usage_accounting": "Charts show the selected revision; bound prior revision receipts retain failed calls and their usage.",
+        }
+        config["review_revision"] = review_revision
+        output = review_path.parent / "evaluation-report"
+    report_path = report_study(
         evidence,
         measurement_revision=_selected_revision(config, "measurement_revision"),
         review_revision=_selected_revision(config, "review_revision"),
@@ -676,20 +854,30 @@ def regenerate_report(root: Path) -> Path:
     report = json.loads(report_path.read_text())
     recipe = json.loads((evidence / "frozen/resolved-recipe.json").read_text())
     packages = {}
-    for name, files in recipe["guidance"].items():
-        rows = [
-            {
-                "path": str(Path(file).relative_to(root)),
-                "sha256": hashlib.sha256(Path(file).read_bytes()).hexdigest(),
-            }
-            for file in files
-        ]
-        packages[name] = {
-            "files": rows,
-            "sha256": hashlib.sha256(
-                json.dumps([row["sha256"] for row in rows]).encode()
-            ).hexdigest(),
+    if "treatments" in recipe:
+        packages = {
+            name: treatment_inventory(
+                resolve_treatment(
+                    Treatment.model_validate(item), evidence / "frozen", recipe["harness"]
+                )
+            )
+            for name, item in recipe["treatments"].items()
         }
+    else:
+        for name, files in recipe["guidance"].items():
+            rows = [
+                {
+                    "path": str(Path(file).relative_to(root)),
+                    "sha256": hashlib.sha256(Path(file).read_bytes()).hexdigest(),
+                }
+                for file in files
+            ]
+            packages[name] = {
+                "files": rows,
+                "sha256": hashlib.sha256(
+                    json.dumps([row["sha256"] for row in rows]).encode()
+                ).hexdigest(),
+            }
     config["guidance_packages"] = packages
     runtime_profiles = {
         json.dumps(
@@ -765,5 +953,22 @@ def regenerate_report(root: Path) -> Path:
                 scope=TypeAdapter(list[str]).validate_python(scope["test_scope"]),
                 change=stage["change"],
             )
+    for task, value in _object(report.get("references", {})).items():
+        # Reference solutions use the task's declared source scope, like every submission.
+        reference = _object(value)
+        if reference.get("status") != "available":
+            continue
+        reference["code_size"] = scoped_code_size(
+            before=evidence / str(_object(reference["before"])["path"]),
+            after=evidence / str(_object(reference["after"])["path"]),
+            scope=TypeAdapter(list[str]).validate_python(
+                _object(_object(config["task_scopes"])[task])["source_scope"]
+            ),
+            change=_object(reference["change"]),
+        )
+    prices = root / "prices.json"
+    if prices.is_file():
+        # Dated prices are reporting input, not measurement settings, so they stay outside the binding.
+        config["prices"] = _object(json.loads(prices.read_text()))
     config["measurement_collection"] = _measurement_collection(root, config)
-    return write_evaluation_report(report, config, root / "report")
+    return write_evaluation_report(report, config, output)

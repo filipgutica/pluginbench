@@ -9,7 +9,6 @@ import json
 import math
 from dataclasses import asdict, dataclass
 from importlib.resources import files
-from pathlib import Path
 from statistics import median
 
 from pluginbench import codex
@@ -28,9 +27,15 @@ REVIEW_CATEGORIES = {
 }
 
 # Panel, subtype, canonical evidence kind, canonical metric key.
+# Panels marked diagnostic stay in results JSON/CSV but out of report charts and summaries.
+DIAGNOSTIC_PANELS = frozenset({"Whole-suite coverage"})
 METRICS = (
     ("Tokens", "Input tokens", "work", "input_tokens"),
+    ("Tokens", "Cached input tokens", "work", "cached_input_tokens"),
+    ("Tokens", "Uncached input tokens", "work", "uncached_input_tokens"),
     ("Tokens", "Output tokens", "work", "output_tokens"),
+    ("Tokens", "Reasoning output tokens", "work", "reasoning_output_tokens"),
+    ("Time", "Coding time", "work", "elapsed_seconds"),
     ("Review tokens", "Judge input tokens", "review_work", "input_tokens"),
     ("Review tokens", "Judge output tokens", "review_work", "output_tokens"),
     ("Review findings", "Total review findings", "review_findings", "finding_count"),
@@ -52,94 +57,67 @@ METRICS = (
         )
         for category in REVIEW_CATEGORIES
     ),
-    ("Complexity", "Reported cognitive maximum", "fallow", "max_cognitive_reported"),
-    ("Complexity", "Reported cyclomatic maximum", "fallow", "max_cyclomatic_reported"),
-    *(
-        (
-            "Changed functions",
-            f"{side.title()} changed-function {label}",
-            "fallow_change",
-            f"changed_functions.{side}.{key}",
-        )
-        for side in ("before", "after")
-        for label, key in (
-            ("count", "function_count_reported"),
-            ("cognitive maximum", "max_cognitive_reported"),
-            ("cyclomatic maximum", "max_cyclomatic_reported"),
-            ("unit-size maximum", "max_unit_size_reported"),
-        )
-    ),
-    *(
-        (
-            "New-file functions",
-            f"New-file function {label}",
-            "fallow_change",
-            f"new_file_functions.after.{key}",
-        )
-        for label, key in (
-            ("count", "function_count_reported"),
-            ("cognitive maximum", "max_cognitive_reported"),
-            ("cyclomatic maximum", "max_cyclomatic_reported"),
-            ("unit-size maximum", "max_unit_size_reported"),
-        )
-    ),
-    ("Coverage", "Branch coverage %", "coverage", "branch_percent"),
-    ("Coverage", "Function coverage %", "coverage", "function_percent"),
-    ("LOC", "Source LOC", "loc", "source_lines"),
-    ("LOC", "Test LOC", "loc", "test_lines"),
-    ("LOC", "Source lines added", "loc_change", "source_lines_added"),
-    ("LOC", "Source lines removed", "loc_change", "source_lines_removed"),
-    ("LOC", "Test lines added", "loc_change", "test_lines_added"),
-    ("LOC", "Test lines removed", "loc_change", "test_lines_removed"),
-    ("Reported dead findings", "Reported dead findings", "fallow", "dead_code"),
+    ("Code added", "Net cognitive complexity added", "fallow_change", "code_added.net_cognitive"),
+    ("Code added", "Net cyclomatic complexity added", "fallow_change", "code_added.net_cyclomatic"),
+    ("Code added", "Functions added", "fallow_change", "code_added.functions_added"),
+    ("Code added", "Source files added", "fallow_change", "code_added.source_files_added"),
+    ("Code added", "Complexity hotspots added", "fallow_change", "code_added.hotspots_added"),
     (
-        "Reported dead findings",
+        "Code added",
         "Introduced dead findings",
         "fallow_change",
         "dead_findings.introduced_count",
     ),
     (
-        "Reported dead findings",
-        "Resolved dead findings",
-        "fallow_change",
-        "dead_findings.resolved_count",
-    ),
-    (
-        "Test overlap",
-        "Zero marginal branch contribution cases",
-        "coverage",
-        "zero_marginal_count",
-    ),
-    ("Reported clone groups", "Reported clone groups", "fallow", "clone_groups"),
-    (
-        "Reported clone groups",
+        "Code added",
         "Introduced clone groups",
         "fallow_change",
         "clone_findings.introduced_count",
     ),
+    ("LOC", "Source lines added", "loc_change", "source_lines_added"),
+    ("LOC", "Source lines removed", "loc_change", "source_lines_removed"),
+    ("LOC", "Source lines net", "loc_change", "source_lines_net"),
+    ("LOC", "Test lines added", "loc_change", "test_lines_added"),
+    ("LOC", "Test lines removed", "loc_change", "test_lines_removed"),
+    ("Tests added", "Changed-line coverage %", "coverage_change", "changed_lines.line_percent"),
+    ("Tests added", "Changed-branch coverage %", "coverage_change", "changed_lines.branch_percent"),
     (
-        "Reported clone groups",
-        "Resolved clone groups",
-        "fallow_change",
-        "clone_findings.resolved_count",
+        "Tests added",
+        "Redundant added tests",
+        "coverage_change",
+        "changed_lines.redundant_added_tests",
     ),
+    (
+        "Tests added",
+        "Duplicated added test lines",
+        "change",
+        "test_duplication.duplicated_added_test_lines",
+    ),
+    ("Whole-suite coverage", "Line coverage %", "coverage", "line_percent"),
+    ("Whole-suite coverage", "Statement coverage %", "coverage", "statement_percent"),
+    ("Whole-suite coverage", "Branch coverage %", "coverage", "branch_percent"),
+    ("Whole-suite coverage", "Function coverage %", "coverage", "function_percent"),
     (
         "Tests with zero unique contribution",
         "Branch contribution",
         "coverage",
         "zero_unique_branch_contribution_tests",
     ),
-    (
-        "Tests with zero unique contribution",
-        "Mutant-kill contribution",
-        "mutation",
-        "zero_unique_mutant_kill_tests",
-    ),
 )
 
 # Display copy stays separate from the metric identities used in evidence and CSVs.
 # Each entry supplies a title, axis unit, and a brief explanation beside the plot.
 METRIC_GUIDE = {
+    "Line coverage %": (
+        "Line coverage",
+        "% covered",
+        "Executable source lines reached by the selected tests. Unsupported units remain unknown; coverage alone does not establish useful assertions.",
+    ),
+    "Statement coverage %": (
+        "Statement coverage",
+        "% covered",
+        "Source statements reached by the selected tests. Go counts statements within measured blocks; this is not branch or function coverage.",
+    ),
     "Input tokens": (
         "Input tokens",
         "tokens",
@@ -176,18 +154,6 @@ METRIC_GUIDE = {
         "Percentage of functions called by the selected tests. "
         "Higher means a larger share ran; it does not prove every path or result was checked.",
     ),
-    "Source LOC": (
-        "Total source lines",
-        "lines",
-        "Source lines in the measured code after the task, including comments and blank lines. "
-        "This is the total size, not the number of lines the agent added.",
-    ),
-    "Test LOC": (
-        "Total test lines",
-        "lines",
-        "Test lines in the measured code after the task, including comments and blank lines. "
-        "More lines do not necessarily mean better tests.",
-    ),
     **{
         f"{kind} lines {action}": (
             f"{kind} lines {action}",
@@ -198,29 +164,11 @@ METRIC_GUIDE = {
         for kind in ("Source", "Test")
         for action in ("added", "removed")
     },
-    "Reported dead findings": (
-        "Total unused-code warnings",
-        "warnings",
-        "Unused-code warnings reported by the analyzer after the task, including inherited ones. "
-        "Public APIs and runtime calls can produce false positives. Zero means no warnings detected.",
-    ),
     "Introduced dead findings": (
         "New unused-code warnings",
         "warnings",
         "Unused-code warnings present after the task that were absent from the starting scan. "
         "Public APIs and runtime calls can produce false positives. Zero means no new warnings.",
-    ),
-    "Resolved dead findings": (
-        "Unused-code warnings cleared",
-        "warnings",
-        "Warnings from the starting unused-code scan that are absent after the task. "
-        "Higher means more warnings disappeared; the code may have been removed or made reachable.",
-    ),
-    "Reported clone groups": (
-        "Total duplicate-code groups",
-        "groups",
-        "Groups of matching code blocks reported by the analyzer after the task, including inherited ones. "
-        "This counts groups, not duplicated lines; some duplication may be intentional.",
     ),
     "Introduced clone groups": (
         "New duplicate-code groups",
@@ -228,76 +176,92 @@ METRIC_GUIDE = {
         "Groups of matching code blocks detected after the task but absent from the starting scan. "
         "Lower means fewer new groups; this counts groups, not duplicated lines.",
     ),
-    "Resolved clone groups": (
-        "Duplicate-code groups cleared",
-        "groups",
-        "Duplicate-code groups from the starting scan that are absent after the task. "
-        "Higher means more groups disappeared; it does not prove the remaining design is better.",
-    ),
-    "Zero marginal branch contribution cases": (
-        "Test cases adding no branch coverage",
-        "test cases",
-        "Test cases from added or edited test files whose removal leaves the suite's covered branches unchanged. "
-        "More means more coverage overlap; those tests may still check different behavior.",
-    ),
     "Branch contribution": (
         "Tests with no unique branch coverage",
         "tests",
         "Supplied tests whose covered branches are also covered by other supplied tests. "
         "Shared coverage does not mean shared assertions or unnecessary tests.",
     ),
-    "Mutant-kill contribution": (
-        "Tests with no unique mutation detection",
-        "tests",
-        "Supplied tests that detect no deliberately changed code missed by the other supplied tests. "
-        "This measures overlap in mutation detection, not whether a test is useful.",
-    ),
 }
 
-_FUNCTION_GUIDE = {
-    "count": (
-        "Function count",
-        "functions",
-        "Number of reported functions",
-        "This describes the measured code; fewer functions is not automatically better.",
-    ),
-    "cognitive maximum": (
-        "Highest cognitive complexity",
-        "score",
-        "Highest branching-and-nesting score for any one function",
-        "Lower suggests simpler control flow. The score starts at zero; it is not the complexity added.",
-    ),
-    "cyclomatic maximum": (
-        "Highest cyclomatic complexity",
-        "paths",
-        "Most independent execution paths through any one function",
-        "Higher means more paths to consider. A function with no branching starts at one.",
-    ),
-    "unit-size maximum": (
-        "Longest function",
-        "lines",
-        "Most source lines occupied by any one function",
-        "Lower means a shorter function; shortness alone does not establish good design.",
-    ),
-}
-for _label, (_title, _unit, _meaning, _reading) in _FUNCTION_GUIDE.items():
-    if _label in {"cognitive maximum", "cyclomatic maximum"}:
-        METRIC_GUIDE[f"Reported {_label}"] = (
-            _title,
-            _unit,
-            f"{_meaning} in the declared scan. {_reading}",
-        )
-    for _side in ("before", "after"):
-        METRIC_GUIDE[f"{_side.title()} changed-function {_label}"] = (
-            f"{_title} · {_side}",
-            _unit,
-            f"{_meaning} touched by changed lines, {_side} the agent's edits. {_reading}",
-        )
-    METRIC_GUIDE[f"New-file function {_label}"] = (
-        f"{_title} in new files",
-        _unit,
-        f"{_meaning} in files added by the agent. {_reading}",
-    )
+METRIC_GUIDE.update(
+    {
+        "Cached input tokens": (
+            "Cached input tokens",
+            "tokens",
+            "Input tokens served from the provider's prompt cache. Usually priced far below fresh input.",
+        ),
+        "Uncached input tokens": (
+            "Uncached input tokens",
+            "tokens",
+            "Input tokens that were not served from cache: input minus cached input. The better input-cost signal.",
+        ),
+        "Reasoning output tokens": (
+            "Reasoning output tokens",
+            "tokens",
+            "Output tokens spent on hidden reasoning. A subset of output tokens, not added to them.",
+        ),
+        "Source lines net": (
+            "Source lines net",
+            "lines",
+            "Source lines added minus source lines removed. Negative means the submission shrank the code.",
+        ),
+        "Coding time": (
+            "Coding time",
+            "seconds",
+            "Elapsed time of the coding run, including subagents. Shared machine load can affect it.",
+        ),
+        "Net cognitive complexity added": (
+            "Cognitive complexity added",
+            "score",
+            "Branching-and-nesting the agent added to source code: changed functions after the edit "
+            "minus the same functions before. New functions count in full; deleted ones subtract.",
+        ),
+        "Net cyclomatic complexity added": (
+            "Cyclomatic complexity added",
+            "paths",
+            "Independent paths the agent added to source code, measured like cognitive complexity "
+            "added. Editing an already-complex function counts only its growth.",
+        ),
+        "Functions added": (
+            "Functions added",
+            "functions",
+            "Source functions after the edit whose path and name did not exist before. Renames count as added.",
+        ),
+        "Source files added": (
+            "Source files added",
+            "files",
+            "New non-test source files. More files is not automatically worse; compare with the reference.",
+        ),
+        "Complexity hotspots added": (
+            "Complexity hotspots added",
+            "functions",
+            "New or grown source functions whose cognitive score is above 15, a common review threshold.",
+        ),
+        "Changed-line coverage %": (
+            "Changed-line coverage",
+            "% covered",
+            "Share of the agent's added executable source lines that its submitted tests run. "
+            "Running a line does not prove its behavior is checked.",
+        ),
+        "Changed-branch coverage %": (
+            "Changed-branch coverage",
+            "% covered",
+            "Share of branches on the agent's added source lines that its submitted tests take.",
+        ),
+        "Redundant added tests": (
+            "Redundant added tests",
+            "tests",
+            "Added tests whose covered added lines are all covered by other tests. "
+            "Candidates only: equal coverage does not mean equal assertions.",
+        ),
+        "Duplicated added test lines": (
+            "Duplicated added test lines",
+            "lines",
+            "Added test lines inside a six-line block that repeats elsewhere in the added tests.",
+        ),
+    }
+)
 
 METRIC_GUIDE["Total review findings"] = (
     "Review findings",
@@ -372,6 +336,64 @@ def _number(value: object) -> float | None:
     return None
 
 
+def _net_lines(size: dict[str, object]) -> float | None:
+    added, removed = (
+        _number(size.get("source_lines_added")),
+        _number(size.get("source_lines_removed")),
+    )
+    return added - removed if added is not None and removed is not None else None
+
+
+def _signed(value: object) -> float | None:
+    """Like _number, for measures that can fall below zero, such as complexity removed."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value) if math.isfinite(value) else None
+    return None
+
+
+def execution_outcome(provenance: object) -> dict[str, object]:
+    """Explain bound native completion independently of source/task grading."""
+    evidence = _map(provenance)
+    if evidence.get("successful_native_completion") is True:
+        return {"status": "complete", "reason": None}
+    if evidence.get("timed_out") is True:
+        return {"status": "timed_out", "reason": "Native execution timed out."}
+    exit_code = evidence.get("exit_code")
+    if evidence.get("successful_native_completion") is not False and not (
+        type(exit_code) is int and exit_code != 0
+    ):
+        return {"status": "unknown", "reason": None}
+    error = _map(evidence.get("error"))
+    error_type = error.get("exception_type")
+    cause = None
+    stream_errors = evidence.get("stream_errors")
+    if isinstance(stream_errors, list):
+        for event in reversed(stream_errors):
+            row = _map(event)
+            message = _map(row.get("error")).get("message", row.get("message"))
+            if isinstance(message, str) and message.strip():
+                cause = message.strip()
+                break
+    if cause is None:
+        message = error.get("message")
+        if not message and not error_type:
+            message = error.get("exception_message")
+        if not message and isinstance(evidence.get("error"), str):
+            message = evidence["error"]
+        if isinstance(message, str) and message.strip():
+            cause = message.strip().splitlines()[0]
+    label = "Native execution failed"
+    if isinstance(error_type, str) and error_type:
+        label += " (" + error_type + ")"
+    if cause:
+        reason = label + ": " + cause
+    elif type(exit_code) is int and exit_code != 0:
+        reason = label + f" (exit {exit_code})."
+    else:
+        reason = label + "."
+    return {"status": "failed", "reason": reason}
+
+
 def _fingerprint(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
@@ -408,8 +430,6 @@ def _runtime(attempt: dict[str, object]) -> dict[str, str]:
     } | {
         "runtime_source": _text(provenance.get("runtime_source"))
         if provenance.get("runtime_source")
-        else "native runtime evidence"
-        if provenance.get("input") == "workflow-matrix"
         else "manifest declaration"
     }
 
@@ -433,118 +453,6 @@ def _assigned_runtime(attempt: dict[str, object]) -> dict[str, object]:
         else runtime["harness_version"],
         "assignment_bound": bound,
     }
-
-
-def _total_work(stages: list[dict[str, object]]) -> dict[str, object]:
-    work = [_map(stage.get("work")) for stage in stages]
-    formats = [_text(row.get("token_format")) for row in work]
-    matching = bool(work) and "unknown" not in formats and len(set(formats)) == 1
-    tokens: dict[str, float | None] = {}
-    for key in ("input_tokens", "output_tokens"):
-        values = [_number(_map(row.get("tokens")).get(key)) for row in work]
-        tokens[key] = (
-            sum(value for value in values if value is not None)
-            if matching and all(value is not None for value in values)
-            else None
-        )
-    elapsed = [_number(row.get("elapsed_seconds")) for row in work]
-    return {
-        "tokens": tokens,
-        "token_format": formats[0] if matching else None,
-        "elapsed_seconds": sum(value for value in elapsed if value is not None)
-        if all(value is not None for value in elapsed)
-        else None,
-    }
-
-
-def _outcomes(attempts: list[dict[str, object]]) -> list[dict[str, object]]:
-    groups: dict[str, list[dict[str, object]]] = {}
-    for attempt in attempts:
-        identity = {
-            "task": _text(attempt.get("task_id")),
-            "arm": _text(attempt.get("arm")),
-            "before_digest": _text(attempt.get("before_digest")),
-            **_assigned_runtime(attempt),
-        }
-        groups.setdefault(json.dumps(identity, sort_keys=True), []).append(attempt)
-    outcomes = []
-    for identity_key, members in groups.items():
-        row = json.loads(identity_key)
-        row["assigned"] = len(members)
-        states: dict[str, int] = {}
-        for attempt in members:
-            state = _text(_map(attempt.get("provenance")).get("attempt_status"))
-            states[state] = states.get(state, 0) + 1
-        row["attempt_states"] = states
-        for role in ("handoff", "final"):
-            counts = {"pass": 0, "fail": 0, "unknown": 0}
-            for attempt in members:
-                stage = next(
-                    (
-                        stage
-                        for stage in _rows(attempt.get("stages"))
-                        if stage.get("id") == attempt.get(role)
-                    ),
-                    {},
-                )
-                status = _text(_map(stage.get("correctness")).get("status"))
-                counts[status if status in counts else "unknown"] += 1
-            row[role] = counts
-        burdens = [_map(attempt.get("correction_burden")) for attempt in members]
-        for key in ("verified_issue_count", "external_rounds"):
-            values = [_number(burden.get(key)) for burden in burdens]
-            row[key] = (
-                sum(value for value in values if value is not None)
-                if all(burden.get("status") == "available" for burden in burdens)
-                and all(value is not None for value in values)
-                else None
-            )
-        reviews = [_map(attempt.get("independent_review")) for attempt in members]
-        values = [_number(review.get("finding_count")) for review in reviews]
-        row["selected_review_findings"] = (
-            sum(value for value in values if value is not None)
-            if all(review.get("status") == "reviewed" for review in reviews)
-            and all(value is not None for value in values)
-            else None
-        )
-        row["selected_review_stages"] = sorted(
-            {_text(review.get("stage")) for review in reviews if review}
-        )
-        rounds = [_number(burden.get("external_rounds")) for burden in burdens]
-        row["recorded_review_rounds"] = (
-            sum(value for value in rounds if value is not None)
-            if all(value is not None for value in rounds)
-            else None
-        )
-        row["guidance_delivery"] = sorted(
-            {_text(_map(attempt.get("provenance")).get("guidance_delivery")) for attempt in members}
-        )
-        actual_runtimes = []
-        for attempt in members:
-            actual = {"model": _text(attempt.get("model")), **_runtime(attempt)}
-            unknown = any(
-                actual[key] == "unknown"
-                for key in ("model", "reasoning_effort", "harness", "harness_version")
-            )
-            mismatch = bool(row["assignment_bound"]) and any(
-                actual[key] != "unknown" and row[key] != "unknown" and actual[key] != row[key]
-                for key in ("model", "reasoning_effort", "harness_version")
-            )
-            actual_runtimes.append(
-                {
-                    "attempt_id": _text(attempt.get("id")),
-                    **actual,
-                    "unknown": unknown,
-                    "mismatch": mismatch,
-                }
-            )
-        row["actual_runtimes"] = actual_runtimes
-        row["actual_runtime_unknown"] = sum(actual["unknown"] is True for actual in actual_runtimes)
-        row["actual_runtime_mismatch"] = sum(
-            actual["mismatch"] is True for actual in actual_runtimes
-        )
-        outcomes.append(row)
-    return outcomes
 
 
 @dataclass
@@ -584,8 +492,23 @@ def _observation(
     attempt: dict[str, object], stage: dict[str, object], role: str, spec: tuple[str, str, str, str]
 ) -> Observation:
     panel, label, kind, key = spec
+    static_kind = (
+        "analysis"
+        if "analysis" in _map(stage.get("metrics"))
+        and _map(_map(stage.get("metrics")).get("analysis")).get("status") == "available"
+        else "fallow"
+    )
     work = _map(stage.get("work"))
-    evidence = _map(_map(stage.get("metrics")).get("fallow" if kind == "fallow_change" else kind))
+    native_outcome = execution_outcome(stage.get("execution_provenance"))
+    evidence = _map(
+        _map(stage.get("metrics")).get(
+            {
+                "fallow": static_kind,
+                "fallow_change": static_kind,
+                "coverage_change": "coverage",
+            }.get(kind, kind)
+        )
+    )
     metrics = _map(evidence.get("metrics"))
     provenance = _map(evidence.get("provenance"))
     settings = _runtime(attempt)
@@ -611,7 +534,7 @@ def _observation(
             (
                 row
                 for row in _rows(attempt.get("stages"))
-                if row.get("id") == review.get("stage_id", attempt.get("handoff"))
+                if row.get("id") == review.get("stage_id")
             ),
             {},
         )
@@ -625,7 +548,7 @@ def _observation(
             ),
             "judge_reasoning_effort": execution.get("runtime_effort_evidence"),
             "judge_harness_version": codex.observed_cli_version(execution.get("startup")),
-            "review_stage": review.get("stage", "handoff"),
+            "review_stage": review.get("stage"),
         }
         judge_effort = provenance["judge_reasoning_effort"]
         if codex.validated_claude_launch(
@@ -659,10 +582,9 @@ def _observation(
         criteria_valid = len(digest) == 64 and all(
             character in "0123456789abcdef" for character in digest
         )
-        if criteria is not None:
-            provenance["criteria_sha256"] = criteria
-            identity["criteria_sha256"] = digest
-            eligible = eligible and criteria_valid
+        provenance["criteria_sha256"] = criteria
+        identity["criteria_sha256"] = digest
+        eligible = eligible and criteria_valid
         if kind == "review_findings":
             provenance.pop("token_format")
             identity.pop("token_format")
@@ -682,26 +604,31 @@ def _observation(
             value = _review_count(review, key) if eligible else None
             reason = (
                 "independent AI judgment under fixed review criteria; counts are not deterministic "
-                "defects, repair rounds, or human review churn"
+                "defects or human review effort"
                 if value is not None
                 else "valid fixed-criteria review, runtime identity, or explicit finding counts unavailable"
             )
     elif kind == "work":
-        value = _number(_map(work.get("tokens")).get(key))
+        tokens = _map(work.get("tokens"))
+        if key == "uncached_input_tokens":
+            total, cached = (
+                _number(tokens.get(name)) for name in ("input_tokens", "cached_input_tokens")
+            )
+            value = total - cached if total is not None and cached is not None else None
+        elif key == "elapsed_seconds":
+            value = _number(work.get("elapsed_seconds"))
+        else:
+            value = _number(tokens.get(key))
         provenance = {"token_format": work.get("token_format")}
         eligible = isinstance(work.get("token_format"), str) and bool(work["token_format"])
         identity.update(provenance)
-        reason = (
-            "total native tokens across all calls through final"
-            if role == "final"
-            else "first-call native tokens at handoff"
-        ) + "; cached input and reasoning output subsets are not added"
-    elif kind in {"loc", "loc_change"}:
+        reason = "native tokens at handoff; cached input and reasoning output subsets are not added"
+    elif kind == "loc_change":
         classification = "source" if key.startswith("source_") else "test"
         code_size = _map(stage.get("code_size" if classification == "source" else "test_code_size"))
         if code_size.get("status") == "available":
-            value = _number(
-                code_size.get(f"after_{classification}_lines" if kind == "loc" else key)
+            value = (
+                _net_lines(code_size) if key == "source_lines_net" else _number(code_size.get(key))
             )
             provenance = {
                 field: code_size.get(field)
@@ -728,8 +655,11 @@ def _observation(
             provenance = {"classification": f"scoped {classification} LOC unavailable"}
             reason = str(code_size.get("reason"))
         else:
-            value = _number(
-                _map(stage.get("snapshot_metadata" if kind == "loc" else "change")).get(key)
+            change_size = _map(stage.get("change"))
+            value = (
+                _net_lines(change_size)
+                if key == "source_lines_net"
+                else _number(change_size.get(key))
             )
             provenance = {
                 "exclusion_names": _map(stage.get("snapshot_metadata")).get("exclusion_names"),
@@ -738,13 +668,32 @@ def _observation(
             eligible = provenance["exclusion_names"] is not None
             identity.update(provenance)
             reason = "extension-classified LOC, including generated files; shared source/test classification"
-    elif kind == "fallow_change":
-        comparison = _map(_map(stage.get("metric_comparison")).get("fallow"))
+    elif kind == "change":
+        section, field = key.split(".")
+        detail = _map(_map(stage.get("change")).get(section))
+        value = _number(detail.get(field))
+        provenance = {"method": detail.get("method")}
+        eligible = bool(detail)
+        identity.update(provenance)
+        reason = str(detail.get("method") or "bound source diff unavailable")
+    elif kind in {"fallow_change", "coverage_change"}:
+        comparison = _map(
+            _map(stage.get("metric_comparison")).get(
+                "coverage" if kind == "coverage_change" else static_kind
+            )
+        )
         path = key.split(".")
         detail = _map(comparison.get(path[0]))
         population_metrics = _map(detail.get(path[1])) if len(path) == 3 else detail
-        value = _number(population_metrics.get(path[-1]))
-        eligible = comparison.get("status") == detail.get("status") == "available" and all(
+        value = (_signed if path[-1].startswith("net_") else _number)(
+            population_metrics.get(path[-1])
+        )
+        # Changed-line results stand on their own; whole-suite coverage is incomplete whenever lines
+        # change. Code-added results still require their static comparison to be available.
+        eligible = (
+            detail.get("status") == "available"
+            and (kind == "coverage_change" or comparison.get("status") == "available")
+        ) and all(
             provenance.get(field) is not None
             for field in ("tool", "tool_version", "config_digest", "scope")
         )
@@ -757,6 +706,14 @@ def _observation(
             "complete_for_declared_scope": population_metrics.get("complete_for_declared_scope"),
             "reported_functions": population_metrics.get("function_count_reported"),
         }
+        if kind == "coverage_change" and key.endswith("_percent"):
+            # Changed-line rates keep their own covered/total counts beside the percentage.
+            covered_key, total_key = (
+                ("added_lines_covered", "added_executable_lines")
+                if key.endswith("line_percent")
+                else ("branch_covered", "branch_total")
+            )
+            provenance.update(covered=detail.get(covered_key), total=detail.get(total_key))
         reason = str(
             detail.get("method")
             or detail.get("reason")
@@ -764,9 +721,7 @@ def _observation(
             or "bound before/after comparison unavailable"
         )
         if detail.get("status") == "incomplete":
-            reason += "; reported functions only; population incomplete"
-        if value is None and population_metrics.get("function_count_reported") == 0:
-            reason += "; no reported functions in this population; maximum undefined"
+            reason += "; population incomplete"
         population = None
     else:
         value = _number(metrics.get(key))
@@ -799,82 +754,59 @@ def _observation(
                 if key == "clone_groups"
                 else "reported function maximum across declared scope, including tests when scoped; partial reporting is not a complete maximum"
             )
-        if kind in {"coverage", "mutation"}:
-            denominator = (
-                "mutant_set_digest"
-                if kind == "mutation"
-                else (
-                    "function_denominator_digest"
-                    if key == "function_percent"
-                    else "branch_denominator_digest"
+            if static_kind == "analysis":
+                reason = (
+                    str(metrics.get("dead_code_detection"))
+                    if key == "dead_code"
+                    else "function scores under the named language analyzer; unlike analyzer definitions are not interchangeable"
                 )
-            )
-            if kind != "coverage":
-                identity[denominator] = metrics.get(denominator)
+                if key != "dead_code" and metrics.get("language") == "python":
+                    reason += "; " + str(_map(metrics.get("settings")).get("python_rca_population"))
+        if kind == "coverage":
+            unit = key.partition("_")[0] if key.endswith("_percent") else "branch"
+            denominator = f"{unit}_denominator_digest"
             provenance = {**provenance, denominator: metrics.get(denominator)}
             eligible = eligible and isinstance(metrics.get(denominator), str)
-            reason = "fixed denominator and matching analyzer/config/scope required for comparison"
-            if kind == "coverage":
-                eligible = (
-                    eligible and metrics.get("population_complete_for_declared_scope") is True
-                )
-                if metrics.get("population_complete_for_declared_scope") is not True:
-                    reason = "reported coverage only; declared source population completeness is unproven"
-                else:
-                    reason = "coverage of each submission's source; populations may differ; descriptive per-submission rates, no fixed-denominator gain claim"
-                provenance.update(
-                    {
-                        name: metrics.get(name)
-                        for name in (
-                            "test_scope",
-                            "selected_test_files",
-                            "reference_test_files",
-                            "selection_policy",
-                        )
-                    }
-                )
-                provenance.update(
-                    {
-                        "covered": metrics.get(
-                            "function_covered" if key == "function_percent" else "branch_covered"
-                        ),
-                        "total": metrics.get(
-                            "function_total" if key == "function_percent" else "branch_total"
-                        ),
-                    }
-                )
-        if key == "zero_marginal_count":
-            contribution = _map(metrics.get("test_contribution"))
-            value = _number(contribution.get("zero_marginal_count"))
-            population = _number(contribution.get("candidate_count"))
-            eligible = eligible and contribution.get("status") == "available"
-            test_scope = metrics.get("test_scope")
-            valid_test_scope = (
-                isinstance(test_scope, list)
-                and bool(test_scope)
-                and all(isinstance(name, str) and name for name in test_scope)
+            complete = metrics.get(
+                f"{unit}_population_complete", metrics.get("population_complete_for_declared_scope")
             )
-            normalized_test_scope = (
-                sorted({str(name).removeprefix("./") for name in test_scope})
-                if valid_test_scope and isinstance(test_scope, list)
-                else None
-            )
-            eligible = eligible and valid_test_scope
-            identity["method"] = contribution.get("method")
-            identity["test_scope"] = normalized_test_scope
+            eligible = eligible and complete is True
+            if metrics.get(denominator) is None:
+                reason = f"{unit} coverage is not supplied by {metrics.get('format') or 'this report format'}"
+            elif complete is not True:
+                reason = (
+                    "reported coverage only; declared source population completeness is unproven"
+                )
+            else:
+                reason = "coverage of each submission's source; populations may differ; descriptive per-submission rates, no fixed-denominator gain claim"
+            plural = {
+                "line": "lines",
+                "statement": "statements",
+                "branch": "branches",
+                "function": "functions",
+            }
+            limit = _map(_map(metrics.get("unavailable_populations")).get(plural[unit]))
+            if limit.get("reason") and (metrics.get(denominator) is None or complete is not True):
+                reason = str(limit["reason"])
+            if metrics.get(f"{unit}_total") == 0 and complete is True:
+                reason = f"measured {unit} population is empty; percentage is undefined"
             provenance.update(
                 {
-                    "method": contribution.get("method"),
-                    "test_scope": normalized_test_scope,
-                    "selection": contribution.get("selection"),
-                    "reference_count": contribution.get("reference_count"),
-                    "candidate_count": population,
-                    "tested_count": contribution.get("tested_count"),
-                    "limitations": contribution.get("limitations"),
+                    name: metrics.get(name)
+                    for name in (
+                        "test_scope",
+                        "selected_test_files",
+                        "reference_test_files",
+                        "selection_policy",
+                    )
                 }
             )
-            identity["selection"] = contribution.get("selection")
-            reason = "fresh leave-one-out runs; zero marginal branch contribution is a test-overlap proxy, not a count of unnecessary tests"
+            provenance.update(
+                {
+                    "covered": metrics.get(f"{unit}_covered"),
+                    "total": metrics.get(f"{unit}_total"),
+                }
+            )
         if key.startswith("zero_unique_"):
             names = metrics.get(key)
             value = (
@@ -884,7 +816,7 @@ def _observation(
             )
             eligible = False
             reason = "among supplied tests only; full-suite population completeness is not attested; shown as raw counts, not semantic redundancy"
-        elif key != "zero_marginal_count":
+        else:
             population = None
         if kind == "coverage" and metrics.get("clock") is not None:
             clock = _map(metrics["clock"])
@@ -934,94 +866,106 @@ def _observation(
     compatibility = (
         _fingerprint(identity) if eligible and identity_known and value is not None else None
     )
+    provenance.update(
+        execution_status=native_outcome["status"], execution_reason=native_outcome["reason"]
+    )
     if value is None:
-        status, reason = (
-            "unknown",
-            reason + "; unknown is not zero"
-            if kind in {"fallow_change", "loc", "loc_change", "review_findings"}
-            or key == "zero_marginal_count"
-            else _text(evidence.get("reason"))
-            if evidence.get("reason")
-            else "measurement unavailable; unknown is not zero",
-        )
+        if kind == "work" and isinstance(provenance.get("execution_reason"), str):
+            reason = (
+                str(provenance["execution_reason"])
+                + "; final token usage unavailable; unknown is not zero"
+            )
+            partial = _map(stage.get("execution_provenance")).get("partial_usage")
+            if isinstance(partial, list) and partial:
+                reason += "; partial usage receipts are lower bounds, not totals"
+            status = "unknown"
+        else:
+            status, reason = (
+                "unknown",
+                reason + "; unknown is not zero"
+                if kind
+                in {
+                    "fallow_change",
+                    "coverage_change",
+                    "change",
+                    "loc",
+                    "loc_change",
+                    "review_findings",
+                }
+                or (kind == "coverage" and metrics)
+                else _text(evidence.get("reason"))
+                if evidence.get("reason")
+                else "measurement unavailable; unknown is not zero",
+            )
     else:
         status = "measured" if compatibility else "not comparable"
     change = _map(stage.get("change"))
-    code_size = _map(stage.get("code_size"))
-    source_change = (
-        code_size
-        if code_size.get("status") == "available"
-        else {}
-        if code_size.get("status") == "unavailable"
-        else change
-    )
-    test_size = _map(stage.get("test_code_size"))
-    test_change = (
-        test_size
-        if test_size.get("status") == "available"
-        else {}
-        if test_size.get("status") == "unavailable"
-        else change
-    )
-    change_provenance: dict[str, object] = {
-        "source": {
-            "status": code_size.get("status", "not configured"),
-            "scope": code_size.get("scope"),
-            "method": code_size.get("method")
-            if code_size.get("status") == "unavailable"
-            else code_size.get("method", "extension-classified LOC, including generated files"),
-            "reason": code_size.get("reason"),
-        },
-        "tests": {
-            "status": test_size.get("status", "not configured"),
-            "scope": test_size.get("scope"),
-            "method": test_size.get("method")
-            if test_size.get("status") == "unavailable"
-            else test_size.get(
-                "method", "extension-classified test LOC, including generated files"
-            ),
-            "reason": test_size.get("reason"),
-        },
-        "raw_extension_classified_counts": {
-            name: change.get(name)
-            for name in (
-                "source_lines_added",
-                "source_lines_removed",
-                "test_lines_added",
-                "test_lines_removed",
-            )
-        },
+    line_changes: dict[str, float | None] = {}
+    change_provenance: dict[str, object] = {}
+    for classification, size_field, section, default_method in (
+        ("source", "code_size", "source", "extension-classified LOC, including generated files"),
+        (
+            "test",
+            "test_code_size",
+            "tests",
+            "extension-classified test LOC, including generated files",
+        ),
+    ):
+        size = _map(stage.get(size_field))
+        size_status = size.get("status")
+        measured_change = (
+            size if size_status == "available" else {} if size_status == "unavailable" else change
+        )
+        for action in ("added", "removed"):
+            field = f"{classification}_lines_{action}"
+            line_changes[field] = _number(measured_change.get(field))
+        change_provenance[section] = {
+            "status": size.get("status", "not configured"),
+            "scope": size.get("scope"),
+            "method": size.get("method")
+            if size_status == "unavailable"
+            else size.get("method", default_method),
+            "reason": size.get("reason"),
+        }
+    change_provenance["raw_extension_classified_counts"] = {
+        name: change.get(name)
+        for name in (
+            "source_lines_added",
+            "source_lines_removed",
+            "test_lines_added",
+            "test_lines_removed",
+        )
     }
     return Observation(
-        _text(attempt.get("id")),
-        _text(attempt.get("task_id")),
-        _text(attempt.get("arm")),
-        _text(attempt.get("model")),
-        host,
-        settings["harness"],
-        settings["harness_version"],
-        settings["reasoning_effort"],
-        settings["requested_reasoning_effort"],
-        runtime_source,
-        role,
-        _text(stage.get("id")),
-        panel,
-        label,
-        value,
-        _text(_map(stage.get("correctness")).get("status")),
-        status,
-        reason,
-        compatibility,
-        _chart_provenance(provenance),
-        _text(stage.get("snapshot_digest")),
-        _text(attempt.get("before_digest")),
-        population,
-        _number(work.get("elapsed_seconds")),
-        _number(source_change.get("source_lines_added")),
-        _number(source_change.get("source_lines_removed")),
-        _number(test_change.get("test_lines_added")),
-        _number(test_change.get("test_lines_removed")),
-        change_provenance,
+        attempt_id=_text(attempt.get("id")),
+        task=_text(attempt.get("task_id")),
+        arm=_text(attempt.get("arm")),
+        model=_text(attempt.get("model")),
+        host=host,
+        harness=settings["harness"],
+        harness_version=settings["harness_version"],
+        reasoning_effort=settings["reasoning_effort"],
+        requested_reasoning_effort=settings["requested_reasoning_effort"],
+        runtime_source=runtime_source,
+        role=role,
+        stage=_text(stage.get("id")),
+        panel=panel,
+        metric=label,
+        value=value,
+        correctness=_text(_map(stage.get("correctness")).get("status")),
+        status=status,
+        reason=reason,
+        compatibility=compatibility,
+        provenance=_chart_provenance(provenance),
+        snapshot_digest=_text(stage.get("snapshot_digest")),
+        before_digest=_text(attempt.get("before_digest")),
+        per_test_count=population,
+        elapsed_seconds=_number(work.get("elapsed_seconds")),
+        source_lines_added=line_changes["source_lines_added"],
+        source_lines_removed=line_changes["source_lines_removed"],
+        test_lines_added=line_changes["test_lines_added"],
+        test_lines_removed=line_changes["test_lines_removed"],
+        change_loc_provenance=change_provenance,
     )
 
 
@@ -1050,34 +994,20 @@ def chart_data(report: dict[str, object]) -> dict[str, object]:
     if report.get("schema_version") != 1 or "snapshot_roots" not in report:
         raise ValueError("charts require a canonical version-1 assessment report")
     observations: list[Observation] = []
-    distinct_final = False
-    single_stage_attempts: list[str] = []
     attempts = _rows(report.get("attempts"))
     for attempt in attempts:
         stages = _rows(attempt.get("stages"))
         if not stages:
             raise ValueError("canonical attempt requires a handoff stage")
-        distinct_final |= attempt.get("handoff") != attempt.get("final")
-        if attempt.get("handoff") == attempt.get("final"):
-            single_stage_attempts.append(_text(attempt.get("id")))
-        for role, identifier in (
-            ("handoff", attempt.get("handoff")),
-            ("final", attempt.get("final")),
-        ):
-            if role == "final" and attempt.get("handoff") == attempt.get("final"):
-                continue
-            stage = next((row for row in stages if row.get("id") == identifier), None)
-            if stage is None:
-                raise ValueError("canonical stage identity is missing")
-            if role == "final":
-                final_index = stages.index(stage)
-                stage = {**stage, "work": _total_work(stages[: final_index + 1])}
-            observations.extend(
-                _observation(attempt, stage, role, spec)
-                for spec in METRICS
-                if spec[2] not in {"review_work", "review_findings"}
-                or report.get("independent_review")
-            )
+        if len(stages) != 1 or stages[0].get("id") != "handoff":
+            raise ValueError("canonical attempt requires exactly one handoff submission")
+        stage = stages[0]
+        role = "handoff"
+        observations.extend(
+            _observation(attempt, stage, role, spec)
+            for spec in METRICS
+            if spec[2] not in {"review_work", "review_findings"} or report.get("independent_review")
+        )
     groups: dict[tuple[str, str, str], list[Observation]] = {}
     raw_groups: dict[tuple[str, str, str], list[Observation]] = {}
     for row in observations:
@@ -1088,13 +1018,9 @@ def chart_data(report: dict[str, object]) -> dict[str, object]:
             if row.compatibility and row.arm != "unknown"
             else _fingerprint((row.task, row.metric, row.attempt_id))
         )
-        roles = [row.role]
-        if distinct_final and row.attempt_id in single_stage_attempts:
-            roles.append("final")
-        for role in roles:
-            raw_groups.setdefault((role, identity, row.arm), []).append(row)
-            if row.compatibility and row.arm != "unknown":
-                groups.setdefault((role, row.compatibility, row.arm), []).append(row)
+        raw_groups.setdefault((row.role, identity, row.arm), []).append(row)
+        if row.compatibility and row.arm != "unknown":
+            groups.setdefault((row.role, row.compatibility, row.arm), []).append(row)
     for row in observations:
         if row.compatibility and not groups.get((row.role, row.compatibility, "baseline")):
             row.status = "not comparable"
@@ -1156,10 +1082,7 @@ def chart_data(report: dict[str, object]) -> dict[str, object]:
             if report.get("independent_review")
         ],
         "limitations": report.get("limitations", []),
-        "assigned": len(_rows(report.get("attempts"))),
-        "distinct_final": distinct_final,
-        "single_stage_attempts": single_stage_attempts,
-        "outcomes": _outcomes(attempts),
+        "assigned": len(attempts),
         "metric_guide": {
             metric: {"title": title, "unit": unit, "explanation": explanation}
             for metric, (title, unit, explanation) in METRIC_GUIDE.items()
@@ -1178,7 +1101,7 @@ def _measurement_completeness(attempts: list[dict[str, object]]) -> list[dict[st
         for attempt in attempts
         if (
             isinstance(configured := attempt.get("configured_metrics"), list)
-            and any(kind in configured for kind in ("coverage", "fallow"))
+            and any(kind in configured for kind in ("coverage", "fallow", "analysis"))
         )
         or any(
             _map(evidence.get(kind)).get("metrics")
@@ -1186,80 +1109,77 @@ def _measurement_completeness(attempts: list[dict[str, object]]) -> list[dict[st
                 _map(attempt.get("before_metrics")),
                 *(_map(stage.get("metrics")) for stage in _rows(attempt.get("stages"))),
             )
-            for kind in ("coverage", "fallow")
+            for kind in ("coverage", "fallow", "analysis")
         )
     }
     rows = []
     for attempt in attempts:
         if attempt.get("task_id") not in measured_tasks:
             continue
-        for role in ("handoff", "final"):
-            stages = _rows(attempt.get("stages"))
-            stage = next(row for row in stages if row["id"] == attempt.get(role))
-            evidence = _map(stage.get("metrics"))
-            static = _map(_map(evidence.get("fallow")).get("metrics"))
-            coverage = _map(_map(evidence.get("coverage")).get("metrics"))
-            overlap = _map(coverage.get("test_contribution"))
-            comparison = _map(_map(stage.get("metric_comparison")).get("fallow"))
-            work = (
-                stage.get("work")
-                if role == "handoff"
-                else _total_work(stages[: stages.index(stage) + 1])
+        stages = _rows(attempt.get("stages"))
+        stage = stages[0]
+        evidence = _map(stage.get("metrics"))
+        static_kind = (
+            "analysis" if _map(evidence.get("analysis")).get("status") == "available" else "fallow"
+        )
+        static = _map(_map(evidence.get(static_kind)).get("metrics"))
+        coverage = _map(_map(evidence.get("coverage")).get("metrics"))
+        comparison = _map(_map(stage.get("metric_comparison")).get(static_kind))
+        work = stage.get("work")
+        tokens = _map(_map(work).get("tokens"))
+        coverage_units = [
+            unit
+            for unit in ("line", "statement", "branch", "function")
+            if any(
+                coverage.get(f"{unit}_{key}") is not None
+                for key in ("total", "covered", "percent", "denominator_digest")
             )
-            tokens = _map(_map(work).get("tokens"))
-            captured = {
-                "Input/output tokens": all(
-                    _number(tokens.get(key)) is not None
-                    for key in ("input_tokens", "output_tokens")
-                ),
-                "Source/test lines added/removed": all(
-                    _map(stage.get(key)).get("status") == "available"
-                    and all(
-                        _number(_map(stage.get(key)).get(f"{kind}_lines_{side}")) is not None
-                        for side in ("added", "removed")
-                    )
-                    for key, kind in (("code_size", "source"), ("test_code_size", "test"))
-                ),
-                "Complexity population": static.get("complexity_complete_for_declared_scope")
-                is True
-                and _number(static.get("function_count_reported")) is not None,
-                "Coverage covered/total counts": coverage.get(
-                    "population_complete_for_declared_scope"
+        ]
+        captured = {
+            "Input/output tokens": all(
+                _number(tokens.get(key)) is not None for key in ("input_tokens", "output_tokens")
+            ),
+            "Source/test lines added/removed": all(
+                _map(stage.get(key)).get("status") == "available"
+                and all(
+                    _number(_map(stage.get(key)).get(f"{kind}_lines_{side}")) is not None
+                    for side in ("added", "removed")
+                )
+                for key, kind in (("code_size", "source"), ("test_code_size", "test"))
+            ),
+            "Complexity population": static.get("complexity_complete_for_declared_scope") is True
+            and _number(static.get("function_count_reported")) is not None,
+            "Coverage covered/total counts": bool(coverage_units)
+            and all(
+                coverage.get(
+                    f"{unit}_population_complete",
+                    coverage.get("population_complete_for_declared_scope"),
                 )
                 is True
                 and all(
-                    _number(coverage.get(key)) is not None
-                    for key in (
-                        "branch_total",
-                        "branch_covered",
-                        "function_total",
-                        "function_covered",
-                    )
-                ),
-                "Introduced dead findings": _map(comparison.get("dead_findings")).get("status")
-                == "available"
-                and _number(_map(comparison.get("dead_findings")).get("introduced_count"))
-                is not None,
-                "Introduced clone groups": _map(comparison.get("clone_findings")).get("status")
-                == "available"
-                and _number(_map(comparison.get("clone_findings")).get("introduced_count"))
-                is not None,
-                "Test-overlap candidate counts": overlap.get("status") == "available"
-                and _number(overlap.get("candidate_count")) is not None
-                and overlap.get("tested_count") == overlap.get("candidate_count")
-                and _number(overlap.get("zero_marginal_count")) is not None,
+                    _number(coverage.get(f"{unit}_{key}")) is not None
+                    for key in ("total", "covered")
+                )
+                for unit in coverage_units
+            ),
+            "Introduced dead findings": _map(comparison.get("dead_findings")).get("status")
+            == "available"
+            and _number(_map(comparison.get("dead_findings")).get("introduced_count")) is not None,
+            "Introduced clone groups": _map(comparison.get("clone_findings")).get("status")
+            == "available"
+            and _number(_map(comparison.get("clone_findings")).get("introduced_count")) is not None,
+        }
+        rows.append(
+            {
+                "attempt_id": attempt["id"],
+                "task": attempt["task_id"],
+                "arm": attempt.get("arm"),
+                "role": "handoff",
+                **_assigned_runtime(attempt),
+                "counts": captured,
+                "complete": all(captured.values()),
             }
-            rows.append(
-                {
-                    "attempt_id": attempt["id"],
-                    "task": attempt["task_id"],
-                    "arm": attempt.get("arm"),
-                    "role": role,
-                    **_assigned_runtime(attempt),
-                    "counts": captured,
-                    "complete": all(captured.values()),
-                }
-            )
+        )
     return rows
 
 
@@ -1276,10 +1196,6 @@ def _csv_cell(value: object) -> str:
         if text.lstrip().startswith(("=", "+", "-", "@")) or text.startswith(("\t", "\r", "\n"))
         else text
     )
-
-
-def chart_artifacts(report: dict[str, object]) -> tuple[str, str]:
-    return chart_artifacts_from_data(chart_data(report))
 
 
 def chart_artifacts_from_data(data: dict[str, object]) -> tuple[str, str]:
@@ -1307,7 +1223,3 @@ def chart_artifacts_from_data(data: dict[str, object]) -> tuple[str, str]:
     for row in rows:
         writer.writerow([_csv_cell(row.get(key)) for key in fields])
     return html, stream.getvalue()
-
-
-def chart_paths(out_dir: Path) -> tuple[Path, Path]:
-    return out_dir / "assessment-charts.html", out_dir / "assessment-charts.csv"
