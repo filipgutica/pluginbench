@@ -311,6 +311,37 @@ def test_arbitrary_model_patch_verifier_has_no_production_admission(tmp_path: Pa
 
 
 @pytest.mark.parametrize(
+    ("service_line", "admitted"),
+    [("", True), ('service = "main"\n', True), ('service = "sidecar"\n', False)],
+)
+def test_collection_without_service_runs_in_main(
+    service_line: str, admitted: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = "a" * 40
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    for name in ("test.sh", "test.patch", "grader.py"):
+        (tests / name).write_text(name + "\n")
+    (tests / "config.json").write_text(json.dumps({"base_commit": base}))
+    # Upstream DeepSWE tasks omit the service; Harbor defaults it to main.
+    (tmp_path / "task.toml").write_text(
+        'artifacts = ["/logs/artifacts/model.patch"]\n'
+        '[verifier]\nnetwork_mode = "no-network"\nenvironment_mode = "separate"\n'
+        "[[verifier.collect]]\n"
+        'command = "cd /app && mkdir -p /logs/artifacts && git config --global --add '
+        f'safe.directory /app && git diff --binary {base} HEAD > /logs/artifacts/model.patch"\n'
+        f"{service_line}timeout_sec = 300.0\n"
+    )
+    monkeypatch.setattr(submissions, "_REVIEWED_TESTS", {native_task_assets(tests): base})
+    monkeypatch.setattr(submissions, "_GRADER_SHA256", hashlib.sha256(b"grader.py\n").hexdigest())
+    if admitted:
+        assert submissions.reviewed_contract(tmp_path)["base_commit"] == base
+    else:
+        with pytest.raises(ValueError, match="collection or environment changed"):
+            submissions.reviewed_contract(tmp_path)
+
+
+@pytest.mark.parametrize(
     "task_name",
     [
         "true-myth-iterable-collection-combinators",
