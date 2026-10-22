@@ -32,6 +32,9 @@ _REVIEWED_TESTS = {
     "9caf86b1898a4e1f9077e7ea9ed7f7e46c16bec89526916cf56a1d50187acfb5": "88e3d965c0b1628642a30a841745b410d6835052",
     "0eaf29b862c00fe04c8d5f76b63297fd15e8193da13b548f9a68e57b8ccf276d": "a691069fcadf9131e5f7a5a130a022dc678f3e1d",
     "5712990cdc674f4a167fc86ac9104daa7070cadbd051eeb329589a0fa1b174db": "c981f9c7aa91b83cc9bd33a09ecee9e751b06e8d",
+    # happy-dom-abort-pending-body-reads and testem-per-launcher-reports at DeepSWE 0b9fabbb.
+    "9d5f5c01aeb6935be963a7858beeacc97f231b92ccd34925a94ba5a46454673c": "82a0888cb2c87a6123e05424b528f8e8c9b3e426",
+    "eda69e4b08e0976c74e59f4556e97ac0721b0ff0e154f58b6c3ec20b52249f10": "158f61ea91c9613d2011c41ee9be40ada1d7a307",
 }
 PATCH_ARTIFACT = "logs/artifacts/model.patch"
 
@@ -111,11 +114,15 @@ def reviewed_contract(task_dir: Path) -> dict[str, object]:
             "timeout_sec": 300.0,
         }
     ]
+    collect = verifier.get("collect")
+    if isinstance(collect, list) and all(isinstance(entry, dict) for entry in collect):
+        # Harbor runs a collect command in the main service when the task names none.
+        collect = [{"service": "main", **entry} for entry in collect]
     if (
         task.get("artifacts") != ["/logs/artifacts/model.patch"]
         or verifier.get("environment_mode") != "separate"
         or verifier.get("network_mode") != "no-network"
-        or verifier.get("collect") != collection
+        or collect != collection
         or verifier.get("env", {}) != {}
         or verifier.get("environment", {}).get("env", {}) != {}
     ):
