@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -60,6 +61,34 @@ def pick(
 def _error(exc: Exception) -> None:
     typer.echo(f"Error: {exc}", err=True)
     raise typer.Exit(2)
+
+
+def _notify(message: str) -> None:
+    """Best-effort macOS notification; a failed notice never fails the run."""
+    text = json.dumps(message, ensure_ascii=False)
+    try:
+        subprocess.run(
+            ["osascript", "-e", f'display notification {text} with title "PluginBench"'],
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _notifying_progress(attempts: object) -> Callable[[str], None]:
+    started = False
+
+    def progress(message: str) -> None:
+        nonlocal started
+        typer.echo(message)
+        # The first coding attempt starts only after preparation and readiness checks pass.
+        if not started and message.startswith("Coding "):
+            started = True
+            _notify(f"Setup passed; {attempts} coding attempts started.")
+
+    return progress
 
 
 @app.callback()
@@ -132,6 +161,11 @@ def run(
     ),
     output: Path | None = typer.Option(None, "--output", help="New run directory."),
     yes: bool = typer.Option(False, "--yes", help="Start without confirmation."),
+    notify: bool = typer.Option(
+        False,
+        "--notify",
+        help="Send macOS notifications when coding starts and when the run finishes or fails.",
+    ),
 ) -> None:
     """Run vanilla and native treatments, selected measurements, and fixed reviews."""
     try:
@@ -219,13 +253,23 @@ def run(
         )
         if not yes and not typer.confirm("Start evaluation?"):
             raise typer.Exit()
-        if resume:
-            root = resume_evaluation(resume, progress=typer.echo)
-        else:
-            if evaluation is None:
-                raise ValueError("missing evaluation settings")
-            destination = output or Path("runs") / datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-            root = run_evaluation(evaluation, destination, progress=typer.echo)
+        progress = _notifying_progress(plan["coding_calls"]) if notify else typer.echo
+        try:
+            if resume:
+                root = resume_evaluation(resume, progress=progress)
+            else:
+                if evaluation is None:
+                    raise ValueError("missing evaluation settings")
+                destination = output or Path("runs") / datetime.now(UTC).strftime(
+                    "%Y%m%dT%H%M%S%fZ"
+                )
+                root = run_evaluation(evaluation, destination, progress=progress)
+        except BaseException as exc:
+            if notify:
+                _notify(f"Run failed: {str(exc) or type(exc).__name__}")
+            raise
+        if notify:
+            _notify(f"Run finished. Report: {root / 'report/report.html'}")
         typer.echo(f"Report: {root / 'report/report.html'}")
         typer.echo(f"Graphable data: {root / 'report/results.json'}")
     except (OSError, ValueError, yaml.YAMLError, subprocess.SubprocessError) as exc:

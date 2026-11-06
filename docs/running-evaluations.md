@@ -147,6 +147,14 @@ pluginbench run --resume runs/<run>
 
 Resume completes pending measurements or starts a review phase that has not begun. Interrupted coding or started review phases require a fresh evaluation. Existing model calls are never replayed. Offline citation recovery can fix formatting only when the exact source supports it.
 
+To start a run and walk away, detach it and turn on notifications:
+
+```sh
+nohup pluginbench run --config evaluation.yaml --yes --notify > run.log 2>&1 &
+```
+
+On macOS, `--notify` reports when preparation and readiness checks pass and coding starts, and when the run finishes or fails. A readiness failure therefore arrives before any model call. Notifications are best effort and never change the run's outcome.
+
 Use exact model IDs. Harbor does not support `ultra` reasoning. Requested effort is separate from effective effort when native evidence cannot verify it. Claude remains available for review configuration; new native treatment coding is qualified for Codex only.
 
 ## Development
