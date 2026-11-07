@@ -9,7 +9,6 @@
 //
 // Each test's sample is converted with c8's own v8-to-istanbul. Any problem leaves no sidecar, so
 // redundancy stays unknown; the hook never fails a test or changes which tests run.
-import { createHash } from "node:crypto";
 import { Session } from "node:inspector/promises";
 import { readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -20,34 +19,12 @@ async function hooks(output) {
   const session = new Session();
   const sources = new Map();
   const tests = {};
-  let titleCounts;
   let failure;
   let activeTest;
   let v8toIstanbul;
 
   const fail = (error) => {
     failure ??= String(error?.stack ?? error);
-  };
-  const titleOf = (test) => `${relative(process.cwd(), test.file)}::${test.fullTitle()}`;
-  const countTitles = (suite, counts) => {
-    for (const test of suite.tests) counts.set(titleOf(test), (counts.get(titleOf(test)) ?? 0) + 1);
-    for (const child of suite.suites) countTitles(child, counts);
-    return counts;
-  };
-  // A unique title is the identity. Tests that share a title are told apart by a hash of their own
-  // function source, so adding one does not rename another; run order numbers only identical bodies.
-  const identityOf = (test) => {
-    if (titleCounts === undefined) {
-      let root = test.parent;
-      while (root.parent) root = root.parent;
-      titleCounts = countTitles(root, new Map());
-    }
-    const title = titleOf(test);
-    if (titleCounts.get(title) === 1) return title;
-    const hashed = `${title} #${createHash("sha256").update(String(test.fn)).digest("hex").slice(0, 8)}`;
-    let name = hashed;
-    for (let seen = 2; Object.hasOwn(tests, name); seen += 1) name = `${hashed}-${seen}`;
-    return name;
   };
   const executedLines = async ({ url, functions }) => {
     const path = fileURLToPath(url);
@@ -88,8 +65,7 @@ async function hooks(output) {
     async beforeEach() {
       try {
         if (activeTest !== undefined) throw new Error("overlapping tests share coverage counters");
-        activeTest = identityOf(this.currentTest);
-        if (Object.hasOwn(tests, activeTest)) throw new Error(`duplicate test identity: ${activeTest}`);
+        activeTest = `${relative(process.cwd(), this.currentTest.file)}::${this.currentTest.fullTitle()}`;
         // Taking coverage resets the counters, so the test's own sample starts here.
         await session.post("Profiler.takePreciseCoverage");
       } catch (error) {
@@ -99,15 +75,17 @@ async function hooks(output) {
     async afterEach() {
       try {
         const { result } = await session.post("Profiler.takePreciseCoverage");
-        const files = {};
+        // Tests that share a title are one test, as parametrized cases share one coverage.py
+        // context, so a repeated title adds its lines to the earlier test's.
+        const files = (tests[activeTest] ??= {});
         for (const script of result) {
           // c8 excludes node: internals and node_modules; finalize drops anything else LCOV lacks.
           if (!script.url.startsWith("file:") || script.url.includes("/node_modules/")) continue;
           if (!script.functions.some(({ ranges }) => ranges.some(({ count }) => count > 0))) continue;
           const lines = await executedLines(script);
-          if (lines.length) files[fileURLToPath(script.url)] = lines;
+          const path = fileURLToPath(script.url);
+          if (lines.length) files[path] = [...new Set([...(files[path] ?? []), ...lines])];
         }
-        tests[activeTest] = files;
       } catch (error) {
         fail(error);
       } finally {

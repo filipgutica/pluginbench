@@ -72,9 +72,14 @@ export default {
               if (!this.options.experimentalAstAwareRemapping) {
                 throw new Error("per-test lines need --coverage.experimentalAstAwareRemapping=true");
               }
+              // Tests that share a title are one test, as parametrized cases share one coverage.py
+              // context, so a repeated title adds its lines to the earlier test's.
               for (const { name, result } of samples) {
-                if (Object.hasOwn(tests, name)) throw new Error(`duplicate test identity: ${name}`);
-                tests[name] = await this.executedLines(result, project, transformMode);
+                const files = (tests[name] ??= {});
+                const executed = await this.executedLines(result, project, transformMode);
+                for (const [path, lines] of Object.entries(executed)) {
+                  files[path] = [...new Set([...(files[path] ?? []), ...lines])];
+                }
               }
             } catch (error) {
               failure ??= String(error?.stack ?? error);

@@ -4,7 +4,6 @@ Mocha and c8 are not installed here, so a driver calls the hooks with `this.curr
 does, and a stand-in v8-to-istanbul applies its line rule. The task-image run covers the real tools.
 """
 
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -97,7 +96,7 @@ hooks.afterAll?.();
 TESTS = [
     ("suite positive", "positive"),
     ("suite positive #2", "negative"),
-    ("suite positive", "positive"),
+    ("suite positive", "both"),
     ("suite nothing", "nothing"),
 ]
 
@@ -161,13 +160,22 @@ def run_hook(
 pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="the hook requires Node")
 
 
-def test_hook_attributes_each_tests_lines_and_keeps_identities_unique(tmp_path: Path) -> None:
+def test_hook_attributes_each_tests_lines_and_merges_repeated_titles(tmp_path: Path) -> None:
     project, report, _ = run_hook(tmp_path)
-    body = hashlib.sha256(b"() => positive()").hexdigest()[:8]
     # Sorted keys make repeated runs byte-identical whatever order tests reported in.
     raw = json.loads(report.with_name("lcov.info.per-test.json").read_text())["per_test_numbits"]
     assert list(raw) == sorted(raw)
     assert all(list(names) == sorted(names) for names in raw.values())
+    assert per_test_lines(project, report) == {
+        # Tests that share a title are one test with the union of their lines; a real "#2"
+        # title is a different test.
+        "test/a.spec.js::suite positive": {2, 3, 5, 6},
+        "test/a.spec.js::suite positive #2": {5, 6},
+        "test/a.spec.js::suite nothing": set(),
+    }
+
+
+def per_test_lines(project: Path, report: Path) -> dict[str, set[int]]:
     parsed = parse_lcov(
         report,
         snapshot=project,
@@ -175,25 +183,29 @@ def test_hook_attributes_each_tests_lines_and_keeps_identities_unique(tmp_path: 
         test_scope=["test/**"],
         workdir=str(project),
     )
-    assert {
+    return {
         name: {line for bits in files.values() for line in numbits_to_lines(bits)}
         for name, files in parsed["per_test_numbits"].items()
-    } == {
-        # Repeated titles carry a hash of the test's function source; identical bodies are then
-        # numbered in run order. Unique titles, including a real "#2", stay bare.
-        f"test/a.spec.js::suite positive #{body}": {2, 3},
-        f"test/a.spec.js::suite positive #{body}-2": {2, 3},
-        "test/a.spec.js::suite positive #2": {5, 6},
-        "test/a.spec.js::suite nothing": set(),
     }
 
 
-def test_inserting_a_same_title_test_flags_the_new_test_not_the_old_one(tmp_path: Path) -> None:
-    """A new test that reuses an existing title must not take over the existing test's identity."""
+@pytest.mark.parametrize(
+    ("existing", "added"),
+    [
+        # The new test reaches more than the existing test with its title.
+        ("positive", "both"),
+        # The new test reaches less than the existing test with its title.
+        ("both", "positive"),
+    ],
+)
+def test_a_same_title_test_joins_the_existing_test(
+    tmp_path: Path, existing: str, added: str
+) -> None:
+    """A new test that reuses an existing title neither renames that test nor counts as added."""
     measured = []
     for name, tests in {
-        "before": [("suite check", "both")],
-        "after": [("suite check", "positive"), ("suite check", "both")],
+        "before": [("suite check", existing)],
+        "after": [("suite check", added), ("suite check", existing)],
     }.items():
         project, report, _ = run_hook(tmp_path / name, tests=tests)
         parsed = parse_lcov(
@@ -210,15 +222,8 @@ def test_inserting_a_same_title_test_flags_the_new_test_not_the_old_one(tmp_path
         (tmp_path / name / "lib/subject.js").write_text(source)
     change = assessment_metrics.compare_snapshots(tmp_path / "old", tmp_path / "new")
     changed = assessment_metrics._changed_line_coverage(*measured, change)
-    inserted = next(
-        name
-        for name, files in parsed["per_test_numbits"].items()
-        if {line for bits in files.values() for line in numbits_to_lines(bits)} == {2, 3}
-    )
-    # The inserted test reaches only lines the existing test also reaches, so it alone is
-    # redundant. The existing test is renamed too (bare title to hashed), so it also counts as added.
-    assert changed["redundant_added_test_names"] == [inserted]
-    assert changed["added_tests"] == 2
+    assert changed["added_tests"] == 0
+    assert changed["redundant_added_tests"] == 0
 
 
 @pytest.mark.parametrize(

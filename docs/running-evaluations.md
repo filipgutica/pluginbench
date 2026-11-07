@@ -132,7 +132,9 @@ form and uses the same redundancy calculation. Named tests with empty bitsets
 are retained; the empty context name is ignored.
 
 The producer must record all measured test cases, including cases that reach no
-source lines, and use stable, unique identities across snapshots. Use the
+source lines, and use stable, unique identities across snapshots. The coverage profiles
+merge tests that share a file and full title into one test, as coverage.py does for
+parametrized cases, so a same-title copy of a test is not detected as redundant. Use the
 report's original-source line population. Generate both reports from the same
 run when per-test sampling leaves the report unchanged. V8 inspector coverage
 cannot: its counter resets are isolate-wide, so sampling inside c8 or Vitest's
