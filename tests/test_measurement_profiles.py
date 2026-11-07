@@ -173,6 +173,21 @@ def test_fallow_extends_is_not_resolved_from_agent_source(
         )
 
 
+def test_fallow_version_ignores_the_npm_launcher_status_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    native = task(tmp_path, "typescript")
+    monkeypatch.setattr(shutil, "which", lambda _: "/tool")
+    monkeypatch.setattr(
+        subprocess,
+        "check_output",
+        lambda *args, **kwargs: "fallow 3.18.0\nverified: yes (cache hit at /x); fallow 3.18.0 signed\n",
+    )
+    result = capability_plan(native, ["cognitive"], MeasurementSettings())
+    assert result["cognitive"]["status"] == "available"
+    assert result["cognitive"]["tool_version"] == "3.18.0"
+
+
 @pytest.mark.parametrize("version", ["fallow 3.19.0", "fallow 3.18.0"])
 def test_fallow_version_capability_is_measured_once_and_does_not_block_task(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
