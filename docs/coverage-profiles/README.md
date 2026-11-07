@@ -84,7 +84,10 @@ image, a never-called function added to `src/unit.ts` reported its lines as
 executed. 889 of 1,114 LCOV lines had exactly one hit. Per-test lines from that
 pipeline were nearly file-level: every test that touched `src/maybe.ts`
 received 215 of its 223 lines. With AST-aware remapping, the uncalled lines
-report zero hits, and the report has 438 statement lines with real counts.
+report zero hits. On the starting repository, the report has 436 statement
+lines with real counts instead of 1,114 lines, 159 branches instead of 277, and
+103 functions instead of 50. A function header or an `if` line can leave the
+line population; it stays covered by the statements inside it.
 
 The provider and setup file depend on Vitest 3.2 internals:
 `readCoverageFiles`, `convertCoverage`, the worker `takeCoverage` options, and
@@ -97,5 +100,8 @@ Limits beyond the Mocha ones:
   between runs, and run 2 can execute a line that run 1 did not, which leaves
   that snapshot's redundancy unknown. All other tests recorded identical lines
   in repeated runs.
+- Readiness probes compare whole coverage metrics, including per-test lines,
+  across two runs. The random tests make true-myth fail that comparison, so
+  `measurement_settings.require_ready: true` stops before coding.
 - `test.concurrent` and other overlapping tests leave no sidecar.
 - Typecheck-only tests have no runtime sample and are not recorded.
