@@ -153,7 +153,9 @@ def stop(root: Path) -> dict[str, object] | None:
     except ProcessLookupError:
         matches = False
     if not matches:
-        raise ValueError(f"run.lock owner {pid} no longer matches its recorded process; nothing signalled")
+        raise ValueError(
+            f"run.lock owner {pid} no longer matches its recorded process; nothing signalled"
+        )
     if pgid == os.getpgrp():
         raise ValueError("refusing to signal this command's own process group")
     os.killpg(pgid, signal.SIGTERM)

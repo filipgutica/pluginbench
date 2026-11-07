@@ -434,7 +434,9 @@ def check(
 
 
 @app.command("stop")
-def stop(run: Path = typer.Argument(..., help="A run directory started by `pluginbench run`.")) -> None:
+def stop(
+    run: Path = typer.Argument(..., help="A run directory started by `pluginbench run`."),
+) -> None:
     """Stop a run: SIGTERM only the process group its run.lock records; nothing else."""
     try:
         owner = run_lock.stop(run)

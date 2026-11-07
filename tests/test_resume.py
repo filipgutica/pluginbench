@@ -210,6 +210,9 @@ def test_work_finished_while_a_stop_drains_is_kept_with_interrupted_usage(
     stopped, drained = calls
     assert states[stopped] == "interrupted"
     assert states[drained] == "complete"
+    ledger = Ledger.open(root / "ledger.sqlite")
+    assert {row["id"]: row["state"] for row in ledger.attempts()} == states
+    ledger.close()
 
     calls.clear()
     monkeypatch.setattr(parallel, "Event", Event)  # The captured event is already set.

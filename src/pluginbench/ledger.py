@@ -56,7 +56,9 @@ class Ledger:
         self._db = connection
 
     @classmethod
-    def create(cls, path: Path, entries: Iterable[dict[str, Any]], states: dict[str, str]) -> Ledger:
+    def create(
+        cls, path: Path, entries: Iterable[dict[str, Any]], states: dict[str, str]
+    ) -> Ledger:
         """A new ledger with one row per plan entry, in plan (slot) order."""
         if path.exists():
             raise ValueError(f"ledger already exists: {path}")
@@ -68,8 +70,15 @@ class Ledger:
                 "INSERT INTO attempts (id, slot, task_id, arm, repeat, state, updated_at)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 [
-                    (entry["id"], slot, entry["task_id"], entry["arm"], entry["attempt"],
-                     states[entry["id"]], _now())
+                    (
+                        entry["id"],
+                        slot,
+                        entry["task_id"],
+                        entry["arm"],
+                        entry["attempt"],
+                        states[entry["id"]],
+                        _now(),
+                    )
                     for slot, entry in enumerate(entries)
                 ],
             )
@@ -144,8 +153,14 @@ class Ledger:
             self._db.execute(
                 "INSERT INTO attempts (id, slot, task_id, arm, repeat, state, updated_at)"
                 " VALUES (?, ?, ?, ?, ?, 'pending', ?)",
-                (replacement["id"], row[0], replacement["task_id"], replacement["arm"],
-                 replacement["attempt"], _now()),
+                (
+                    replacement["id"],
+                    row[0],
+                    replacement["task_id"],
+                    replacement["arm"],
+                    replacement["attempt"],
+                    _now(),
+                ),
             )
 
     def attempts(self) -> list[dict[str, Any]]:

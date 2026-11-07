@@ -85,20 +85,38 @@ def test_stop_refuses_an_owner_whose_start_time_differs(tmp_path: Path) -> None:
         _cleanup(child)
 
 
+# Owns a lock and asks `stop` to signal it. It leads its own session, so even a broken guard
+# could only signal this child, never the test's group.
+_SELF_STOP = """
+import sys
+from pathlib import Path
+from pluginbench import run_lock
+root = Path(sys.argv[1])
+with run_lock.hold(root):
+    try:
+        run_lock.stop(root)
+    except ValueError as exc:
+        print(exc)
+"""
+
+
 def test_stop_never_signals_a_dead_owner_or_its_own_group(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="never started"):
         run_lock.stop(tmp_path)
-    dead = tmp_path / "dead"
-    dead.mkdir()
-    child = _holder(dead)
+    child = _holder(tmp_path)
     child.kill()
     child.wait(timeout=5)
-    assert run_lock.stop(dead) is None
-    own = tmp_path / "own"
-    own.mkdir()
-    with run_lock.hold(own):
-        with pytest.raises(ValueError, match="own process group"):
-            run_lock.stop(own)
+    assert run_lock.stop(tmp_path) is None
+    own = subprocess.run(
+        [sys.executable, "-c", _SELF_STOP, str(tmp_path)],
+        env={**os.environ, "PYTHONPATH": _SOURCE},
+        start_new_session=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert own.returncode == 0, own.stderr
+    assert "refusing to signal this command's own process group" in own.stdout
 
 
 def test_second_owner_and_moved_root_are_refused(tmp_path: Path) -> None:

@@ -926,7 +926,9 @@ def _discard(root: Path, slot: int, entry: dict[str, Any], replacement: str) -> 
     )
 
 
-def _reconcile(root: Path, run: dict[str, Any], ledger: Ledger) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+def _reconcile(
+    root: Path, run: dict[str, Any], ledger: Ledger
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
     """Plan, records and states for the next coding pass; never discards finished work.
 
     - complete, or a record receipt on disk: kept as complete.
@@ -940,7 +942,9 @@ def _reconcile(root: Path, run: dict[str, Any], ledger: Ledger) -> tuple[dict[st
     plan = _bound_document(root, run["plan"])
     checkpoint = _bound_document(root, run["assessment_input"])
     saved = {record["id"]: record for record in checkpoint["records"]}
-    live = {row["slot"]: row for row in ledger.attempts() if row["state"] != "discarded-interrupted"}
+    live = {
+        row["slot"]: row for row in ledger.attempts() if row["state"] != "discarded-interrupted"
+    }
     if sorted(live) != list(range(len(plan["entries"]))):
         raise ValueError("ledger slots differ from the saved study plan")
     records = []
@@ -954,16 +958,18 @@ def _reconcile(root: Path, run: dict[str, Any], ledger: Ledger) -> tuple[dict[st
                 record = _bound_document(root, row["record"])
             elif receipt.is_file():
                 record = json.loads(receipt.read_text())
-                ledger.complete(entry["id"], _reference(root, receipt), [stage["id"] for stage in record["stages"]])
+                stages = [stage["id"] for stage in record["stages"]]
+                ledger.complete(entry["id"], _reference(root, receipt), stages)
             else:
-                record = saved[entry["id"]]  # Older runs kept records only in assessment-input.json.
+                # Older runs kept records only in assessment-input.json.
+                record = saved[entry["id"]]
             records.append(record)
             states[entry["id"]] = "complete"
         elif not list((root / "invocations" / entry["id"]).glob("*.json")):
             if row["state"] != "pending":
-                for leftover in (root / "attempts" / entry["id"], root / "baseline-evidence" / entry["id"]):
-                    if leftover.exists():
-                        shutil.rmtree(leftover)
+                for leftover in ("attempts", "baseline-evidence"):
+                    if (root / leftover / entry["id"]).exists():
+                        shutil.rmtree(root / leftover / entry["id"])
                 ledger.set_state(entry["id"], "pending")
             records.append(_pending_record(entry))
             states[entry["id"]] = "pending"
@@ -1254,7 +1260,11 @@ def _run_attempts(
                 )
 
         run_jobs(
-            [index for index, entry in enumerate(plan["entries"]) if states[entry["id"]] != "complete"],
+            [
+                index
+                for index, entry in enumerate(plan["entries"])
+                if states[entry["id"]] != "complete"
+            ],
             jobs=frozen.recipe.jobs,
             operation=attempt,
             on_submit=submitted,
@@ -1266,7 +1276,6 @@ def _run_attempts(
         for attempt_id, state in states.items():
             if state == "running":
                 states[attempt_id] = "interrupted"
-                ledger.set_state(attempt_id, "interrupted")
         for record in records:
             observed = []
             for stage in record["stages"]:

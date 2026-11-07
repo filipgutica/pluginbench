@@ -445,7 +445,8 @@ class BaselineCache:
                 try:
                     # Exclusive while this run may still publish a missing repeat.
                     complete = all(path.exists() for path in cached.values())
-                    fcntl.flock(lock, (fcntl.LOCK_SH if complete else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+                    mode = fcntl.LOCK_SH if complete else fcntl.LOCK_EX
+                    fcntl.flock(lock, mode | fcntl.LOCK_NB)
                 except BlockingIOError as exc:
                     raise ValueError(
                         f"baseline cache cohort is in use: {key}; wait for its owning run to finish"

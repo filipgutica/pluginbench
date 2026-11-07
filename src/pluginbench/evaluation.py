@@ -693,7 +693,9 @@ def check_evaluation(
 def run_evaluation(
     config: Evaluation, output: Path, *, progress: Callable[[str], None] | None = None
 ) -> Path:
-    return resume_evaluation(prepare_evaluation(config, output, progress=progress), progress=progress)
+    return resume_evaluation(
+        prepare_evaluation(config, output, progress=progress), progress=progress
+    )
 
 
 def prepare_evaluation(
@@ -763,7 +765,10 @@ def prepare_evaluation(
         prepared / _PROFILES,
         {
             task: [
-                {**collector.model_dump(mode="json"), "config": str(collector.config.relative_to(prepared))}
+                {
+                    **collector.model_dump(mode="json"),
+                    "config": str(collector.config.relative_to(prepared)),
+                }
                 for collector in collectors
             ]
             for task, collectors in profiles.items()
@@ -802,19 +807,25 @@ def _code(
     identity_path = root / "inputs/vanilla-identity.json"
     # Runs prepared before vanilla identities were saved resume without the vanilla cache.
     identity = _object(json.loads(identity_path.read_text())) if identity_path.is_file() else None
-    if (evidence / "run.json").is_file():
+    resuming = (evidence / "run.json").is_file()
+    if resuming and _coding_left(root, selection):
         version = _harness_version(config.runner.harness)
         if version != recipe["harness_version"]:
             raise ValueError(
                 f"{config.runner.harness} CLI is {version}, but this run codes with "
                 f"{recipe['harness_version']}; install that version to resume it"
             )
-        if identity is not None and identity["launcher_sha256"] != _launcher_sha256(
-            config.runner.harness
-        ):
-            identity = None
-            if progress:
-                progress("Launcher code changed since this run started; new vanilla attempts are not cached")
+    if (
+        resuming
+        and identity
+        and identity["launcher_sha256"] != _launcher_sha256(config.runner.harness)
+    ):
+        identity = None
+        if progress:
+            progress(
+                "Launcher code changed since this run started; new vanilla attempts are not cached"
+            )
+    if resuming:
         resume_study(
             evidence,
             progress=progress,
@@ -1046,6 +1057,11 @@ def _assigned(selection: dict[str, object]) -> int:
     return len(config.tasks.task_ids) * config.repeats * (len(config.treatments) + 1)
 
 
+def _coding_done(root: Path) -> bool:
+    run = root / "evidence/run.json"
+    return run.is_file() and json.loads(run.read_text())["status"] == "complete"
+
+
 def _coding_left(root: Path, selection: dict[str, object]) -> int:
     """Coding calls a resume makes: one per slot without a complete attempt."""
     run = root / "evidence/run.json"
@@ -1058,12 +1074,11 @@ def _coding_left(root: Path, selection: dict[str, object]) -> int:
 def plan_resume(root: Path) -> dict[str, object]:
     root = root.expanduser().absolute()
     selection = _load_selection(root)
-    coding = _coding_left(root, selection)
-    if coding:
+    if not _coding_done(root):
         reviewer = selection.get("reviewer")
         return {
             "name": selection["name"],
-            "coding_calls": coding,
+            "coding_calls": _coding_left(root, selection),
             # At most one review per assigned attempt; only submitted attempts are reviewed.
             "review_calls": _assigned(selection) if reviewer else 0,
             "collect_measurements": bool(selection["measurement_required"]),
@@ -1090,7 +1105,7 @@ def resume_evaluation(
     """Run whatever a prepared evaluation has left: coding, then measurement and reviews."""
     root = root.expanduser().absolute()
     selection = _load_selection(root)
-    if _coding_left(root, selection) or not (root / "evidence/run.json").is_file():
+    if not _coding_done(root):
         _code(root, selection, progress=progress, guard=guard)
     if guard:
         guard()

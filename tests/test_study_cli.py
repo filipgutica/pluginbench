@@ -1470,9 +1470,10 @@ def _coding_and_review_backend(
     return invoke
 
 
-def test_run_on_a_stopped_run_codes_only_unfinished_slots_then_measures_and_reviews(
+def _measured_and_reviewed(
     config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+) -> evaluation.Evaluation:
+    """One task, coverage and a Codex reviewer, one job, with offline preparation."""
     from pluginbench.measurement_profiles import CoverageSettings
 
     standards = tmp_path / "review-standards.md"
@@ -1491,6 +1492,13 @@ def test_run_on_a_stopped_run_codes_only_unfinished_slots_then_measures_and_revi
     monkeypatch.setattr(codex, "runtime_environment", lambda *args, **kwargs: ({}, ()))
     monkeypatch.setattr(harbor_backend, "prepare_native_task", _prepare_fixture_task)
     monkeypatch.setattr(harbor_backend, "run_native_command", _lcov)
+    return config
+
+
+def test_run_on_a_stopped_run_codes_only_unfinished_slots_then_measures_and_reviews(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _measured_and_reviewed(config, tmp_path, monkeypatch)
     calls: list[str] = []
     reviews: list[str] = []
     backend = _coding_and_review_backend(
@@ -1537,3 +1545,39 @@ def test_run_on_a_stopped_run_codes_only_unfinished_slots_then_measures_and_revi
     assert (root / "report/report.html").is_file()
     events = [json.loads(line)["event"] for line in (root / "events.jsonl").read_text().splitlines()]
     assert events[0] == "started" and events[-1] == "finished"
+
+
+def test_run_interrupted_after_its_last_attempt_finishes_measurement_and_reviews(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _measured_and_reviewed(config, tmp_path, monkeypatch)
+    calls: list[str] = []
+    reviews: list[str] = []
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=config.timeout_seconds, interrupt_at=None
+    )
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    checkpoint = study._checkpoint
+
+    def stopped_at_the_end(*args: Any, status: str, **kwargs: Any) -> None:
+        if status == "complete":
+            raise KeyboardInterrupt("stopped by SIGTERM")
+        checkpoint(*args, status=status, **kwargs)
+
+    root = tmp_path / "run"
+    with monkeypatch.context() as patched:
+        patched.setattr(study, "_checkpoint", stopped_at_the_end)
+        with pytest.raises(KeyboardInterrupt):
+            evaluation.run_evaluation(config, root)
+    run = json.loads((root / "evidence/run.json").read_text())
+    assert run["status"] == "interrupted" and set(run["attempt_states"].values()) == {"complete"}
+    assert evaluation.plan_resume(root)["coding_calls"] == 0
+    coded = len(calls)
+
+    result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert len(calls) == coded and len(reviews) == 9
+    assert json.loads((root / "evidence/run.json").read_text())["status"] == "complete"
+    assert evaluation._load_selection(root)["review_revision"] == "review"
