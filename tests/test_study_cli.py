@@ -1174,3 +1174,28 @@ def test_each_predictable_failure_stops_before_any_coding_call(
     assert not checkable["calls"]
     assert not list(checkable["output"].rglob("invocation.json"))
     assert not (checkable["output"] / "evidence").exists()
+
+
+def test_check_warns_when_a_prebuilt_image_ignores_the_task_dockerfile(
+    checkable: dict[str, Any],
+) -> None:
+    # A git-identity fix in this Dockerfile silently did nothing, and a whole pilot was lost.
+    raw = yaml.safe_load(checkable["path"].read_text())
+    task = Path(raw["tasks"]["source"]) / raw["tasks"]["ids"][0]
+    (task / "environment/Dockerfile").write_text(
+        "FROM fixture:pinned\nRUN git config --global user.name x\n"
+    )
+    result = CliRunner().invoke(
+        cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"])]
+    )
+    assert result.exit_code == 0, result.stderr
+    assert "Warning: arbitrary-native-task: runs the prebuilt image fixture:pinned" in result.stdout
+    report = json.loads((checkable["output"] / "check.json").read_text())
+    assert report["warnings"] == [
+        "arbitrary-native-task: runs the prebuilt image fixture:pinned; environment/Dockerfile "
+        "is never built, so changes to it have no effect"
+    ]
+    assert report["coding_images"]["covered-native-task"]["ignored_dockerfile"] is None
+    environment = report["matrix"]["arbitrary-native-task"]["coding_environment"]
+    assert environment["image_source"] == "prebuilt"
+    assert environment["ignored_dockerfile"] == "environment/Dockerfile"
