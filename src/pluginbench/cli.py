@@ -11,7 +11,7 @@ from pathlib import Path
 import typer
 import yaml
 
-from pluginbench import __version__
+from pluginbench import __version__, run_lock
 from pluginbench.evaluation import (
     CheckFailed,
     Evaluation,
@@ -326,6 +326,23 @@ def check(
         typer.echo(f"Ready. Check: {destination / 'check.json'}")
     except (OSError, ValueError, yaml.YAMLError, subprocess.SubprocessError) as exc:
         _error(exc)
+
+
+@app.command("stop")
+def stop(run: Path = typer.Argument(..., help="A run directory started by `pluginbench run`.")) -> None:
+    """Stop a run: SIGTERM only the process group its run.lock records; nothing else."""
+    try:
+        owner = run_lock.stop(run)
+    except (OSError, ValueError) as exc:
+        _error(exc)
+        return
+    if owner is None:
+        typer.echo(f"No active run owns {run}; nothing signalled.")
+    else:
+        typer.echo(
+            f"Sent SIGTERM to process group {owner['pgid']}. Attempts already coding finish "
+            "and are kept; no new attempt starts."
+        )
 
 
 @app.command("report")
