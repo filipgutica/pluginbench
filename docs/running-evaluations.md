@@ -180,7 +180,7 @@ PluginBench keeps prepared task images, vanilla submissions, and oracle and nop 
 
 The cache key hashes the modules that launch an attempt. Codex session parsing lives in `codex_events.py`, outside that hash, so a parser-only change keeps every vanilla cache key. Reuse requires matching task assets, source policy, source, prompt, harness, model, reasoning, CLI, runtime, image identities, transport and treatment-delivery policies, capability settings, resources, timeout, jobs, seed, and repeat count. Guidance, reviewer settings, and selected measurements do not change the coding cache key. Cache admission validates the diagnostic export and canonical reconstruction independently, including file modes. Older cache entries without the current source policy cannot be reused.
 
-A cached cohort includes failures and unknowns. Missing isolation receipts, corrupt entries, or a concurrent reservation stop reuse. Imported submissions retain original usage and timing; current native verification, selected measurements, and reviews run again. Reports disclose reuse. Reused runs are not fresh independent samples.
+Each vanilla repeat is its own cache entry, `<key>/<repeat>`, published as soon as that attempt finishes. A run that stops midway still caches the repeats it finished. A cached cohort includes failures and unknowns. Missing isolation receipts, corrupt entries, or a concurrent reservation stop reuse. Imported submissions retain original usage and timing; current native verification, selected measurements, and reviews run again. Reports disclose reuse. Reused runs are not fresh independent samples.
 
 Open `report/report.html`. `results.json` contains raw observations, capabilities, grading evidence, baseline deltas, reference values and ratios, and cost rows. `results.csv` contains individual measurements. Rebuild with `pluginbench report runs/<run>` without model calls.
 
@@ -194,20 +194,21 @@ Unknown values are never zero. A complete scan of a submission that changed no f
 
 Coding attempts, measurement inputs, and reviews run concurrently within their phases. `jobs` defaults to 2 on every machine and accepts 1 to 4. Docker capacity is bounded by Docker CPU capacity and an 80% Docker memory budget. A `jobs` value above that capacity fails before preparation instead of being lowered, because jobs is part of the comparison identity. Preparation and each snapshot's two measurement repeats stay sequential. Jobs affect scheduling and comparison identity, not the number of coding attempts. Subagents can make additional model requests.
 
-On interruption or fatal failure, new jobs stop. Active jobs finish or time out; their receipts remain. Resume requires a completed coding phase:
+On interruption or fatal failure, new jobs stop. Active jobs finish or time out; their receipts remain, and an attempt that finishes while the run drains is kept as complete.
+
+`pluginbench run evaluation.yaml` checks in the foreground, then starts the run in the background and returns once the background process owns `runs/<run>/run.lock`. That lock records the process ID, process group, start time, and run directory. The background process appends one JSON line per event to `events.jsonl` and writes its output to `run.log`. Use `--foreground` to run in the terminal instead.
 
 ```sh
-pluginbench run --resume runs/<run> --dry-run
-pluginbench run --resume runs/<run>
+pluginbench stop runs/<run>
+pluginbench run runs/<run> --dry-run
+pluginbench run runs/<run>
 ```
 
-Resume completes pending measurements or starts a review phase that has not begun. Interrupted coding or started review phases require a fresh evaluation. Existing model calls are never replayed. Offline citation recovery can fix formatting only when the exact source supports it.
+`stop` sends SIGTERM only to the process group recorded in `run.lock`, and only while that process still holds the lock with the recorded start time. No new attempt starts; attempts already coding finish and are kept. If the run directory moves while the run is active, the run stops before its next attempt. A moved, stopped run is refused until you delete its `run.lock`.
 
-To start a run and walk away, detach it and turn on notifications:
+Resume reads attempt states from the run's single-writer SQLite ledger, `evidence/ledger.sqlite`. Runs from before the ledger load their states from `evidence/run.json`. Complete attempts are kept. Pending attempts run. An attempt whose invocation receipt shows a started model call, but which did not complete, becomes `discarded-interrupted`. Its receipt under `evidence/discarded/` keeps its invocation and any saved usage; usage is unknown when the run was killed before it saved an execution receipt. A new attempt with a derived ID takes the same randomized slot, so discarded attempts are counted in `actual_calls` and listed in `discarded_attempts`. Replacing interrupted attempts can favour faster attempts. Resume refuses a coding CLI version that differs from the frozen one. Existing model calls are never replayed.
 
-```sh
-nohup pluginbench run --config evaluation.yaml --yes --notify > run.log 2>&1 &
-```
+Resume then completes pending measurements or starts a review phase that has not begun. Started review phases require a fresh evaluation. Runs prepared before measurement profiles were saved resume coding but cannot start measurement. Offline citation recovery can fix formatting only when the exact source supports it.
 
 On macOS, `--notify` reports when preparation and readiness checks pass and coding starts, and when the run finishes or fails. A readiness failure therefore arrives before any model call. Notifications are best effort and never change the run's outcome.
 
