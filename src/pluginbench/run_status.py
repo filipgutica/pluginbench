@@ -45,13 +45,20 @@ def _usage(execution: dict[str, Any] | None) -> tuple[dict[str, int] | None, str
     """Token usage and how far to trust it: exact, lower_bound, or unknown."""
     if execution is None:
         return None, "unknown"
-    usage = execution.get("usage")
-    if isinstance(usage, dict):
-        return usage, "exact"
-    observed = (execution.get("usage_accounting") or {}).get("observed_usage_lower_bound")
-    if isinstance(observed, dict):
-        return observed, "lower_bound"
-    return None, "unknown"
+    usage, status = execution.get("usage"), "exact"
+    if not isinstance(usage, dict):
+        usage = (execution.get("usage_accounting") or {}).get("observed_usage_lower_bound")
+        status = "lower_bound"
+        if not isinstance(usage, dict):
+            return None, "unknown"
+    if isinstance(usage.get("total_tokens"), int):
+        return usage, status
+    # Receipts from runs without subagents carry no total. Codex counts total as input plus
+    # output; cached input and reasoning output are subsets of those.
+    parts = (usage.get("input_tokens"), usage.get("output_tokens"))
+    if all(isinstance(part, int) for part in parts):
+        return {**usage, "total_tokens": sum(part for part in parts if part)}, status
+    return usage, "lower_bound"
 
 
 def _add(total: dict[str, int], usage: dict[str, int] | None) -> None:
@@ -197,6 +204,7 @@ def _phase(
     started = [event for event in events if event.get("event") == "started"]
     if active and started and started[-1].get("command") == "review":
         return "reviewing"
+    pending: str | None = None
     if run is None:
         pending = "starting"
     elif run.get("status") != "complete":
@@ -207,12 +215,13 @@ def _phase(
         pending = "reviewing"
     elif not (root / "report/report.html").is_file():
         pending = "reporting"
-    else:
-        return "complete"
-    if active:
+    if active and pending:
         return pending
-    if events and events[-1].get("event") == "failed":
-        return "failed"
+    # The latest operation, such as a re-review of a finished run, may have stopped or failed.
+    if events and events[-1].get("event") in ("stopped", "failed"):
+        return str(events[-1]["event"])
+    if pending is None:
+        return "complete"
     return "not_started" if run is None else "stopped"
 
 
@@ -273,8 +282,10 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
     discarded = []
     for path in sorted((evidence / "discarded").glob("*.json")):
         receipt = json.loads(path.read_text())
-        work = ((receipt.get("stages") or {}).get(_STAGE) or {}).get("work") or {}
-        tokens = work.get("tokens") if isinstance(work.get("tokens"), dict) else None
+        stage = (receipt.get("stages") or {}).get(_STAGE) or {}
+        reference = stage.get("execution")
+        execution = _read(evidence / reference["path"]) if isinstance(reference, dict) else None
+        tokens, tokens_status = _usage(execution)
         discarded.append(
             {
                 "id": receipt["id"],
@@ -285,7 +296,7 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
                 "replaced_by": receipt.get("replaced_by"),
                 "tokens": tokens,
                 # Usage the attempt saved before it was interrupted is at most a floor.
-                "tokens_status": "lower_bound" if tokens else "unknown",
+                "tokens_status": "lower_bound" if tokens_status == "exact" else tokens_status,
             }
         )
 

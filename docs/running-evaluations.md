@@ -214,7 +214,7 @@ Resume then completes pending measurements or starts a review phase that has not
 
 ## Watch a run
 
-`pluginbench status runs/<run>` shows the run's phase, the process that owns it, its last activity, attempt states and outcomes per arm and task, coding tokens, vanilla cache reuse, discarded attempts, and the measurement and review revisions. `--watch` redraws every 2 seconds and exits when the run ends or is stopped. `status` only reads: it opens `evidence/ledger.sqlite` read-only and falls back to `evidence/run.json` for runs from before the ledger or while the ledger cannot be read. It works on any run directory, including stopped and old ones.
+`pluginbench status runs/<run>` shows the run's phase, the process that owns it, its last activity, attempt states and outcomes per arm and task, coding tokens, vanilla cache reuse, discarded attempts, and the measurement and review revisions. `--watch` redraws every 2 seconds and exits when the run ends or is stopped. A redraw that catches a file mid-write is skipped. `status` only reads: it opens `evidence/ledger.sqlite` read-only and falls back to `evidence/run.json` for runs from before the ledger, or while the ledger cannot be read: busy, left with a crashed writer's journal, or not in rollback-journal mode. It works on any run directory, including stopped and old ones.
 
 `status --json` prints one JSON object for dashboards. Fields are only added within a `schema_version`; a removed or renamed field bumps it. Version 1:
 
@@ -222,7 +222,7 @@ Resume then completes pending measurements or starts a review phase that has not
 | --- | --- |
 | `schema_version` | `1` |
 | `run`, `name` | Absolute run directory and evaluation name |
-| `phase` | `starting`, `coding`, `measuring`, `reviewing`, `reporting`, `complete`, `stopped` (unfinished, no live owner), `failed` (the last event is a failure), or `not_started`. `stop` and Ctrl-C record a `stopped` event, not a failure |
+| `phase` | `starting`, `coding`, `measuring`, `reviewing`, `reporting`, `complete`, `stopped` (unfinished with no live owner, or the latest operation, such as a re-review, was stopped), `failed` (the last event is a failure), or `not_started`. `stop` and Ctrl-C record a `stopped` event, not a failure |
 | `active`, `owner` | Whether a live process holds `run.lock`, and its `pid`, `pgid`, and `started_at` |
 | `heartbeat` | `at` and `age_seconds` of the newest write to `events.jsonl`, `run.log`, the ledger, or `run.json` |
 | `last_event`, `error` | The last line of `events.jsonl` (`started`, `progress`, `stopped`, `failed`, or `finished`), and the failure message if the run failed |
@@ -236,7 +236,7 @@ Resume then completes pending measurements or starts a review phase that has not
 | `report`, `log` | Paths to `report/report.html` and `run.log`, or null |
 | `attempts` | One row per live slot: `id`, `slot`, `task`, `arm`, `repeat`, `state`, `outcome`, `outcome_reason`, `reused`, `tokens`, `tokens_status`, `minutes`, and `measures` (metric → `status`, `value`, `unit`, `reason`, from `report/results.json` once it exists) |
 
-States are `pending`, `running`, `complete`, and `interrupted`. Outcomes are `pass`, `fail`, `empty` (the graded patch is empty), and `unknown`, with the verifier's reason in `outcome_reason`. `tokens_status` is `exact`, `lower_bound` (usage saved by an unfinished attempt, or only an observed floor), `unknown` (no usage saved yet), or `not_started`. A total's `lower_bound` is true when any attempt it counts is `lower_bound` or `unknown`. The vanilla arm is `vanilla`, including in runs that recorded it as `baseline`. The table shows a `running` attempt of a run that no process owns as `interrupted`; the JSON keeps the recorded state.
+States are `pending`, `running`, `complete`, and `interrupted`. Outcomes are `pass`, `fail`, `empty` (the graded patch is empty), and `unknown`, with the verifier's reason in `outcome_reason`. `tokens_status` is `exact`, `lower_bound` (usage saved by an unfinished attempt, or only an observed floor), `unknown` (no usage saved yet), or `not_started`. A receipt without `total_tokens` gets input plus output, as Codex counts it; when either is missing the attempt is `lower_bound`. A total's `lower_bound` is true when any attempt it counts is `lower_bound` or `unknown`. The vanilla arm is `vanilla`, including in runs that recorded it as `baseline`. The table shows a `running` attempt of a run that no process owns as `interrupted`; the JSON keeps the recorded state.
 
 ## Review again
 

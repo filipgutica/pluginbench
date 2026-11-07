@@ -1573,7 +1573,11 @@ def test_status_follows_a_stopped_run_through_its_resume(
     assert done["outcomes"] == {"pass": 9}
     assert len(done["discarded"]) == 1
     assert done["discarded"][0]["replaced_by"] in {row["id"] for row in done["attempts"]}
-    assert done["discarded"][0]["tokens"] == {"input_tokens": 10, "output_tokens": 5}
+    assert done["discarded"][0]["tokens"] == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+    }
     assert set(done["arms"]) == {"vanilla", "superpowers", "workflow"}
     assert [(row["revision"], row["selected"]) for row in done["measures"]["review_revisions"]] == [
         ("review", True)

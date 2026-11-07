@@ -408,8 +408,18 @@ def status(
     try:
         if watch and as_json:
             raise ValueError("--watch redraws the table; for JSON, run status --json repeatedly")
+        decode_errors = 0
         while True:
-            current = run_status(run)
+            try:
+                current = run_status(run)
+            except json.JSONDecodeError:
+                # A settings or report file caught mid-write; skip this redraw, not the watch.
+                decode_errors += 1
+                if not watch or decode_errors > _WATCH_DECODE_RETRIES:
+                    raise
+                time.sleep(_WATCH_INTERVAL)
+                continue
+            decode_errors = 0
             if as_json:
                 typer.echo(json.dumps(current, indent=2))
                 return
@@ -424,6 +434,7 @@ def status(
 
 
 _WATCH_INTERVAL = 2.0
+_WATCH_DECODE_RETRIES = 5
 
 
 @app.command("stop")

@@ -124,9 +124,15 @@ def test_status_counts_outcomes_tokens_reuse_and_discarded_attempts(tmp_path: Pa
             "attempt": 2,
             "slot": 3,
             "replaced_by": "a4",
-            "stages": {"handoff": {"work": {"tokens": {"total_tokens": 7}}}},
+            "stages": {
+                "handoff": {
+                    "execution": {"path": "attempts/d1/handoff/execution.json", "sha256": "x"},
+                    "work": {"tokens": {"total_tokens": 7}},
+                }
+            },
         },
     )
+    _write(evidence / "attempts/d1/handoff/execution.json", {"usage": {"total_tokens": 7}})
 
     with run_lock.hold(root):
         status = run_status.run_status(root)
@@ -279,3 +285,116 @@ def test_review_refuses_an_active_run_before_planning(tmp_path: Path) -> None:
     with run_lock.hold(root):
         result = CliRunner().invoke(cli.app, ["review", str(root), "--revision", "r2", "--yes"])
     assert result.exit_code == 2 and "run is already active" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "usage,total,lower_bound",
+    [
+        # Codex receipts without subagents have no total: input plus output, as Codex counts it.
+        ({"input_tokens": 1000, "cached_input_tokens": 600, "output_tokens": 50}, 1050, False),
+        ({"input_tokens": 1000}, 0, True),
+    ],
+)
+def test_a_receipt_without_a_total_derives_it_or_stays_a_lower_bound(
+    tmp_path: Path, usage: dict[str, int], total: int, lower_bound: bool
+) -> None:
+    root = _run(tmp_path / "run", states={**STATES, "a3": "pending"}, ledger=True)
+    _write(root / "evidence/attempts/a2/handoff/execution.json", {"usage": usage})
+
+    tokens = run_status.run_status(root)["arms"]["workflow"]["tokens"]
+
+    assert (tokens["total_tokens"], tokens["lower_bound"]) == (total, lower_bound)
+
+
+def test_a_wal_ledger_is_never_opened_and_status_falls_back(tmp_path: Path) -> None:
+    root = _run(tmp_path / "run", states=STATES, ledger=True)
+    path = root / "evidence" / LEDGER_NAME
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.close()
+    before = _tree(root)
+
+    status = run_status.run_status(root)
+
+    assert status["states_source"] == "run.json"
+    assert _tree(root) == before  # Opening a WAL database read-only still creates -wal/-shm.
+
+
+def test_watch_skips_a_redraw_when_a_file_is_mid_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _run(tmp_path / "run", states=STATES, ledger=True)
+    owners: list[dict[str, Any] | None] = [{"pid": 1, "pgid": 1, "started_at": "t"}, None]
+    monkeypatch.setattr(run_lock, "owner", lambda path: owners.pop(0))
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
+    real = run_status.run_status
+    calls = 0
+
+    def flaky(path: Path) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise json.JSONDecodeError("Expecting value", "", 0)  # evaluation.json truncated
+        return real(path)
+
+    monkeypatch.setattr(cli, "run_status", flaky)
+
+    result = CliRunner().invoke(cli.app, ["status", str(root), "--watch"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.count("Phase: coding") == 1 and "Phase: stopped" in result.stdout
+
+
+@pytest.mark.parametrize("ending", ["stopped", "failed"])
+def test_a_finished_run_whose_review_ended_early_shows_that_ending(
+    tmp_path: Path, ending: str
+) -> None:
+    root = _run(tmp_path / "run", states=dict.fromkeys(STATES, "complete"), ledger=True)
+    run = json.loads((root / "evidence/run.json").read_text())
+    _write(root / "evidence/run.json", {**run, "status": "complete"})
+    _write(root / "report/report.html", "")
+    (root / "events.jsonl").write_text(
+        json.dumps({"event": "started", "command": "review"})
+        + "\n"
+        + json.dumps(
+            {"event": ending, "error": "boom"} if ending == "failed" else {"event": ending}
+        )
+        + "\n"
+    )
+
+    status = run_status.run_status(root)
+
+    assert status["phase"] == ending
+    assert status["report"] == str(root / "report/report.html")
+
+
+def test_a_discarded_attempt_keeps_its_observed_lower_bound(tmp_path: Path) -> None:
+    root = _run(tmp_path / "run", states={**STATES, "a3": "pending"}, ledger=True)
+    evidence = root / "evidence"
+    _write(
+        evidence / "attempts/d1/handoff/execution.json",
+        {"usage": None, "usage_accounting": {"observed_usage_lower_bound": USAGE}},
+    )
+    _write(
+        evidence / "discarded/d1.json",
+        {
+            "id": "d1",
+            "task_id": "task-a",
+            "arm": "workflow",
+            "attempt": 2,
+            "slot": 3,
+            "replaced_by": "a4",
+            "stages": {
+                "handoff": {
+                    "execution": {"path": "attempts/d1/handoff/execution.json", "sha256": "x"},
+                    "work": {"tokens": None},
+                }
+            },
+        },
+    )
+
+    status = run_status.run_status(root)
+
+    assert status["discarded"][0]["tokens"]["total_tokens"] == 1050
+    assert status["discarded"][0]["tokens_status"] == "lower_bound"
+    assert status["tokens"]["total_tokens"] == 1050 + 1050
