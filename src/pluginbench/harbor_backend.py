@@ -630,6 +630,11 @@ def _native_object(value: object, label: str) -> dict[str, object]:
     return {key: item for key, item in value.items()}
 
 
+def _portable_mode(path: Path) -> int:
+    """Git tracks only the executable bit, so group and other bits depend on the checkout's umask."""
+    return 0o755 if path.stat().st_mode & 0o100 else 0o644
+
+
 def _native_asset_inventory(task_dir: Path, *, exclude: str | None = None) -> dict[str, str]:
     files: dict[str, str] = {}
     if task_dir.is_symlink() or not task_dir.is_dir():
@@ -641,12 +646,10 @@ def _native_asset_inventory(task_dir: Path, *, exclude: str | None = None) -> di
             continue
         if path.is_file():
             files[path.relative_to(task_dir).as_posix()] = hashlib.sha256(
-                str(path.stat().st_mode & 0o777).encode() + b"\0" + path.read_bytes()
+                str(_portable_mode(path)).encode() + b"\0" + path.read_bytes()
             ).hexdigest()
         else:
-            files[path.relative_to(task_dir).as_posix() + "/"] = "directory:" + str(
-                path.stat().st_mode & 0o777
-            )
+            files[path.relative_to(task_dir).as_posix() + "/"] = "directory:" + str(0o755)
     return files
 
 

@@ -232,6 +232,19 @@ def test_execution_budget_and_package_metadata_are_part_of_the_native_asset_hash
     assert harbor_backend.native_task_assets(path) not in {original, changed_budget}
 
 
+def test_native_asset_hash_ignores_umask_bits_but_binds_the_executable_bit(
+    assets: dict[str, Path],
+) -> None:
+    path = assets[NAMES[0]]
+    original = harbor_backend.native_task_assets(path)
+    for entry in [path, *path.rglob("*")]:
+        entry.chmod(entry.stat().st_mode | 0o020)
+    assert harbor_backend.native_task_assets(path) == original
+    manifest = path / "task.toml"
+    manifest.chmod(manifest.stat().st_mode | 0o100)
+    assert harbor_backend.native_task_assets(path) != original
+
+
 def test_git_task_links_are_pinned_before_execution(
     assets: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:

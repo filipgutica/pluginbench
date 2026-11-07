@@ -780,11 +780,17 @@ def named_native_spawn() -> list[dict[str, object]]:
     ]
 
 
-def test_native_inherited_child_counts_only_own_history_and_deduplicates_copies() -> None:
+@pytest.mark.parametrize("version", ["0.162.1", "0.167.0"])
+def test_native_inherited_child_counts_only_own_history_and_deduplicates_copies(
+    version: str,
+) -> None:
     root = native_session(
         "root", [{"input_tokens": 20, "output_tokens": 5}], extra=named_native_spawn()
     )
     events = inherited_native_child()
+    metadata = events[0]["payload"]
+    assert isinstance(metadata, dict)
+    metadata["cli_version"] = version
     child = stream(*events)
     parsed = codex.parse_events(
         "", [root, child, child, stream(*events[:-1])], "codex", include_descendants=True

@@ -304,7 +304,11 @@ def _python_file(
 ) -> dict[str, tuple[set[str], set[str]]]:
     data = _json_object(value, "Python coverage file")
     summary = _json_object(data.get("summary"), "Python coverage summary")
-    executed = _python_lines(data.get("executed_lines"), record)
+    raw_executed = data.get("executed_lines")
+    if isinstance(raw_executed, list):
+        # coverage.py reports line 0, the module entry, as executed for a file without statements.
+        raw_executed = [line for line in raw_executed if line != 0]
+    executed = _python_lines(raw_executed, record)
     missing = _python_lines(data.get("missing_lines"), record)
     excluded = _python_lines(data.get("excluded_lines"), record)
     if "statement_lines" in data:
@@ -435,7 +439,7 @@ def _python_per_test(
         for name, encoded in _json_object(contexts, "Python per-test contexts").items():
             if not isinstance(encoded, str):
                 raise ValueError("Python per-test numbits must be base64 strings")
-            lines = numbits_to_lines(encoded)
+            lines = numbits_to_lines(encoded) - {0}  # coverage.py's module-entry line
             # Traced non-statement lines (decorators, docstrings) stay outside the population;
             # a statement the report calls missing, or a line outside the file, is an error.
             if lines & missing or any(not 1 <= line <= line_count for line in lines):
