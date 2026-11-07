@@ -43,7 +43,7 @@ from pluginbench.remeasure import (
     validate_remeasurement,
 )
 from pluginbench import study
-from pluginbench.study import _text_files, load_study, report_study, run_study
+from pluginbench.study import _text_files, load_study, report_study, resume_study, run_study
 from pluginbench.study_review import (
     _criteria_digest,
     _fixed_criteria,
@@ -693,6 +693,13 @@ def check_evaluation(
 def run_evaluation(
     config: Evaluation, output: Path, *, progress: Callable[[str], None] | None = None
 ) -> Path:
+    return resume_evaluation(prepare_evaluation(config, output, progress=progress), progress=progress)
+
+
+def prepare_evaluation(
+    config: Evaluation, output: Path, *, progress: Callable[[str], None] | None = None
+) -> Path:
+    """Check, then save everything coding needs, so any later process can run or resume it."""
     checked = _check(config, output, progress)
     config = checked.config
     root = checked.root
@@ -703,7 +710,6 @@ def run_evaluation(
     task_environment = checked.task_environment
     capabilities = checked.capabilities
     prepared = root / "inputs"
-    evidence = root / "evidence"
     fixed_guidance = []
     if config.reviewer:
         for index, original in enumerate(config.reviewer.guidance):
@@ -752,20 +758,87 @@ def run_evaluation(
         "measurement_revision": None,
         "review_revision": None,
     }
-    _save_selection(root, selection)
-    run_study(
-        load_study(prepared / "study.json"),
-        evidence,
-        progress=progress,
-        baseline_cache=checked.caches.vanilla,
-        baseline_identity=checked.vanilla_identity,
+    _write(prepared / "vanilla-identity.json", checked.vanilla_identity)
+    _write(
+        prepared / _PROFILES,
+        {
+            task: [
+                {**collector.model_dump(mode="json"), "config": str(collector.config.relative_to(prepared))}
+                for collector in collectors
+            ]
+            for task, collectors in profiles.items()
+            if collectors
+        },
     )
+    _save_selection(root, selection)
+    return root
+
+
+# Measurement profiles saved at preparation, so measurement can start after coding resumes.
+_PROFILES = "profiles.json"
+
+
+def _saved_profiles(root: Path) -> dict[str, list[Collector]]:
+    path = root / "inputs" / _PROFILES
+    if not path.is_file():
+        raise ValueError(
+            "this run predates saved measurement profiles, so measurement cannot start on "
+            "resume; its coding evidence is kept"
+        )
+    return load_profiles(path)
+
+
+def _code(
+    root: Path,
+    selection: dict[str, object],
+    *,
+    progress: Callable[[str], None] | None,
+    guard: Callable[[], None] | None,
+) -> None:
+    """Start coding, or resume it: complete attempts are kept and never coded again."""
+    evidence = root / "evidence"
+    config = _saved_evaluation(selection)
+    recipe = _object(json.loads((root / "inputs/study.json").read_text()))
+    identity_path = root / "inputs/vanilla-identity.json"
+    # Runs prepared before vanilla identities were saved resume without the vanilla cache.
+    identity = _object(json.loads(identity_path.read_text())) if identity_path.is_file() else None
+    if (evidence / "run.json").is_file():
+        version = _harness_version(config.runner.harness)
+        if version != recipe["harness_version"]:
+            raise ValueError(
+                f"{config.runner.harness} CLI is {version}, but this run codes with "
+                f"{recipe['harness_version']}; install that version to resume it"
+            )
+        if identity is not None and identity["launcher_sha256"] != _launcher_sha256(
+            config.runner.harness
+        ):
+            identity = None
+            if progress:
+                progress("Launcher code changed since this run started; new vanilla attempts are not cached")
+        resume_study(
+            evidence,
+            progress=progress,
+            baseline_cache=_caches(root).vanilla if identity else None,
+            baseline_identity=identity,
+            guard=guard,
+        )
+    else:
+        run_study(
+            load_study(root / "inputs/study.json"),
+            evidence,
+            progress=progress,
+            baseline_cache=_caches(root).vanilla if identity else None,
+            baseline_identity=identity,
+            guard=guard,
+        )
+    if not (root / "inputs" / _PROFILES).is_file():
+        return
     # Measurement contexts refer to the same run-owned frozen task assets as grading/review.
     frozen_catalog = TaskCatalog.model_validate_json((evidence / "frozen/tasks.json").read_text())
     frozen_tasks = {
         entry.id: evidence / "frozen" / entry.native_task for entry in frozen_catalog.tasks
     }
-    for task, collectors in profiles.items():
+    for task, collectors in _saved_profiles(root).items():
         for collector in collectors:
             if collector.kind == "analysis" or (
                 collector.kind == "coverage" and collector.report_format is not None
@@ -773,13 +846,6 @@ def run_evaluation(
                 payload = json.loads(collector.config.read_text())
                 payload["native_task_identity"]["task_dir"] = str(frozen_tasks[task])
                 _write(collector.config, payload)
-    return _finish_evaluation(
-        root,
-        selection=selection,
-        profiles={task: collectors for task, collectors in profiles.items() if collectors},
-        guidance=fixed_guidance,
-        progress=progress,
-    )
 
 
 def _saved_evaluation(selection: dict[str, object]) -> Evaluation:
@@ -903,6 +969,16 @@ def _resume_inputs(
         validate_remeasurement(
             evidence, evidence / "observer-revisions" / str(selection["measurement_revision"])
         )
+    elif selection["measurement_required"] and not any(
+        (evidence / "observer-revisions" / str(candidate)).exists()
+        for candidate in (
+            selection.get("pending_measurement_revision", "measurements"),
+            selection.get("recovery_measurement_revision"),
+        )
+        if candidate is not None
+    ):
+        # No observer revision started; collect with the profiles saved at preparation.
+        profiles = _saved_profiles(root)
     elif selection["measurement_required"]:
         candidates = (
             selection.get("pending_measurement_revision", "measurements"),
@@ -965,8 +1041,36 @@ def _resume_inputs(
     return selection, profiles, guidance, calls
 
 
+def _assigned(selection: dict[str, object]) -> int:
+    config = _saved_evaluation(selection)
+    return len(config.tasks.task_ids) * config.repeats * (len(config.treatments) + 1)
+
+
+def _coding_left(root: Path, selection: dict[str, object]) -> int:
+    """Coding calls a resume makes: one per slot without a complete attempt."""
+    run = root / "evidence/run.json"
+    if not run.is_file():
+        return _assigned(selection)
+    states = _object(json.loads(run.read_text())["attempt_states"])
+    return sum(state != "complete" for state in states.values())
+
+
 def plan_resume(root: Path) -> dict[str, object]:
-    selection, profiles, _, calls = _resume_inputs(root.expanduser().absolute())
+    root = root.expanduser().absolute()
+    selection = _load_selection(root)
+    coding = _coding_left(root, selection)
+    if coding:
+        reviewer = selection.get("reviewer")
+        return {
+            "name": selection["name"],
+            "coding_calls": coding,
+            # At most one review per assigned attempt; only submitted attempts are reviewed.
+            "review_calls": _assigned(selection) if reviewer else 0,
+            "collect_measurements": bool(selection["measurement_required"]),
+            "jobs": selection["jobs"],
+            "baseline": "keep complete attempts; code pending slots and replace interrupted ones",
+        }
+    selection, profiles, _, calls = _resume_inputs(root)
     return {
         "name": selection["name"],
         "coding_calls": 0,
@@ -977,8 +1081,19 @@ def plan_resume(root: Path) -> dict[str, object]:
     }
 
 
-def resume_evaluation(root: Path, *, progress: Callable[[str], None] | None = None) -> Path:
+def resume_evaluation(
+    root: Path,
+    *,
+    progress: Callable[[str], None] | None = None,
+    guard: Callable[[], None] | None = None,
+) -> Path:
+    """Run whatever a prepared evaluation has left: coding, then measurement and reviews."""
     root = root.expanduser().absolute()
+    selection = _load_selection(root)
+    if _coding_left(root, selection) or not (root / "evidence/run.json").is_file():
+        _code(root, selection, progress=progress, guard=guard)
+    if guard:
+        guard()
     selection, profiles, guidance, calls = _resume_inputs(root)
     if calls:
         reviewer = _object(selection["reviewer"])

@@ -115,32 +115,41 @@ def hold(root: Path) -> Iterator[RunLock]:
         os.close(fd)
 
 
+def owner(root: Path) -> dict[str, object] | None:
+    """The recorded owner while a live process holds root/run.lock; otherwise None."""
+    path = root.resolve() / LOCK_NAME
+    if not path.is_file():
+        return None
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # Held: the owner may not have written its record yet.
+            return _owner(fd) or {}
+        return None
+    finally:
+        os.close(fd)
+
+
 def stop(root: Path) -> dict[str, object] | None:
     """SIGTERM the process group recorded in root/run.lock; None when no live run owns it.
 
     Nothing is signalled unless the lock is held and its recorded process still has the
     recorded start time and group. This command's own group is never signalled.
     """
-    path = root.resolve() / LOCK_NAME
-    if not path.is_file():
+    if not (root.resolve() / LOCK_NAME).is_file():
         raise ValueError(f"no run lock in {root}; it never started here")
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            owner = _owner(fd)
-        else:
-            return None
-    finally:
-        os.close(fd)
-    if owner is None:
+    current = owner(root)
+    if current is None:
+        return None
+    if not current:
         raise ValueError("run.lock is held but names no owner yet; try again")
-    pid, pgid = owner.get("pid"), owner.get("pgid")
+    pid, pgid = current.get("pid"), current.get("pgid")
     if type(pid) is not int or type(pgid) is not int:
         raise ValueError("run.lock owner must record integer pid and pgid")
     try:
-        matches = process_start(pid) == owner.get("process_start") and os.getpgid(pid) == pgid
+        matches = process_start(pid) == current.get("process_start") and os.getpgid(pid) == pgid
     except ProcessLookupError:
         matches = False
     if not matches:
@@ -148,4 +157,4 @@ def stop(root: Path) -> dict[str, object] | None:
     if pgid == os.getpgrp():
         raise ValueError("refusing to signal this command's own process group")
     os.killpg(pgid, signal.SIGTERM)
-    return owner
+    return current

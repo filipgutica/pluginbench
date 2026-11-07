@@ -104,7 +104,9 @@ def test_config_dry_run_includes_fresh_vanilla_and_every_package(
 ) -> None:
     path = tmp_path / "eval.yaml"
     path.write_text(yaml.safe_dump(config.model_dump(mode="json")))
-    monkeypatch.setattr(cli, "run_evaluation", lambda *args: pytest.fail("dry run cannot execute"))
+    monkeypatch.setattr(
+        cli, "prepare_evaluation", lambda *args, **kwargs: pytest.fail("dry run cannot execute")
+    )
     result = CliRunner().invoke(cli.app, ["run", "--config", str(path), "--dry-run"])
     assert result.exit_code == 0, result.stderr
     plan = json.loads(result.stdout)
@@ -747,10 +749,10 @@ def test_integrated_evaluation_and_report_regeneration(
         # Resumed reviews get the same sandbox probe before their first call.
         with monkeypatch.context() as patched:
             patched.setattr(isolation, "codex_code_mode_host", missing_host)
-            blocked = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes"])
+            blocked = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes", "--foreground"])
         assert blocked.exit_code == 2 and "codex-code-mode-host" in blocked.stderr
         assert len(calls) == 9 and not judge_calls
-        result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes"])
+        result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes", "--foreground"])
         assert result.exit_code == 0, result.stderr
         assert "0 coding attempts +" in result.stdout
         failed = root / "evidence/observer-revisions/measurements/revision.json"
@@ -942,7 +944,7 @@ def test_integrated_evaluation_and_report_regeneration(
         assert len(calls) == len(judge_calls) == 9
         assert (root / "report/results.json").read_bytes() == original
     if citation_error:
-        result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes"])
+        result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes", "--foreground"])
         assert result.exit_code == 0, result.stderr
         assert "0 coding attempts + 0 review calls" in result.stdout
         assert (root / "report/results.json").read_bytes() == original
@@ -951,7 +953,7 @@ def test_integrated_evaluation_and_report_regeneration(
         saved["pending_measurement_revision"] = saved["measurement_revision"]
         saved["measurement_revision"] = None
         evaluation._save_selection(root, saved)
-        result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes"])
+        result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes", "--foreground"])
         assert result.exit_code == 0, result.stderr
         assert "0 coding attempts + 0 review calls" in result.stdout
         assert (root / "report/results.json").read_bytes() == original
@@ -1415,3 +1417,119 @@ def test_parser_only_change_keeps_the_vanilla_cache_identity(
     launcher = package / "codex.py"
     launcher.write_text(launcher.read_text() + "\n# a launch change\n")
     assert identity() != original
+
+
+def _coding_and_review_backend(
+    calls: list[str], reviews: list[str], *, timeout: int, interrupt_at: int | None
+) -> Any:
+    usage = {"input_tokens": 10, "output_tokens": 5}
+
+    def invoke(**kwargs: Any) -> dict[str, Any]:
+        area = kwargs["area"]
+        if kwargs.get("output_schema") is not None:
+            packet = json.loads((area / "workspace/packet.json").read_text())
+            reviews.append(packet["packet_id"])
+            return {
+                "successful_native_completion": True,
+                "actual_primary_models": ["gpt-6-astra"],
+                "runtime_effort_evidence": ["high"],
+                "command_items": [],
+                "usage": {"input_tokens": 50, "output_tokens": 10},
+                "startup": [{"type": "session_meta", "payload": {"cli_version": "judge-version"}}],
+                "final": json.dumps(
+                    {
+                        "packet_id": packet["packet_id"],
+                        "status": "reviewed",
+                        "issues": [],
+                        "limitations": ["Fixture only"],
+                        "outside_packet_access": False,
+                    }
+                ),
+            }
+        calls.append(kwargs["entry"]["id"])
+        if len(calls) == interrupt_at:
+            # As `stop` does: SIGTERM becomes KeyboardInterrupt after some usage was saved.
+            (area / "artifacts").mkdir()
+            (area / "artifacts/execution.json").write_text(json.dumps({"usage": usage}))
+            raise KeyboardInterrupt("stopped by SIGTERM")
+        (area / "workspace/src/answer.py").write_text("answer = 1\n")
+        result = native_execution(
+            area,
+            kwargs["protocol"]["native_task_identity"],
+            reward=1,
+            timeout=timeout,
+            version="0.167.0",
+        )
+        result["startup"] = [{"type": "session_meta", "payload": {"cli_version": "0.167.0"}}]
+        return result
+
+    return invoke
+
+
+def test_run_on_a_stopped_run_codes_only_unfinished_slots_then_measures_and_reviews(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pluginbench.measurement_profiles import CoverageSettings
+
+    standards = tmp_path / "review-standards.md"
+    standards.write_text("Report actionable correctness findings only.\n")
+    config.jobs = 1
+    config.measurements += ["coverage", "review"]
+    config.measurement_settings.coverage = CoverageSettings(
+        command=["python3", "-m", "coverage"],
+        report_path="coverage/lcov.info",
+        tool_version="fixture-1",
+    )
+    config.reviewer = evaluation.Reviewer(
+        harness="codex", model="gpt-6-astra", reasoning="high", guidance=[standards]
+    )
+    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.167.0"})
+    monkeypatch.setattr(codex, "runtime_environment", lambda *args, **kwargs: ({}, ()))
+    monkeypatch.setattr(harbor_backend, "prepare_native_task", _prepare_fixture_task)
+    monkeypatch.setattr(harbor_backend, "run_native_command", _lcov)
+    calls: list[str] = []
+    reviews: list[str] = []
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=config.timeout_seconds, interrupt_at=3
+    )
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    root = tmp_path / "run"
+    with pytest.raises(KeyboardInterrupt):
+        evaluation.run_evaluation(config, root)
+    stopped = json.loads((root / "evidence/run.json").read_text())
+    states = stopped["attempt_states"]
+    finished = {key for key, state in states.items() if state == "complete"}
+    assert stopped["status"] == "interrupted" and len(states) == 9
+    assert len(finished) == 2 and states[calls[2]] == "interrupted"
+    assert evaluation.plan_resume(root)["coding_calls"] == 7
+    interrupted = calls[2]
+    calls.clear()
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=config.timeout_seconds, interrupt_at=None
+    )
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+
+    result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert result.stdout.startswith("7 coding attempts")
+    run = json.loads((root / "evidence/run.json").read_text())
+    assert run["status"] == "complete"
+    assert set(run["attempt_states"].values()) == {"complete"} and len(run["attempt_states"]) == 9
+    assert len(calls) == 7 and not set(calls) & (finished | {interrupted})
+    discarded = run["discarded_attempts"][interrupted]
+    assert discarded["replaced_by"] in calls
+    assert discarded["stages"]["handoff"]["work"]["tokens"] == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+    }
+    # Measurement and review run on the replaced attempt identities.
+    selection = evaluation._load_selection(root)
+    assert selection["measurement_revision"] == "measurements"
+    assert selection["review_revision"] == "review"
+    assert len(reviews) == 9
+    assert (root / "report/report.html").is_file()
+    events = [json.loads(line)["event"] for line in (root / "events.jsonl").read_text().splitlines()]
+    assert events[0] == "started" and events[-1] == "finished"

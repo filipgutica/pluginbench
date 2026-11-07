@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
-from collections.abc import Callable
+import sys
+import threading
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -19,10 +24,10 @@ from pluginbench.evaluation import (
     load_evaluation,
     plan_evaluation,
     plan_resume,
+    prepare_evaluation,
     regenerate_report,
     resolve_evaluation,
     resume_evaluation,
-    run_evaluation,
 )
 
 app = typer.Typer(
@@ -125,6 +130,86 @@ def _notifying_progress(attempts: object) -> Callable[[str], None]:
     return progress
 
 
+@contextmanager
+def _events(root: Path) -> Iterator[Callable[..., None]]:
+    """Append one JSON line per event to events.jsonl, so a background run can be followed."""
+    lock = threading.Lock()
+    with (root / "events.jsonl").open("a", encoding="utf-8") as stream:
+
+        def event(kind: str, **fields: object) -> None:
+            line = json.dumps({"at": datetime.now(UTC).isoformat(), "event": kind, **fields})
+            with lock:
+                stream.write(line + "\n")
+                stream.flush()
+
+        yield event
+
+
+def _work(root: Path, *, progress: Callable[[str], None], notify: bool) -> None:
+    """Own the run directory and run what it has left; SIGTERM from `stop` interrupts it."""
+    with run_lock.hold(root) as lock, _events(root) as event:
+        event("started", pid=os.getpid(), root=str(root))
+
+        def logged(message: str) -> None:
+            event("progress", message=message)
+            progress(message)
+
+        try:
+            resume_evaluation(root, progress=logged, guard=lock.assert_in_place)
+        except BaseException as exc:
+            event("failed", error=f"{type(exc).__name__}: {exc}")
+            if notify:
+                _notify(f"Run failed: {str(exc) or type(exc).__name__}")
+            raise
+        event("finished", report=str(root / "report/report.html"))
+    if notify:
+        _notify(f"Run finished. Report: {root / 'report/report.html'}")
+    typer.echo(f"Report: {root / 'report/report.html'}")
+    typer.echo(f"Graphable data: {root / 'report/results.json'}")
+
+
+def _worker_argv(root: Path, *, notify: bool) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "pluginbench",
+        "run",
+        str(root),
+        "--yes",
+        "--foreground",
+        *(["--notify"] if notify else []),
+    ]
+
+
+_DETACH_TIMEOUT = 30.0
+
+
+def _detach(root: Path, *, notify: bool) -> None:
+    """Start the run in its own session and return once that process holds run.lock."""
+    log = root / "run.log"
+    with log.open("ab") as output:
+        child = subprocess.Popen(
+            _worker_argv(root, notify=notify),
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    deadline = time.monotonic() + _DETACH_TIMEOUT
+    while (run_lock.owner(root) or {}).get("pid") != child.pid:
+        if child.poll() is not None:
+            raise ValueError(
+                f"background run exited with code {child.returncode} before it started; see {log}"
+            )
+        if time.monotonic() > deadline:
+            raise ValueError(f"background run did not start within {_DETACH_TIMEOUT:g}s; see {log}")
+        time.sleep(0.05)
+    typer.echo(f"Started run {root} in the background (process group {child.pid}).")
+    typer.echo(f"Events: {root / 'events.jsonl'}   Log: {log}")
+    typer.echo(f"Stop it: pluginbench stop {root}")
+    typer.echo(f"Resume it after a stop or crash: pluginbench run {root}")
+
+
 @app.callback()
 def main(version: bool = typer.Option(False, "--version", is_eager=True)) -> None:
     if version:
@@ -134,10 +219,14 @@ def main(version: bool = typer.Option(False, "--version", is_eager=True)) -> Non
 
 @app.command("run")
 def run(
+    target: Path | None = typer.Argument(
+        None,
+        help="Evaluation YAML or JSON to start, or a run directory to resume.",
+    ),
     resume: Path | None = typer.Option(
         None,
         "--resume",
-        help="Finish collection/reviews or recover citation formatting from saved attempts.",
+        help="Run directory to resume: keeps complete attempts and codes only what is left.",
     ),
     config: Path | None = typer.Option(
         None, "--config", help="Evaluation YAML or JSON; relative paths use its directory."
@@ -200,9 +289,25 @@ def run(
         "--notify",
         help="Send macOS notifications when coding starts and when the run finishes or fails.",
     ),
+    foreground: bool = typer.Option(
+        False,
+        "--foreground",
+        help="Run in this process instead of in the background.",
+    ),
 ) -> None:
-    """Run vanilla and native treatments, selected measurements, and fixed reviews."""
+    """Start or resume a run: vanilla and native treatments, measurements, and fixed reviews.
+
+    Checks run first, in this process. The run then continues in the background unless
+    --foreground is set.
+    """
     try:
+        if target is not None:
+            if resume or config:
+                raise ValueError("give a config or run directory once, not also --resume/--config")
+            if target.is_dir():
+                resume = target
+            else:
+                config = target
         overrides = [
             harness,
             model,
@@ -288,22 +393,22 @@ def run(
         if not yes and not typer.confirm("Start evaluation?"):
             raise typer.Exit()
         progress = _notifying_progress(plan["coding_calls"]) if notify else typer.echo
-        try:
-            if resume:
-                root = resume_evaluation(resume, progress=progress)
-            else:
-                if evaluation is None:
-                    raise ValueError("missing evaluation settings")
-                destination = output or _new_run_directory()
-                root = run_evaluation(evaluation, destination, progress=progress)
-        except BaseException as exc:
-            if notify:
-                _notify(f"Run failed: {str(exc) or type(exc).__name__}")
-            raise
-        if notify:
-            _notify(f"Run finished. Report: {root / 'report/report.html'}")
-        typer.echo(f"Report: {root / 'report/report.html'}")
-        typer.echo(f"Graphable data: {root / 'report/results.json'}")
+        if resume:
+            root = resume.expanduser().absolute()
+        else:
+            if evaluation is None:
+                raise ValueError("missing evaluation settings")
+            destination = output or _new_run_directory()
+            try:
+                root = prepare_evaluation(evaluation, destination, progress=typer.echo)
+            except BaseException as exc:
+                if notify:
+                    _notify(f"Run failed: {str(exc) or type(exc).__name__}")
+                raise
+        if foreground:
+            _work(root, progress=progress, notify=notify)
+        else:
+            _detach(root, notify=notify)
     except (OSError, ValueError, yaml.YAMLError, subprocess.SubprocessError) as exc:
         _error(exc)
 
