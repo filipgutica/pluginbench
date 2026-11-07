@@ -474,6 +474,30 @@ def test_profile_loader_preserves_symlinked_virtualenv_executable(tmp_path: Path
     assert command[1] == str(tmp_path / "collector.py")
 
 
+def test_profile_loader_keeps_an_inline_script_longer_than_a_file_name(tmp_path: Path) -> None:
+    # A saved coverage profile's `sh -c` script: one path segment past the 255-byte name limit.
+    script = "echo " + "x" * 300 + " > coverage/lcov.info"
+    _write(tmp_path / "config.json", {})
+    profile = tmp_path / "profiles.json"
+    _write(
+        profile,
+        {
+            "task": [
+                {
+                    "kind": "coverage",
+                    "config": "config.json",
+                    "command": ["bash", "-c", script],
+                    "tool_version": "fixture",
+                    "report_format": "lcov",
+                    "report_path": "coverage/lcov.info",
+                }
+            ]
+        },
+    )
+
+    assert remeasure.load_profiles(profile)["task"][0].command == ["bash", "-c", script]
+
+
 def test_command_resolution_leaves_path_commands_literal(tmp_path: Path) -> None:
     from pluginbench.collectors import resolve_collector_command
 

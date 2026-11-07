@@ -70,6 +70,14 @@ def _json(path: Path, data: object) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
+def _names_file(path: Path) -> bool:
+    """Whether path is a file; an argument too long to be a path, such as a script, is not."""
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
 def resolve_collector_command(base: Path, command: list[str]) -> list[str]:
     """Resolve local arguments without dereferencing a venv executable symlink."""
     resolved = []
@@ -79,10 +87,10 @@ def resolve_collector_command(base: Path, command: list[str]) -> list[str]:
         if index == 0:
             explicit_path = "/" in argument or argument.startswith("~")
             resolved.append(
-                str(candidate.absolute()) if explicit_path and candidate.is_file() else argument
+                str(candidate.absolute()) if explicit_path and _names_file(candidate) else argument
             )
         else:
-            resolved.append(str(candidate.resolve()) if candidate.is_file() else argument)
+            resolved.append(str(candidate.resolve()) if _names_file(candidate) else argument)
     return resolved
 
 
