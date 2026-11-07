@@ -126,3 +126,21 @@ else:
     )
     assert result.returncode == 0, result.stderr
     assert tool in isolation.tool_roots()
+
+
+def test_tool_roots_grant_the_codex_code_mode_host_beside_the_launched_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release = tmp_path / "release" / "bin"
+    release.mkdir(parents=True)
+    for name in ("codex", "codex-code-mode-host"):
+        (release / name).write_text("#!/bin/sh\n")
+        (release / name).chmod(0o755)
+    launcher = tmp_path / "launcher"
+    launcher.mkdir()
+    (launcher / "codex").symlink_to(release / "codex")
+    (launcher / "codex-code-mode-host").symlink_to(release / "codex-code-mode-host")
+    monkeypatch.setenv("PATH", str(launcher) + os.pathsep + os.environ["PATH"])
+    roots = isolation.tool_roots()
+    assert launcher / "codex-code-mode-host" in roots
+    assert release / "codex-code-mode-host" in roots

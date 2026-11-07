@@ -67,6 +67,12 @@ def tool_roots() -> list[Path]:
         if executable:
             path = Path(executable).resolve()
             roots.append(Path(executable))
+            # Codex code mode spawns a sibling host binary, looked up beside the launched path.
+            if name == "codex":
+                for directory in {Path(executable).parent, path.parent}:
+                    host = directory / "codex-code-mode-host"
+                    if host.is_file():
+                        roots.append(host)
             # Grant package assets, never an arbitrary executable's parent/home.
             for prefix in (
                 Path("/opt/homebrew/Cellar"),
