@@ -1120,6 +1120,9 @@ def _run_attempts(
             else:
                 ledger.set_state(record["id"], status)
             _checkpoint(root, frozen, manifest, states, status="running")
+            if cache is not None and status == "complete":
+                # Cached as it finishes, so a run that stops later still keeps it for reuse.
+                cache.publish(record)
 
         def invoked(index: int, record: dict[str, Any], stage_id: str) -> None:
             if guard:
@@ -1257,8 +1260,6 @@ def _run_attempts(
             on_submit=submitted,
         )
         _checkpoint(root, frozen, manifest, states, status="complete")
-        if cache is not None:
-            cache.publish(records, frozen.tasks)
     except RunMoved:
         raise  # Writing anything now would recreate the old path.
     except BaseException as exc:

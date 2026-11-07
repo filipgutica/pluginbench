@@ -1289,7 +1289,7 @@ def test_new_output_folder_keeps_comparison_identity_and_cache_decisions(
     assert {row["status"] for row in rows} == {"miss"}
     # Once a cohort is published under that key, a third folder sees every attempt as a hit.
     for row in rows:
-        (second.caches.vanilla / row["cache_key"]).mkdir(parents=True, exist_ok=True)
+        (second.caches.vanilla / row["cache_key"] / str(row["repeat"])).mkdir(parents=True)
     third = evaluation.check_evaluation(config, tmp_path / "c/run")
     assert [row["status"] for row in third["vanilla_cache"]] == ["hit"] * config.repeats
     assert len(built) == 1 and len(qualified) == 1
@@ -1385,15 +1385,19 @@ def test_check_prints_a_hit_or_miss_for_every_vanilla_attempt(
     assert len(rows) == 2 * 3 and {row["status"] for row in rows} == {"miss"}
     assert "Vanilla cache: 0 of 6 attempts hit" in result.stdout
     covered = next(row for row in rows if row["task_id"] == "covered-native-task")
-    (isolated_cache / "pluginbench/vanilla" / covered["cache_key"]).mkdir(parents=True)
+    # Each repeat is its own cache entry, so a stopped run's finished repeats are hits.
+    for repeat in (1, 2):
+        (isolated_cache / "pluginbench/vanilla" / covered["cache_key"] / str(repeat)).mkdir(
+            parents=True
+        )
     again = CliRunner().invoke(
         cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"]) + "-2"]
     )
     assert again.exit_code == 0, again.stderr
-    assert "Vanilla cache: 3 of 6 attempts hit" in again.stdout
+    assert "Vanilla cache: 2 of 6 attempts hit" in again.stdout
     for repeat in (1, 2, 3):
-        hit = f"covered-native-task repeat {repeat}: hit ({covered['cache_key'][:12]})"
-        assert hit in again.stdout
+        status = "miss" if repeat == 3 else f"hit ({covered['cache_key'][:12]})"
+        assert f"covered-native-task repeat {repeat}: {status}" in again.stdout
         assert f"arbitrary-native-task repeat {repeat}: miss" in again.stdout
 
 

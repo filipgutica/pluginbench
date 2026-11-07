@@ -36,6 +36,7 @@ def _killed_run(
     treatments: int = 1,
     repeats: int = 3,
     jobs: int = 1,
+    cache: Path | None = None,
 ) -> Path:
     recipe = resume_support.recipe(
         tmp_path / "config", tasks=tasks, treatments=treatments, repeats=repeats, jobs=jobs
@@ -50,6 +51,7 @@ def _killed_run(
             str(root),
             boundary,
             str(at),
+            *([str(cache)] if cache else []),
         ],
         env={**os.environ, "PYTHONPATH": _PATH},
         capture_output=True,
@@ -242,3 +244,24 @@ def test_resume_reads_a_moved_copy_from_its_own_frozen_files(
     study.resume_study(moved)
     assert len(calls) == 11
     assert paths and all(path.startswith(str(moved.resolve())) for path in paths)
+
+
+def test_vanilla_attempts_finished_before_a_kill_are_already_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = tmp_path / "cache"
+    root = _killed_run(tmp_path, boundary="during-call", at=7, cache=cache)
+    entries = _json(root / "plan.json")["entries"]
+    finished = {entry["id"] for entry in entries[:6] if entry["arm"] == "baseline"}
+    assert finished
+    cached = [_json(path)["records"][0]["id"] for path in cache.glob("*/*/manifest.json")]
+    assert sorted(cached) == sorted(finished)
+
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+    resolved = study._frozen_study(root)
+    study.resume_study(
+        root, baseline_cache=cache, baseline_identity=resume_support.vanilla_identity(resolved)
+    )
+    assert not set(calls) & finished
+    assert len(list(cache.glob("*/*/manifest.json"))) == 6

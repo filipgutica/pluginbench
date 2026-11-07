@@ -16,8 +16,14 @@ from typing import Any
 import pytest
 import yaml
 
-from native_support import execution as native_execution, synthetic_contract, task_entry
+from native_support import (
+    execution as native_execution,
+    runtime_identity,
+    synthetic_contract,
+    task_entry,
+)
 from pluginbench import harbor_backend, ledger, study, submissions
+from pluginbench.datasets import native_identity, portable_native_identity
 
 # Where the child kills itself, relative to its Nth native call or Nth completed attempt.
 BOUNDARIES = {
@@ -97,9 +103,7 @@ def install(
             _kill()
         area = kwargs["area"]
         (area / "workspace/src/answer.py").write_text("answer = 1\n")
-        result = native_execution(area, kwargs["protocol"]["native_task_identity"], reward=1)
-        result["startup"] = [{"type": "session_meta", "payload": {"cli_version": "observed-1"}}]
-        return result
+        return native_execution(area, kwargs["protocol"]["native_task_identity"], reward=1)
 
     verify = study._verify_snapshot
 
@@ -124,9 +128,28 @@ def install(
     monkeypatch.setattr(ledger.Ledger, "complete", ledger_complete)
 
 
+def vanilla_identity(resolved: study.ResolvedStudy) -> dict[str, object]:
+    """A vanilla cache identity the fake attempts above are eligible for."""
+    return {
+        "isolation": runtime_identity(),
+        "harness_version": "1.2.3",
+        "timeout_seconds": resolved.recipe.timeout_seconds,
+        "task_environment": {
+            task.task_id: portable_native_identity(native_identity(task)) for task in resolved.tasks
+        },
+    }
+
+
 def child() -> None:
-    """argv: recipe, output, boundary, at. Runs a fresh study that kills itself at `boundary`."""
+    """argv: recipe, output, boundary, at[, cache]. A fresh study that kills itself at `boundary`."""
     recipe_path, output, boundary, at = sys.argv[1:5]
     install(pytest.MonkeyPatch(), [], boundary=boundary, at=int(at))
-    study.run_study(study.load_study(Path(recipe_path)), Path(output))
+    resolved = study.load_study(Path(recipe_path))
+    cache = Path(sys.argv[5]) if len(sys.argv) > 5 else None
+    study.run_study(
+        resolved,
+        Path(output),
+        baseline_cache=cache,
+        baseline_identity=vanilla_identity(resolved) if cache else None,
+    )
     raise SystemExit("the study finished without reaching its kill boundary")

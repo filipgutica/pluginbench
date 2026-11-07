@@ -132,11 +132,11 @@ def _cohort(
     )
 
 
-def _publish(
-    cache: baselines.BaselineCache, tasks: tuple[TaskSpec, ...], records: list[dict[str, Any]]
-) -> None:
+def _publish(cache: baselines.BaselineCache, records: list[dict[str, Any]]) -> None:
     try:
-        cache.reserve().publish(records, tasks)
+        cache.reserve()
+        for record in records:
+            cache.publish(record)
     finally:
         cache.close()
 
@@ -146,7 +146,7 @@ def test_native_cache_reuses_failed_attempts_and_unknown_usage_without_observers
 ) -> None:
     path = tmp_path / "cache"
     first, tasks, records = _cohort(tmp_path / "first", path)
-    _publish(first, tasks, records)
+    _publish(first, records)
     second, _, entries = _cohort(tmp_path / "second", path)
     shutil.rmtree(second.root)
     second.root.mkdir()
@@ -186,7 +186,7 @@ def test_native_cache_reuses_failed_attempts_and_unknown_usage_without_observers
 def test_changed_native_coding_identity_misses(tmp_path: Path, field: str) -> None:
     path = tmp_path / "cache"
     first, tasks, records = _cohort(tmp_path / "first", path)
-    _publish(first, tasks, records)
+    _publish(first, records)
     other, _, _ = _cohort(tmp_path / "second", path)
     context = json.loads(json.dumps(other.contexts["answer"]))
     coding = context["coding"]
@@ -394,24 +394,25 @@ def test_incomplete_or_mismatched_native_delivery_cannot_seed_cache(
         file.write_text(json.dumps(receipt))
     if fault == "linked-client":
         with pytest.raises(ValueError, match="unsupported artifact"):
-            _publish(cache, tasks, records)
+            _publish(cache, records)
     else:
-        _publish(cache, tasks, records)
-    assert not list(path.glob("*/manifest.json"))
+        _publish(cache, records)
+    # The faulty repeat seeds nothing; an intact repeat is cached on its own.
+    assert not list(path.glob("*/1"))
 
 
 def test_cached_artifact_tampering_is_rejected_before_import(tmp_path: Path) -> None:
     path = tmp_path / "cache"
     first, tasks, records = _cohort(tmp_path / "first", path)
-    _publish(first, tasks, records)
-    cohort = path / first.keys["answer"]
+    _publish(first, records)
+    cohort = path / first.keys["answer"] / "1"
     (cohort / "attempts/baseline-1/handoff/artifacts/submission-source.json").write_text("tampered")
     second, _, _ = _cohort(tmp_path / "second", path)
     with pytest.raises(ValueError, match="cohort changed"):
         second.reserve()
 
 
-def test_missing_cohort_lock_and_partial_publication_preserve_full_repeats(tmp_path: Path) -> None:
+def test_cohort_lock_and_each_published_repeat_is_its_own_hit(tmp_path: Path) -> None:
     path = tmp_path / "cache"
     first, tasks, records = _cohort(tmp_path / "first", path)
     second, _, _ = _cohort(tmp_path / "second", path)
@@ -419,14 +420,17 @@ def test_missing_cohort_lock_and_partial_publication_preserve_full_repeats(tmp_p
         first.reserve()
         with pytest.raises(ValueError, match="cohort is in use"):
             second.reserve()
-        with pytest.raises(ValueError):
-            first.publish(records[:1], tasks)
-        assert not list(path.glob("*/manifest.json"))
+        # A run that stops after one repeat still caches that repeat.
+        first.publish(records[0])
+        assert [entry.name for entry in (path / first.keys["answer"]).iterdir()] == ["1"]
     finally:
         first.close()
     try:
         second.reserve()
-        assert all(row["status"] == "miss" for row in second.decisions().values())
+        decisions = second.decisions()
+        assert decisions["baseline-1"]["status"] == "hit"
+        assert decisions["baseline-1"]["origin_cohort"].endswith(f"{second.keys['answer']}/1")
+        assert decisions["baseline-2"]["status"] == "miss"
     finally:
         second.close()
 
@@ -512,7 +516,8 @@ def test_reuse_regrades_without_replaying_models_and_retains_failures(
     assert json.loads(correctness.read_text())["checks"]["native_completion"] is False
     # Origins name their cohort relative to the cache root, never the origin run's path.
     assert all(
-        item["origin_cohort"] == "cache/" + item["cache_key"] and "origin_run" not in item
+        item["origin_cohort"] == f"cache/{item['cache_key']}/{item['original_record']['attempt']}"
+        and "origin_run" not in item
         for item in run["baseline_origin"].values()
     )
     for record in baseline:
@@ -534,7 +539,7 @@ def test_reuse_regrades_without_replaying_models_and_retains_failures(
 
 def test_moved_cache_and_run_keep_their_cache_decisions_readable(tmp_path: Path) -> None:
     first, tasks, records = _cohort(tmp_path / "first", tmp_path / "cache-a/vanilla")
-    _publish(first, tasks, records)
+    _publish(first, records)
     (tmp_path / "cache-a").rename(tmp_path / "cache-b")
     second, _, entries = _cohort(tmp_path / "second", tmp_path / "cache-b/vanilla")
     shutil.rmtree(second.root)
