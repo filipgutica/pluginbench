@@ -144,3 +144,39 @@ def test_tool_roots_grant_the_codex_code_mode_host_beside_the_launched_path(
     roots = isolation.tool_roots()
     assert launcher / "codex-code-mode-host" in roots
     assert release / "codex-code-mode-host" in roots
+
+
+def _codex_launcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, host: bool) -> Path:
+    launcher = tmp_path / "launcher"
+    launcher.mkdir()
+    names = ("codex", "codex-code-mode-host") if host else ("codex",)
+    for name in names:
+        (launcher / name).write_text("#!/bin/sh\n")
+        (launcher / name).chmod(0o755)
+    monkeypatch.setenv("PATH", str(launcher) + os.pathsep + os.environ["PATH"])
+    return launcher
+
+
+def test_reviewer_probe_finds_the_code_mode_host_inside_the_sandbox_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    launcher = _codex_launcher(tmp_path, monkeypatch, host=True)
+    assert isolation.codex_code_mode_host() == launcher / "codex-code-mode-host"
+
+
+def test_reviewer_probe_fails_when_codex_code_mode_host_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Every pilot review failed: code mode could not start its host inside the sandbox.
+    _codex_launcher(tmp_path, monkeypatch, host=False)
+    with pytest.raises(ValueError, match="codex-code-mode-host"):
+        isolation.codex_code_mode_host()
+
+
+def test_reviewer_probe_fails_when_the_sandbox_would_not_grant_the_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _codex_launcher(tmp_path, monkeypatch, host=True)
+    monkeypatch.setattr(isolation, "tool_roots", lambda: [])
+    with pytest.raises(ValueError, match="sandbox"):
+        isolation.codex_code_mode_host()

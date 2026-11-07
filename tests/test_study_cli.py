@@ -14,7 +14,16 @@ import yaml
 from typer.testing import CliRunner
 from typer.main import get_group
 
-from pluginbench import claude, cli, codex, evaluation, harbor_backend, study, submissions
+from pluginbench import (
+    claude,
+    cli,
+    codex,
+    evaluation,
+    harbor_backend,
+    isolation,
+    study,
+    submissions,
+)
 from pluginbench.remeasure import propose_remeasurement
 from pluginbench.study_review import recover_review_citations
 from native_support import (
@@ -23,6 +32,9 @@ from native_support import (
     runtime_identity as native_runtime_identity,
     synthetic_contract,
     qualify_synthetic_source,
+    passing_git_probe,
+    passing_reference_agents,
+    reference_agent,
 )
 
 
@@ -61,6 +73,12 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> evaluation.Evalua
     )
     monkeypatch.setattr(harbor_backend, "assert_runtime", lambda expected: None)
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {})
+    # Docker-backed checks pass here; tests that exercise a failing check replace one of these.
+    monkeypatch.setattr(harbor_backend, "probe_coding_environment", passing_git_probe)
+    monkeypatch.setattr(harbor_backend, "run_reference_agents", passing_reference_agents)
+    monkeypatch.setattr(
+        isolation, "codex_code_mode_host", lambda: Path("/fixture/codex-code-mode-host")
+    )
     return evaluation.resolve_evaluation(
         {
             "runner": {"harness": "codex", "model": "gpt-6.1-sol", "reasoning": "medium"},
@@ -75,7 +93,7 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> evaluation.Evalua
 def test_public_commands_cover_evaluations_reports_and_task_selection() -> None:
     result = CliRunner().invoke(cli.app, ["--help"])
     assert result.exit_code == 0
-    assert set(get_group(cli.app).commands) == {"run", "report", "tasks"}
+    assert set(get_group(cli.app).commands) == {"check", "run", "report", "tasks"}
     assert set(get_group(cli.tasks_app).commands) == {"pick"}
     assert CliRunner().invoke(cli.app, ["--version"]).stdout.strip() == "0.4.0"
 
@@ -251,7 +269,7 @@ def test_failed_native_preparation_stops_before_coding_or_grading(
     monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 1)
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: kwargs)
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {})
-    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.162.0"})
+    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.167.0"})
     monkeypatch.setattr(codex, "runtime_environment", lambda *args, **kwargs: ({}, ()))
     monkeypatch.setattr(codex, "invoke", lambda **kwargs: pytest.fail("no coding call"))
     monkeypatch.setattr(
@@ -580,7 +598,7 @@ def test_integrated_evaluation_and_report_regeneration(
             kwargs["protocol"]["native_task_identity"],
             reward=0 if call_number == 1 else 1,
             timeout=config.timeout_seconds,
-            version="0.162.0",
+            version="0.167.0",
         )
         if separate_coverage_scope:
             verifier = result["native_verifier_result"]
@@ -594,14 +612,14 @@ def test_integrated_evaluation_and_report_regeneration(
                 {
                     "type": "session_meta",
                     "payload": {
-                        "cli_version": "0.162.0" if separate_coverage_scope else "test-version"
+                        "cli_version": "0.167.0" if separate_coverage_scope else "test-version"
                     },
                 }
             ],
         )
         return result
 
-    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.162.0"})
+    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.167.0"})
     monkeypatch.setattr(harbor_backend, "prepare_native_task", prepare)
     monkeypatch.setattr(harbor_backend, "run_native_command", native_coverage)
     monkeypatch.setattr(codex, "runtime_environment", lambda *args: ({}, ()))
@@ -719,6 +737,16 @@ def test_integrated_evaluation_and_report_regeneration(
             for file in files:
                 file.unlink()
         standards.unlink()
+
+        def missing_host() -> Path:
+            raise ValueError("Codex reviews need an executable codex-code-mode-host")
+
+        # Resumed reviews get the same sandbox probe before their first call.
+        with monkeypatch.context() as patched:
+            patched.setattr(isolation, "codex_code_mode_host", missing_host)
+            blocked = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes"])
+        assert blocked.exit_code == 2 and "codex-code-mode-host" in blocked.stderr
+        assert len(calls) == 9 and not judge_calls
         result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes"])
         assert result.exit_code == 0, result.stderr
         assert "0 coding attempts +" in result.stdout
@@ -726,11 +754,18 @@ def test_integrated_evaluation_and_report_regeneration(
         assert json.loads(failed.read_text())["status"] == "failed"
     else:
         if collection_unavailable:
-            monkeypatch.setattr(
-                harbor_backend,
-                "run_native_command",
-                lambda **kwargs: {"exit_code": 3, "timed_out": False, "report_collected": False},
-            )
+            prepared_collection = harbor_backend.run_native_command
+
+            def failed_collection(**kwargs: Any) -> dict[str, object]:
+                # A collector broken before coding blocks the check; only the required-readiness
+                # case keeps it broken there. Otherwise collection fails after coding.
+                if not readiness_required and "measurement-readiness" in str(
+                    kwargs.get("destination")
+                ):
+                    return prepared_collection(**kwargs)
+                return {"exit_code": 3, "timed_out": False, "report_collected": False}
+
+            monkeypatch.setattr(harbor_backend, "run_native_command", failed_collection)
         if readiness_required:
             with pytest.raises(ValueError, match="no coding calls"):
                 evaluation.run_evaluation(config, root)
@@ -920,7 +955,7 @@ def test_review_credentials_checked_before_coding(
     raw["measurements"].append("review")
     raw["reviewer"] = {"harness": "claude", "model": "claude-sonnet-5-5", "reasoning": "high"}
     selected = evaluation.resolve_evaluation(raw, Path.cwd())
-    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.162.0"})
+    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.167.0"})
     monkeypatch.setattr(claude, "preflight", lambda: {"harness_version": "2.1.0"})
 
     def credentials(private: Path, harness: str) -> tuple[dict[str, str], tuple[str, ...]]:
@@ -943,3 +978,224 @@ def test_review_credentials_checked_before_coding(
 def test_claude_aliases_rejected_before_calls(model: str) -> None:
     with pytest.raises(ValueError, match="exact claude-"):
         evaluation.Runner(harness="claude", model=model, reasoning="high")
+
+
+REAL_CODE_MODE_HOST = isolation.codex_code_mode_host
+LCOV = "SF:src/answer.py\nDA:1,1\nLF:1\nLH:1\nFN:1,answer\nFNDA:1,answer\nFNF:1\nFNH:1\nend_of_record\n"
+
+
+def _prepare_fixture_task(**kwargs: Any) -> dict[str, object]:
+    """Offline preparation: the frozen task is a copy of the real config's task."""
+    destination = kwargs["destination"]
+    destination.mkdir(parents=True)
+    entry = task_entry(destination, kwargs["task_dir"].name, version=kwargs["version"])
+    provenance = entry["provenance"]
+    assert isinstance(provenance, dict)
+    identity: dict[str, object] = json.loads(provenance["native_task_identity"])
+    native_task = Path(str(identity["task_dir"]))
+    shutil.rmtree(native_task)
+    shutil.copytree(kwargs["task_dir"], native_task)
+    identity.update(
+        task_assets_sha256=harbor_backend.native_task_assets(native_task),
+        original_task_assets_sha256=harbor_backend.native_task_assets(kwargs["task_dir"]),
+        resources=kwargs["limits"],
+        isolation=harbor_backend.runtime_identity(
+            cpus=kwargs["limits"]["cpus"], memory_mb=kwargs["limits"]["memory_mb"]
+        ),
+    )
+    qualify_synthetic_source(identity)
+    return identity
+
+
+def _lcov(**kwargs: Any) -> dict[str, object]:
+    kwargs["destination"].mkdir(parents=True, exist_ok=True)
+    (kwargs["destination"] / "report.raw").write_text(LCOV)
+    return {"exit_code": 0, "timed_out": False, "report_collected": True}
+
+
+@pytest.fixture
+def checkable(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, Any]:
+    """One coverage task, one task with no coverage tool, a Codex reviewer; every check passes."""
+    covered = config.tasks.resolve() / "covered-native-task"
+    shutil.copytree(config.tasks.resolve() / config.tasks.ids[0], covered)
+    toml = (covered / "task.toml").read_text()
+    (covered / "task.toml").write_text(
+        toml.replace(
+            "[agent]", "[metadata]\nrepository_url='https://example.invalid/covered'\n[agent]"
+        )
+    )
+    standards = tmp_path / "review-standards.md"
+    standards.write_text("Report actionable correctness findings only.\n")
+    raw = config.model_dump(mode="json")
+    raw["tasks"]["ids"].append(covered.name)
+    raw["measurements"] += ["coverage", "review"]
+    raw["measurement_settings"]["coverage_profiles"] = {
+        "https://example.invalid/covered": {
+            "command": ["python3", "-m", "coverage"],
+            "report_path": "coverage/lcov.info",
+            "tool_version": "fixture-1",
+        }
+    }
+    raw["reviewer"] = {
+        "harness": "codex",
+        "model": "gpt-6-astra",
+        "reasoning": "high",
+        "guidance": [str(standards)],
+    }
+    calls: list[object] = []
+    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.167.0"})
+    monkeypatch.setattr(codex, "runtime_environment", lambda *args, **kwargs: ({}, ()))
+    monkeypatch.setattr(harbor_backend, "prepare_native_task", _prepare_fixture_task)
+    monkeypatch.setattr(harbor_backend, "run_native_command", _lcov)
+    monkeypatch.setattr(codex, "invoke", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(harbor_backend, "invoke_native", lambda **kwargs: calls.append(kwargs))
+    path = tmp_path / "eval.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    return {"path": path, "calls": calls, "output": tmp_path / "checked"}
+
+
+def test_check_passes_tasks_with_and_without_a_coverage_tool_in_one_config(
+    checkable: dict[str, Any],
+) -> None:
+    # The pilot had to split every phase into two evaluations because of blanket require_ready.
+    result = CliRunner().invoke(
+        cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"])]
+    )
+    assert result.exit_code == 0, result.stderr
+    report = json.loads((checkable["output"] / "check.json").read_text())
+    assert report["status"] == "ready" and report["model_calls"] == 0
+    matrix = report["matrix"]
+    assert matrix["covered-native-task"]["coverage"]["state"] == "ready"
+    assert matrix["arbitrary-native-task"]["coverage"]["state"] == "not_configured"
+    assert {
+        row["state"] for task in matrix.values() for name, row in task.items() if name != "coverage"
+    } == {"ready"}
+    assert matrix["covered-native-task"]["coding_environment"]["image_source"] == "prebuilt"
+    header = result.stdout.splitlines()[-4]
+    assert header.split()[:2] == ["task", "coverage"] and "oracle" in header
+    assert not checkable["calls"]
+    assert not list(checkable["output"].rglob("invocation.json"))
+    assert not (checkable["output"] / "evidence").exists()
+
+
+def test_required_measure_that_is_not_configured_blocks_the_check(
+    checkable: dict[str, Any],
+) -> None:
+    raw = yaml.safe_load(checkable["path"].read_text())
+    raw["measurement_settings"]["require_ready"] = True
+    checkable["path"].write_text(yaml.safe_dump(raw))
+    result = CliRunner().invoke(
+        cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"])]
+    )
+    assert result.exit_code == 2
+    assert "arbitrary-native-task: coverage is not_configured" in result.stderr
+    assert not checkable["calls"]
+
+
+def _failing_reference_agents(oracle: dict[str, object], nop: dict[str, object]) -> Any:
+    return lambda identity, destination: {"oracle": oracle, "nop": nop}
+
+
+@pytest.mark.parametrize("command", ["check", "run"])
+@pytest.mark.parametrize(
+    "failure,expected",
+    [
+        ("codex 0.168.0", "Codex CLI 0.168.0 is not supported"),
+        ("no code-mode host", "codex-code-mode-host"),
+        ("git commit fails", "coding_environment is broken: git commit failed"),
+        (
+            "oracle empty patch",
+            "oracle is broken: reference solution produced an empty graded patch",
+        ),
+        ("oracle reward 0", "oracle is broken: verifier reward is False; expected 1"),
+        ("nop reward 1", "nop is broken: verifier reward is True; expected 0"),
+        ("broken collector", "coverage is broken"),
+    ],
+)
+def test_each_predictable_failure_stops_before_any_coding_call(
+    checkable: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    failure: str,
+    expected: str,
+) -> None:
+    if failure == "codex 0.168.0":
+        monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.168.0"})
+    elif failure == "no code-mode host":
+        launcher = tmp_path / "launcher"
+        launcher.mkdir()
+        (launcher / "codex").write_text("#!/bin/sh\n")
+        (launcher / "codex").chmod(0o755)
+        monkeypatch.setenv("PATH", str(launcher) + os.pathsep + os.environ["PATH"])
+        monkeypatch.setattr(isolation, "codex_code_mode_host", REAL_CODE_MODE_HOST)
+    elif failure == "git commit fails":
+        monkeypatch.setattr(
+            harbor_backend,
+            "probe_coding_environment",
+            lambda identity: {
+                "status": "failed",
+                "reason": "git commit failed in the coding image (exit 128): Author identity unknown",
+            },
+        )
+    elif failure.startswith("oracle"):
+        oracle = reference_agent(reward=0.0, patch_bytes=0 if "empty" in failure else 120)
+        monkeypatch.setattr(
+            harbor_backend,
+            "run_reference_agents",
+            _failing_reference_agents(oracle, reference_agent(reward=0.0, patch_bytes=0)),
+        )
+    elif failure == "nop reward 1":
+        monkeypatch.setattr(
+            harbor_backend,
+            "run_reference_agents",
+            _failing_reference_agents(
+                reference_agent(reward=1.0, patch_bytes=120),
+                reference_agent(reward=1.0, patch_bytes=0),
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            harbor_backend,
+            "run_native_command",
+            lambda **kwargs: {"exit_code": 3, "timed_out": False, "report_collected": False},
+        )
+    output = str(checkable["output"])
+    arguments = (
+        ["check", str(checkable["path"]), "--output", output]
+        if command == "check"
+        else ["run", "--config", str(checkable["path"]), "--output", output, "--yes"]
+    )
+    result = CliRunner().invoke(cli.app, arguments)
+    assert result.exit_code == 2, result.stdout
+    assert expected in result.stderr and "Traceback" not in result.stderr
+    assert not checkable["calls"]
+    assert not list(checkable["output"].rglob("invocation.json"))
+    assert not (checkable["output"] / "evidence").exists()
+
+
+def test_check_warns_when_a_prebuilt_image_ignores_the_task_dockerfile(
+    checkable: dict[str, Any],
+) -> None:
+    # A git-identity fix in this Dockerfile silently did nothing, and a whole pilot was lost.
+    raw = yaml.safe_load(checkable["path"].read_text())
+    task = Path(raw["tasks"]["source"]) / raw["tasks"]["ids"][0]
+    (task / "environment/Dockerfile").write_text(
+        "FROM fixture:pinned\nRUN git config --global user.name x\n"
+    )
+    result = CliRunner().invoke(
+        cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"])]
+    )
+    assert result.exit_code == 0, result.stderr
+    assert "Warning: arbitrary-native-task: runs the prebuilt image fixture:pinned" in result.stdout
+    report = json.loads((checkable["output"] / "check.json").read_text())
+    assert report["warnings"] == [
+        "arbitrary-native-task: runs the prebuilt image fixture:pinned; environment/Dockerfile "
+        "is never built, so changes to it have no effect"
+    ]
+    assert report["coding_images"]["covered-native-task"]["ignored_dockerfile"] is None
+    environment = report["matrix"]["arbitrary-native-task"]["coding_environment"]
+    assert environment["image_source"] == "prebuilt"
+    assert environment["ignored_dockerfile"] == "environment/Dockerfile"

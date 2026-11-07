@@ -916,3 +916,17 @@ def test_native_named_spawn_rejects_two_session_identities_for_one_child_path() 
         "conflicting descendant identities for agent /root/check from session root"
         in parsed["usage_accounting"]["reasons"]
     )
+
+
+@pytest.mark.parametrize("version", ["0.162.1", "0.167.0"])
+def test_version_admission_accepts_versions_the_usage_parser_was_checked_against(
+    version: str,
+) -> None:
+    codex.admit_version(version)
+
+
+@pytest.mark.parametrize("version", ["0.168.0", "0.162.0", "0.167.1"])
+def test_version_admission_rejects_versions_whose_usage_would_be_lost(version: str) -> None:
+    # 0.167.0 forked rollouts were silently recorded with no usage under a 0.162.1-only parser.
+    with pytest.raises(ValueError, match=f"Codex CLI {version} is not supported"):
+        codex.admit_version(version)

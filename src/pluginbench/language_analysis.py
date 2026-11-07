@@ -75,7 +75,11 @@ def default_tool_paths(language: str) -> dict[str, str]:
 def language_capability(language: str) -> dict[str, dict[str, object]]:
     if language not in SUFFIXES:
         return {
-            name: {"status": "unavailable", "reason": f"No pinned observer for {language}"}
+            name: {
+                "status": "unavailable",
+                "reason": f"No pinned observer for {language}",
+                "configured": False,
+            }
             for name in ("cognitive", "cyclomatic", "dead_code")
         }
     tools = probe_language_tools(language)

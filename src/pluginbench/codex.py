@@ -453,6 +453,16 @@ def _token_usage(value: object) -> dict[str, int] | None:
 _INHERITED_HISTORY_VERSIONS = frozenset({"0.162.1", "0.167.0"})
 
 
+def admit_version(version: str) -> None:
+    """Refuse a Codex CLI whose session traces the usage parser has not been checked against."""
+    if version not in _INHERITED_HISTORY_VERSIONS:
+        raise ValueError(
+            f"Codex CLI {version} is not supported: token usage is parsed only for "
+            + ", ".join(sorted(_INHERITED_HISTORY_VERSIONS))
+            + ". Install a supported version, or check this version's rollouts and add it."
+        )
+
+
 def _session_history(
     events: list[dict[str, Any]], reasons: set[str]
 ) -> tuple[dict[str, Any], list[dict[str, Any]], bool] | None:

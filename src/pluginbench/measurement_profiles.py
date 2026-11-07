@@ -142,20 +142,45 @@ def capability_plan(
     for name in sorted(selected):
         reason = None
         collector = None
+        # A measure with no collector for this task is not configured; a configured one that
+        # cannot run (missing or wrong tool) is broken. See readiness_state.
+        configured = True
         if name in FALLOW_MEASUREMENTS:
             collector = "fallow" if is_fallow else "analysis"
             reason = fallow_reason if is_fallow else analysis.get(name, {}).get("reason")
+            configured = is_fallow or analysis.get(name, {}).get("configured") is not False
         elif name == "coverage":
             collector = "coverage"
             if coverage is None:
                 reason = "Coverage requires an explicit test command, report format/path and tool version"
+                configured = False
         result[name] = {
             "status": "unavailable" if reason else "available",
             "reason": reason,
             **({"collector": collector} if collector else {}),
             **({"tool_version": fallow_version} if collector == "fallow" else {}),
+            **({} if configured else {"configured": False}),
         }
     return result
+
+
+def readiness_state(row: dict[str, object]) -> str:
+    """ready, not_configured (no collector for this task), or broken (configured but failing)."""
+    if row.get("status") == "available":
+        return "ready"
+    return "not_configured" if row.get("configured") is False else "broken"
+
+
+def blocking_findings(
+    matrix: dict[str, dict[str, dict[str, object]]], *, require_ready: bool
+) -> list[str]:
+    """Broken rows always block; not-configured rows block only when every measure is required."""
+    return [
+        f"{task}: {name} is {row['state']}: {row.get('reason')}"
+        for task, rows in matrix.items()
+        for name, row in rows.items()
+        if row["state"] == "broken" or (require_ready and row["state"] == "not_configured")
+    ]
 
 
 def coverage_settings(task_dir: Path, settings: MeasurementSettings) -> CoverageSettings | None:
@@ -464,7 +489,11 @@ def probe_measurements(
         capability = _object(capabilities[metric], "measurement capability")
         kind = capability.get("collector")
         if not isinstance(kind, str):
-            result[metric] = {**capability, "readiness": "not_applicable"}
+            result[metric] = {
+                **capability,
+                "state": readiness_state(capability),
+                "readiness": "not_applicable",
+            }
             continue
         measurements = [repeat.get(kind) for repeat in repeats]
         values = [row.get("metrics") if isinstance(row, dict) else None for row in measurements]
@@ -487,7 +516,7 @@ def probe_measurements(
             reason = (
                 "; ".join(str(failure["reason"]) for failure in failures) or "no bound measurement"
             )
-        result[metric] = {
+        row = {
             **capability,
             "status": "available" if ready else "unavailable",
             "readiness": "passed" if ready else "failed",
@@ -499,5 +528,6 @@ def probe_measurements(
                 else {}
             ),
         }
+        result[metric] = {**row, "state": readiness_state(row)}
     _json(output / "readiness.json", result)
     return result

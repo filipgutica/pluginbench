@@ -691,8 +691,18 @@ def validate_native_task(task_dir: Path) -> dict[str, object]:
             )
         if not configuration.docker_image and not (directory / "Dockerfile").is_file():
             raise ValueError("Native environment needs a Docker image or Dockerfile")
+    image = task.config.environment.docker_image
+    dockerfile = task.paths.environment_dir / "Dockerfile"
     return {
         "task_assets_sha256": native_task_assets(task_dir),
+        # Agents run in a prebuilt image as published; a Dockerfile beside it is never built.
+        "coding_image": {
+            "source": "prebuilt" if image else "dockerfile",
+            "image": image,
+            "ignored_dockerfile": str(dockerfile.relative_to(task_dir))
+            if image and dockerfile.is_file()
+            else None,
+        },
         "configuration": task.config.model_dump(mode="json"),
         "verifier_directory": str(definition.directory),
         "verifier_bundled_tests": definition.bundled_tests,
@@ -1644,6 +1654,208 @@ def prepare_native_task(
         }
         codex.write_json(destination / "artifacts/native-preparation.json", receipt)
         return receipt
+
+
+def probe_coding_environment(identity: dict[str, object]) -> dict[str, object]:
+    """No-model proof that an agent can commit in the frozen coding image.
+
+    Graded patches are `git diff BASE HEAD`, so an image where `git commit` fails (for example,
+    with no git identity) makes every attempt an empty patch. The probe uses only the task's own
+    environment and agent user, exactly as Harbor starts the agent.
+    """
+    expected = _native_object(identity["isolation"], "probe runtime")
+    limits = _native_object(expected["resources"], "probe resources")
+    image = _native_object(identity["image_identity"], "probe coding image")
+    task = importlib.import_module("harbor.models.task.task").Task(Path(str(identity["task_dir"])))
+    resolve_env = importlib.import_module("harbor.utils.env").resolve_env_vars
+    workdir = shlex.quote(str(identity["workdir"]))
+    git = "git -c safe.directory=" + workdir
+    command = (
+        f"exec 2>&1; set -eu; cd {workdir}; before=$({git} rev-parse HEAD); "
+        f"{git} commit --allow-empty --no-verify -q -m pluginbench-git-probe; "
+        f'test "$({git} rev-parse HEAD)" != "$before"; {git} var GIT_AUTHOR_IDENT'
+    )
+    owner = uuid4().hex
+    project = "pluginbench-git-probe-" + owner
+    arguments = [
+        "create",
+        "--label",
+        "com.docker.compose.project=" + project,
+        "--label",
+        _OWNER_LABEL + "=" + owner,
+        "--cpus",
+        str(limits["cpus"]),
+        "--memory",
+        str(limits["memory_mb"]) + "m",
+        "--network",
+        "none",
+        "--entrypoint",
+        "bash",
+    ]
+    for key, value in sorted(resolve_env(task.config.environment.env).items()):
+        arguments.extend(["--env", f"{key}={value}"])
+    if task.config.agent.user is not None:
+        arguments.extend(["--user", str(task.config.agent.user)])
+    receipt: dict[str, object] = {"status": "failed", "image_id": image["image_id"]}
+    try:
+        container = _docker(
+            *arguments, str(image["image_id"]), "-c", command, expected_runtime=expected
+        ).strip()
+        _docker("start", "--attach", container, timeout=60, expected_runtime=expected)
+        exit_code = _docker("wait", container, expected_runtime=expected).strip()
+        output = _docker("logs", container, expected_runtime=expected).strip()
+        if exit_code == "0":
+            receipt.update(status="passed", author=output.splitlines()[-1] if output else None)
+        else:
+            receipt["reason"] = (
+                f"git commit failed in the coding image (exit {exit_code}): {output}"
+            )
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        receipt["reason"] = str(error)
+    finally:
+        try:
+            receipt["cleanup"] = cleanup(project=project, owner=owner, expected_runtime=expected)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+            receipt["cleanup"] = {"status": "incomplete", "error": str(error)}
+            receipt.update(status="failed", reason="git probe cleanup incomplete: " + str(error))
+    return receipt
+
+
+def binary_native_reward(verifier: object) -> bool | None:
+    """A native verifier's pass (1) or fail (0); None when its reward is not binary."""
+    rewards = verifier.get("rewards") if isinstance(verifier, dict) else None
+    if isinstance(rewards, dict) and ("reward" in rewards or len(rewards) == 1):
+        reward = rewards["reward"] if "reward" in rewards else next(iter(rewards.values()))
+        if type(reward) in {int, float} and reward in (0, 1):
+            return bool(reward)
+    return None
+
+
+_REFERENCE_AGENT_TIMEOUT = 900
+
+
+def run_reference_agents(identity: dict[str, object], destination: Path) -> dict[str, object]:
+    """Run Harbor's oracle and nop agents through the frozen coding, patch and verifier path.
+
+    No credentials enter these trials (install-only environment), so no model can be called.
+    Each trial's stopped source is exported and its graded patch reconstructed over the frozen
+    fixture with the same functions paid attempts use, so a failure there blocks the check.
+    The caller judges the results: oracle needs a nonempty patch and reward 1, nop reward 0.
+    """
+    task_dir = Path(str(identity["task_dir"]))
+    expected = _native_object(identity["isolation"], "reference runtime")
+    toolchain = _native_object(identity["toolchain_identity"], "reference toolchain")
+    solve = importlib.import_module("harbor.models.task.task").Task(task_dir).paths.solve_path
+    results: dict[str, object] = {}
+    for agent in ("oracle", "nop"):
+        if agent == "oracle" and not solve.is_file():
+            results[agent] = {
+                "status": "not_configured",
+                "reason": "task ships no solution/solve.sh",
+            }
+            continue
+        area = destination / agent
+        area.mkdir(parents=True)
+        owner = uuid4().hex
+        name = "pluginbench-" + owner
+        config = _native_config(
+            task_dir=task_dir,
+            area=area,
+            owner=owner,
+            harness=str(toolchain["harness"]),
+            version=str(toolchain["harness_version"]),
+            limits=_native_object(expected["resources"], "reference resources"),
+            timeout=_REFERENCE_AGENT_TIMEOUT,
+        )
+        # Harbor's built-in agents take no coding-CLI settings or provider hosts.
+        config["agent"] = {
+            "name": agent,
+            "override_timeout_sec": _REFERENCE_AGENT_TIMEOUT,
+            "kwargs": {},
+        }
+        row: dict[str, object] = {"status": "failed"}
+        result: dict[str, object] = {}
+        export: dict[str, object] | None = None
+        try:
+            worker = _native_process(
+                area=area,
+                config=config,
+                expected=expected,
+                harness=str(toolchain["harness"]),
+                timeout=_native_worker_budget(
+                    task_dir=task_dir, agent_seconds=_REFERENCE_AGENT_TIMEOUT
+                ),
+                install_only=True,
+            )
+            if worker.get("session_id") != name + "__env":
+                raise ValueError("Reference agent returned a foreign trial identity")
+            result = _native_object(worker["result"], "reference agent result")
+        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+            row["reason"] = str(error)
+        finally:
+            # Freeze the stopped source before cleanup, exactly as a paid attempt does.
+            try:
+                export = _native_submission(
+                    area=area, name=name, identity=identity, expected=expected
+                )
+                codex.write_json(area / "artifacts/submission-source.json", export)
+            except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                row.setdefault("reason", "stopped-source export failed: " + str(error))
+            row["cleanup"] = _native_cleanup_projects(name=name, owner=owner, expected=expected)
+        if export is not None and "reason" not in row:
+            try:
+                row.update(
+                    status="complete",
+                    exception_info=result.get("exception_info"),
+                    verifier_result=result.get("verifier_result"),
+                    **_admit_reference_submission(
+                        area=area, name=name, identity=identity, export=export
+                    ),
+                )
+            except (OSError, ValueError) as error:
+                row.update(status="failed", reason="graded patch admission failed: " + str(error))
+        codex.write_json(area / "reference-agent.json", row)
+        results[agent] = row
+    return results
+
+
+def _admit_reference_submission(
+    *, area: Path, name: str, identity: dict[str, object], export: dict[str, object]
+) -> dict[str, object]:
+    """Admit a reference trial's export and graded patch as the study admits a paid attempt's."""
+    artifacts = area / "artifacts"
+    (artifacts / "harbor" / name).rename(artifacts / "harbor/trial")
+    execution: dict[str, Any] = {
+        "submission_export_digest": export["snapshot_digest"],
+        "native_artifact_hashes": _native_artifact_hashes(artifacts / "harbor/trial/artifacts"),
+    }
+    submissions.validate_export(
+        diagnostic=area / "workspace", artifacts=artifacts, execution=execution
+    )
+    patch = artifacts / "harbor/trial/artifacts" / submissions.PATCH_ARTIFACT
+    qualification = identity.get("source_qualification")
+    if identity.get("source_policy") != submissions.SOURCE_POLICY or not (
+        isinstance(qualification, dict) and qualification.get("status") == "complete"
+    ):
+        # The submission_source readiness row already reports why; paid attempts fail the same way.
+        reconstruction: dict[str, object] = {
+            "status": "skipped",
+            "reason": "submission source is not qualified",
+        }
+    else:
+        reconstruction = submissions.reconstruct(
+            before=Path(str(identity["fixture_dir"])),
+            task_dir=Path(str(identity["task_dir"])),
+            identity=identity,
+            artifacts=artifacts,
+            execution=execution,
+            destination=area / "snapshot",
+        )
+    return {
+        "patch_bytes": patch.stat().st_size if patch.is_file() else None,
+        "export_digest": export["snapshot_digest"],
+        "reconstruction": reconstruction,
+    }
 
 
 def _native_cleanup_projects(
