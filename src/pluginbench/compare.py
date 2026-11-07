@@ -194,20 +194,21 @@ def measure(evidence: Evidence, gate: Gate, arm: str, tasks: list[str]) -> Measu
         values = [_sum(row.values, gate.metrics) for row in attempts]
         present = [value for value in values if value is not None]
         repeats[task] = len(present)
-        if present and len(present) < len(attempts):
-            why = sorted(
+        why = "; ".join(
+            sorted(
                 {
                     _missing_reason(row, gate.metrics)
                     for row, value in zip(attempts, values, strict=True)
                     if value is None
                 }
             )
+        )
+        if present and len(present) < len(attempts):
             partial[task] = (
-                f"{len(attempts) - len(present)} of {len(attempts)} attempts unmeasured: "
-                + "; ".join(why)
+                f"{len(attempts) - len(present)} of {len(attempts)} attempts unmeasured: {why}"
             )
         if not present:
-            missing[task] = "no attempts" if not attempts else "no measured value"
+            missing[task] = f"no measured value: {why}" if attempts else "no attempts"
             continue
         if gate.statistic == "total":
             per_task[task] = sum(present)
@@ -409,7 +410,8 @@ def _section(evidence: Evidence, gates: Gates, split: str, tasks: list[str]) -> 
             cells.append(f"{_number(result.value)} ({count})")
             notes += [
                 f"{gate.name}, {arm}, {task}: {why}"
-                for task, why in {**result.missing, **result.partial}.items()
+                for found in (result.missing, result.partial)
+                for task, why in found.items()
             ]
         rows.append([gate.name, *cells])
     lines += ["", *_table(rows)]

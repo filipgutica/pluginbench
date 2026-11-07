@@ -95,6 +95,37 @@ def test_reference_below_the_floor_is_missing_and_the_gate_counts_its_tasks(
     assert verdict.detail == "3 of 4 tasks" and verdict.result == "pass"
 
 
+def test_a_partly_measured_task_below_the_floor_shows_both_notes(tmp_path: Path) -> None:
+    runs = []
+    for name in ("pilot-coverage", "pilot-no-coverage"):
+        shutil.copytree(FIXTURE / name, tmp_path / name)
+        runs.append(str(tmp_path / name))
+    task = "happy-dom-abort-pending-body-reads"
+    results = next(
+        path
+        for path in (
+            tmp_path / "pilot-coverage/report/results.json",
+            tmp_path / "pilot-no-coverage/report/results.json",
+        )
+        if any(row["task"] == task for row in json.loads(path.read_text())["attempts"])
+    )
+    data = json.loads(results.read_text())
+    first = next(
+        row for row in data["attempts"] if row["task"] == task and row["guidance"] == "baseline"
+    )
+    for row in data["observations"]:
+        if row["attempt_id"] == first["id"] and row["metric"] == "Net cognitive complexity added":
+            row.update(value=None, status="unknown")
+    results.write_text(json.dumps(data))
+    gates = _gates_file(tmp_path, cognitive_ratio_to_reference={"reference_floor": 10})
+
+    printed = CliRunner().invoke(cli.app, ["compare", *runs, "--gates", str(gates)]).stdout
+
+    note = f"cognitive ratio to reference, vanilla, {task}: "
+    assert note + "reference below floor (3 < 10)" in printed
+    assert note + "1 of 3 attempts unmeasured" in printed
+
+
 def test_a_missing_value_stays_missing_and_leaves_a_total_undetermined(tmp_path: Path) -> None:
     runs = []
     for name in ("pilot-coverage", "pilot-no-coverage"):
@@ -123,7 +154,11 @@ def test_a_missing_value_stays_missing_and_leaves_a_total_undetermined(tmp_path:
     tokens = check_gate(evidence, gates, _gate("tokens"), "superpowers", CLIMB)
     assert tokens.detail == f"4 of 4 tasks; measured repeats differ: {first['task']} 2 vs 3"
     coverage = measure(evidence, _gate("changed-line coverage"), "vanilla", CLIMB)
-    assert coverage.missing == {"happy-dom-abort-pending-body-reads": "no measured value"}
+    assert coverage.missing == {
+        "happy-dom-abort-pending-body-reads": (
+            "no measured value: Changed-line coverage %: no observation"
+        )
+    }
     # A task measured on only some attempts is listed too, with the report's reason.
     hotspots = measure(evidence, gate, "superpowers", CLIMB)
     assert hotspots.partial == {
