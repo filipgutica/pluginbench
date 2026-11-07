@@ -102,7 +102,7 @@ def test_picker_yaml_can_be_used_by_the_actual_evaluation_planner(
             }
         )
     )
-    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 1)
+    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 16)
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: {"fixture": True})
     resolved = evaluation.load_evaluation(config)
     plan = evaluation.plan_evaluation(resolved)

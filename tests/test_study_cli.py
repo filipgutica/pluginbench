@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import shutil
@@ -155,7 +156,7 @@ def test_harbor_rejects_cli_versions_it_cannot_pin_exactly(
     config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
 ) -> None:
     selected = config.model_copy(deep=True)
-    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 1)
+    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 16)
     monkeypatch.setattr(
         harbor_backend,
         "runtime_identity",
@@ -180,7 +181,7 @@ def test_harbor_plan_uses_task_resources_and_labels_the_shorter_agent_budget(
     config: evaluation.Evaluation, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     selected = config.model_copy(deep=True)
-    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 1)
+    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 16)
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: kwargs)
     plan = evaluation.plan_evaluation(selected)
     assert plan["container_limits"] == {"cpus": 2, "memory_mb": 8192}
@@ -212,7 +213,7 @@ def test_task_resource_reduction_stops_before_setup_or_model_calls(
     override: dict[str, int],
 ) -> None:
     selected = config.model_copy(update=override)
-    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 1)
+    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 16)
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: {})
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {})
     monkeypatch.setattr(codex, "preflight", lambda: pytest.fail("must reject before harness setup"))
@@ -251,7 +252,7 @@ def test_mixed_task_resources_require_an_explicit_common_budget(
         "[agent]\ntimeout_sec=10800\n[environment]\ncpus=2\nmemory_mb=4096\nbuild_timeout_sec=1800\ndocker_image='fixture:pinned'\n[verifier]\nmode='separate'\n[verifier.environment]\ndocker_image='grader:pinned'\ncpus=2\nmemory_mb=4096\nbuild_timeout_sec=1800\n"
     )
     selected.tasks.ids.append(task.name)
-    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 1)
+    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 16)
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: kwargs)
     with pytest.raises(ValueError, match="common container_memory_mb"):
         evaluation.plan_evaluation(selected)
@@ -266,7 +267,7 @@ def test_failed_native_preparation_stops_before_coding_or_grading(
     config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     selected = config.model_copy(deep=True)
-    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 1)
+    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 16)
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: kwargs)
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {})
     monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.167.0"})
@@ -794,6 +795,16 @@ def test_integrated_evaluation_and_report_regeneration(
             evaluation.resume_evaluation(root)
         else:
             evaluation.run_evaluation(config, root)
+    # check previews exactly the cache keys the run then decides with.
+    checked = json.loads((root / "check.json").read_text())
+    planned = json.loads((root / "evidence/plan.json").read_text())
+    assert {
+        (row["task_id"], row["repeat"]): row["cache_key"] for row in checked["vanilla_cache"]
+    } == {
+        (entry["task_id"], entry["attempt"]): planned["baseline_cache"][entry["id"]]["cache_key"]
+        for entry in planned["entries"]
+        if entry["arm"] == "baseline"
+    }
     if separate_coverage_scope:
         original_receipts = {
             path: path.read_bytes()
@@ -1199,3 +1210,206 @@ def test_check_warns_when_a_prebuilt_image_ignores_the_task_dockerfile(
     environment = report["matrix"]["arbitrary-native-task"]["coding_environment"]
     assert environment["image_source"] == "prebuilt"
     assert environment["ignored_dockerfile"] == "environment/Dockerfile"
+
+
+def _build_with_fresh_image_ids(
+    monkeypatch: pytest.MonkeyPatch, scratch: Path
+) -> list[str]:
+    """Keep the real preparation cache; fake only the build, which commits a new image ID."""
+    base = {
+        "image": "sha256:" + "a" * 64,
+        "image_id": "sha256:" + "a" * 64,
+        "platform": "linux/arm64",
+        "workdir": "/app",
+    }
+    monkeypatch.setattr(harbor_backend, "_native_image", lambda **kwargs: base)
+    monkeypatch.setattr(
+        harbor_backend, "_inspect_image", lambda reference, **kwargs: {"Id": reference}
+    )
+    built: list[str] = []
+
+    def build(**kwargs: Any) -> dict[str, object]:
+        image_id = "sha256:" + os.urandom(32).hex()  # docker commit never repeats an ID
+        built.append(image_id)
+        identity = _prepare_fixture_task(
+            **{**kwargs, "destination": scratch / f"build-{len(built)}"}
+        )
+        destination = kwargs["destination"]
+        shutil.copytree(Path(str(identity["task_dir"])), destination / "task")
+        shutil.copytree(Path(str(identity["fixture_dir"])), destination / "fixture")
+        image = {**base, "image": image_id, "image_id": image_id}
+        toolchain = identity["toolchain_identity"]
+        assert isinstance(toolchain, dict)
+        identity.update(
+            task_dir=str(destination / "task"),
+            fixture_dir=str(destination / "fixture"),
+            image_identity=image,
+            toolchain_identity={**toolchain, "image_id": image_id, "base_image_identity": base},
+            grader_image_identity=base,
+        )
+        qualify_synthetic_source(identity)
+        (destination / "artifacts").mkdir()
+        (destination / "artifacts/native-preparation.json").write_text(json.dumps(identity))
+        return identity
+
+    monkeypatch.setattr(harbor_backend, "_prepare_native_task", build)
+    return built
+
+
+def test_new_output_folder_keeps_comparison_identity_and_cache_decisions(
+    config: evaluation.Evaluation,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_cache: Path,
+) -> None:
+    # Caches beside the output folder missed every vanilla attempt once the folder moved.
+    built = _build_with_fresh_image_ids(monkeypatch, tmp_path / "scratch")
+    qualified: list[Path] = []
+
+    def reference_agents(identity: dict[str, object], destination: Path) -> dict[str, object]:
+        qualified.append(destination)
+        return passing_reference_agents(identity, destination)
+
+    monkeypatch.setattr(harbor_backend, "run_reference_agents", reference_agents)
+    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.167.0"})
+    monkeypatch.setattr(codex, "runtime_environment", lambda *args, **kwargs: ({}, ()))
+    first = evaluation._check(config, tmp_path / "a/run", None)
+    second = evaluation._check(config, tmp_path / "b/run", None)
+    assert len(built) == 1 and len(qualified) == 1
+    assert second.caches.vanilla == isolated_cache / "pluginbench/vanilla"
+    for name in ("comparison", "task_environment", "capabilities", "vanilla_identity"):
+        assert getattr(first, name) == getattr(second, name), name
+    assert first.report["vanilla_cache"] == second.report["vanilla_cache"]
+    rows = second.report["vanilla_cache"]
+    assert isinstance(rows, list) and len(rows) == config.repeats
+    assert {row["status"] for row in rows} == {"miss"}
+    # Once a cohort is published under that key, a third folder sees every attempt as a hit.
+    for row in rows:
+        (second.caches.vanilla / row["cache_key"]).mkdir(parents=True, exist_ok=True)
+    third = evaluation.check_evaluation(config, tmp_path / "c/run")
+    assert [row["status"] for row in third["vanilla_cache"]] == ["hit"] * config.repeats
+    assert len(built) == 1 and len(qualified) == 1
+
+
+@pytest.mark.parametrize("layout", ["linked-root", "linked-vanilla", "output-in-cache"])
+def test_cache_location_is_resolved_and_checked_before_preparation(
+    config: evaluation.Evaluation,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_cache: Path,
+    layout: str,
+) -> None:
+    real = tmp_path / "real-cache"
+    (real / "pluginbench").mkdir(parents=True)
+    output = tmp_path / "results"
+    if layout == "linked-root":
+        (tmp_path / "linked-cache").symlink_to(real)
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "linked-cache"))
+        caches = evaluation._caches(output)
+        assert caches.vanilla == real / "pluginbench/vanilla"
+        assert not any(path.is_symlink() for path in (caches.vanilla, *caches.vanilla.parents))
+        return
+    monkeypatch.setenv("XDG_CACHE_HOME", str(real))
+    if layout == "linked-vanilla":
+        (tmp_path / "elsewhere").mkdir()
+        (real / "pluginbench/vanilla").symlink_to(tmp_path / "elsewhere")
+        expected = "must not be symlinks"
+    else:
+        output = real / "pluginbench/runs/results"
+        expected = "must not overlap"
+    monkeypatch.setattr(
+        harbor_backend,
+        "prepare_native_task",
+        lambda **kwargs: pytest.fail("the cache is checked before any preparation"),
+    )
+    with pytest.raises(ValueError, match=expected):
+        evaluation.check_evaluation(config, output)
+    assert not output.exists()
+
+
+def test_jobs_above_docker_capacity_fail_instead_of_being_lowered(
+    config: evaluation.Evaluation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 2)
+    with pytest.raises(ValueError, match="jobs=3 does not fit.*set jobs: 2 or fewer"):
+        evaluation.plan_evaluation(config.model_copy(update={"jobs": 3}))
+    plan = evaluation.plan_evaluation(config.model_copy(update={"jobs": 2}))
+    assert plan["jobs"] == plan["comparison_identity"]["jobs"] == 2
+
+
+def test_reference_agents_reuse_only_a_pass_for_the_same_preparation_and_images(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broken = {
+        "oracle": reference_agent(reward=0.0, patch_bytes=0),
+        "nop": reference_agent(reward=0.0, patch_bytes=0),
+    }
+    passing = passing_reference_agents({}, tmp_path)
+    results = iter([broken, passing, passing])
+    runs: list[Path] = []
+
+    def run(identity: dict[str, object], destination: Path) -> dict[str, object]:
+        runs.append(destination)
+        return next(results)
+
+    monkeypatch.setattr(harbor_backend, "run_reference_agents", run)
+    identity: dict[str, object] = {
+        "preparation_key": "6" * 64,
+        "image_identity": {"image_id": "sha256:" + "1" * 64},
+        "grader_image_identity": {"image_id": "sha256:" + "2" * 64},
+    }
+    cache = tmp_path / "reference-agents"
+    states = [
+        evaluation._reference_agents(identity, tmp_path / str(index), cache)["oracle"]["state"]
+        for index in range(3)
+    ]
+    assert states == ["broken", "ready", "ready"] and len(runs) == 2
+    rebuilt = {**identity, "image_identity": {"image_id": "sha256:" + "3" * 64}}
+    rows = evaluation._reference_agents(rebuilt, tmp_path / "3", cache)
+    assert rows["oracle"]["state"] == "ready" and len(runs) == 3
+
+
+def test_check_prints_a_hit_or_miss_for_every_vanilla_attempt(
+    checkable: dict[str, Any], isolated_cache: Path
+) -> None:
+    result = CliRunner().invoke(
+        cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"])]
+    )
+    assert result.exit_code == 0, result.stderr
+    report = json.loads((checkable["output"] / "check.json").read_text())
+    rows = report["vanilla_cache"]
+    assert len(rows) == 2 * 3 and {row["status"] for row in rows} == {"miss"}
+    assert "Vanilla cache: 0 of 6 attempts hit" in result.stdout
+    covered = next(row for row in rows if row["task_id"] == "covered-native-task")
+    (isolated_cache / "pluginbench/vanilla" / covered["cache_key"]).mkdir(parents=True)
+    again = CliRunner().invoke(
+        cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"]) + "-2"]
+    )
+    assert again.exit_code == 0, again.stderr
+    assert "Vanilla cache: 3 of 6 attempts hit" in again.stdout
+    for repeat in (1, 2, 3):
+        hit = f"covered-native-task repeat {repeat}: hit ({covered['cache_key'][:12]})"
+        assert hit in again.stdout
+        assert f"arbitrary-native-task repeat {repeat}: miss" in again.stdout
+
+
+def test_parser_only_change_keeps_the_vanilla_cache_identity(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Every edit to codex.py once missed every cached vanilla attempt, parser fixes included.
+    package = tmp_path / "pluginbench"
+    shutil.copytree(Path(evaluation.__file__).parent, package)
+    monkeypatch.setattr(evaluation, "__file__", str(package / "evaluation.py"))
+    comparison = evaluation.plan_evaluation(config)["comparison_identity"]
+    assert isinstance(comparison, dict)
+
+    def identity() -> dict[str, object]:
+        return evaluation._vanilla_identity(config, comparison, "0.167.0", {})
+
+    original = identity()
+    parser = package / Path(str(inspect.getsourcefile(codex.parse_events))).name
+    parser.write_text(parser.read_text() + "\n# a parser-only change\n")
+    assert identity() == original
+    launcher = package / "codex.py"
+    launcher.write_text(launcher.read_text() + "\n# a launch change\n")
+    assert identity() != original

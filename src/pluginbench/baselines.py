@@ -339,6 +339,62 @@ def _native_export_matches(value: object, identity: dict[str, Any], digest: obje
     return True
 
 
+def cohort_contexts(
+    *, tasks: tuple[TaskSpec, ...], entries: list[dict[str, Any]], identity: dict[str, object]
+) -> dict[str, dict[str, Any]]:
+    """Each task's vanilla cohort context; its hash is the cache key. Holds no run paths."""
+    contexts = {}
+    for task in tasks:
+        coding = {
+            key: value.get(task.task_id)
+            if key in {"task_assets", "task_environment"} and isinstance(value, dict)
+            else value
+            for key, value in identity.items()
+        }
+        coding["native_task_identity"] = portable_native_identity(native_identity(task))
+        contexts[task.task_id] = {
+            "protocol": "native-harbor-baseline-cohort-v3",
+            "source_policy": submissions.SOURCE_POLICY,
+            "coding": coding,
+            "task_id": task.task_id,
+            "task_digest": task.digest,
+            "prompt": task.prompt,
+            "fixture_digest": inspect_snapshot(task.fixture)["digest"],
+            "repeats": sorted(
+                entry["attempt"]
+                for entry in entries
+                if entry["arm"] == "baseline" and entry["task_id"] == task.task_id
+            ),
+        }
+    return contexts
+
+
+def preview(
+    *, path: Path, tasks: tuple[TaskSpec, ...], repeats: int, identity: dict[str, object]
+) -> list[dict[str, object]]:
+    """Hit or miss for every vanilla attempt from cache keys alone; `reserve` still validates."""
+    entries: list[dict[str, Any]] = [
+        {"task_id": task.task_id, "arm": "baseline", "attempt": repeat}
+        for task in tasks
+        for repeat in range(1, repeats + 1)
+    ]
+    keys = {
+        task_id: _hash(context)
+        for task_id, context in cohort_contexts(
+            tasks=tasks, entries=entries, identity=identity
+        ).items()
+    }
+    return [
+        {
+            "task_id": entry["task_id"],
+            "repeat": entry["attempt"],
+            "status": "hit" if (path / keys[entry["task_id"]]).is_dir() else "miss",
+            "cache_key": keys[entry["task_id"]],
+        }
+        for entry in entries
+    ]
+
+
 class BaselineCache:
     """Reserve all missing keys before calls; hold each lock until atomic publication."""
 
@@ -355,27 +411,7 @@ class BaselineCache:
         self.root = root
         self.tasks = {task.task_id: task for task in tasks}
         self.entries = [entry for entry in entries if entry["arm"] == "baseline"]
-        self.contexts = {}
-        for task in tasks:
-            coding = {
-                key: value.get(task.task_id)
-                if key in {"task_assets", "task_environment"} and isinstance(value, dict)
-                else value
-                for key, value in identity.items()
-            }
-            coding["native_task_identity"] = portable_native_identity(native_identity(task))
-            self.contexts[task.task_id] = {
-                "protocol": "native-harbor-baseline-cohort-v3",
-                "source_policy": submissions.SOURCE_POLICY,
-                "coding": coding,
-                "task_id": task.task_id,
-                "task_digest": task.digest,
-                "prompt": task.prompt,
-                "fixture_digest": inspect_snapshot(task.fixture)["digest"],
-                "repeats": sorted(
-                    entry["attempt"] for entry in self.entries if entry["task_id"] == task.task_id
-                ),
-            }
+        self.contexts = cohort_contexts(tasks=tasks, entries=self.entries, identity=identity)
         self.keys = {task_id: _hash(context) for task_id, context in self.contexts.items()}
         self.hits: dict[str, dict[str, Any]] = {}
         self._resources = ExitStack()
@@ -456,10 +492,12 @@ class BaselineCache:
                 if hit
                 else None
             )
+            # Relative to the cache root, so moving the cache or this run keeps it resolvable.
+            # Historical decisions held an absolute `origin_run` path instead.
             decisions[entry["id"]] = {
                 "status": "hit" if hit else "miss",
                 "cache_key": self.keys[task_id],
-                "origin_run": hit["origin_run"] if hit else None,
+                "origin_cohort": f"{self.path.name}/{self.keys[task_id]}" if hit else None,
                 "origin_attempt": old["id"] if old else None,
             }
         return decisions
@@ -581,7 +619,6 @@ class BaselineCache:
                 manifest = {
                     "context": self.contexts[task_id],
                     "records": cohort,
-                    "origin_run": str(self.root),
                     "origin_status": "complete",
                     "task_digest": task_digests[task_id],
                     "inventory": _inventory(staged),

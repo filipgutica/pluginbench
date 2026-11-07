@@ -164,6 +164,10 @@ The checks:
 - `git commit` must work in the coding image with only the task's environment. Graded patches are `git diff BASE HEAD`, so a failing commit makes every patch empty. A prebuilt `docker_image` is used as published; `check` warns when a Dockerfile beside it is never built.
 - Harbor's oracle agent must produce a nonempty patch with reward 1, and its nop agent must get reward 0, through the same commit, patch and verifier path.
 
+Oracle and nop results are cached by preparation key and image IDs. Only passing results are cached, so a failure is retried on the next check.
+
+`check` also prints hit or miss for every vanilla attempt, computed from cache keys alone. `run` validates each hit again before it reuses it.
+
 Results are saved in `check.json`, with measurement receipts in `measurement-readiness.json`. Test-command outcomes remain separate from coverage availability. A failed check or interrupted preparation makes no coding calls. Repair its inputs and start a new evaluation. Post-coding resume continues to use frozen submissions.
 
 Optional local analyzer versions are pinned: Mozilla rust-code-analysis CLI 0.0.25, Vulture 2.16, Go 1.26.4, Staticcheck 0.8.2, gocognit 1.3.0, and gocyclo 0.6.0. Install RCA/Vulture/Staticcheck on PATH when selecting these measurements. Rust unused analysis requires Rust/Cargo 1.92.0 inside the frozen task image and a locked offline build. The shipped Go observer builds its pinned scoring libraries in the observer cache during preparation. Analysis does not download project dependencies. Go unused-code collection needs packages to load under the fixed build settings; missing dependencies or excluded files stay unavailable.
@@ -172,7 +176,9 @@ Python complexity counts RCA's reported function spaces. Anonymous closures have
 
 ## Baselines and reports
 
-Vanilla submissions are cached in `.baseline-cache` beside run directories. Reuse requires matching task assets, source policy, source, prompt, harness, model, reasoning, CLI, runtime, image identities, transport and treatment-delivery policies, capability settings, resources, timeout, jobs, seed, and repeat count. Guidance, reviewer settings, and selected measurements do not change the coding cache key. Cache admission validates the diagnostic export and canonical reconstruction independently, including file modes. Older cache entries without the current source policy cannot be reused.
+PluginBench keeps prepared task images, vanilla submissions, and oracle and nop results in one cache root: `$XDG_CACHE_HOME/pluginbench`, or `~/.cache/pluginbench`. Every output folder shares it, so a new folder reuses prepared images and their committed image IDs, and gets the same vanilla cache keys. The cache root is resolved before preparation, so a symlinked `~/.cache` works. A symlink inside the cache root, or an output folder that overlaps it, fails the check. Cache decisions name their cohort relative to the cache root (`origin_cohort`). Runs made before this change record an absolute `origin_run` path instead; reports still read it. Earlier `.baseline-cache` and `.prepared-images` directories beside run folders are not migrated.
+
+The cache key hashes the modules that launch an attempt. Codex session parsing lives in `codex_events.py`, outside that hash, so a parser-only change keeps every vanilla cache key. Reuse requires matching task assets, source policy, source, prompt, harness, model, reasoning, CLI, runtime, image identities, transport and treatment-delivery policies, capability settings, resources, timeout, jobs, seed, and repeat count. Guidance, reviewer settings, and selected measurements do not change the coding cache key. Cache admission validates the diagnostic export and canonical reconstruction independently, including file modes. Older cache entries without the current source policy cannot be reused.
 
 A cached cohort includes failures and unknowns. Missing isolation receipts, corrupt entries, or a concurrent reservation stop reuse. Imported submissions retain original usage and timing; current native verification, selected measurements, and reviews run again. Reports disclose reuse. Reused runs are not fresh independent samples.
 
@@ -186,7 +192,7 @@ Unknown values are never zero. A complete scan of a submission that changed no f
 
 ## Concurrency and resume
 
-Coding attempts, measurement inputs, and reviews run concurrently within their phases. Jobs are capped by the requested limit, four, Docker CPU capacity, and an 80% Docker memory budget. Preparation and each snapshot's two measurement repeats stay sequential. Jobs affect scheduling and comparison identity, not the number of coding attempts. Subagents can make additional model requests.
+Coding attempts, measurement inputs, and reviews run concurrently within their phases. Docker capacity allows at most four jobs, bounded by Docker CPU capacity and an 80% Docker memory budget. A requested or default `jobs` value above that capacity fails before preparation instead of being lowered, because jobs is part of the comparison identity. Preparation and each snapshot's two measurement repeats stay sequential. Jobs affect scheduling and comparison identity, not the number of coding attempts. Subagents can make additional model requests.
 
 On interruption or fatal failure, new jobs stop. Active jobs finish or time out; their receipts remain. Resume requires a completed coding phase:
 
