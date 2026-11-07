@@ -105,6 +105,20 @@ class Ledger:
             raise ValueError(f"unsupported ledger schema version {version}")
         return cls(connection)
 
+    @classmethod
+    def read(cls, path: Path) -> Ledger:
+        """Open read-only, for observers such as `status`; any write raises sqlite3.Error."""
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
+        try:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+        except sqlite3.Error:
+            connection.close()
+            raise
+        if version != SCHEMA_VERSION:
+            connection.close()
+            raise ValueError(f"unsupported ledger schema version {version}")
+        return cls(connection)
+
     def close(self) -> None:
         self._db.close()
 

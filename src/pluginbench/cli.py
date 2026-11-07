@@ -1,4 +1,4 @@
-"""Run an evaluation or rebuild its saved report."""
+"""The pluginbench command line: init, check, run, status, stop, compare, report, review."""
 
 from __future__ import annotations
 
@@ -19,16 +19,17 @@ import yaml
 from pluginbench import __version__, run_lock
 from pluginbench.evaluation import (
     CheckFailed,
-    Evaluation,
     check_evaluation,
     load_evaluation,
     plan_evaluation,
     plan_resume,
+    plan_review,
     prepare_evaluation,
     regenerate_report,
-    resolve_evaluation,
     resume_evaluation,
+    review_evaluation,
 )
+from pluginbench.run_status import format_status, run_status
 
 app = typer.Typer(
     help="Compare native instructions, skills, and plugins with vanilla coding agents.",
@@ -102,18 +103,56 @@ def _new_run_directory(prefix: str = "") -> Path:
     return Path("runs") / (prefix + datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ"))
 
 
-def _notify(message: str) -> None:
-    """Best-effort macOS notification; a failed notice never fails the run."""
-    text = json.dumps(message, ensure_ascii=False)
-    try:
-        subprocess.run(
-            ["osascript", "-e", f'display notification {text} with title "PluginBench"'],
-            capture_output=True,
-            check=False,
-            timeout=10,
+def _plan_summary(plan: dict[str, object]) -> str:
+    """The readable form of a plan from plan_evaluation or plan_resume."""
+    lines = [f"Evaluation: {plan['name']}"] if "name" in plan else []
+    runner = plan.get("runner")
+    if isinstance(runner, dict):
+        lines.append(
+            f"Runner: {runner['harness']} {runner['model']}, reasoning {runner['reasoning']}"
         )
+    treatments = plan.get("treatments")
+    if isinstance(treatments, dict):
+        lines.append("Arms: " + ", ".join(["vanilla", *treatments]))
+    tasks = plan.get("tasks")
+    if isinstance(tasks, list):
+        lines.append(f"Tasks ({len(tasks)}): " + ", ".join(tasks))
+    for label, key in (("Repeats", "repeats"), ("Jobs", "jobs")):
+        if key in plan:
+            lines.append(f"{label}: {plan[key]}")
+    lines.append(f"Coding attempts: {plan['coding_calls']}   Review calls: {plan['review_calls']}")
+    measurements = plan.get("measurements")
+    if isinstance(measurements, list):
+        lines.append("Measurements: " + (", ".join(measurements) or "none"))
+    capabilities = plan.get("measurement_capabilities")
+    if isinstance(capabilities, dict):
+        unavailable = [
+            f"  {task}: {name}: {row.get('reason')}"
+            for task, rows in capabilities.items()
+            for name, row in rows.items()
+            if row.get("status") != "available"
+        ]
+        if unavailable:
+            lines += ["Unavailable measurements:", *unavailable]
+    if "collect_measurements" in plan:
+        pending = "collected after coding" if plan["collect_measurements"] else "none pending"
+        lines.append(f"Measurements: {pending}")
+    if "vanilla" in plan:
+        lines.append(f"Reuse: {plan['vanilla']}")
+    return "\n".join(lines)
+
+
+def _notify(message: str) -> None:
+    """Best-effort desktop notification; a failed notice never fails the run."""
+    if sys.platform == "darwin":
+        text = json.dumps(message, ensure_ascii=False)
+        command = ["osascript", "-e", f'display notification {text} with title "PluginBench"']
+    else:
+        command = ["notify-send", "PluginBench", message]
+    try:
+        subprocess.run(command, capture_output=True, check=False, timeout=10)
     except (OSError, subprocess.SubprocessError):
-        pass
+        pass  # No notifier installed, or it hung: the run's outcome does not depend on it.
 
 
 def _notifying_progress(attempts: object) -> Callable[[str], None]:
@@ -212,6 +251,7 @@ def _detach(root: Path, *, notify: bool) -> None:
             raise ValueError(f"background run did not start within {_DETACH_TIMEOUT:g}s; see {log}")
         time.sleep(0.05)
     typer.echo(f"Started run {root} in the background (process group {child.pid}).")
+    typer.echo(f"Watch it: pluginbench status {root} --watch")
     typer.echo(f"Events: {root / 'events.jsonl'}   Log: {log}")
     typer.echo(f"Stop it: pluginbench stop {root}")
     typer.echo(f"Resume it after a stop or crash: pluginbench run {root}")
@@ -224,77 +264,45 @@ def main(version: bool = typer.Option(False, "--version", is_eager=True)) -> Non
         raise typer.Exit()
 
 
+@app.command("init")
+def init(
+    config: Path = typer.Argument(
+        Path("evaluation.yaml"), help="Where to write the starter evaluation config."
+    ),
+) -> None:
+    """Write a starter evaluation config to edit; no checks and no model calls."""
+    try:
+        if config.exists():
+            raise ValueError(f"{config} already exists; edit it, or give another path")
+        starter = Path(__file__).with_name("evaluation.example.yaml").read_text()
+        with config.open("x", encoding="utf-8") as stream:
+            stream.write(starter)
+    except (OSError, ValueError) as exc:
+        _error(exc)
+    typer.echo(f"Wrote {config}. Replace its /path/to placeholders, then run:")
+    typer.echo(f"  pluginbench check {config}")
+
+
 @app.command("run")
 def run(
-    target: Path | None = typer.Argument(
-        None,
+    target: Path = typer.Argument(
+        ...,
         help="Evaluation YAML or JSON to start, or a run directory to resume.",
     ),
-    resume: Path | None = typer.Option(
-        None,
-        "--resume",
-        help="Run directory to resume: keeps complete attempts and codes only what is left.",
-    ),
-    config: Path | None = typer.Option(
-        None, "--config", help="Evaluation YAML or JSON; relative paths use its directory."
-    ),
-    harness: str | None = typer.Option(
-        None, "--harness", help="Coding harness; native treatments currently require codex."
-    ),
-    model: str | None = typer.Option(None, "--model"),
-    reasoning: str | None = typer.Option(None, "--reasoning"),
-    guidance: list[Path] | None = typer.Option(
-        None,
-        "--guidance",
-        help="Instruction file; composed into native AGENTS.md, never the task prompt.",
-    ),
-    skill: list[Path] | None = typer.Option(
-        None, "--skill", help="Native skill directory or collection; repeat for one treatment."
-    ),
-    plugin: list[Path] | None = typer.Option(
-        None, "--plugin", help="Complete native plugin package; repeat for one treatment."
-    ),
-    guidance_name: str = typer.Option(
-        "guidance", "--guidance-name", help="Bundle label when using flags."
-    ),
-    tasks: Path | None = typer.Option(
-        None, "--tasks", help="Local Harbor task directory or checkout."
-    ),
-    task: list[str] | None = typer.Option(
-        None, "--task", help="Exact task ID; repeat to select tasks."
-    ),
-    measure: list[str] | None = typer.Option(
-        None,
-        "--measure",
-        help="tokens, lines, cyclomatic, cognitive, dead_code, coverage, review; repeat.",
-    ),
-    review_harness: str | None = typer.Option(None, "--review-harness"),
-    review_model: str | None = typer.Option(None, "--review-model"),
-    review_reasoning: str | None = typer.Option(None, "--review-reasoning"),
-    review_guidance: list[Path] | None = typer.Option(
-        None, "--review-guidance", help="Fixed review standards for every output; repeat."
-    ),
-    repeats: int | None = typer.Option(None, "--repeats", min=1),
-    seed: int | None = typer.Option(None, "--seed"),
-    timeout: int | None = typer.Option(None, "--timeout", min=1),
-    jobs: int | None = typer.Option(
-        None,
-        "--jobs",
-        min=1,
-        max=4,
-        help="Jobs per phase (default 2, at most 4); fails if Docker capacity is lower.",
+    output: Path | None = typer.Option(
+        None, "--output", help="Directory for a new run; default runs/<timestamp>."
     ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
-        help="Validate inputs and show planned attempts; no model calls or preparation.",
+        help="Show what would run; no preparation and no model calls.",
     ),
-    output: Path | None = typer.Option(None, "--output", help="New run directory."),
+    as_json: bool = typer.Option(False, "--json", help="With --dry-run, print the plan as JSON."),
     yes: bool = typer.Option(False, "--yes", help="Start without confirmation."),
     notify: bool = typer.Option(
         False,
         "--notify",
-        help="Send macOS notifications when coding starts and when the run finishes or fails.",
+        help="Desktop notifications when coding starts and when the run finishes or fails.",
     ),
     foreground: bool = typer.Option(
         False,
@@ -302,114 +310,44 @@ def run(
         help="Run in this process instead of in the background.",
     ),
 ) -> None:
-    """Start or resume a run: vanilla and native treatments, measurements, and fixed reviews.
+    """Start a run from a config, or resume a run directory.
 
     Checks run first, in this process. The run then continues in the background unless
-    --foreground is set.
+    --foreground is set. Every setting comes from the config; a resume uses the saved one.
     """
     owned = ExitStack()
     lock: run_lock.RunLock | None = None
     try:
-        if target is not None:
-            if resume or config:
-                raise ValueError("give a config or run directory once, not also --resume/--config")
-            if target.is_dir():
-                resume = target
-            else:
-                config = target
-        overrides = [
-            harness,
-            model,
-            reasoning,
-            guidance,
-            skill,
-            plugin,
-            tasks,
-            task,
-            measure,
-            review_harness,
-            review_model,
-            review_reasoning,
-            review_guidance,
-            repeats,
-            seed,
-            timeout,
-        ]
+        if as_json and not dry_run:
+            raise ValueError("--json prints the dry-run plan; add --dry-run")
+        if not target.exists():
+            raise ValueError(
+                f"{target} does not exist; give an evaluation YAML or JSON, or a run directory"
+            )
         evaluation = None
-        if resume:
-            if (
-                config
-                or output
-                or jobs is not None
-                or any(value is not None for value in overrides)
-                or guidance_name != "guidance"
-            ):
+        if target.is_dir():
+            if output is not None:
                 raise ValueError(
-                    "--resume uses saved settings; --dry-run/--yes are its only other options"
+                    f"{target} is a run directory, which resumes in place; "
+                    "--output names the directory for a new run from a config"
                 )
             if foreground and not dry_run:
                 # Own the run before planning, so a background start never races its parent.
-                lock = owned.enter_context(run_lock.hold(resume))
-            plan = plan_resume(resume)
-        elif config:
-            if any(value is not None for value in overrides) or guidance_name != "guidance":
-                raise ValueError(
-                    "use --config or evaluation flags, not both; --jobs/--output/--dry-run/--yes work with either"
-                )
-            evaluation = load_evaluation(config)
-            if jobs is not None:
-                evaluation = Evaluation.model_validate(
-                    {**evaluation.model_dump(mode="json"), "jobs": jobs}
-                )
+                lock = owned.enter_context(run_lock.hold(target))
+            plan = plan_resume(target)
         else:
-            raw: dict[str, object] = {
-                "runner": {"harness": harness, "model": model, "reasoning": reasoning},
-                "treatments": {
-                    guidance_name: {
-                        "guidance": guidance or [],
-                        "skills": skill or [],
-                        "plugins": plugin or [],
-                    }
-                },
-                "tasks": {"source": tasks, "ids": task or []},
-                "measurements": measure or [],
-            }
-            if any(
-                value is not None
-                for value in (review_harness, review_model, review_reasoning, review_guidance)
-            ):
-                raw["reviewer"] = {
-                    "harness": review_harness,
-                    "model": review_model,
-                    "reasoning": review_reasoning,
-                    "guidance": review_guidance or [],
-                }
-            for key, value in (
-                ("repeats", repeats),
-                ("seed", seed),
-                ("timeout_seconds", timeout),
-                ("jobs", jobs),
-            ):
-                if value is not None:
-                    raw[key] = value
-            evaluation = resolve_evaluation(raw, Path.cwd())
-        if evaluation is not None:
+            evaluation = load_evaluation(target)
             plan = plan_evaluation(evaluation)
         if dry_run:
-            typer.echo(json.dumps(plan, indent=2))
+            typer.echo(json.dumps(plan, indent=2) if as_json else _plan_summary(plan))
             return
-        typer.echo(
-            f"{plan['coding_calls']} coding attempts + {plan['review_calls']} review calls; "
-            + ("saved submissions reused." if resume else "vanilla reused when compatible.")
-        )
+        typer.echo(_plan_summary(plan))
         if not yes and not typer.confirm("Start evaluation?"):
             raise typer.Exit()
         progress = _notifying_progress(plan["coding_calls"]) if notify else typer.echo
-        if resume:
-            root = resume.expanduser().absolute()
+        if evaluation is None:
+            root = target.expanduser().absolute()
         else:
-            if evaluation is None:
-                raise ValueError("missing evaluation settings")
             destination = output or _new_run_directory()
             try:
                 root = prepare_evaluation(evaluation, destination, progress=typer.echo)
@@ -445,6 +383,38 @@ def check(
         typer.echo(f"Ready. Check: {destination / 'check.json'}")
     except (OSError, ValueError, yaml.YAMLError, subprocess.SubprocessError) as exc:
         _error(exc)
+
+
+@app.command("status")
+def status(
+    run: Path = typer.Argument(..., help="A run directory started by `pluginbench run`."),
+    watch: bool = typer.Option(
+        False, "--watch", help="Redraw every 2 seconds; exit when the run ends or is stopped."
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print one JSON object (schema in docs/running-evaluations.md)."
+    ),
+) -> None:
+    """Show a run's phase, attempts, outcomes, tokens, reuse and measures; never writes."""
+    try:
+        if watch and as_json:
+            raise ValueError("--watch redraws the table; for JSON, run status --json repeatedly")
+        while True:
+            current = run_status(run)
+            if as_json:
+                typer.echo(json.dumps(current, indent=2))
+                return
+            if watch and sys.stdout.isatty():
+                typer.echo("\033[H\033[2J", nl=False)  # Clear the screen before redrawing.
+            typer.echo(format_status(current))
+            if not watch or not current["active"]:
+                return
+            time.sleep(_WATCH_INTERVAL)
+    except (OSError, ValueError) as exc:
+        _error(exc)
+
+
+_WATCH_INTERVAL = 2.0
 
 
 @app.command("stop")
@@ -484,10 +454,48 @@ def compare(
 
 
 @app.command("report")
-def report(directory: Path = typer.Argument(..., help="A saved evaluation directory.")) -> None:
+def report(
+    run: Path = typer.Argument(..., help="A run directory started by `pluginbench run`."),
+) -> None:
     """Rebuild JSON, CSV and charts from saved evidence; no model calls."""
     try:
-        path = regenerate_report(directory)
+        path = regenerate_report(run)
         typer.echo(f"Report: {path.parent / 'report.html'}")
     except (OSError, ValueError, yaml.YAMLError) as exc:
+        _error(exc)
+
+
+@app.command("review")
+def review(
+    run: Path = typer.Argument(..., help="A finished run directory."),
+    revision: str = typer.Option(
+        ..., "--revision", help="Name for the new review revision, such as review-2."
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Start without confirmation."),
+) -> None:
+    """Review every submission again with the run's frozen reviewer and criteria.
+
+    Earlier review revisions stay in evidence. The new one is selected and the report rebuilt.
+    """
+    try:
+        plan = plan_review(run, revision)
+        typer.echo(f"{plan['review_calls']} review calls as review revision {revision}.")
+        if not yes and not typer.confirm("Start review?"):
+            raise typer.Exit()
+        with run_lock.hold(run), _events(run) as event:
+            event("started", command="review", pid=os.getpid(), revision=revision)
+
+            def logged(message: str) -> None:
+                event("progress", message=message)
+                typer.echo(message)
+
+            try:
+                selected = review_evaluation(run, revision, progress=logged)
+            except BaseException as exc:
+                event("failed", error=f"{type(exc).__name__}: {exc}")
+                raise
+            event("finished", command="review", revision=selected)
+        typer.echo(f"Selected review revision {selected}.")
+        typer.echo(f"Report: {run / 'report/report.html'}")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         _error(exc)

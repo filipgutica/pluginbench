@@ -4,7 +4,7 @@ An evaluation runs the same tasks with vanilla and each named guidance package. 
 
 ## Choose inputs
 
-Use [the example YAML](../examples/evaluation.yaml). JSON accepts the same fields. Config paths are relative to the config file; flag paths use your current directory. Use a config or flags. Both accept `--jobs`, `--output`, `--dry-run`, and `--yes`.
+`pluginbench init [path]` writes [the starter config](../src/pluginbench/evaluation.example.yaml) to `evaluation.yaml`, or to the path you give, and never overwrites a file. JSON accepts the same fields. Paths are relative to the config file. Every setting lives in the config. `run` takes only `--output` (the new run directory, default `runs/<timestamp>`), `--dry-run`, `--json` (with `--dry-run`, the full plan as JSON), `--yes`, `--foreground`, and `--notify`. A run directory resumes with its saved settings, so `--output` applies only to a config.
 
 Choose one task source: a Harbor `dataset` with `version` and `ids`, GitHub task-folder `urls`, or a local `source` with `ids`.
 
@@ -50,7 +50,7 @@ Before coding, the pinned CLI must discover every declared skill and synchronous
 
 The same capability policy applies to vanilla and every treatment. Subagents default to enabled, with at most four concurrently running children. `subagents: false` disables native agents explicitly. The selected model determines the native agent runtime. V2 enforces concurrency only; the optional `max_depth` setting (default one) is a V1 preference and has no effect on V2. There is no enforced depth limit for V2 runs. Children inherit the selected model and effort by default; explicit spawn settings can override them. These settings are neither model allowlists nor lifetime call or dollar limits. The attempt timeout bounds runtime, including child work. Dry runs count coding attempts, not total model requests.
 
-New native treatment runs currently require Codex. Legacy file-only `guidance` maps migrate to native instructions; directory entries must move to `skills` or `plugins`. Existing single-handoff text-injection campaigns remain readable, but their delivery identity differs and their baselines cannot be reused for native treatments. Removed multi-stage standards/ledger formats are not supported by report regeneration. CLI flags support `--guidance`, `--skill`, and `--plugin`, each grouped by `--guidance-name`.
+New native treatment runs currently require Codex. Legacy file-only `guidance` maps migrate to native instructions; directory entries must move to `skills` or `plugins`. Existing single-handoff text-injection campaigns remain readable, but their delivery identity differs and their baselines cannot be reused for native treatments. Removed multi-stage standards/ledger formats are not supported by report regeneration.
 
 ## Execution and isolation
 
@@ -196,7 +196,7 @@ Coding attempts, measurement inputs, and reviews run concurrently within their p
 
 On interruption or fatal failure, new jobs stop. Active jobs finish or time out; their receipts remain, and an attempt that finishes while the run drains is kept as complete.
 
-`pluginbench run evaluation.yaml` checks in the foreground, then starts the run in the background and returns once the background process owns `runs/<run>/run.lock`. That lock records the process ID, process group, start time, and run directory. The background process appends one JSON line per event to `events.jsonl` and writes its output to `run.log`. Use `--foreground` to run in the terminal instead.
+`pluginbench run evaluation.yaml` checks in the foreground, then starts the run in the background and returns once the background process owns `runs/<run>/run.lock`. It prints the `pluginbench status runs/<run> --watch` command. The lock records the process ID, process group, start time, and run directory. The background process appends one JSON line per event to `events.jsonl` and writes its output to `run.log`. Use `--foreground` to run in the terminal instead.
 
 ```sh
 pluginbench stop runs/<run>
@@ -210,7 +210,37 @@ Resume reads attempt states from the run's single-writer SQLite ledger, `evidenc
 
 Resume then completes pending measurements or starts a review phase that has not begun. Started review phases require a fresh evaluation. A run prepared before measurement profiles were saved, with measurement not yet started, is refused before any coding call. The same applies to a reviewer whose CLI, credentials, or sandbox host fail their check. Offline citation recovery can fix formatting only when the exact source supports it.
 
-On macOS, `--notify` reports when preparation and readiness checks pass and coding starts, and when the run finishes or fails. A readiness failure therefore arrives before any model call. Notifications are best effort and never change the run's outcome.
+`--notify` sends a desktop notification (macOS `osascript`, Linux `notify-send`) when preparation and readiness checks pass and coding starts, and when the run finishes or fails. A readiness failure therefore arrives before any model call. Notifications are best effort and never change the run's outcome.
+
+## Watch a run
+
+`pluginbench status runs/<run>` shows the run's phase, the process that owns it, its last activity, attempt states and outcomes per arm and task, coding tokens, vanilla cache reuse, discarded attempts, and the measurement and review revisions. `--watch` redraws every 2 seconds and exits when the run ends or is stopped. `status` only reads: it opens `evidence/ledger.sqlite` read-only and falls back to `evidence/run.json` for runs from before the ledger or while the ledger cannot be read. It works on any run directory, including stopped and old ones.
+
+`status --json` prints one JSON object for dashboards. Fields are only added within a `schema_version`; a removed or renamed field bumps it. Version 1:
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | `1` |
+| `run`, `name` | Absolute run directory and evaluation name |
+| `phase` | `starting`, `coding`, `measuring`, `reviewing`, `reporting`, `complete`, `stopped` (unfinished, no live owner), `failed` (the last event is a failure), or `not_started` |
+| `active`, `owner` | Whether a live process holds `run.lock`, and its `pid`, `pgid`, and `started_at` |
+| `heartbeat` | `at` and `age_seconds` of the newest write to `events.jsonl`, `run.log`, the ledger, or `run.json` |
+| `last_event`, `error` | The last line of `events.jsonl`, and the failure message if the run failed |
+| `states_source` | `ledger`, `run.json`, or `none` |
+| `attempts_total`, `states`, `outcomes` | Live attempt slots, counts by state, and counts by outcome of complete attempts |
+| `tokens` | Coding tokens this run spent: `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens`, and `lower_bound`. Reused vanilla attempts are excluded; discarded attempts are included |
+| `reuse` | `vanilla_attempts`, `planned_hits` (from the plan's cache decisions), and `reused` (imported from the cache) |
+| `discarded` | Interrupted attempts a resume replaced: `id`, `slot`, `task`, `arm`, `repeat`, `replaced_by`, `tokens`, `tokens_status` |
+| `arms` | Per arm: `attempts`, `states`, `outcomes`, `reused`, and `tokens` (reused attempts included) |
+| `measures` | `selected` measurements; `measurement_revisions` and `review_revisions` as `revision`, `status`, `selected`, and for reviews `reviewed` of `assigned`; `references`: task → metric → `status`, `value`, `reason` |
+| `report`, `log` | Paths to `report/report.html` and `run.log`, or null |
+| `attempts` | One row per live slot: `id`, `slot`, `task`, `arm`, `repeat`, `state`, `outcome`, `outcome_reason`, `reused`, `tokens`, `tokens_status`, `minutes`, and `measures` (metric → `status`, `value`, `unit`, `reason`, from `report/results.json` once it exists) |
+
+States are `pending`, `running`, `complete`, and `interrupted`. Outcomes are `pass`, `fail`, `empty` (the graded patch is empty), and `unknown`, with the verifier's reason in `outcome_reason`. `tokens_status` is `exact`, `lower_bound` (usage saved by an unfinished attempt, or only an observed floor), `unknown` (no usage saved yet), or `not_started`. A total's `lower_bound` is true when any attempt it counts is `lower_bound` or `unknown`. The vanilla arm is `vanilla`, including in runs that recorded it as `baseline`.
+
+## Review again
+
+`pluginbench review runs/<run> --revision <name>` reviews every submission of a finished run again with the run's frozen reviewer, criteria, seed, and jobs, as review revision `<name>`. It prints the number of review calls and asks before starting unless `--yes` is set. It owns `run.lock` while it works, so it refuses an active run, and it checks the reviewer's CLI, credentials, and sandbox host before the first call. Earlier revisions stay in evidence. The new revision, or `<name>-citations` when offline citation recovery repaired its formatting, becomes the selected one, and the report is rebuilt. A name that already exists is refused; choose a new one. A run with no reviewer, or whose first review has not finished, is refused.
 
 Use exact model IDs. Harbor does not support `ultra` reasoning. Requested effort is separate from effective effort when native evidence cannot verify it. Claude remains available for review configuration; new native treatment coding is qualified for Codex only.
 
@@ -257,6 +287,6 @@ npm ci
 npm run build:charts
 ```
 
-These checks make no model calls. The Python API can create a separate review revision on frozen submissions. Report projection validates fixed criteria and preserves earlier failed calls and usage; it never replays coding.
+These checks make no model calls. Report projection validates fixed criteria and preserves earlier failed calls and usage; it never replays coding.
 
 Codex runs explicitly enable Code Mode tool access in the private harness configuration. This fixed setting applies to vanilla, treatments, and review calls; host configuration remains excluded. CLI arguments and effective model/effort evidence are retained.

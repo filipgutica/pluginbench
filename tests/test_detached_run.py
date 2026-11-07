@@ -54,6 +54,7 @@ def test_run_returns_while_the_background_run_continues(
     try:
         assert result.exit_code == 0, result.output
         assert f"pluginbench stop {tmp_path.absolute()}" in result.stdout
+        assert f"pluginbench status {tmp_path.absolute()} --watch" in result.stdout
         assert owner and owner["pid"] == owner["pgid"] != os.getpgrp()
         time.sleep(0.2)
         assert run_lock.owner(tmp_path) == owner

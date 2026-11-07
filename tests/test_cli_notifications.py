@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -25,9 +26,10 @@ def notices(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 def _run(tmp_path: Path, *extra: str) -> Any:
+    (tmp_path / "evaluation.yaml").touch()
     return CliRunner().invoke(
         cli.app,
-        ["run", "--config", str(tmp_path / "evaluation.yaml"), "--yes", "--foreground", *extra],
+        ["run", str(tmp_path / "evaluation.yaml"), "--yes", "--foreground", *extra],
     )
 
 
@@ -84,19 +86,30 @@ def test_runs_without_the_flag_send_no_notices(
     assert notices == []
 
 
-def test_a_failed_notice_never_fails_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "platform,command",
+    [
+        (
+            "darwin",
+            [
+                "osascript",
+                "-e",
+                'display notification "Run failed: \\"quoted\\" reason" with title "PluginBench"',
+            ],
+        ),
+        ("linux", ["notify-send", "PluginBench", 'Run failed: "quoted" reason']),
+    ],
+)
+def test_a_failed_notice_never_fails_the_run(
+    monkeypatch: pytest.MonkeyPatch, platform: str, command: list[str]
+) -> None:
     calls: list[list[str]] = []
 
     def unavailable(command: list[str], **kwargs: object) -> None:
         calls.append(command)
-        raise FileNotFoundError("osascript")
+        raise FileNotFoundError(command[0])
 
     monkeypatch.setattr(subprocess, "run", unavailable)
+    monkeypatch.setattr(sys, "platform", platform)
     cli._notify('Run failed: "quoted" reason')
-    assert calls == [
-        [
-            "osascript",
-            "-e",
-            'display notification "Run failed: \\"quoted\\" reason" with title "PluginBench"',
-        ]
-    ]
+    assert calls == [command]

@@ -95,11 +95,14 @@ def test_public_commands_cover_evaluations_reports_and_task_selection() -> None:
     result = CliRunner().invoke(cli.app, ["--help"])
     assert result.exit_code == 0
     assert set(get_group(cli.app).commands) == {
+        "init",
         "check",
         "run",
+        "status",
         "stop",
-        "report",
         "compare",
+        "report",
+        "review",
         "tasks",
     }
     assert set(get_group(cli.tasks_app).commands) == {"pick"}
@@ -114,52 +117,74 @@ def test_config_dry_run_includes_fresh_vanilla_and_every_package(
     monkeypatch.setattr(
         cli, "prepare_evaluation", lambda *args, **kwargs: pytest.fail("dry run cannot execute")
     )
-    result = CliRunner().invoke(cli.app, ["run", "--config", str(path), "--dry-run"])
+    result = CliRunner().invoke(cli.app, ["run", str(path), "--dry-run", "--json"])
     assert result.exit_code == 0, result.stderr
-    positional = CliRunner().invoke(cli.app, ["run", str(path), "--dry-run"])
-    assert positional.exit_code == 0 and positional.stdout == result.stdout
     plan = json.loads(result.stdout)
     assert plan["coding_calls"] == 9 and plan["review_calls"] == 0
     assert set(plan["treatments"]) == {"superpowers", "workflow"}
-    assert "fresh vanilla" in plan["baseline"]
+    assert "fresh vanilla" in plan["vanilla"]
+    summary = CliRunner().invoke(cli.app, ["run", str(path), "--dry-run"])
+    assert summary.exit_code == 0, summary.stderr
+    assert "Arms: vanilla, " in summary.stdout
+    assert "Coding attempts: 9   Review calls: 0" in summary.stdout
+    assert not summary.stdout.lstrip().startswith("{")
 
 
-@pytest.mark.parametrize("jobs", [1, 2, 4])
-def test_flags_match_single_package_config(
-    config: evaluation.Evaluation, monkeypatch: pytest.MonkeyPatch, jobs: int
+def test_init_writes_a_starter_config_that_plans_once_its_paths_are_filled(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    expected = config.model_copy(deep=True)
-    expected.treatments = {"workflow": expected.treatments["workflow"]}
-    expected.jobs = jobs
-    result = CliRunner().invoke(
-        cli.app,
-        [
-            "run",
-            "--harness",
-            "codex",
-            "--model",
-            "gpt-6.1-sol",
-            "--reasoning",
-            "medium",
-            "--guidance",
-            str(config.treatments["workflow"].guidance[0]),
-            "--guidance-name",
-            "workflow",
-            "--tasks",
-            str(config.tasks.source),
-            "--task",
-            config.tasks.ids[0],
-            "--measure",
-            "tokens",
-            "--measure",
-            "lines",
-            "--jobs",
-            str(jobs),
-            "--dry-run",
-        ],
-    )
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(cli.app, ["init"])
     assert result.exit_code == 0, result.stderr
-    assert json.loads(result.stdout) == evaluation.plan_evaluation(expected)
+    assert "pluginbench check evaluation.yaml" in result.stdout
+    starter = tmp_path / "evaluation.yaml"
+    written = starter.read_text()
+    again = CliRunner().invoke(cli.app, ["init"])
+    assert again.exit_code == 2 and "already exists" in again.stderr
+    assert starter.read_text() == written
+    # Fill the /path/to placeholders and the remote task source with this fixture's local ones.
+    raw = yaml.safe_load(written)
+    raw["treatments"] = {"workflow": {"guidance": ["a.md"]}}
+    raw["tasks"] = {"source": "deep-swe/tasks", "ids": ["arbitrary-native-task"]}
+    raw["reviewer"]["guidance"] = ["b.md"]
+    starter.write_text(yaml.safe_dump(raw))
+    planned = CliRunner().invoke(cli.app, ["run", str(starter), "--dry-run", "--json"])
+    assert planned.exit_code == 0, planned.stderr
+    assert json.loads(planned.stdout)["coding_calls"] == 2 * raw["repeats"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--config", "eval.yaml"],
+        ["eval.yaml", "--model", "gpt-6.1-sol"],
+        ["eval.yaml", "--guidance", "a.md"],
+        ["eval.yaml", "--jobs", "2"],
+        ["--resume", "runs/x"],
+    ],
+)
+def test_settings_come_only_from_the_positional_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arguments: list[str]
+) -> None:
+    # One way to configure a run: the config file, or a run directory's saved settings.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "eval.yaml").write_text("name: x\n")
+    result = CliRunner().invoke(cli.app, ["run", *arguments, "--dry-run"])
+    assert result.exit_code == 2 and "No such option" in result.output
+
+
+def test_json_without_dry_run_says_what_to_add(tmp_path: Path) -> None:
+    (tmp_path / "eval.yaml").write_text("name: x\n")
+    result = CliRunner().invoke(cli.app, ["run", str(tmp_path / "eval.yaml"), "--json"])
+    assert result.exit_code == 2 and "add --dry-run" in result.stderr
+
+
+def test_a_missing_target_says_what_to_give(tmp_path: Path) -> None:
+    missing = CliRunner().invoke(cli.app, ["run", str(tmp_path / "missing.yaml"), "--dry-run"])
+    assert missing.exit_code == 2 and "does not exist" in missing.stderr
+    not_a_run = CliRunner().invoke(cli.app, ["run", str(tmp_path), "--dry-run"])
+    assert not_a_run.exit_code == 2 and "not a run directory" in not_a_run.stderr
+    assert "Traceback" not in missing.stderr + not_a_run.stderr
 
 
 @pytest.mark.parametrize("version", ["codex-cli 0.162.0-alpha.1", "codex-cli 0.162.0+build.4"])
@@ -417,15 +442,6 @@ def test_comparison_identity_ignores_guidance_label_but_tracks_task_and_runtime(
     assert evaluation.plan_evaluation(config)["comparison_identity"] != original
 
 
-def test_config_and_overrides_fail_clearly(tmp_path: Path) -> None:
-    result = CliRunner().invoke(
-        cli.app, ["run", "--config", str(tmp_path / "missing.yaml"), "--model", "x", "--dry-run"]
-    )
-    assert (
-        result.exit_code == 2 and "not both" in result.stderr and "Traceback" not in result.stderr
-    )
-
-
 @pytest.mark.parametrize("cores", [None, 1, 18])
 def test_default_jobs_is_two_on_every_machine_and_at_most_four(
     config: evaluation.Evaluation, monkeypatch: pytest.MonkeyPatch, cores: int | None
@@ -441,18 +457,6 @@ def test_default_jobs_is_two_on_every_machine_and_at_most_four(
     assert selected.jobs == plan["jobs"] == identity["jobs"] == 2
     with pytest.raises(ValueError, match="less than or equal to 4"):
         evaluation.resolve_evaluation({**raw, "jobs": 5}, Path.cwd())
-
-
-def test_jobs_override_works_with_config_and_is_visible_in_dry_run(
-    config: evaluation.Evaluation, tmp_path: Path
-) -> None:
-    path = tmp_path / "eval.yaml"
-    path.write_text(yaml.safe_dump(config.model_dump(mode="json")))
-    result = CliRunner().invoke(cli.app, ["run", "--config", str(path), "--jobs", "2", "--dry-run"])
-    assert result.exit_code == 0, result.stderr
-    plan = json.loads(result.stdout)
-    assert plan["jobs"] == plan["comparison_identity"]["jobs"] == 2
-    assert plan["coding_calls"] == 9
 
 
 @pytest.mark.parametrize(
@@ -716,15 +720,9 @@ def test_integrated_evaluation_and_report_regeneration(
         with pytest.raises(ValueError, match="model calls cannot be replayed"):
             evaluation.plan_resume(root)
         existing_review.rmdir()
-        for extra in (
-            ["--model", "other"],
-            ["--config", "missing.yaml"],
-            ["--output", "other"],
-            ["--jobs", "2"],
-        ):
-            rejected = CliRunner().invoke(cli.app, ["run", "--resume", str(root), *extra])
-            assert rejected.exit_code == 2 and "saved settings" in rejected.stderr
-        dry = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--dry-run"])
+        rejected = CliRunner().invoke(cli.app, ["run", str(root), "--output", "other"])
+        assert rejected.exit_code == 2 and "resumes in place" in rejected.stderr
+        dry = CliRunner().invoke(cli.app, ["run", str(root), "--dry-run", "--json"])
         assert dry.exit_code == 0, dry.stderr
         assert json.loads(dry.stdout)["coding_calls"] == 0
         assert not (root / "report").exists()
@@ -758,12 +756,12 @@ def test_integrated_evaluation_and_report_regeneration(
         # Resumed reviews get the same sandbox probe before their first call.
         with monkeypatch.context() as patched:
             patched.setattr(isolation, "codex_code_mode_host", missing_host)
-            blocked = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes", "--foreground"])
+            blocked = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
         assert blocked.exit_code == 2 and "codex-code-mode-host" in blocked.stderr
         assert len(calls) == 9 and not judge_calls
-        result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes", "--foreground"])
+        result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
         assert result.exit_code == 0, result.stderr
-        assert "0 coding attempts +" in result.stdout
+        assert "Coding attempts: 0   Review calls:" in result.stdout
         failed = root / "evidence/observer-revisions/measurements/revision.json"
         assert json.loads(failed.read_text())["status"] == "failed"
     else:
@@ -953,18 +951,18 @@ def test_integrated_evaluation_and_report_regeneration(
         assert len(calls) == len(judge_calls) == 9
         assert (root / "report/results.json").read_bytes() == original
     if citation_error:
-        result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes", "--foreground"])
+        result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
         assert result.exit_code == 0, result.stderr
-        assert "0 coding attempts + 0 review calls" in result.stdout
+        assert "Coding attempts: 0   Review calls: 0" in result.stdout
         assert (root / "report/results.json").read_bytes() == original
     if recover:
         saved = json.loads((root / "evaluation.json").read_text())
         saved["pending_measurement_revision"] = saved["measurement_revision"]
         saved["measurement_revision"] = None
         evaluation._save_selection(root, saved)
-        result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes", "--foreground"])
+        result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
         assert result.exit_code == 0, result.stderr
-        assert "0 coding attempts + 0 review calls" in result.stdout
+        assert "Coding attempts: 0   Review calls: 0" in result.stdout
         assert (root / "report/results.json").read_bytes() == original
     selection = root / "evaluation.json"
     selection.write_text(selection.read_text().replace('"repeats": 3', '"repeats": 4'))
@@ -1227,7 +1225,7 @@ def test_each_predictable_failure_stops_before_any_coding_call(
     arguments = (
         ["check", str(checkable["path"]), "--output", output]
         if command == "check"
-        else ["run", "--config", str(checkable["path"]), "--output", output, "--yes"]
+        else ["run", str(checkable["path"]), "--output", output, "--yes"]
     )
     result = CliRunner().invoke(cli.app, arguments)
     assert result.exit_code == 2, result.stdout
@@ -1541,6 +1539,105 @@ def _measured_and_reviewed(
     return config
 
 
+def test_status_follows_a_stopped_run_through_its_resume(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _measured_and_reviewed(config, tmp_path, monkeypatch)
+    calls: list[str] = []
+    reviews: list[str] = []
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=config.timeout_seconds, interrupt_at=3
+    )
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    root = tmp_path / "run"
+    with pytest.raises(KeyboardInterrupt):
+        evaluation.run_evaluation(config, root)
+
+    stopped = json.loads(CliRunner().invoke(cli.app, ["status", str(root), "--json"]).stdout)
+    assert stopped["phase"] == "stopped" and stopped["states_source"] == "ledger"
+    assert stopped["states"] == {"complete": 2, "interrupted": 1, "pending": 6}
+    assert stopped["tokens"]["lower_bound"] is True
+
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=config.timeout_seconds, interrupt_at=None
+    )
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    assert CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"]).exit_code == 0
+
+    done = json.loads(CliRunner().invoke(cli.app, ["status", str(root), "--json"]).stdout)
+    assert done["phase"] == "complete" and done["states"] == {"complete": 9}
+    assert done["outcomes"] == {"pass": 9}
+    assert len(done["discarded"]) == 1
+    assert done["discarded"][0]["replaced_by"] in {row["id"] for row in done["attempts"]}
+    assert done["discarded"][0]["tokens"] == {"input_tokens": 10, "output_tokens": 5}
+    assert set(done["arms"]) == {"vanilla", "superpowers", "workflow"}
+    assert [(row["revision"], row["selected"]) for row in done["measures"]["review_revisions"]] == [
+        ("review", True)
+    ]
+    assert done["report"] == str(root / "report/report.html")
+    assert all(row["measures"] for row in done["attempts"])
+
+
+def test_review_adds_a_selected_revision_with_the_frozen_reviewer(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _measured_and_reviewed(config, tmp_path, monkeypatch)
+    calls: list[str] = []
+    reviews: list[str] = []
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=config.timeout_seconds, interrupt_at=None
+    )
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    root = tmp_path / "run"
+    evaluation.run_evaluation(config, root)
+    first = (root / "evidence/review-revisions/review/review-state.json").read_bytes()
+    report = (root / "report/results.json").stat().st_mtime_ns
+    coded, reviewed = len(calls), len(reviews)
+
+    def missing_host() -> Path:
+        raise ValueError("Codex reviews need an executable codex-code-mode-host")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(isolation, "codex_code_mode_host", missing_host)
+        blocked = CliRunner().invoke(cli.app, ["review", str(root), "--revision", "r2", "--yes"])
+    assert blocked.exit_code == 2 and "codex-code-mode-host" in blocked.stderr
+    assert len(reviews) == reviewed
+
+    result = CliRunner().invoke(cli.app, ["review", str(root), "--revision", "r2", "--yes"])
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert "9 review calls as review revision r2." in result.stdout
+    assert len(reviews) == reviewed + 9 and len(calls) == coded
+    assert evaluation._load_selection(root)["review_revision"] == "r2"
+    assert (root / "evidence/review-revisions/review/review-state.json").read_bytes() == first
+    assert (root / "report/results.json").stat().st_mtime_ns != report
+    status = json.loads(CliRunner().invoke(cli.app, ["status", str(root), "--json"]).stdout)
+    assert [(row["revision"], row["selected"]) for row in status["measures"]["review_revisions"]] == [
+        ("r2", True),
+        ("review", False),
+    ]
+    assert status["last_event"]["event"] == "finished"
+
+    again = CliRunner().invoke(cli.app, ["review", str(root), "--revision", "r2", "--yes"])
+    assert again.exit_code == 2 and "choose a new --revision name" in again.stderr
+    assert len(reviews) == reviewed + 9
+    saved = evaluation._load_selection(root)
+    for change, message in (
+        (
+            {"reviewer": None, "measurements": [m for m in saved["measurements"] if m != "review"]},
+            "has no reviewer",
+        ),
+        ({"review_revision": None}, "has not finished its first review"),
+    ):
+        evaluation._save_selection(root, {**saved, **change})
+        refused = CliRunner().invoke(cli.app, ["review", str(root), "--revision", "r3", "--yes"])
+        assert refused.exit_code == 2 and message in refused.stderr
+    assert len(reviews) == reviewed + 9
+
+
 def test_run_on_a_stopped_run_codes_only_unfinished_slots_then_measures_and_reviews(
     config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1572,7 +1669,7 @@ def test_run_on_a_stopped_run_codes_only_unfinished_slots_then_measures_and_revi
     result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
 
     assert result.exit_code == 0, result.stderr + result.stdout
-    assert result.stdout.startswith("7 coding attempts")
+    assert "Coding attempts: 7   Review calls: 9" in result.stdout
     run = json.loads((root / "evidence/run.json").read_text())
     assert run["status"] == "complete"
     assert set(run["attempt_states"].values()) == {"complete"} and len(run["attempt_states"]) == 9

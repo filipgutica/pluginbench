@@ -47,6 +47,7 @@ from pluginbench.study import _text_files, load_study, report_study, resume_stud
 from pluginbench.study_review import (
     _criteria_digest,
     _fixed_criteria,
+    _review_directory,
     recover_review_citations,
     review_study,
     validate_review_revision,
@@ -306,7 +307,7 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
         "repeats": config.repeats,
         "jobs": jobs,
         "container_limits": limits,
-        "baseline": "reuse a verified isolated vanilla cohort when available; otherwise fresh vanilla attempts; native built-in instructions remain",
+        "vanilla": "reuse a verified isolated vanilla cohort when available; otherwise fresh vanilla attempts; native built-in instructions remain",
         "call_estimate": "maximum new root attempts; native subagent turns are additional and metered from session traces; baseline hits resolve before coding",
         "comparison_identity": comparison,
     }
@@ -953,6 +954,11 @@ def _finish_evaluation(
 
 def _load_selection(root: Path) -> dict[str, object]:
     path = root / "evaluation.json"
+    if not path.is_file():
+        raise ValueError(
+            f"{root} is not a run directory (it has no evaluation.json); give the directory "
+            "that `pluginbench run` printed"
+        )
     binding = json.loads((root / "evaluation-binding.json").read_text())
     if hashlib.sha256(path.read_bytes()).hexdigest() != binding["sha256"]:
         raise ValueError("saved evaluation settings changed")
@@ -1061,18 +1067,23 @@ def _resume_inputs(
         else:
             if (evidence / "review-revisions/review").exists():
                 raise ValueError("review evidence already exists; model calls cannot be replayed")
-            guidance = [
-                root / "inputs" / f"review-{index}.md"
-                for index in range(len(config.reviewer.guidance))
-            ]
-            criteria = _fixed_criteria([file.read_text() for file in guidance])
-            if (
-                _criteria_digest(criteria)
-                != _object(selection["comparison_identity"])["review_criteria_sha256"]
-            ):
-                raise ValueError("frozen review criteria changed")
+            guidance = _frozen_review_guidance(root, selection, config.reviewer)
             calls = sum(record.stages[-1].snapshot is not None for record in manifest.records)
     return selection, profiles, guidance, calls
+
+
+def _frozen_review_guidance(
+    root: Path, selection: dict[str, object], reviewer: Reviewer
+) -> list[Path]:
+    """The run's saved review standards, refused if they no longer match its comparison."""
+    guidance = [root / "inputs" / f"review-{index}.md" for index in range(len(reviewer.guidance))]
+    criteria = _fixed_criteria([file.read_text() for file in guidance])
+    if (
+        _criteria_digest(criteria)
+        != _object(selection["comparison_identity"])["review_criteria_sha256"]
+    ):
+        raise ValueError("frozen review criteria changed")
+    return guidance
 
 
 def _assigned(selection: dict[str, object]) -> int:
@@ -1108,7 +1119,7 @@ def plan_resume(root: Path) -> dict[str, object]:
             "review_calls": _assigned(selection) if reviewer else 0,
             "collect_measurements": bool(selection["measurement_required"]),
             "jobs": selection["jobs"],
-            "baseline": "keep complete attempts; code pending slots and replace interrupted ones",
+            "vanilla": "keep complete attempts; code pending slots and replace interrupted ones",
         }
     selection, profiles, _, calls = _resume_inputs(root)
     return {
@@ -1117,7 +1128,7 @@ def plan_resume(root: Path) -> dict[str, object]:
         "review_calls": calls,
         "collect_measurements": bool(profiles),
         "jobs": selection["jobs"],
-        "baseline": "reuse immutable saved submissions; no coding replay",
+        "vanilla": "reuse immutable saved submissions; no coding replay",
     }
 
 
@@ -1141,6 +1152,64 @@ def resume_evaluation(
     return _finish_evaluation(
         root, selection=selection, profiles=profiles, guidance=guidance, progress=progress
     )
+
+
+def plan_review(root: Path, revision: str) -> dict[str, object]:
+    """Check that a finished run can be reviewed again as `revision`, and count its calls."""
+    root = root.expanduser().absolute()
+    selection = _load_selection(root)
+    config = _saved_evaluation(selection)
+    if config.reviewer is None:
+        raise ValueError("this run has no reviewer, so it has no review to repeat")
+    if selection["review_revision"] is None:
+        raise ValueError(
+            f"this run has not finished its first review; finish it with `pluginbench run {root}`"
+        )
+    if _review_directory(root / "evidence", revision).exists():
+        raise ValueError(f"review revision {revision} already exists; choose a new --revision name")
+    _frozen_review_guidance(root, selection, config.reviewer)
+    _, manifest, _ = _native_state(root / "evidence")
+    return {
+        "name": selection["name"],
+        "revision": revision,
+        "review_calls": sum(record.stages[-1].snapshot is not None for record in manifest.records),
+    }
+
+
+def review_evaluation(
+    root: Path, revision: str, *, progress: Callable[[str], None] | None = None
+) -> str:
+    """Review every submission again with the frozen reviewer as `revision`, then select it.
+
+    Earlier revisions stay in evidence. Returns the selected revision: `<revision>-citations`
+    when offline citation recovery repaired its formatting.
+    """
+    root = root.expanduser().absolute()
+    plan_review(root, revision)
+    selection = _load_selection(root)
+    config = _saved_evaluation(selection)
+    if config.reviewer is None:
+        raise ValueError("this run has no reviewer, so it has no review to repeat")
+    guidance = _frozen_review_guidance(root, selection, config.reviewer)
+    _review_preflight(selection)
+    if progress:
+        progress(f"Reviewing all submissions again as review revision {revision}")
+    review_study(
+        root / "evidence",
+        harness=config.reviewer.harness,
+        model=config.reviewer.model,
+        effort=config.reviewer.reasoning,
+        timeout=config.reviewer.timeout_seconds or config.timeout_seconds,
+        seed=config.seed,
+        revision=revision,
+        guidance=guidance,
+        jobs=config.jobs,
+    )
+    selected = recover_review_citations(root / "evidence", revision)
+    selection["review_revision"] = selected
+    _save_selection(root, selection)
+    regenerate_report(root)
+    return selected
 
 
 def _save_selection(root: Path, selection: object) -> None:
