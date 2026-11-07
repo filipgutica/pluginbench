@@ -1118,6 +1118,8 @@ def _run_attempts(
         )
         preflight["filesystem_isolation"] = expected_runtime
         preflight["harness_version"] = frozen.recipe.harness_version
+        if guard:
+            guard()  # Preflight checks Docker, which is slow enough for the run to be moved.
         _write(root / "runtime-preflight.json", preflight)
         _checkpoint(
             root,

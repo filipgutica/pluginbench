@@ -363,6 +363,33 @@ def test_moving_the_run_during_a_call_never_writes_to_the_old_path(
     assert set(_json(moved / "evidence/run.json")["discarded_attempts"]) == {calls[0]}
 
 
+def test_moving_the_run_during_preflight_never_writes_to_the_old_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pluginbench import run_lock
+
+    recipe = resume_support.recipe(tmp_path / "config", tasks=1, treatments=1, repeats=1, jobs=1)
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+    preflight = harbor_backend.preflight
+    owned, moved = tmp_path / "run", tmp_path / "moved"
+    owned.mkdir()
+
+    def moving(**kwargs: Any) -> dict[str, Any]:
+        result = preflight(**kwargs)
+        owned.rename(moved)  # The operator moves the run while Docker is checked.
+        return result
+
+    monkeypatch.setattr(harbor_backend, "preflight", moving)
+    with run_lock.hold(owned) as lock:
+        with pytest.raises(run_lock.RunMoved):
+            study.run_study(
+                study.load_study(recipe), owned / "evidence", guard=lock.assert_in_place
+            )
+    assert not owned.exists()
+    assert calls == []
+
+
 def test_vanilla_attempt_killed_before_it_was_cached_is_cached_on_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
