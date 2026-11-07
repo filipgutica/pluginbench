@@ -11,8 +11,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from pluginbench import evaluation, submissions
 from pluginbench import harbor_backend as harbor
+from pluginbench.measurement_profiles import blocking_findings
 from pluginbench.assessment_metrics import inspect_snapshot
+from native_support import synthetic_contract, task_entry
 
 
 def native_task(root: Path, *, bundled: bool = True, mode: str = "separate") -> Path:
@@ -1509,14 +1512,36 @@ def test_git_probe_commits_in_the_coding_image_with_only_the_task_environment(
         assert "Author identity unknown" in str(receipt["reason"])
 
 
-@pytest.mark.parametrize("solution", [True, False])
-def test_reference_agents_run_harbor_oracle_and_nop_without_credentials(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, solution: bool
-) -> None:
-    task = native_task(tmp_path)
+ORACLE_PATCH = """diff --git a/src/answer.py b/src/answer.py
+--- a/src/answer.py
++++ b/src/answer.py
+@@ -1 +1 @@
+-answer = 0
++answer = 1
+"""
+
+
+def _reference_identity(tmp_path: Path, *, solution: bool) -> dict[str, object]:
+    """A prepared task with a qualified source, so its graded patch can be reconstructed."""
+    entry = task_entry(tmp_path / "prepared", "reference-task")
+    provenance = entry["provenance"]
+    assert isinstance(provenance, dict)
+    identity: dict[str, object] = json.loads(provenance["native_task_identity"])
+    task = Path(str(identity["task_dir"]))
     if solution:
         (task / "solution").mkdir()
         (task / "solution/solve.sh").write_text("#!/bin/sh\ngit apply /solution/fix.patch\n")
+        identity["task_assets_sha256"] = harbor.native_task_assets(task)
+    return identity
+
+
+@pytest.mark.parametrize("failure", [None, "no solution", "export", "reconstruction"])
+def test_reference_agents_admit_their_patch_exactly_as_paid_attempts_do(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None
+) -> None:
+    monkeypatch.setattr(submissions, "reviewed_contract", synthetic_contract)
+    identity = _reference_identity(tmp_path, solution=failure != "no solution")
+    fixture = Path(str(identity["fixture_dir"]))
     started: list[str] = []
 
     def process(**kwargs: object) -> dict[str, object]:
@@ -1531,29 +1556,71 @@ def test_reference_agents_run_harbor_oracle_and_nop_without_credentials(
         trial = Path(str(config["trials_dir"])) / str(config["trial_name"])
         patch = trial / "artifacts/logs/artifacts/model.patch"
         patch.parent.mkdir(parents=True)
-        patch.write_text("diff --git a/x b/x\n" if agent["name"] == "oracle" else "")
+        if agent["name"] == "oracle":
+            # A patch whose context differs from the frozen fixture cannot be reconstructed.
+            text = ORACLE_PATCH.replace("-answer = 0", "-answer = 5")
+            patch.write_text(text if failure == "reconstruction" else ORACLE_PATCH)
+        else:
+            patch.write_text("")
         reward = 1.0 if agent["name"] == "oracle" else 0.0
         return {
             "session_id": str(config["trial_name"]) + "__env",
             "result": {"verifier_result": {"rewards": {"reward": reward}}, "exception_info": None},
         }
 
+    def export(**kwargs: object) -> dict[str, object]:
+        # The stopped container's source: the oracle's commit applied, nop unchanged.
+        if failure == "export" and "oracle" in str(kwargs["destination"]):
+            raise ValueError("Native source contains a symlink: src/link")
+        destination = Path(str(kwargs["destination"]))
+        destination.mkdir()
+        (destination / "src").mkdir()
+        oracle = "oracle" in str(destination)
+        (destination / "src/answer.py").write_text("answer = 1\n" if oracle else "answer = 0\n")
+        return {
+            "status": "complete",
+            "snapshot_digest": inspect_snapshot(destination)["digest"],
+            "source_metadata_digest": harbor.native_task_assets(destination),
+        }
+
     monkeypatch.setattr(harbor, "_native_process", process)
+    monkeypatch.setattr(harbor, "_native_container", lambda **kwargs: {"Id": "stopped"})
+    monkeypatch.setattr(harbor, "_docker", lambda *args, **kwargs: "")
+    monkeypatch.setattr(harbor, "export_native_source", export)
     monkeypatch.setattr(harbor, "_native_cleanup_projects", lambda **kwargs: {"status": "complete"})
-    results = harbor.run_reference_agents(_prepared_identity(task), tmp_path / "check")
+    results = harbor.run_reference_agents(identity, tmp_path / "check")
+    rows = evaluation._reference_agent_rows(results)
+    findings = blocking_findings({"reference-task": rows}, require_ready=False)
+    # A broken export or reconstruction must block before any paid attempt hits it.
+    if failure == "export":
+        assert findings == [
+            "reference-task: oracle is broken: stopped-source export failed: "
+            "Native source contains a symlink: src/link"
+        ]
+    elif failure == "reconstruction":
+        assert len(findings) == 1 and findings[0].startswith(
+            "reference-task: oracle is broken: graded patch admission failed: "
+            "graded patch could not be safely reconstructed"
+        )
+    else:
+        assert not findings
     nop = results["nop"]
     assert isinstance(nop, dict)
-    assert nop["status"] == "complete" and nop["patch_bytes"] == 0
-    assert nop["verifier_result"] == {"rewards": {"reward": 0.0}}
     assert json.loads((tmp_path / "check/nop/reference-agent.json").read_text()) == nop
-    if solution:
-        assert started == ["oracle", "nop"]
-        oracle = results["oracle"]
-        assert isinstance(oracle, dict)
-        assert oracle["status"] == "complete" and oracle["patch_bytes"] == 19
-    else:
+    assert nop["status"] == "complete" and nop["patch_bytes"] == 0
+    reconstruction = nop["reconstruction"]
+    assert isinstance(reconstruction, dict) and reconstruction["status"] == "complete"
+    assert rows["nop"] == {"state": "ready", "reason": None}
+    if failure == "no solution":
         assert started == ["nop"]
-        assert results["oracle"] == {
-            "status": "not_configured",
-            "reason": "task ships no solution/solve.sh",
-        }
+        assert rows["oracle"]["state"] == "not_configured"
+        return
+    assert started == ["oracle", "nop"]
+    if failure is None:
+        oracle = results["oracle"]
+        assert isinstance(oracle, dict) and rows["oracle"] == {"state": "ready", "reason": None}
+        assert oracle["patch_bytes"] == len(ORACLE_PATCH)
+        reconstruction = oracle["reconstruction"]
+        assert isinstance(reconstruction, dict) and reconstruction["status"] == "complete"
+        assert (tmp_path / "check/oracle/snapshot/src/answer.py").read_text() == "answer = 1\n"
+        assert fixture.joinpath("src/answer.py").read_text() == "answer = 0\n"

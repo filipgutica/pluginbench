@@ -1738,6 +1738,8 @@ def run_reference_agents(identity: dict[str, object], destination: Path) -> dict
     """Run Harbor's oracle and nop agents through the frozen coding, patch and verifier path.
 
     No credentials enter these trials (install-only environment), so no model can be called.
+    Each trial's stopped source is exported and its graded patch reconstructed over the frozen
+    fixture with the same functions paid attempts use, so a failure there blocks the check.
     The caller judges the results: oracle needs a nonempty patch and reward 1, nop reward 0.
     """
     task_dir = Path(str(identity["task_dir"]))
@@ -1772,6 +1774,8 @@ def run_reference_agents(identity: dict[str, object], destination: Path) -> dict
             "kwargs": {},
         }
         row: dict[str, object] = {"status": "failed"}
+        result: dict[str, object] = {}
+        export: dict[str, object] | None = None
         try:
             worker = _native_process(
                 area=area,
@@ -1786,20 +1790,72 @@ def run_reference_agents(identity: dict[str, object], destination: Path) -> dict
             if worker.get("session_id") != name + "__env":
                 raise ValueError("Reference agent returned a foreign trial identity")
             result = _native_object(worker["result"], "reference agent result")
-            patch = area / "artifacts/harbor" / name / "artifacts" / submissions.PATCH_ARTIFACT
-            row.update(
-                status="complete",
-                exception_info=result.get("exception_info"),
-                verifier_result=result.get("verifier_result"),
-                patch_bytes=patch.stat().st_size if patch.is_file() else None,
-            )
         except (OSError, ValueError, subprocess.TimeoutExpired) as error:
             row["reason"] = str(error)
         finally:
+            # Freeze the stopped source before cleanup, exactly as a paid attempt does.
+            try:
+                export = _native_submission(
+                    area=area, name=name, identity=identity, expected=expected
+                )
+                codex.write_json(area / "artifacts/submission-source.json", export)
+            except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                row.setdefault("reason", "stopped-source export failed: " + str(error))
             row["cleanup"] = _native_cleanup_projects(name=name, owner=owner, expected=expected)
-            codex.write_json(area / "reference-agent.json", row)
+        if export is not None and "reason" not in row:
+            try:
+                row.update(
+                    status="complete",
+                    exception_info=result.get("exception_info"),
+                    verifier_result=result.get("verifier_result"),
+                    **_admit_reference_submission(
+                        area=area, name=name, identity=identity, export=export
+                    ),
+                )
+            except (OSError, ValueError) as error:
+                row.update(status="failed", reason="graded patch admission failed: " + str(error))
+        codex.write_json(area / "reference-agent.json", row)
         results[agent] = row
     return results
+
+
+def _admit_reference_submission(
+    *, area: Path, name: str, identity: dict[str, object], export: dict[str, object]
+) -> dict[str, object]:
+    """Admit a reference trial's export and graded patch as the study admits a paid attempt's."""
+    artifacts = area / "artifacts"
+    (artifacts / "harbor" / name).rename(artifacts / "harbor/trial")
+    execution: dict[str, Any] = {
+        "submission_export_digest": export["snapshot_digest"],
+        "native_artifact_hashes": _native_artifact_hashes(artifacts / "harbor/trial/artifacts"),
+    }
+    submissions.validate_export(
+        diagnostic=area / "workspace", artifacts=artifacts, execution=execution
+    )
+    patch = artifacts / "harbor/trial/artifacts" / submissions.PATCH_ARTIFACT
+    qualification = identity.get("source_qualification")
+    if identity.get("source_policy") != submissions.SOURCE_POLICY or not (
+        isinstance(qualification, dict) and qualification.get("status") == "complete"
+    ):
+        # The submission_source readiness row already reports why; paid attempts fail the same way.
+        reconstruction: dict[str, object] = {
+            "status": "skipped",
+            "reason": "submission source is not qualified",
+        }
+    else:
+        reconstruction = submissions.reconstruct(
+            before=Path(str(identity["fixture_dir"])),
+            task_dir=Path(str(identity["task_dir"])),
+            identity=identity,
+            artifacts=artifacts,
+            execution=execution,
+            destination=area / "snapshot",
+        )
+    return {
+        "patch_bytes": patch.stat().st_size if patch.is_file() else None,
+        "export_digest": export["snapshot_digest"],
+        "reconstruction": reconstruction,
+    }
 
 
 def _native_cleanup_projects(
