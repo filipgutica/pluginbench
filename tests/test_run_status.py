@@ -252,3 +252,30 @@ def test_a_finished_run_reads_as_reviewing_while_review_owns_it(tmp_path: Path) 
 
     with run_lock.hold(root):
         assert run_status.run_status(root)["phase"] == "reviewing"
+
+
+def test_a_stopped_run_reads_as_stopped_not_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `stop` sends SIGTERM, which the run lock turns into KeyboardInterrupt in the worker.
+    root = _run(tmp_path / "run", states=STATES, ledger=True)
+
+    def stopped(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt("stopped by SIGTERM")
+
+    monkeypatch.setattr(cli, "resume_evaluation", stopped)
+    with pytest.raises(KeyboardInterrupt):
+        cli._work(root, lock=None, progress=lambda message: None, notify=False)
+
+    status = run_status.run_status(root)
+    assert status["phase"] == "stopped" and status["error"] is None
+    assert status["last_event"]["event"] == "stopped"
+    # Nothing owns the run, so its recorded `running` attempt is shown as interrupted.
+    assert "  task-a  vanilla   pass interrupted" in run_status.format_status(status)
+
+
+def test_review_refuses_an_active_run_before_planning(tmp_path: Path) -> None:
+    root = _run(tmp_path / "run", states=STATES, ledger=True)
+    with run_lock.hold(root):
+        result = CliRunner().invoke(cli.app, ["review", str(root), "--revision", "r2", "--yes"])
+    assert result.exit_code == 2 and "run is already active" in result.stderr

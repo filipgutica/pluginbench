@@ -161,6 +161,13 @@ def _events(root: Path) -> list[dict[str, Any]]:
     return events
 
 
+def _error(events: list[dict[str, Any]], run: dict[str, Any] | None) -> str | None:
+    """Why the run failed. A stop is not a failure; runs without events only have run.json."""
+    if events:
+        return events[-1].get("error") if events[-1].get("event") == "failed" else None
+    return (run or {}).get("error")
+
+
 def _heartbeat(root: Path, evidence: Path, now: datetime) -> dict[str, Any] | None:
     """The most recent write to any file the run updates as it works."""
     times = [
@@ -303,10 +310,7 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
         "owner": {key: owner.get(key) for key in ("pid", "pgid", "started_at")} if owner else None,
         "heartbeat": _heartbeat(root, evidence, now),
         "last_event": events[-1] if events else None,
-        "error": (
-            events[-1].get("error") if events and events[-1].get("event") == "failed" else None
-        )
-        or (run or {}).get("error"),
+        "error": _error(events, run),
         "states_source": source,
         "attempts_total": len(attempts),
         "states": dict(Counter(attempt["state"] for attempt in attempts)),
@@ -361,6 +365,13 @@ def _age(seconds: int) -> str:
 _RESULTS = ("pass", "fail", "unknown", "empty", "running", "interrupted", "pending")
 
 
+def _result(row: dict[str, Any], active: bool) -> str:
+    """An attempt's outcome, or its state; a `running` attempt of a run no one owns is stale."""
+    if row["outcome"]:
+        return str(row["outcome"])
+    return "interrupted" if row["state"] == "running" and not active else str(row["state"])
+
+
 def format_status(status: dict[str, Any]) -> str:
     """The terminal view of run_status()."""
     lines = [f"Run: {status['run']}" + (f"  ({status['name']})" if status["name"] else "")]
@@ -401,7 +412,7 @@ def format_status(status: dict[str, Any]) -> str:
         lines += ["", "arm".ljust(width) + "".join(c.rjust(n) for c, n in zip(columns, sizes))]
         for arm, summary_row in status["arms"].items():
             counts = Counter(
-                row["outcome"] or row["state"] for row in status["attempts"] if row["arm"] == arm
+                _result(row, status["active"]) for row in status["attempts"] if row["arm"] == arm
             )
             total = summary_row["tokens"]
             lines.append(
@@ -415,7 +426,7 @@ def format_status(status: dict[str, Any]) -> str:
         lines.append("")
         results: dict[tuple[str, str], list[str]] = {}
         for row in sorted(status["attempts"], key=lambda row: row["repeat"]):
-            results.setdefault((row["task"], row["arm"]), []).append(row["outcome"] or row["state"])
+            results.setdefault((row["task"], row["arm"]), []).append(_result(row, status["active"]))
         for (task, arm), values in sorted(results.items()):
             lines.append(f"  {task.ljust(task_width)}  {arm.ljust(width)}  {' '.join(values)}")
     measures = status["measures"]

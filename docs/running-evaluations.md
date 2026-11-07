@@ -210,7 +210,7 @@ Resume reads attempt states from the run's single-writer SQLite ledger, `evidenc
 
 Resume then completes pending measurements or starts a review phase that has not begun. Started review phases require a fresh evaluation. A run prepared before measurement profiles were saved, with measurement not yet started, is refused before any coding call. The same applies to a reviewer whose CLI, credentials, or sandbox host fail their check. Offline citation recovery can fix formatting only when the exact source supports it.
 
-`--notify` sends a desktop notification (macOS `osascript`, Linux `notify-send`) when preparation and readiness checks pass and coding starts, and when the run finishes or fails. A readiness failure therefore arrives before any model call. Notifications are best effort and never change the run's outcome.
+`--notify` sends a desktop notification (macOS `osascript`, Linux `notify-send`) when preparation and readiness checks pass and coding starts, and when the run finishes, stops, or fails. A readiness failure therefore arrives before any model call. Notifications are best effort and never change the run's outcome.
 
 ## Watch a run
 
@@ -222,10 +222,10 @@ Resume then completes pending measurements or starts a review phase that has not
 | --- | --- |
 | `schema_version` | `1` |
 | `run`, `name` | Absolute run directory and evaluation name |
-| `phase` | `starting`, `coding`, `measuring`, `reviewing`, `reporting`, `complete`, `stopped` (unfinished, no live owner), `failed` (the last event is a failure), or `not_started` |
+| `phase` | `starting`, `coding`, `measuring`, `reviewing`, `reporting`, `complete`, `stopped` (unfinished, no live owner), `failed` (the last event is a failure), or `not_started`. `stop` and Ctrl-C record a `stopped` event, not a failure |
 | `active`, `owner` | Whether a live process holds `run.lock`, and its `pid`, `pgid`, and `started_at` |
 | `heartbeat` | `at` and `age_seconds` of the newest write to `events.jsonl`, `run.log`, the ledger, or `run.json` |
-| `last_event`, `error` | The last line of `events.jsonl`, and the failure message if the run failed |
+| `last_event`, `error` | The last line of `events.jsonl` (`started`, `progress`, `stopped`, `failed`, or `finished`), and the failure message if the run failed |
 | `states_source` | `ledger`, `run.json`, or `none` |
 | `attempts_total`, `states`, `outcomes` | Live attempt slots, counts by state, and counts by outcome of complete attempts |
 | `tokens` | Coding tokens this run spent: `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens`, and `lower_bound`. Reused vanilla attempts are excluded; discarded attempts are included |
@@ -236,7 +236,7 @@ Resume then completes pending measurements or starts a review phase that has not
 | `report`, `log` | Paths to `report/report.html` and `run.log`, or null |
 | `attempts` | One row per live slot: `id`, `slot`, `task`, `arm`, `repeat`, `state`, `outcome`, `outcome_reason`, `reused`, `tokens`, `tokens_status`, `minutes`, and `measures` (metric → `status`, `value`, `unit`, `reason`, from `report/results.json` once it exists) |
 
-States are `pending`, `running`, `complete`, and `interrupted`. Outcomes are `pass`, `fail`, `empty` (the graded patch is empty), and `unknown`, with the verifier's reason in `outcome_reason`. `tokens_status` is `exact`, `lower_bound` (usage saved by an unfinished attempt, or only an observed floor), `unknown` (no usage saved yet), or `not_started`. A total's `lower_bound` is true when any attempt it counts is `lower_bound` or `unknown`. The vanilla arm is `vanilla`, including in runs that recorded it as `baseline`.
+States are `pending`, `running`, `complete`, and `interrupted`. Outcomes are `pass`, `fail`, `empty` (the graded patch is empty), and `unknown`, with the verifier's reason in `outcome_reason`. `tokens_status` is `exact`, `lower_bound` (usage saved by an unfinished attempt, or only an observed floor), `unknown` (no usage saved yet), or `not_started`. A total's `lower_bound` is true when any attempt it counts is `lower_bound` or `unknown`. The vanilla arm is `vanilla`, including in runs that recorded it as `baseline`. The table shows a `running` attempt of a run that no process owns as `interrupted`; the JSON keeps the recorded state.
 
 ## Review again
 

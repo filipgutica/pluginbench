@@ -184,6 +184,14 @@ def _events(root: Path) -> Iterator[Callable[..., None]]:
         yield event
 
 
+def _ended(event: Callable[..., None], exc: BaseException) -> None:
+    """Record why work ended early: `stop` (SIGTERM) and Ctrl-C stop it; anything else fails."""
+    if isinstance(exc, KeyboardInterrupt):
+        event("stopped", reason=str(exc) or "interrupted")
+    else:
+        event("failed", error=f"{type(exc).__name__}: {exc}")
+
+
 def _work(
     root: Path,
     *,
@@ -203,9 +211,10 @@ def _work(
         try:
             resume_evaluation(root, progress=logged, guard=lock.assert_in_place)
         except BaseException as exc:
-            event("failed", error=f"{type(exc).__name__}: {exc}")
+            _ended(event, exc)
             if notify:
-                _notify(f"Run failed: {str(exc) or type(exc).__name__}")
+                outcome = "stopped" if isinstance(exc, KeyboardInterrupt) else "failed"
+                _notify(f"Run {outcome}: {str(exc) or type(exc).__name__}")
             raise
         event("finished", report=str(root / "report/report.html"))
     if notify:
@@ -478,24 +487,30 @@ def review(
     Earlier review revisions stay in evidence. The new one is selected and the report rebuilt.
     """
     try:
-        plan = plan_review(run, revision)
-        typer.echo(f"{plan['review_calls']} review calls as review revision {revision}.")
-        if not yes and not typer.confirm("Start review?"):
-            raise typer.Exit()
-        with run_lock.hold(run), _events(run) as event:
-            event("started", command="review", pid=os.getpid(), revision=revision)
-
-            def logged(message: str) -> None:
-                event("progress", message=message)
-                typer.echo(message)
-
-            try:
-                selected = review_evaluation(run, revision, progress=logged)
-            except BaseException as exc:
-                event("failed", error=f"{type(exc).__name__}: {exc}")
-                raise
-            event("finished", command="review", revision=selected)
-        typer.echo(f"Selected review revision {selected}.")
-        typer.echo(f"Report: {run / 'report/report.html'}")
+        with run_lock.hold(run):
+            plan = plan_review(run, revision)
+            typer.echo(f"{plan['review_calls']} review calls as review revision {revision}.")
+            if not yes and not typer.confirm("Start review?"):
+                raise typer.Exit()
+            _review(run, revision)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         _error(exc)
+
+
+def _review(run: Path, revision: str) -> None:
+    """Run a planned review while this process owns the run, recording it in events.jsonl."""
+    with _events(run) as event:
+        event("started", command="review", pid=os.getpid(), revision=revision)
+
+        def logged(message: str) -> None:
+            event("progress", message=message)
+            typer.echo(message)
+
+        try:
+            selected = review_evaluation(run, revision, progress=logged)
+        except BaseException as exc:
+            _ended(event, exc)
+            raise
+        event("finished", command="review", revision=selected)
+    typer.echo(f"Selected review revision {selected}.")
+    typer.echo(f"Report: {run / 'report/report.html'}")
