@@ -1,6 +1,6 @@
 # Measurement specification
 
-Status: Ready, except JavaScript/TypeScript test redundancy (gate G4).
+Status: Ready. JavaScript/TypeScript test redundancy needs a per-test coverage profile (gate G4).
 
 ## Context
 
@@ -65,10 +65,10 @@ Complexity scores come from the language's pinned analyzer. Never pool raw score
 | --- | --- |
 | Test lines added | Existing count. |
 | Changed-line coverage | Share of the attempt's added executable source lines that its submitted visible test suite executes. Branch coverage uses the same population when the report format supplies it. |
-| Redundant added tests | Added test cases whose covered added source lines are all covered by other test cases. One suite run with per-test coverage tracking supplies the data. Equal coverage does not prove equal assertions, so this flags candidates only. |
+| Redundant added tests | Added test cases whose executed added source lines are all covered by the union of every other test case, existing tests included. Candidates are checked smallest first, and each flagged test leaves the pool, so of two identical added tests one is flagged. Added tests that execute no added line are counted separately, not as redundant. Per-test coverage tracking supplies the data. Equal coverage does not prove equal assertions, so this flags candidates only. |
 | Duplicated test code | Added test lines, in test source files, that belong to a six-line block repeated elsewhere in the added test code. Copies of pre-existing tests are not detected. |
 
-Per-test coverage is available through coverage.py dynamic contexts. JavaScript/TypeScript support depends on G4; until then, report redundant added tests as unknown with a reason for those tasks.
+Per-test coverage is available through coverage.py dynamic contexts. JavaScript/TypeScript tasks need a per-test profile (G4); without one, report redundant added tests as unknown with a reason.
 
 Reference solutions add no tests, so R4 has no reference baseline. Compare attempts with vanilla.
 
@@ -136,7 +136,7 @@ Stop emitting these derived metrics from new reports. Saved raw evidence is unch
 
 ### Gate
 
-- **G4. JavaScript/TypeScript per-test coverage.** Confirm whether the pinned Vitest and c8 setups can attribute coverage to individual tests in one run. This blocks only JavaScript/TypeScript redundant added tests.
+- **G4. JavaScript/TypeScript per-test coverage.** Met for Mocha with c8 and Vitest 3.2 with the v8 provider by the [coverage profiles](coverage-profiles/README.md), which take per-test samples in a second run. Other JavaScript/TypeScript setups keep redundant added tests unknown.
 
 ### Assumptions
 

@@ -108,7 +108,7 @@ Coverage.py can trace lines outside its executable-statement population. A trust
 
 A coverage profile's `source_scope` declares its measured package independently of repository-wide LOC and analysis.
 
-Redundant added tests need per-test coverage. For coverage.py, run with `[run] dynamic_context = test_function`, then have the reporting step add `per_test_numbits` to the JSON report: for each measured file, map each context name to its executed lines in coverage.py numbits form (base64), using `CoverageData.contexts_by_lineno`. Do not use `coverage json --show-contexts`; on large suites its output can reach hundreds of megabytes. PluginBench ignores the empty context (code run outside a test). Parametrized cases share one test-function context, so redundancy is per test function. Without per-test data, redundant added tests are unknown.
+An added test is redundant when the added source lines it executes are all executed by the union of the other tests, existing tests included. Candidates are checked smallest first, and each flagged test leaves the pool, so of two identical added tests one is flagged. Redundant added tests need per-test coverage. For coverage.py, run with `[run] dynamic_context = test_function`, then have the reporting step add `per_test_numbits` to the JSON report: for each measured file, map each context name to its executed lines in coverage.py numbits form (base64), using `CoverageData.contexts_by_lineno`. Do not use `coverage json --show-contexts`; on large suites its output can reach hundreds of megabytes. PluginBench ignores the empty context (code run outside a test). Parametrized cases share one test-function context, so redundancy is per test function. Without per-test data, redundant added tests are unknown.
 
 For LCOV, the same command can generate `<report_path>.per-test.json` next to its
 report. For example, `coverage/lcov.info` uses `coverage/lcov.info.per-test.json`:
@@ -132,8 +132,15 @@ form and uses the same redundancy calculation. Named tests with empty bitsets
 are retained; the empty context name is ignored.
 
 The producer must record all measured test cases, including cases that reach no
-source lines, and use stable, unique identities across snapshots. Generate both
-reports from the same run and original-source line population. A missing sidecar
+source lines, and use stable, unique identities across snapshots. The coverage profiles
+merge tests that share a file and full title into one test, as coverage.py does for
+parametrized cases, so a same-title copy of a test is not detected as redundant. Use the
+report's original-source line population. Generate both reports from the same
+run when per-test sampling leaves the report unchanged. V8 inspector coverage
+cannot: its counter resets are isolate-wide, so sampling inside c8 or Vitest's
+v8 provider changes the report. Such a command may take per-test samples in a
+second run of the same suite. Every per-test line must then be executed in the
+report, or the command writes no sidecar. A missing sidecar
 or one without named test contexts leaves redundancy unknown with a reason; file-level hits never substitute
 for per-test data. Both snapshots need per-test data. The frozen input must not
 already contain the sidecar, to prevent stale attribution. Native collection
@@ -141,7 +148,10 @@ retains it as `report.raw.per-test.json` beside `report.raw`.
 
 The [JavaScript inspector spike](../tests/fixtures/js-per-test-coverage/README.md)
 demonstrates serial plain JavaScript and awaited async work with `node:test`.
-Mocha integration and Vitest TypeScript source-map remapping remain unverified.
+[Coverage profiles](coverage-profiles/README.md) has per-test helpers for Mocha
+with c8 and for Vitest's v8 provider, with the csstree and true-myth profiles
+that use them. Vitest needs AST-aware remapping: its default remapping reports
+never-called TypeScript lines as executed.
 
 Changed-line coverage is incomplete when an added source file is missing from the coverage report. Configure coverage to report every source file, for example coverage.py `--source=<package>` or c8 `--all`.
 

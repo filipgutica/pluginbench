@@ -44,10 +44,13 @@ with bit n representing line n, as in coverage.py.
 - A Mocha root-hook plugin would reset in `beforeEach`, take in `afterEach`,
   and form identity from the relative `this.currentTest.file` and
   `this.currentTest.fullTitle()`. Promise/callback completion must precede the
-  final sample. This adaptation was not run; disable parallel mode for its
-  first validation and account for setup/teardown within the hook interval.
+  final sample. [`docs/coverage-profiles`](../../../docs/coverage-profiles/README.md)
+  now implements and validates this design for csstree.
 
 ## Vitest and TypeScript: proposed next experiment
+
+[`docs/coverage-profiles`](../../../docs/coverage-profiles/README.md) now runs
+this experiment for true-myth. It works only with AST-aware remapping.
 
 Vitest's [V8 provider](https://vitest.dev/guide/coverage.html) uses AST-based
 coverage remapping. A TypeScript experiment must retain each worker's transformed

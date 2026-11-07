@@ -1,0 +1,293 @@
+# coverage_profiles entry. Heredocs are the vitest-*.mjs files and per-test-finalize.mjs; see README.md.
+https://github.com/true-myth/true-myth:
+  command:
+    - bash
+    - -c
+    - |
+      # Helpers live under the report directory so they resolve the project's vitest packages;
+      # the coverage run therefore must not clean that directory.
+      mkdir -p coverage/pluginbench /tmp/pluginbench-per-test
+      cat > coverage/pluginbench/vitest.config.mjs <<'JS'
+      // Wrapper around the project's Vitest config for both coverage runs; the profile writes it to
+      // coverage/pluginbench/. Both runs seed Math.random. With PLUGINBENCH_PER_TEST_DIR set, the
+      // per-test run also samples each test and starts workers without optimizing compilers.
+      import { mergeConfig } from "vitest/config";
+      import base from "../../vitest.config.ts";
+
+      const helper = (name) => new URL(name, import.meta.url).pathname;
+      const perTest = Boolean(process.env.PLUGINBENCH_PER_TEST_DIR);
+      const flags = ["--no-opt", "--no-maglev"];
+
+      const config = mergeConfig(base, {
+        test: {
+          setupFiles: [helper("./seeded-random.mjs"), ...(perTest ? [helper("./setup.mjs")] : [])],
+          ...(perTest && { poolOptions: { forks: { execArgv: flags }, threads: { execArgv: flags } } }),
+        },
+      });
+      // The per-test run's own report is discarded, so its thresholds would only add noise.
+      if (perTest) delete config.test.coverage.thresholds;
+      export default config;
+      JS
+      cat > coverage/pluginbench/seeded-random.mjs <<'JS'
+      // Vitest setup file that makes Math.random repeatable per test, so the coverage run and the
+      // per-test run execute the same branches. Each test reseeds from its own identity, so its values do
+      // not depend on run order or on which other tests ran.
+      import { beforeEach, expect } from "vitest";
+      import { relative } from "node:path";
+
+      let state = 0;
+
+      // FNV-1a: a 32-bit seed from the test identity.
+      const seedFrom = (text) => {
+        let hash = 0x811c9dc5;
+        for (let index = 0; index < text.length; index += 1) {
+          hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193);
+        }
+        return hash >>> 0;
+      };
+
+      // mulberry32, a small seeded generator with Math.random's range [0, 1).
+      Math.random = () => {
+        state = (state + 0x6d2b79f5) | 0;
+        let mixed = Math.imul(state ^ (state >>> 15), 1 | state);
+        mixed = (mixed + Math.imul(mixed ^ (mixed >>> 7), 61 | mixed)) ^ mixed;
+        return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
+      };
+
+      beforeEach(() => {
+        const { testPath, currentTestName } = expect.getState();
+        state = seedFrom(`${relative(process.cwd(), testPath)}::${currentTestName}`);
+      });
+      JS
+      cat > coverage/pluginbench/provider.mjs <<'JS'
+      // Vitest custom coverage provider that records per-test lines for PluginBench (Vitest 3.2).
+      //
+      // Inspector coverage resets are isolate-wide, so per-test samples cannot be taken inside the
+      // coverage run without changing its report. After the unchanged coverage run, run the suite again
+      // with this provider, vitest-per-test-setup.mjs as a setup file, workers started with
+      // --no-opt --no-maglev, a throwaway reportsDirectory and PLUGINBENCH_PER_TEST_DIR set; then write
+      // the sidecar with per-test-finalize.mjs.
+      //
+      // The setup file samples each test in its worker. This provider converts each sample with the
+      // stock v8 provider's own convertCoverage and source-map transform, which needs AST-aware
+      // remapping: default v8-to-istanbul remapping counts nearly every line of a loaded file as run.
+      import { Session } from "node:inspector/promises";
+      import { realpathSync, writeFileSync } from "node:fs";
+      import { createRequire } from "node:module";
+      import { join, resolve } from "node:path";
+      import { fileURLToPath } from "node:url";
+      import v8 from "@vitest/coverage-v8";
+
+      // Shared with the setup file, whichever module loads first.
+      const state = (globalThis.__pluginbenchPerTest ??= { samples: [] });
+
+      export default {
+        async startCoverage() {
+          if (state.session) return;
+          try {
+            // Optimized code drops counts of inlined calls, so samples would randomly lose lines.
+            if (!["--no-opt", "--no-maglev"].every((flag) => process.execArgv.includes(flag))) {
+              throw new Error("start Vitest workers with --no-opt --no-maglev");
+            }
+            state.session = new Session();
+            state.session.connect();
+            await state.session.post("Profiler.enable");
+            await state.session.post("Profiler.startPreciseCoverage", { callCount: true, detailed: true });
+          } catch (error) {
+            state.failure ??= String(error?.stack ?? error);
+          }
+        },
+        takeCoverage({ moduleExecutionInfo } = {}) {
+          // The same module wrapper offsets the stock runtime attaches to its file-level sample.
+          const perTest = state.samples.splice(0).map(({ name, result }) => ({
+            name,
+            result: result.map((script) => ({
+              ...script,
+              startOffset: moduleExecutionInfo?.get(fileURLToPath(script.url))?.startOffset || 0,
+            })),
+          }));
+          return { result: [], perTest, failure: state.failure };
+        },
+        // The session stays open for the worker's later test files.
+        stopCoverage() {},
+        async getProvider() {
+          const stock = await v8.getProvider();
+          const coverageV8 = realpathSync(resolve("node_modules/@vitest/coverage-v8/package.json"));
+          const libSourceMaps = createRequire(coverageV8)("istanbul-lib-source-maps");
+          const tests = {};
+          let failure;
+
+          class PerTestProvider extends stock.constructor {
+            // Workers load the runtime named by the provider, so it must stay "custom".
+            name = "custom";
+
+            async readCoverageFiles({ onFileRead, onFinished, onDebug }) {
+              let samples = [];
+              await super.readCoverageFiles({
+                onFileRead(coverage) {
+                  failure ??= coverage.failure;
+                  samples.push(...(coverage.perTest ?? []));
+                  onFileRead(coverage);
+                },
+                onFinished: async (project, transformMode) => {
+                  try {
+                    if (!this.options.experimentalAstAwareRemapping) {
+                      throw new Error("per-test lines need --coverage.experimentalAstAwareRemapping=true");
+                    }
+                    // Tests that share a title are one test, as parametrized cases share one coverage.py
+                    // context, so a repeated title adds its lines to the earlier test's.
+                    for (const { name, result } of samples) {
+                      const files = (tests[name] ??= {});
+                      const executed = await this.executedLines(result, project, transformMode);
+                      for (const [path, lines] of Object.entries(executed)) {
+                        files[path] = [...new Set([...(files[path] ?? []), ...lines])];
+                      }
+                    }
+                  } catch (error) {
+                    failure ??= String(error?.stack ?? error);
+                  }
+                  samples = [];
+                  await onFinished(project, transformMode);
+                },
+                onDebug,
+              });
+            }
+
+            async executedLines(result, project, transformMode) {
+              const converted = await this.convertCoverage({ result }, project, transformMode);
+              const map = await libSourceMaps.createSourceMapStore().transformCoverage(converted);
+              const files = {};
+              for (const path of map.files()) {
+                const lines = Object.entries(map.fileCoverageFor(path).getLineCoverage())
+                  .filter(([, count]) => count > 0)
+                  .map(([line]) => Number(line));
+                if (lines.length) files[path] = lines;
+              }
+              return files;
+            }
+
+            async generateCoverage(options) {
+              const map = await super.generateCoverage(options);
+              try {
+                const record = failure === undefined ? { tests } : { failure };
+                const output = join(process.env.PLUGINBENCH_PER_TEST_DIR, `record-${process.pid}.json`);
+                writeFileSync(output, JSON.stringify(record), { flag: "wx" });
+              } catch (error) {
+                console.error(`PluginBench per-test coverage not recorded: ${error.message}`);
+              }
+              return map;
+            }
+          }
+          return new PerTestProvider();
+        },
+      };
+      JS
+      cat > coverage/pluginbench/setup.mjs <<'JS'
+      // Vitest setup file that samples each test for vitest-per-test-provider.mjs. Errors are recorded,
+      // never thrown, so the hook cannot fail a test.
+      import { afterEach, beforeEach, expect } from "vitest";
+      import { relative } from "node:path";
+
+      // Shared with the provider's worker runtime, whichever module loads first.
+      const state = (globalThis.__pluginbenchPerTest ??= { samples: [] });
+
+      beforeEach(async () => {
+        try {
+          if (!state.session) throw new Error("the PluginBench coverage provider is not active");
+          if (state.active !== undefined) throw new Error("overlapping tests share coverage counters");
+          const { testPath, currentTestName } = expect.getState();
+          state.active = `${relative(process.cwd(), testPath)}::${currentTestName}`;
+          // Taking coverage resets the counters, so the test's own sample starts here.
+          await state.session.post("Profiler.takePreciseCoverage");
+        } catch (error) {
+          state.failure ??= String(error?.stack ?? error);
+        }
+      });
+
+      afterEach(async () => {
+        try {
+          if (!state.session) return;
+          const { result } = await state.session.post("Profiler.takePreciseCoverage");
+          // The stock runtime's filter, keeping only scripts this test ran.
+          const executed = result.filter(
+            ({ url, functions }) =>
+              url.startsWith("file://") &&
+              !url.includes("/node_modules/") &&
+              functions.some(({ ranges }) => ranges.some(({ count }) => count > 0)),
+          );
+          state.samples.push({ name: state.active, result: executed });
+        } catch (error) {
+          state.failure ??= String(error?.stack ?? error);
+        } finally {
+          state.active = undefined;
+        }
+      });
+      JS
+      npx vitest run --config coverage/pluginbench/vitest.config.mjs --coverage.clean=false \
+        --coverage.enabled=true --coverage.provider=v8 --coverage.reporter=lcovonly --coverage.reportsDirectory=coverage \
+        "--coverage.include=src/**" "--coverage.exclude=pluginbench-excludes-nothing/**" --coverage.experimentalAstAwareRemapping=true
+      status=$?
+      cat > /tmp/pluginbench-per-test-finalize.mjs <<'JS'
+      // Writes PluginBench's per-test sidecar beside an LCOV report from the single record that a per-test
+      // run left in <record dir> (mocha-per-test.mjs or vitest-per-test-provider.mjs):
+      //   node per-test-finalize.mjs <lcov report> <record dir>
+      // The record maps test identity -> absolute source path -> executed lines. Any problem leaves no
+      // sidecar, so redundancy stays unknown.
+      import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+      import { join, resolve } from "node:path";
+
+      function finalize(report, directory) {
+        if (existsSync(`${report}.per-test.json`)) throw new Error("per-test sidecar already exists");
+        const records = readdirSync(directory).filter((name) => /^record-\d+\.json$/.test(name));
+        if (records.length !== 1) {
+          throw new Error(`expected one per-test record, found ${records.length}; tests must report from one process`);
+        }
+        const { failure, tests } = JSON.parse(readFileSync(join(directory, records[0]), "utf8"));
+        if (failure !== undefined) throw new Error(failure);
+        // Absolute source path -> LCOV's own SF spelling and executed lines.
+        const covered = new Map();
+        let lines;
+        for (const row of readFileSync(report, "utf8").split("\n")) {
+          if (row.startsWith("SF:")) covered.set(resolve(row.slice(3)), { sf: row.slice(3), lines: (lines = new Set()) });
+          if (row.startsWith("DA:") && Number(row.split(",")[1]) > 0) lines.add(Number(row.slice(3).split(",")[0]));
+        }
+        if (covered.size === 0) throw new Error("LCOV report names no sources");
+        const perTest = {};
+        for (const [name, files] of Object.entries(tests)) {
+          let recorded = false;
+          for (const [path, executed] of Object.entries(files)) {
+            const source = covered.get(path);
+            if (source === undefined) continue; // outside the LCOV source scope
+            // The LCOV comes from the coverage run; a line it never saw executed means the runs diverged.
+            const outside = executed.filter((line) => !source.lines.has(line));
+            if (outside.length) throw new Error(`${name} executed ${path} lines LCOV reports unexecuted: ${outside}`);
+            const bits = Buffer.alloc((Math.max(...executed) >> 3) + 1);
+            for (const line of executed) bits[line >> 3] |= 1 << (line & 7);
+            (perTest[source.sf] ??= {})[name] = bits.toString("base64");
+            recorded = true;
+          }
+          // Tests that reach no measured source are still recorded, with an empty bitset.
+          if (!recorded) (perTest[covered.values().next().value.sf] ??= {})[name] = "";
+        }
+        // Sorted keys keep the bytes independent of the order in which workers reported.
+        const sorted = (object) => Object.fromEntries(Object.entries(object).sort(([a], [b]) => (a < b ? -1 : 1)));
+        const numbits = sorted(Object.fromEntries(Object.entries(perTest).map(([path, names]) => [path, sorted(names)])));
+        writeFileSync(`${report}.per-test.json`, JSON.stringify({ per_test_numbits: numbits }), { flag: "wx" });
+      }
+
+      try {
+        finalize(...process.argv.slice(2, 4));
+      } catch (error) {
+        console.error(`PluginBench per-test coverage unavailable: ${error.message}`);
+      }
+      JS
+      # A failed sampling run may leave a partial record, so only a clean run writes the sidecar.
+      PLUGINBENCH_PER_TEST_DIR=/tmp/pluginbench-per-test npx vitest run --config coverage/pluginbench/vitest.config.mjs \
+        --coverage.enabled=true --coverage.provider=custom --coverage.customProviderModule=coverage/pluginbench/provider.mjs \
+        --coverage.reporter=lcovonly --coverage.reportsDirectory=/tmp/pluginbench-vitest-coverage \
+        "--coverage.include=src/**" "--coverage.exclude=pluginbench-excludes-nothing/**" --coverage.experimentalAstAwareRemapping=true \
+        && node /tmp/pluginbench-per-test-finalize.mjs coverage/lcov.info /tmp/pluginbench-per-test
+      exit $status
+  report_path: coverage/lcov.info
+  tool_version: "@vitest/coverage-v8 3.2.4"
+  source_scope: ["src/**"]
