@@ -142,6 +142,8 @@ def test_init_writes_a_starter_config_that_plans_once_its_paths_are_filled(
     again = CliRunner().invoke(cli.app, ["init"])
     assert again.exit_code == 2 and "already exists" in again.stderr
     assert starter.read_text() == written
+    unfilled = CliRunner().invoke(cli.app, ["run", str(starter), "--dry-run"])
+    assert unfilled.exit_code == 2 and "/path/to/workflow-plugin" in unfilled.stderr
     # Fill the /path/to placeholders and the remote task source with this fixture's local ones.
     raw = yaml.safe_load(written)
     raw["treatments"] = {"workflow": {"guidance": ["a.md"]}}

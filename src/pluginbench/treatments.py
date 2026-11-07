@@ -44,7 +44,7 @@ def _checked_path(path: Path, base: Path) -> Path:
         try:
             mode = current.lstat().st_mode
         except OSError as error:
-            raise ValueError(f"treatment path is missing or unreadable: {current}") from error
+            raise ValueError(f"treatment path is missing or unreadable: {value}") from error
         if stat.S_ISLNK(mode):
             raise ValueError(f"treatment path must not contain a symlink: {current}")
     return current
