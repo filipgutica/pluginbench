@@ -310,3 +310,29 @@ default_subagent_reasoning_effort = "medium"
         "runtime_effort_evidence": ["medium"],
         "startup": [{"type": "session_meta", "payload": {"cli_version": version}}],
     }
+
+
+def reference_agent(*, reward: float, patch_bytes: int | None) -> dict[str, object]:
+    """A completed Harbor oracle or nop trial as run_reference_agents records it."""
+    return {
+        "status": "complete",
+        "exception_info": None,
+        "verifier_result": {"rewards": {"reward": reward}},
+        "patch_bytes": patch_bytes,
+        "cleanup": {"status": "complete"},
+    }
+
+
+def passing_reference_agents(identity: dict[str, object], destination: Path) -> dict[str, object]:
+    return {
+        "oracle": reference_agent(reward=1.0, patch_bytes=120),
+        "nop": reference_agent(reward=0.0, patch_bytes=0),
+    }
+
+
+def passing_git_probe(identity: dict[str, object]) -> dict[str, object]:
+    return {
+        "status": "passed",
+        "author": "Task Developer <developer@example.invalid> 0 +0000",
+        "cleanup": {"status": "complete"},
+    }

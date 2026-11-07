@@ -147,7 +147,24 @@ Changed-line coverage is incomplete when an added source file is missing from th
 
 LCOV callbacks can share names. When mixed hit counts cannot be matched to source lines, function coverage for those files stays unknown, with a reason. Line and branch coverage remain available.
 
-`measurement_settings.require_ready: true` requires a qualified submission source and repeatable selected collectors before any coding call. Selected unused-code measurements also require unambiguous declaration matching in the starting population. Receipts are saved in `measurement-readiness.json`; test-command outcomes remain separate from coverage availability. A preparation/readiness interruption makes no coding calls. Repair its inputs and start a new evaluation. Post-coding resume continues to use frozen submissions.
+`pluginbench check <config>` runs every check that needs no model, and `run` runs the same checks before its first coding attempt. Each task gets one readiness state per measure and check:
+
+| State | Meaning | Blocks the run |
+| --- | --- | --- |
+| `ready` | Measured, or the check passed | No |
+| `not_configured` | No collector for this task, such as coverage without a profile | Only with `measurement_settings.require_ready: true` |
+| `broken` | Configured but failing, such as a missing tool or a probe that failed | Yes |
+
+The checks:
+
+- The Codex CLI version must be one whose session traces the usage parser was checked against.
+- A Codex reviewer needs `codex-code-mode-host` beside the launched `codex`, inside the review sandbox.
+- Selected collectors run twice on the starting source. Selected unused-code measurements also require unambiguous declaration matching in the starting population.
+- The submission source must qualify when the task has a reviewed patch-grading contract.
+- `git commit` must work in the coding image with only the task's environment. Graded patches are `git diff BASE HEAD`, so a failing commit makes every patch empty. A prebuilt `docker_image` is used as published; `check` warns when a Dockerfile beside it is never built.
+- Harbor's oracle agent must produce a nonempty patch with reward 1, and its nop agent must get reward 0, through the same commit, patch and verifier path.
+
+Results are saved in `check.json`, with measurement receipts in `measurement-readiness.json`. Test-command outcomes remain separate from coverage availability. A failed check or interrupted preparation makes no coding calls. Repair its inputs and start a new evaluation. Post-coding resume continues to use frozen submissions.
 
 Optional local analyzer versions are pinned: Mozilla rust-code-analysis CLI 0.0.25, Vulture 2.16, Go 1.26.4, Staticcheck 0.8.2, gocognit 1.3.0, and gocyclo 0.6.0. Install RCA/Vulture/Staticcheck on PATH when selecting these measurements. Rust unused analysis requires Rust/Cargo 1.92.0 inside the frozen task image and a locked offline build. The shipped Go observer builds its pinned scoring libraries in the observer cache during preparation. Analysis does not download project dependencies. Go unused-code collection needs packages to load under the fixed build settings; missing dependencies or excluded files stay unavailable.
 

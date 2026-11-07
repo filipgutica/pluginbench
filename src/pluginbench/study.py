@@ -21,6 +21,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from pluginbench import codex, harbor_backend, submissions
+from pluginbench.harbor_backend import binary_native_reward as _binary_native_reward
 from pluginbench.treatments import (
     Treatment, resolve_treatment, freeze_treatment, treatment_inventory,
 )
@@ -367,15 +368,6 @@ def _native_grade_binding(
     if result["pass"] is None:
         result["reason"] = "native reward is unavailable or not a single binary result"
     return result
-
-
-def _binary_native_reward(verifier: object) -> bool | None:
-    rewards = verifier.get("rewards") if isinstance(verifier, dict) else None
-    if isinstance(rewards, dict) and ("reward" in rewards or len(rewards) == 1):
-        reward = rewards["reward"] if "reward" in rewards else next(iter(rewards.values()))
-        if type(reward) in {int, float} and reward in (0, 1):
-            return bool(reward)
-    return None
 
 
 def _collect(

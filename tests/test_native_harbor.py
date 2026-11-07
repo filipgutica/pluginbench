@@ -1425,3 +1425,135 @@ def test_failed_native_build_never_removes_unqualified_or_foreign_image(
     assert len(calls) == 1
     if foreign_reference:
         assert any("ownership" in note for note in caught.value.__notes__)
+
+
+@pytest.mark.parametrize("prebuilt", [True, False])
+def test_admission_reports_prebuilt_coding_image_and_the_dockerfile_it_ignores(
+    tmp_path: Path, prebuilt: bool
+) -> None:
+    # The pilot fixed git identity in a Dockerfile that a prebuilt image never ran.
+    task = native_task(tmp_path)
+    if prebuilt:
+        toml = (task / "task.toml").read_text()
+        (task / "task.toml").write_text(
+            toml.replace("[environment]\n", '[environment]\ndocker_image="published:1"\n')
+        )
+    assert harbor.validate_native_task(task)["coding_image"] == (
+        {
+            "source": "prebuilt",
+            "image": "published:1",
+            "ignored_dockerfile": "environment/Dockerfile",
+        }
+        if prebuilt
+        else {"source": "dockerfile", "image": None, "ignored_dockerfile": None}
+    )
+
+
+def _prepared_identity(task: Path) -> dict[str, object]:
+    return {
+        "task_dir": str(task),
+        "workdir": "/app",
+        "isolation": {"resources": {"cpus": 2, "memory_mb": 4096}},
+        "image_identity": {"image_id": "sha256:" + "c" * 64},
+        "toolchain_identity": {"harness": "codex", "harness_version": "0.167.0"},
+    }
+
+
+@pytest.mark.parametrize("committed", [True, False])
+def test_git_probe_commits_in_the_coding_image_with_only_the_task_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, committed: bool
+) -> None:
+    task = native_task(tmp_path)
+    toml = (task / "task.toml").read_text()
+    (task / "task.toml").write_text(
+        toml.replace(
+            "[verifier]",
+            '[environment.env]\nGIT_CONFIG_COUNT="1"\nGIT_CONFIG_KEY_0="user.name"\n'
+            'GIT_CONFIG_VALUE_0="Task Developer"\n[verifier]',
+        )
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def docker(*arguments: str, **kwargs: object) -> str:
+        calls.append(arguments)
+        return {
+            "create": "probe-container\n",
+            "wait": "0\n" if committed else "128\n",
+            "logs": "Task Developer <dev@example.invalid> 1 +0000\n"
+            if committed
+            else "Author identity unknown\n",
+        }.get(arguments[0], "")
+
+    cleaned: list[str] = []
+    monkeypatch.setattr(harbor, "_docker", docker)
+    monkeypatch.setattr(
+        harbor,
+        "cleanup",
+        lambda **kwargs: cleaned.append(str(kwargs["project"])) or {"status": "complete"},
+    )
+    receipt = harbor.probe_coding_environment(_prepared_identity(task))
+    create = calls[0]
+    assert create[0] == "create" and "sha256:" + "c" * 64 in create
+    assert create[create.index("--network") + 1] == "none"
+    assert "GIT_CONFIG_KEY_0=user.name" in create and "GIT_CONFIG_COUNT=1" in create
+    # The probe must not supply an identity of its own, or it would hide the failure.
+    script = create[-1]
+    assert "commit" in script and "user.name" not in script and "user.email" not in script
+    assert [call[0] for call in calls] == ["create", "start", "wait", "logs"]
+    assert cleaned and cleaned[0].startswith("pluginbench-git-probe-")
+    if committed:
+        assert receipt["status"] == "passed"
+        assert receipt["author"] == "Task Developer <dev@example.invalid> 1 +0000"
+    else:
+        assert receipt["status"] == "failed"
+        assert "Author identity unknown" in str(receipt["reason"])
+
+
+@pytest.mark.parametrize("solution", [True, False])
+def test_reference_agents_run_harbor_oracle_and_nop_without_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, solution: bool
+) -> None:
+    task = native_task(tmp_path)
+    if solution:
+        (task / "solution").mkdir()
+        (task / "solution/solve.sh").write_text("#!/bin/sh\ngit apply /solution/fix.patch\n")
+    started: list[str] = []
+
+    def process(**kwargs: object) -> dict[str, object]:
+        config = kwargs["config"]
+        assert isinstance(config, dict)
+        agent = config["agent"]
+        # No credentials (install-only) and no coding-CLI settings: no model can be called.
+        assert kwargs["install_only"] is True
+        assert agent == {"name": agent["name"], "override_timeout_sec": 900, "kwargs": {}}
+        assert config["verifier"] == {"disable": False}
+        started.append(agent["name"])
+        trial = Path(str(config["trials_dir"])) / str(config["trial_name"])
+        patch = trial / "artifacts/logs/artifacts/model.patch"
+        patch.parent.mkdir(parents=True)
+        patch.write_text("diff --git a/x b/x\n" if agent["name"] == "oracle" else "")
+        reward = 1.0 if agent["name"] == "oracle" else 0.0
+        return {
+            "session_id": str(config["trial_name"]) + "__env",
+            "result": {"verifier_result": {"rewards": {"reward": reward}}, "exception_info": None},
+        }
+
+    monkeypatch.setattr(harbor, "_native_process", process)
+    monkeypatch.setattr(harbor, "_native_cleanup_projects", lambda **kwargs: {"status": "complete"})
+    results = harbor.run_reference_agents(_prepared_identity(task), tmp_path / "check")
+    nop = results["nop"]
+    assert isinstance(nop, dict)
+    assert nop["status"] == "complete" and nop["patch_bytes"] == 0
+    assert nop["verifier_result"] == {"rewards": {"reward": 0.0}}
+    assert json.loads((tmp_path / "check/nop/reference-agent.json").read_text()) == nop
+    if solution:
+        assert started == ["oracle", "nop"]
+        oracle = results["oracle"]
+        assert isinstance(oracle, dict)
+        assert oracle["status"] == "complete" and oracle["patch_bytes"] == 19
+    else:
+        assert started == ["nop"]
+        assert results["oracle"] == {
+            "status": "not_configured",
+            "reason": "task ships no solution/solve.sh",
+        }

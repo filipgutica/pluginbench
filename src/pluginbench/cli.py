@@ -13,7 +13,9 @@ import yaml
 
 from pluginbench import __version__
 from pluginbench.evaluation import (
+    CheckFailed,
     Evaluation,
+    check_evaluation,
     load_evaluation,
     plan_evaluation,
     plan_resume,
@@ -59,8 +61,29 @@ def pick(
 
 
 def _error(exc: Exception) -> None:
+    if isinstance(exc, CheckFailed):
+        typer.echo(_readiness_table(exc.report), err=True)
     typer.echo(f"Error: {exc}", err=True)
     raise typer.Exit(2)
+
+
+def _readiness_table(report: dict[str, object]) -> str:
+    """One row per task, one column per measure or check, each cell a readiness state."""
+    matrix = report["matrix"]
+    assert isinstance(matrix, dict)
+    columns = list(dict.fromkeys(name for rows in matrix.values() for name in rows))
+    table = [["task", *columns]] + [
+        [task, *(str(rows.get(name, {}).get("state", "-")) for name in columns)]
+        for task, rows in matrix.items()
+    ]
+    widths = [max(len(row[index]) for row in table) for index in range(len(columns) + 1)]
+    return "\n".join(
+        "  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip() for row in table
+    )
+
+
+def _new_run_directory(prefix: str = "") -> Path:
+    return Path("runs") / (prefix + datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ"))
 
 
 def _notify(message: str) -> None:
@@ -260,9 +283,7 @@ def run(
             else:
                 if evaluation is None:
                     raise ValueError("missing evaluation settings")
-                destination = output or Path("runs") / datetime.now(UTC).strftime(
-                    "%Y%m%dT%H%M%S%fZ"
-                )
+                destination = output or _new_run_directory()
                 root = run_evaluation(evaluation, destination, progress=progress)
         except BaseException as exc:
             if notify:
@@ -272,6 +293,25 @@ def run(
             _notify(f"Run finished. Report: {root / 'report/report.html'}")
         typer.echo(f"Report: {root / 'report/report.html'}")
         typer.echo(f"Graphable data: {root / 'report/results.json'}")
+    except (OSError, ValueError, yaml.YAMLError, subprocess.SubprocessError) as exc:
+        _error(exc)
+
+
+@app.command("check")
+def check(
+    config: Path = typer.Argument(
+        ..., help="Evaluation YAML or JSON; relative paths use its directory."
+    ),
+    output: Path | None = typer.Option(
+        None, "--output", help="New directory for prepared inputs and check.json."
+    ),
+) -> None:
+    """Prepare tasks and run every no-model check; exit 2 if the run would fail or lose data."""
+    try:
+        destination = output or _new_run_directory("check-")
+        report = check_evaluation(load_evaluation(config), destination, progress=typer.echo)
+        typer.echo(_readiness_table(report))
+        typer.echo(f"Ready. Check: {destination / 'check.json'}")
     except (OSError, ValueError, yaml.YAMLError, subprocess.SubprocessError) as exc:
         _error(exc)
 

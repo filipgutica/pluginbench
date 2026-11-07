@@ -15,8 +15,11 @@ pip install -e '.[harbor]'
 cp examples/evaluation.yaml evaluation.yaml
 # Edit evaluation.yaml: replace the treatment and review paths.
 pluginbench run --config evaluation.yaml --dry-run
+pluginbench check evaluation.yaml
 pluginbench run --config evaluation.yaml
 ```
+
+`check` makes no model calls. It prepares each task and exits 2 when the run would fail or lose data. `run` runs the same checks before its first coding attempt.
 
 Choose **runner**, **treatments**, **tasks**, **measurements**, and optional **reviewer** in [the config](examples/evaluation.yaml), or use CLI flags (`pluginbench run --help`). Preparation and measurement happen automatically.
 
@@ -36,7 +39,7 @@ Open `runs/<run>/report/report.html`. `results.json` contains metrics and baseli
 
 Resume interrupted measurement work with `pluginbench run --resume runs/<run>`. It reuses saved submissions. Interrupted coding or review phases require a fresh evaluation; resume cannot repair a failing solution.
 
-Accepts standard [Harbor tasks](docs/running-evaluations.md) with Linux CPU environments and separate verifiers. There is no task-name allowlist. Measurement support is reported separately. Pinned analyzers cover JS/TS, Python, Go, and Rust complexity; unused-code support depends on the analyzer and build environment. Coverage accepts LCOV, coverage.py JSON, and Go profiles, with each unit labeled separately. It is reported for the lines each attempt added. Python per-test coverage also flags redundant added tests. Tasks that ship `solution/solution.patch` are measured as a reference baseline. Preparation probes selected collectors twice before coding; `measurement_settings.require_ready: true` stops before paid calls when measurements are unavailable.
+Accepts standard [Harbor tasks](docs/running-evaluations.md) with Linux CPU environments and separate verifiers. There is no task-name allowlist. Measurement support is reported separately. Pinned analyzers cover JS/TS, Python, Go, and Rust complexity; unused-code support depends on the analyzer and build environment. Coverage accepts LCOV, coverage.py JSON, and Go profiles, with each unit labeled separately. It is reported for the lines each attempt added. Python per-test coverage also flags redundant added tests. Tasks that ship `solution/solution.patch` are measured as a reference baseline. Preparation probes selected collectors twice before coding. A broken collector stops the run before paid calls. A measure with no collector for a task, such as coverage on an image without a coverage tool, is reported as not configured. `measurement_settings.require_ready: true` stops on those too.
 
 Treatments use native Codex instructions, skill discovery, and plugin installation. The task prompt stays unchanged. Complete package resources and synchronous command hooks are preserved; unsupported components stop admission. Discovery proves availability, not that the model used a skill. Smaller numbers alone do not prove better work.
 

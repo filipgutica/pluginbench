@@ -13,8 +13,10 @@ from pluginbench.assessment_metrics import _analysis_candidates
 from pluginbench.measurement_profiles import (
     CoverageSettings,
     MeasurementSettings,
+    blocking_findings,
     capability_plan,
     prepare_profiles,
+    readiness_state,
 )
 
 
@@ -532,3 +534,38 @@ def test_repository_coverage_profile_overrides_language_default(tmp_path: Path) 
         coverage_profiles={"go": language, "https://github.com/example/repo": repository}
     )
     assert profiles.coverage_settings(native, settings) == repository
+
+
+def test_missing_collector_is_not_configured_but_a_failing_tool_is_broken(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Tasks whose images ship no coverage tool are not configured, not broken.
+    (tmp_path / "plain").mkdir()
+    (tmp_path / "ts").mkdir()
+    plain = capability_plan(
+        task(tmp_path / "plain", "cobol"), ["coverage", "cyclomatic"], MeasurementSettings()
+    )
+    assert readiness_state(plain["coverage"]) == "not_configured"
+    assert readiness_state(plain["cyclomatic"]) == "not_configured"
+    monkeypatch.setattr(shutil, "which", lambda _: "/tool")
+    monkeypatch.setattr(subprocess, "check_output", lambda *args, **kwargs: "fallow 3.19.0")
+    wrong = capability_plan(
+        task(tmp_path / "ts", "typescript"), ["cognitive", "lines"], MeasurementSettings()
+    )
+    assert readiness_state(wrong["cognitive"]) == "broken"
+    assert readiness_state(wrong["lines"]) == "ready"
+
+
+@pytest.mark.parametrize("require_ready", [False, True])
+def test_only_broken_rows_block_unless_every_measure_is_required(require_ready: bool) -> None:
+    matrix = {
+        "covered": {"coverage": {"state": "ready", "reason": None}},
+        "uncovered": {"coverage": {"state": "not_configured", "reason": "no coverage tool"}},
+    }
+    assert blocking_findings(matrix, require_ready=require_ready) == (
+        ["uncovered: coverage is not_configured: no coverage tool"] if require_ready else []
+    )
+    matrix["covered"]["coverage"] = {"state": "broken", "reason": "test command exited 3"}
+    assert "covered: coverage is broken: test command exited 3" in blocking_findings(
+        matrix, require_ready=require_ready
+    )

@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 from collections.abc import Callable
@@ -16,16 +17,18 @@ from collections.abc import Callable
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
-from pluginbench import claude, codex, harbor_backend, submissions
+from pluginbench import claude, codex, harbor_backend, isolation, submissions
 from pluginbench.treatments import Treatment, resolve_treatment, treatment_inventory
 from pluginbench.native_treatments import NativeCapabilities, DELIVERY_POLICY, admit
 from pluginbench.task_sources import Tasks
 from pluginbench.measurement_profiles import (
     REMOVED_TEST_OVERLAP,
     MeasurementSettings,
+    blocking_findings,
     capability_plan,
     prepare_profiles,
     probe_measurements,
+    readiness_state,
 )
 from pluginbench.assessment_metrics import scoped_code_size, scoped_test_size
 from pluginbench.datasets import TaskCatalog, TaskEntry, portable_native_identity
@@ -213,11 +216,13 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
     identities = {}
     declared = {}
     capabilities = {}
+    coding_images = {}
     submission_sources: dict[str, dict[str, object]] = {}
     for task in config.tasks.task_ids:
         path = suite / "tasks" / task
         admission = harbor_backend.validate_native_task(path)
         identities[task] = admission["task_assets_sha256"]
+        coding_images[task] = admission["coding_image"]
         task_limits = _task_limits(_object(admission["configuration"]))
         verifier = _object(admission["verifier_configuration"])
         for key in ("cpus", "memory_mb"):
@@ -287,6 +292,7 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
         "tasks": config.tasks.task_ids,
         "measurements": config.measurements,
         "measurement_capabilities": capabilities,
+        "coding_images": coding_images,
         "submission_sources": submission_sources,
         "repeats": config.repeats,
         "jobs": jobs,
@@ -301,9 +307,84 @@ def _write(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
-def run_evaluation(
-    config: Evaluation, output: Path, *, progress: Callable[[str], None] | None = None
-) -> Path:
+class CheckFailed(ValueError):
+    """A blocking check finding; no coding call was made. `report` holds the whole matrix."""
+
+    def __init__(self, report: dict[str, object], findings: list[str], path: Path) -> None:
+        super().__init__(
+            "Check failed; no coding calls were made. Repair the inputs and start a new "
+            f"evaluation. See {path}.\n" + "\n".join(findings)
+        )
+        self.report = report
+
+
+@dataclass
+class _Checked:
+    """What a passed check hands to coding, all in the same new run root."""
+
+    config: Evaluation
+    root: Path
+    comparison: dict[str, object]
+    harness_versions: dict[str, str]
+    profiles: dict[str, list[Collector]]
+    scopes: dict[str, object]
+    task_environment: dict[str, object]
+    capabilities: dict[str, object]
+    report: dict[str, object]
+
+
+def _harness_version(harness: str) -> str:
+    native = (claude.preflight if harness == "claude" else codex.preflight)()
+    version = str(native.get("harness_version", ""))
+    match = re.search(r"(?<![\w.+-])\d+\.\d+\.\d+(?![\w.+-])", version)
+    if match is None:
+        raise ValueError(f"cannot pin {harness} CLI version: {version}")
+    if harness == "codex":
+        codex.admit_version(match.group())
+    with tempfile.TemporaryDirectory(prefix="pluginbench-auth-check-") as temporary:
+        codex.runtime_environment(Path(temporary) / "private", harness)
+    return match.group()
+
+
+def _coding_environment_row(
+    image: dict[str, object], probe: dict[str, object]
+) -> dict[str, object]:
+    passed = probe.get("status") == "passed"
+    return {
+        "state": "ready" if passed else "broken",
+        "reason": None if passed else probe.get("reason"),
+        "image_source": image["source"],
+        "ignored_dockerfile": image["ignored_dockerfile"],
+        "git_probe": probe,
+    }
+
+
+def _reference_agent_rows(results: dict[str, object]) -> dict[str, dict[str, object]]:
+    """Oracle must produce a nonempty patch with reward 1; nop must get reward 0."""
+    rows: dict[str, dict[str, object]] = {}
+    for agent, expected in (("oracle", True), ("nop", False)):
+        result = _object(results[agent])
+        if result["status"] == "not_configured":
+            rows[agent] = {"state": "not_configured", "reason": result["reason"]}
+            continue
+        reward = harbor_backend.binary_native_reward(result.get("verifier_result"))
+        reason = None
+        if result["status"] != "complete":
+            reason = str(result.get("reason") or "trial did not complete")
+        elif _object(result["cleanup"]).get("status") != "complete":
+            reason = "trial cleanup incomplete"
+        elif result.get("exception_info") is not None:
+            reason = f"trial failed: {result['exception_info']}"
+        elif expected and not result.get("patch_bytes"):
+            reason = "reference solution produced an empty graded patch"
+        elif reward is not expected:
+            reason = f"verifier reward is {reward}; expected {int(expected)}"
+        rows[agent] = {"state": "broken" if reason else "ready", "reason": reason}
+    return rows
+
+
+def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | None) -> _Checked:
+    """Every no-model check, in a new run root. Raises CheckFailed on any blocking finding."""
     plan = plan_evaluation(config)
     source = config.tasks.resolve()
     suite = source.parent if source.name == "tasks" else source
@@ -320,25 +401,34 @@ def run_evaluation(
     if root.exists():
         raise ValueError(f"output must be a new directory: {root}")
     harbor_backend.preflight(jobs=config.jobs, **limits)
-    harness_versions = {}
-    for harness in {config.runner.harness, *([config.reviewer.harness] if config.reviewer else [])}:
-        native = (claude.preflight if harness == "claude" else codex.preflight)()
-        version = str(native.get("harness_version", ""))
-        match = re.search(r"(?<![\w.+-])\d+\.\d+\.\d+(?![\w.+-])", version)
-        if match is None:
-            raise ValueError(f"cannot pin {harness} CLI version: {version}")
-        harness_versions[harness] = match.group()
-        with tempfile.TemporaryDirectory(prefix="pluginbench-auth-check-") as temporary:
-            codex.runtime_environment(Path(temporary) / "private", harness)
+    harness_versions: dict[str, str] = {
+        harness: _harness_version(harness)
+        for harness in {
+            config.runner.harness,
+            *([config.reviewer.harness] if config.reviewer else []),
+        }
+    }
+    if config.reviewer and config.reviewer.harness == "codex":
+        isolation.codex_code_mode_host()
+    coding_images = _object(plan["coding_images"])
+    warnings = [
+        f"{task}: runs the prebuilt image {image['image']}; {image['ignored_dockerfile']} is "
+        "never built, so changes to it have no effect"
+        for task, value in coding_images.items()
+        if (image := _object(value))["ignored_dockerfile"]
+    ]
+    if progress:
+        for warning in warnings:
+            progress("Warning: " + warning)
     root.mkdir(parents=True)
     prepared = root / "inputs"
     prepared.mkdir()
-    evidence = root / "evidence"
     entries = []
     profiles = {}
-    scopes = {}
-    task_environment = {}
-    capabilities = {}
+    scopes: dict[str, object] = {}
+    task_environment: dict[str, object] = {}
+    capabilities: dict[str, object] = {}
+    matrix: dict[str, dict[str, dict[str, object]]] = {}
     for task in config.tasks.task_ids:
         if progress:
             progress(f"Preparing native Harbor task {task}")
@@ -383,20 +473,19 @@ def run_evaluation(
             "test_scope": json.loads(provenance["test_scope"]),
             "version": provenance["measurement_profile_version"],
         }
-        capabilities[task] = provenance["capabilities"]
-        capabilities[task] = probe_measurements(
+        rows = probe_measurements(
             fixture,
             destination / "measurement-readiness",
             profiles[task],
             config.measurements,
-            _object(capabilities[task]),
+            _object(provenance["capabilities"]),
         )
         qualification = _object(identity.get("source_qualification", {}))
         qualified = (
             identity.get("source_policy") == submissions.SOURCE_POLICY
             and qualification.get("status") == "complete"
         )
-        capabilities[task]["submission_source"] = {
+        submission_source: dict[str, object] = {
             "status": "available" if qualified else "unavailable",
             "source_policy": submissions.SOURCE_POLICY,
             "reason": None
@@ -405,26 +494,83 @@ def run_evaluation(
                 "reason", "canonical submission source has no compatible preparation proof"
             ),
         }
+        # A task without a reviewed patch-grading contract has no submission source to qualify.
+        if _object(_object(plan["submission_sources"])[task])["status"] == "unsupported":
+            submission_source["configured"] = False
+        rows["submission_source"] = {
+            **submission_source,
+            "state": readiness_state(submission_source),
+        }
+        capabilities[task] = rows
         task_environment[task] = portable_native_identity(identity)
+        matrix[task] = {
+            name: {"state": row["state"], "reason": row.get("reason")} for name, row in rows.items()
+        }
+        matrix[task]["coding_environment"] = _coding_environment_row(
+            _object(coding_images[task]), harbor_backend.probe_coding_environment(identity)
+        )
+        matrix[task].update(
+            _reference_agent_rows(
+                harbor_backend.run_reference_agents(identity, root / "check" / task)
+            )
+        )
         if progress:
-            for metric, capability in _object(capabilities[task]).items():
-                row = _object(capability)
-                if row["status"] == "unavailable":
-                    progress(f"{task}: {metric} unavailable — {row['reason']}")
+            for name, row in matrix[task].items():
+                if row["state"] != "ready":
+                    progress(f"{task}: {name} {row['state']} — {row['reason']}")
     _write(
         prepared / "tasks.json",
         TaskCatalog(schema_version=1, tasks=entries).model_dump(mode="json"),
     )
     _write(root / "measurement-readiness.json", capabilities)
-    if config.measurement_settings.require_ready and any(
-        row.get("status") == "unavailable"
-        for task in capabilities.values()
-        for row in _object(task).values()
-        if isinstance(row, dict)
-    ):
-        raise ValueError(
-            "Selected measurements or submission sources are not ready; no coding calls were made. See measurement-readiness.json. Repair the inputs and start a new evaluation."
-        )
+    findings = blocking_findings(matrix, require_ready=config.measurement_settings.require_ready)
+    report: dict[str, object] = {
+        "status": "blocked" if findings else "ready",
+        "model_calls": 0,
+        "require_ready": config.measurement_settings.require_ready,
+        "harness_versions": harness_versions,
+        "coding_images": coding_images,
+        "warnings": warnings,
+        "findings": findings,
+        "matrix": matrix,
+    }
+    _write(root / "check.json", report)
+    if findings:
+        raise CheckFailed(report, findings, root / "check.json")
+    return _Checked(
+        config=config,
+        root=root,
+        comparison=comparison,
+        harness_versions=harness_versions,
+        profiles=profiles,
+        scopes=scopes,
+        task_environment=task_environment,
+        capabilities=capabilities,
+        report=report,
+    )
+
+
+def check_evaluation(
+    config: Evaluation, output: Path, *, progress: Callable[[str], None] | None = None
+) -> dict[str, object]:
+    """Prepare every task and run every no-model check; never starts a coding attempt."""
+    return _check(config, output, progress).report
+
+
+def run_evaluation(
+    config: Evaluation, output: Path, *, progress: Callable[[str], None] | None = None
+) -> Path:
+    checked = _check(config, output, progress)
+    config = checked.config
+    root = checked.root
+    comparison = checked.comparison
+    harness_versions = checked.harness_versions
+    profiles = checked.profiles
+    scopes = checked.scopes
+    task_environment = checked.task_environment
+    capabilities = checked.capabilities
+    prepared = root / "inputs"
+    evidence = root / "evidence"
     fixed_guidance = []
     if config.reviewer:
         for index, original in enumerate(config.reviewer.guidance):
@@ -731,6 +877,8 @@ def resume_evaluation(root: Path, *, progress: Callable[[str], None] | None = No
         (claude.preflight if harness == "claude" else codex.preflight)()
         with tempfile.TemporaryDirectory(prefix="pluginbench-auth-check-") as temporary:
             codex.runtime_environment(Path(temporary) / "private", harness)
+        if harness == "codex":
+            isolation.codex_code_mode_host()
     return _finish_evaluation(
         root, selection=selection, profiles=profiles, guidance=guidance, progress=progress
     )

@@ -98,6 +98,23 @@ def tool_roots() -> list[Path]:
     return _roots(roots)
 
 
+def codex_code_mode_host() -> Path:
+    """Statically prove an isolated Codex review can start its code-mode host."""
+    executable = shutil.which("codex")
+    if executable is None:
+        raise ValueError("Codex reviews need codex on PATH")
+    host = Path(executable).parent / "codex-code-mode-host"
+    if not host.is_file() or not os.access(host, os.X_OK):
+        raise ValueError(
+            f"Codex reviews need an executable {host}: code mode starts it beside the launched "
+            "codex, and every review tool call fails without it"
+        )
+    roots = tool_roots()
+    if host.absolute() not in roots or host.resolve() not in roots:
+        raise ValueError(f"The review sandbox does not grant {host}; code mode cannot start")
+    return host
+
+
 @lru_cache(maxsize=64)
 def _file_hash(path: Path, signature: tuple[int, ...]) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
