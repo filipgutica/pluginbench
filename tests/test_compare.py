@@ -124,6 +124,15 @@ def test_a_missing_value_stays_missing_and_leaves_a_total_undetermined(tmp_path:
     assert tokens.detail == f"4 of 4 tasks; measured repeats differ: {first['task']} 2 vs 3"
     coverage = measure(evidence, _gate("changed-line coverage"), "vanilla", CLIMB)
     assert coverage.missing == {"happy-dom-abort-pending-body-reads": "no measured value"}
+    # A task measured on only some attempts is listed too, with the report's reason.
+    hotspots = measure(evidence, gate, "superpowers", CLIMB)
+    assert hotspots.partial == {
+        first["task"]: "1 of 3 attempts unmeasured: Complexity hotspots added: unknown"
+    }
+    printed = CliRunner().invoke(
+        cli.app, ["compare", *runs, "--gates", str(FIXTURE / "card-gates.yaml")]
+    )
+    assert f"tokens, superpowers, {first['task']}: 1 of 3 attempts unmeasured" in printed.stdout
 
 
 def test_a_factor_limit_keeps_its_slack_when_the_comparator_is_negative() -> None:
@@ -172,6 +181,11 @@ def test_round_one_takes_the_incumbent_from_the_pilot_only_when_selected() -> No
         cli.app, ["compare", *round_one, str(FIXTURE / "pilot-coverage"), "--gates", gates]
     )
     assert clash.exit_code == 2 and "comes from both" in clash.stderr
+    # The same run named twice would double its attempts.
+    twice = CliRunner().invoke(
+        cli.app, ["compare", *PILOT, f"{PILOT[0]}=workflow-main", "--gates", gates]
+    )
+    assert twice.exit_code == 2 and "comes from both" in twice.stderr
 
     incumbent = [f"{run}=workflow-main" for run in PILOT]
     result = CliRunner().invoke(cli.app, ["compare", *round_one, *incumbent, "--gates", gates])

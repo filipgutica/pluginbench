@@ -76,6 +76,8 @@ class Attempt:
     arm: str
     correctness: str
     values: dict[str, float | None]
+    # Why a metric has no value, from the report's observation.
+    reasons: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -91,6 +93,8 @@ class Measure:
     value: float | None
     tasks: dict[str, float]
     missing: dict[str, str]
+    # Tasks measured on only some attempts, with why the others have no value.
+    partial: dict[str, str]
     measured: int
     assigned: int
     # Measured repeats per task, so a comparison can show where the two sides differ.
@@ -104,8 +108,8 @@ def load_gates(path: Path) -> Gates:
 def load_evidence(specs: list[str]) -> Evidence:
     """Read runs given as DIR or DIR=ARM,ARM; one run may supply each package and task."""
     evidence = Evidence()
-    owners: dict[tuple[str, str], str] = {}
-    for spec in specs:
+    owners: dict[tuple[str, str], int] = {}
+    for index, spec in enumerate(specs):
         directory, _, selection = spec.partition("=")
         wanted = {ARM_NAMES.get(arm, arm) for arm in selection.split(",") if arm}
         results = Path(directory) / "report" / "results.json"
@@ -113,21 +117,27 @@ def load_evidence(specs: list[str]) -> Evidence:
             raise ValueError(f"{directory} has no report/results.json; run `pluginbench report`")
         data = json.loads(results.read_text())
         values: dict[str, dict[str, float | None]] = {}
+        reasons: dict[str, dict[str, str]] = {}
         for row in data["observations"]:
             measured = row.get("status") == "measured" and isinstance(row.get("value"), int | float)
             values.setdefault(row["attempt_id"], {})[row["metric"]] = (
                 float(row["value"]) if measured else None
             )
+            if not measured:
+                reasons.setdefault(row["attempt_id"], {})[row["metric"]] = str(
+                    row.get("reason") or row.get("status") or "no value"
+                )
         found: set[str] = set()
         for row in data["attempts"]:
             arm = ARM_NAMES.get(row["guidance"], row["guidance"])
             found.add(arm)
             if wanted and arm not in wanted:
                 continue
-            owner = owners.setdefault((arm, row["task"]), directory)
-            if owner != directory:
+            # Repeats come from one input; a second input with the same package would double them.
+            owner = owners.setdefault((arm, row["task"]), index)
+            if owner != index:
                 raise ValueError(
-                    f"{arm} on {row['task']} comes from both {owner} and {directory}; "
+                    f"{arm} on {row['task']} comes from both {specs[owner]} and {spec}; "
                     "select packages with DIR=ARM,ARM"
                 )
             evidence.attempts.append(
@@ -138,6 +148,7 @@ def load_evidence(specs: list[str]) -> Evidence:
                     arm=arm,
                     correctness=correctness_state(row["correctness"], row.get("native_grading")),
                     values=values.get(row["id"], {}),
+                    reasons=reasons.get(row["id"], {}),
                 )
             )
         if wanted - found:
@@ -176,12 +187,25 @@ def measure(evidence: Evidence, gate: Gate, arm: str, tasks: list[str]) -> Measu
     assert gate.metrics is not None
     per_task: dict[str, float] = {}
     missing: dict[str, str] = {}
+    partial: dict[str, str] = {}
     repeats: dict[str, int] = {}
     for task in tasks:
         attempts = [row for row in evidence.attempts if row.arm == arm and row.task == task]
         values = [_sum(row.values, gate.metrics) for row in attempts]
         present = [value for value in values if value is not None]
         repeats[task] = len(present)
+        if present and len(present) < len(attempts):
+            why = sorted(
+                {
+                    _missing_reason(row, gate.metrics)
+                    for row, value in zip(attempts, values, strict=True)
+                    if value is None
+                }
+            )
+            partial[task] = (
+                f"{len(attempts) - len(present)} of {len(attempts)} attempts unmeasured: "
+                + "; ".join(why)
+            )
         if not present:
             missing[task] = "no attempts" if not attempts else "no measured value"
             continue
@@ -199,10 +223,16 @@ def measure(evidence: Evidence, gate: Gate, arm: str, tasks: list[str]) -> Measu
         value=_combine(gate, list(per_task.values())),
         tasks=per_task,
         missing=missing,
+        partial=partial,
         measured=sum(repeats.values()),
         assigned=sum(row.arm == arm and row.task in repeats for row in evidence.attempts),
         repeats=repeats,
     )
+
+
+def _missing_reason(row: Attempt, metrics: list[str]) -> str:
+    metric = next(metric for metric in metrics if row.values.get(metric) is None)
+    return f"{metric}: {row.reasons.get(metric, 'no observation')}"
 
 
 def _combine(gate: Gate, values: list[float]) -> float | None:
@@ -377,7 +407,10 @@ def _section(evidence: Evidence, gates: Gates, split: str, tasks: list[str]) -> 
             if gate.statistic != "total":
                 count = f"{len(result.tasks)}/{len(tasks)} tasks, {count}"
             cells.append(f"{_number(result.value)} ({count})")
-            notes += [f"{gate.name}, {arm}, {task}: {why}" for task, why in result.missing.items()]
+            notes += [
+                f"{gate.name}, {arm}, {task}: {why}"
+                for task, why in {**result.missing, **result.partial}.items()
+            ]
         rows.append([gate.name, *cells])
     lines += ["", *_table(rows)]
     if notes:

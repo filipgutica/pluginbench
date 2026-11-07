@@ -66,7 +66,7 @@ Canonical submission support currently covers four reviewed DeepSWE verifier con
 
 For these contracts, PluginBench reconstructs the hash-bound `model.patch` over the frozen starting source. That reconstruction supplies measurements and review. Generated files present only in the stopped working tree remain diagnostics; files included in the patch remain part of the submission. Unsupported contracts, missing preparation proof, or unsafe/unverifiable patches produce no canonical submission. They never fall back to the diagnostic tree.
 
-A native reward applies to the canonical submission only when its source binding is valid and the task supplies one binary reward. Patches that overlap paths replaced by trusted tests remain measurable, but their source-bound correctness is unknown. Failed attempts and usage receipts remain visible. The raw verifier result is retained even when source-bound correctness is unknown; it does not establish correctness of authored tests that the verifier replaced. The legacy `graded_source_digest` and `measured_source_digest` fields both identify the reconstructed canonical submission, not separate post-verification exports. Their equality alone is not proof: validation independently reconstructs the patch and compares content and file modes against the saved canonical snapshot.
+A native reward applies to the canonical submission only when its source binding is valid and the task supplies one binary reward. Patches that overlap paths replaced by trusted tests remain measurable, but their source-bound correctness is withheld. Such an attempt is an `overlap_pass` when its native reward is 1 and every fail-to-pass and pass-to-pass test passed, `fail` when its reward is 0, and `unknown` otherwise. Reports show overlap passes beside confirmed passes, and a gates file decides whether they count. Failed attempts and usage receipts remain visible. The raw verifier result is retained even when source-bound correctness is unknown; it does not establish correctness of authored tests that the verifier replaced. The legacy `graded_source_digest` and `measured_source_digest` fields both identify the reconstructed canonical submission, not separate post-verification exports. Their equality alone is not proof: validation independently reconstructs the patch and compares content and file modes against the saved canonical snapshot.
 
 CPU and memory budgets must cover both coding and verifier requirements. Tasks with different declarations need explicit common `container_cpus` and `container_memory_mb` settings. Smaller budgets are rejected. Docker capacity is checked before preparation; PluginBench never increases the VM allocation automatically.
 
@@ -213,6 +213,37 @@ Resume then completes pending measurements or starts a review phase that has not
 On macOS, `--notify` reports when preparation and readiness checks pass and coding starts, and when the run finishes or fails. A readiness failure therefore arrives before any model call. Notifications are best effort and never change the run's outcome.
 
 Use exact model IDs. Harbor does not support `ultra` reasoning. Requested effort is separate from effective effort when native evidence cannot verify it. Claude remains available for review configuration; new native treatment coding is qualified for Codex only.
+
+## Compare runs
+
+`pluginbench compare <run>... --gates gates.yaml` reads each run's `report/results.json` and prints, for each split and for all tasks, a measure table and a gate table. It makes no model calls and rebuilds nothing. Pass `DIR=ARM,ARM` to take only those packages from a run. The same package and task may come from only one input.
+
+```yaml
+count_overlap_passes: true        # required: the study decides
+splits:
+  climb: [task-a, task-b]
+gates:
+  - name: passes
+    correctness: passes           # or unknown; per_task: true checks each task
+    against: vanilla
+    direction: higher
+    tolerance: 1
+  - name: tokens
+    metrics: [Input tokens, Output tokens]
+    statistic: mean_of_task_medians   # or total, or mean_of_task_median_ratios
+    against: vanilla
+    direction: lower
+    factor: 1.3
+  - name: cognitive ratio to reference
+    metrics: [Net cognitive complexity added]
+    statistic: mean_of_task_median_ratios
+    reference_floor: 10           # a smaller reference makes that task missing
+    against: workflow-main
+    direction: lower
+    factor: 1.1
+```
+
+Statistics are taken per task first, then averaged. A missing value is never 0: tasks without a value, and tasks measured on only some attempts, are listed under "Missing values" with their reasons. A `total` with any unmeasured attempt is `undetermined`. Each gate compares both sides over the tasks both have and says how many, and names tasks whose measured repeat counts differ.
 
 ## Development
 
