@@ -109,6 +109,8 @@ def test_config_dry_run_includes_fresh_vanilla_and_every_package(
     )
     result = CliRunner().invoke(cli.app, ["run", "--config", str(path), "--dry-run"])
     assert result.exit_code == 0, result.stderr
+    positional = CliRunner().invoke(cli.app, ["run", str(path), "--dry-run"])
+    assert positional.exit_code == 0 and positional.stdout == result.stdout
     plan = json.loads(result.stdout)
     assert plan["coding_calls"] == 9 and plan["review_calls"] == 0
     assert set(plan["treatments"]) == {"superpowers", "workflow"}
@@ -1581,3 +1583,57 @@ def test_run_interrupted_after_its_last_attempt_finishes_measurement_and_reviews
     assert len(calls) == coded and len(reviews) == 9
     assert json.loads((root / "evidence/run.json").read_text())["status"] == "complete"
     assert evaluation._load_selection(root)["review_revision"] == "review"
+
+
+def _stopped_after_two_attempts(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, list[str], list[str]]:
+    config = _measured_and_reviewed(config, tmp_path, monkeypatch)
+    calls: list[str] = []
+    reviews: list[str] = []
+    for interrupt_at in (3, None):
+        backend = _coding_and_review_backend(
+            calls, reviews, timeout=config.timeout_seconds, interrupt_at=interrupt_at
+        )
+        monkeypatch.setattr(codex, "invoke", backend)
+        monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+        if interrupt_at:
+            with pytest.raises(KeyboardInterrupt):
+                evaluation.run_evaluation(config, tmp_path / "run")
+    return tmp_path / "run", calls, reviews
+
+
+def test_resume_refuses_before_coding_what_would_fail_after_it(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, calls, _ = _stopped_after_two_attempts(config, tmp_path, monkeypatch)
+    coded = len(calls)
+    profiles = root / "inputs/profiles.json"
+    saved = profiles.read_bytes()
+    profiles.unlink()  # As in runs prepared before profiles were saved, like the pilot.
+    old = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+    assert old.exit_code == 2 and "predates saved measurement profiles" in old.stderr
+    profiles.write_bytes(saved)
+
+    def missing_host() -> Path:
+        raise ValueError("Codex reviews need an executable codex-code-mode-host")
+
+    monkeypatch.setattr(isolation, "codex_code_mode_host", missing_host)
+    blocked = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+    assert blocked.exit_code == 2 and "codex-code-mode-host" in blocked.stderr
+    assert len(calls) == coded
+
+
+def test_stopped_run_copied_to_a_new_path_resumes_there(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, calls, reviews = _stopped_after_two_attempts(config, tmp_path, monkeypatch)
+    moved = tmp_path / "moved"
+    shutil.copytree(root, moved, symlinks=True)
+    shutil.rmtree(root)
+    coded = len(calls)
+    result = CliRunner().invoke(cli.app, ["run", str(moved), "--yes", "--foreground"])
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert len(calls) == coded + 7 and len(reviews) == 9
+    assert json.loads((moved / "evidence/run.json").read_text())["status"] == "complete"
+    assert not root.exists()

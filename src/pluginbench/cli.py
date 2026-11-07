@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -145,9 +145,16 @@ def _events(root: Path) -> Iterator[Callable[..., None]]:
         yield event
 
 
-def _work(root: Path, *, progress: Callable[[str], None], notify: bool) -> None:
+def _work(
+    root: Path,
+    *,
+    lock: run_lock.RunLock | None,
+    progress: Callable[[str], None],
+    notify: bool,
+) -> None:
     """Own the run directory and run what it has left; SIGTERM from `stop` interrupts it."""
-    with run_lock.hold(root) as lock, _events(root) as event:
+    owned = nullcontext(lock) if lock else run_lock.hold(root)
+    with owned as lock, _events(root) as event:
         event("started", pid=os.getpid(), root=str(root))
 
         def logged(message: str) -> None:
@@ -300,6 +307,8 @@ def run(
     Checks run first, in this process. The run then continues in the background unless
     --foreground is set.
     """
+    owned = ExitStack()
+    lock: run_lock.RunLock | None = None
     try:
         if target is not None:
             if resume or config:
@@ -338,6 +347,9 @@ def run(
                 raise ValueError(
                     "--resume uses saved settings; --dry-run/--yes are its only other options"
                 )
+            if foreground and not dry_run:
+                # Own the run before planning, so a background start never races its parent.
+                lock = owned.enter_context(run_lock.hold(resume))
             plan = plan_resume(resume)
         elif config:
             if any(value is not None for value in overrides) or guidance_name != "guidance":
@@ -406,11 +418,13 @@ def run(
                     _notify(f"Run failed: {str(exc) or type(exc).__name__}")
                 raise
         if foreground:
-            _work(root, progress=progress, notify=notify)
+            _work(root, lock=lock, progress=progress, notify=notify)
         else:
             _detach(root, notify=notify)
     except (OSError, ValueError, yaml.YAMLError, subprocess.SubprocessError) as exc:
         _error(exc)
+    finally:
+        owned.close()
 
 
 @app.command("check")

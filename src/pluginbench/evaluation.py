@@ -793,6 +793,37 @@ def _saved_profiles(root: Path) -> dict[str, list[Collector]]:
     return load_profiles(path)
 
 
+def _measurement_unstarted(root: Path, selection: dict[str, object]) -> bool:
+    """Measurement is required and no observer revision has started: it uses saved profiles."""
+    return bool(selection["measurement_required"]) and not any(
+        (root / "evidence/observer-revisions" / str(candidate)).exists()
+        for candidate in (
+            selection.get("pending_measurement_revision", "measurements"),
+            selection.get("recovery_measurement_revision"),
+        )
+        if candidate is not None
+    )
+
+
+def _review_preflight(selection: dict[str, object]) -> None:
+    """The reviewer's CLI, credentials and sandbox host, checked before any paid review call."""
+    reviewer = _object(selection["reviewer"])
+    harness = str(reviewer["harness"])
+    (claude.preflight if harness == "claude" else codex.preflight)()
+    with tempfile.TemporaryDirectory(prefix="pluginbench-auth-check-") as temporary:
+        codex.runtime_environment(Path(temporary) / "private", harness)
+    if harness == "codex":
+        isolation.codex_code_mode_host()
+
+
+def _assert_resumable(root: Path, selection: dict[str, object]) -> None:
+    """Fail before any resumed coding call on what would otherwise fail after it."""
+    if _measurement_unstarted(root, selection):
+        _saved_profiles(root)
+    if selection.get("reviewer") and selection["review_revision"] is None:
+        _review_preflight(selection)
+
+
 def _code(
     root: Path,
     selection: dict[str, object],
@@ -980,15 +1011,7 @@ def _resume_inputs(
         validate_remeasurement(
             evidence, evidence / "observer-revisions" / str(selection["measurement_revision"])
         )
-    elif selection["measurement_required"] and not any(
-        (evidence / "observer-revisions" / str(candidate)).exists()
-        for candidate in (
-            selection.get("pending_measurement_revision", "measurements"),
-            selection.get("recovery_measurement_revision"),
-        )
-        if candidate is not None
-    ):
-        # No observer revision started; collect with the profiles saved at preparation.
+    elif _measurement_unstarted(root, selection):
         profiles = _saved_profiles(root)
     elif selection["measurement_required"]:
         candidates = (
@@ -1075,6 +1098,8 @@ def plan_resume(root: Path) -> dict[str, object]:
     root = root.expanduser().absolute()
     selection = _load_selection(root)
     if not _coding_done(root):
+        if _measurement_unstarted(root, selection):
+            _saved_profiles(root)
         reviewer = selection.get("reviewer")
         return {
             "name": selection["name"],
@@ -1106,18 +1131,13 @@ def resume_evaluation(
     root = root.expanduser().absolute()
     selection = _load_selection(root)
     if not _coding_done(root):
+        _assert_resumable(root, selection)
         _code(root, selection, progress=progress, guard=guard)
     if guard:
         guard()
     selection, profiles, guidance, calls = _resume_inputs(root)
     if calls:
-        reviewer = _object(selection["reviewer"])
-        harness = str(reviewer["harness"])
-        (claude.preflight if harness == "claude" else codex.preflight)()
-        with tempfile.TemporaryDirectory(prefix="pluginbench-auth-check-") as temporary:
-            codex.runtime_environment(Path(temporary) / "private", harness)
-        if harness == "codex":
-            isolation.codex_code_mode_host()
+        _review_preflight(selection)
     return _finish_evaluation(
         root, selection=selection, profiles=profiles, guidance=guidance, progress=progress
     )

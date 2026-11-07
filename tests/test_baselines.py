@@ -397,7 +397,9 @@ def test_incomplete_or_mismatched_native_delivery_cannot_seed_cache(
             _publish(cache, records)
     else:
         _publish(cache, records)
-    # The faulty repeat seeds nothing; an intact repeat is cached on its own.
+        # An intact repeat is cached on its own.
+        assert (path / cache.keys["answer"] / "2/manifest.json").is_file()
+    # The faulty repeat seeds nothing.
     assert not list(path.glob("*/1"))
 
 

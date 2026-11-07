@@ -468,8 +468,8 @@ def review_study(
         for key in ("task_id", "arm", "attempt")
     ):
         raise ValueError("review assignment identity differs from the original study plan")
-    resolved = study.load_study(root / "frozen/resolved-recipe.json")
-    tasks = {task.task_id: task for task in resolved.tasks}
+    # Read tasks from this run's own frozen copy, even if the run was moved after it stopped.
+    tasks = {task.task_id: task for task in study._frozen_study(root).tasks}
     selections = {record.id: record.stages[0] for record in records}
     contents = [path.read_text() for path in guidance]
     directory.mkdir(parents=True)

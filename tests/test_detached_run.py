@@ -58,7 +58,8 @@ def test_run_returns_while_the_background_run_continues(
         time.sleep(0.2)
         assert run_lock.owner(tmp_path) == owner
     finally:
-        if owner:
+        # Only ever signal the detached child's own group, never this test's.
+        if owner and owner.get("pgid") != os.getpgrp():
             run_lock.stop(tmp_path)
     _until(lambda: run_lock.owner(tmp_path) is None)
     assert "KeyboardInterrupt: stopped by SIGTERM" in (tmp_path / "run.log").read_text()
@@ -80,16 +81,22 @@ def test_foreground_run_owns_the_lock_and_writes_events(
 ) -> None:
     owners = []
 
+    def plan(root: Path) -> dict[str, object]:
+        # The run is owned before planning, so a background start cannot race its parent.
+        owners.append(run_lock.owner(root))
+        return {"coding_calls": 3, "review_calls": 0}
+
     def work(root: Path, *, progress: Callable[[str], None], guard: Callable[[], None]) -> Path:
         owners.append(run_lock.owner(root))
         guard()
         progress("Coding 1/3: task · baseline · repeat 1")
         return root
 
+    monkeypatch.setattr(cli, "plan_resume", plan)
     monkeypatch.setattr(cli, "resume_evaluation", work)
     result = CliRunner().invoke(cli.app, ["run", str(tmp_path), "--yes", "--foreground"])
     assert result.exit_code == 0, result.output
-    assert owners[0] is not None and owners[0]["pid"] == os.getpid()
+    assert len(owners) == 2 and all(owner and owner["pid"] == os.getpid() for owner in owners)
     events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
     assert [event["event"] for event in events] == ["started", "progress", "finished"]
     assert events[1]["message"] == "Coding 1/3: task · baseline · repeat 1"
