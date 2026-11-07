@@ -62,7 +62,8 @@ def test_run_returns_while_the_background_run_continues(
         if owner and owner.get("pgid") != os.getpgrp():
             run_lock.stop(tmp_path)
     _until(lambda: run_lock.owner(tmp_path) is None)
-    assert "KeyboardInterrupt: stopped by SIGTERM" in (tmp_path / "run.log").read_text()
+    # The lock is released before the child prints its traceback, so wait for the log too.
+    _until(lambda: "KeyboardInterrupt: stopped by SIGTERM" in (tmp_path / "run.log").read_text())
 
 
 def test_background_run_that_exits_before_it_starts_fails_the_command(
