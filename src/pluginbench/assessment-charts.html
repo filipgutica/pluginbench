@@ -493,6 +493,19 @@ function showCompleteness() {
     create("th", metric, tr);
     create("td", rows.filter(row => row.counts[metric]).length + "/" + rows.length + " complete", tr);
   }
+  // Task × measure × package: measured, unknown with its reason, or not configured for the task.
+  const matrix = (data.completeness_matrix || []).filter(row => !taskSelect.value || row.task === taskSelect.value);
+  if (!matrix.length) return;
+  const arms = unique(matrix.flatMap(row => Object.keys(row.cells)));
+  const grid = create("table", undefined, body);
+  const head = create("tr", undefined, grid);
+  for (const label of ["Task", "Measure", ...arms.map(armLabel)]) create("th", label, head);
+  for (const row of matrix) {
+    const tr = create("tr", undefined, grid);
+    create("td", row.task, tr);
+    create("td", row.metric, tr);
+    for (const arm of arms) create("td", row.cells[arm] ? row.cells[arm].text : "", tr);
+  }
 }
 function showCollectionStatus() {
   const target = document.getElementById("collection-status"), collection = data.measurement_collection;

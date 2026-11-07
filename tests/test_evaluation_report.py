@@ -719,9 +719,9 @@ def test_trusted_test_overlap_with_every_test_passing_is_an_overlap_pass(
         "overlap-missing-test": "unknown",
         "confirmed": "pass",
     }
-    assert {
-        (row["attempt_id"], row["correctness"]) for row in _rows(data, "observations")
-    } == set(states.items())
+    assert {(row["attempt_id"], row["correctness"]) for row in _rows(data, "observations")} == set(
+        states.items()
+    )
     visible = _outcome_text(data, tmp_path, package=True)
     assert "1/4 attempts passed" in visible
     assert "1 failed task check · 1 overlap pass · 0 execution failures · 1 unknown" in visible
@@ -1102,6 +1102,77 @@ def test_report_explains_unsupported_metrics_and_preserves_native_grade_binding(
         for row in _rows(data, "observations")
         if row["family"] == "tokens" and row["metric"] in supplied
     )
+
+
+def test_completeness_matrix_shows_each_task_measure_and_arm(tmp_path: Path) -> None:
+    report = _token_report()
+    for attempt in _rows(report, "attempts"):
+        if attempt["arm"] == "superpowers":
+            attempt["task_id"] = "covered-task"
+    work = _stage(report, 3)["work"]  # workflow repeat 1 lost its output count
+    assert isinstance(work, dict)
+    work["tokens"] = {"input_tokens": 60}
+    config = _config("tokens", "coverage")
+    config["measurement_capabilities"] = {
+        "fixture-task": {
+            "coverage": {"status": "unavailable", "reason": "no tool", "configured": False}
+        },
+        "covered-task": {"coverage": {"status": "available", "reason": None}},
+    }
+
+    data = json.loads(write_evaluation_report(report, config, tmp_path).read_text())
+
+    cells = {
+        (row["task"], row["metric"], arm): cell
+        for row in _rows(data, "completeness_matrix")
+        for arm, cell in row["cells"].items()
+    }
+    assert cells["fixture-task", "Output tokens", "baseline"]["text"] == "measured"
+    missing = cells["fixture-task", "Output tokens", "workflow"]
+    assert missing["state"] == "unknown" and (missing["measured"], missing["assigned"]) == (2, 3)
+    assert missing["text"].startswith("unknown: ") and missing["text"].endswith("(2 of 3 measured)")
+    assert cells["fixture-task", "Line coverage %", "workflow"]["text"] == "not_configured"
+    covered = cells["covered-task", "Line coverage %", "superpowers"]
+    assert covered["state"] == "unknown" and covered["measured"] == 0
+    assert ("covered-task", "Line coverage %", "baseline") not in cells
+    visible = _completeness_text(data, tmp_path)
+    header = visible.index("Task")
+    assert visible[header : header + 5] == [
+        "Task",
+        "Measure",
+        "superpowers",
+        "baseline",
+        "workflow",
+    ]
+    row = visible.index("Output tokens", visible.index("fixture-task", header)) - 1
+    assert visible[row : row + 5] == [
+        "fixture-task",
+        "Output tokens",
+        "",
+        "measured",
+        missing["text"],
+    ]
+
+
+def _completeness_text(data: dict[str, object], tmp_path: Path) -> list[str]:
+    controller = Path("src/pluginbench/assessment-charts.html").read_text().rsplit("<script>", 1)[1]
+    function = re.search(r"function showCompleteness\(\) \{.*?\n\}", controller, re.S)
+    assert function is not None
+    script = tmp_path / "completeness.js"
+    script.write_text(
+        "const data=" + json.dumps(data) + ";\n"
+        "const texts=[];const element=()=>({replaceChildren(){},querySelector(){return element()}});\n"
+        "const document={getElementById:element},taskSelect={value:''};\n"
+        "const unique=items=>[...new Set(items)],armLabel=arm=>arm;\n"
+        "const create=(tag,text,parent)=>{if(text!==undefined)texts.push(String(text));return element();};\n"
+        + function.group(0)
+        + "\nshowCompleteness();console.log(JSON.stringify(texts));\n"
+    )
+    result = subprocess.run(["node", str(script)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    texts = json.loads(result.stdout)
+    assert isinstance(texts, list)
+    return texts
 
 
 def test_overview_keeps_language_analyzers_separate() -> None:

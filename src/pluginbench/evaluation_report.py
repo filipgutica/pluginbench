@@ -6,7 +6,7 @@ import json
 import statistics
 from pathlib import Path
 
-from pluginbench.measurement_profiles import REMOVED_TEST_OVERLAP
+from pluginbench.measurement_profiles import REMOVED_TEST_OVERLAP, readiness_state
 from pluginbench.assessment_charts import (
     DIAGNOSTIC_PANELS,
     METRICS,
@@ -230,6 +230,45 @@ def _selected_completeness(
             }
         )
     return results
+
+
+def _completeness_matrix(
+    observations: list[dict[str, object]], capabilities: dict[str, object]
+) -> list[dict[str, object]]:
+    """Task × measure × arm: measured, unknown with its reasons, or not configured for the task."""
+    groups: dict[tuple[str, str, str], dict[str, list[dict[str, object]]]] = {}
+    for row in observations:
+        key = (str(row["task"]), str(row["family"]), str(row["metric"]))
+        groups.setdefault(key, {}).setdefault(str(row["arm"]), []).append(row)
+    matrix: list[dict[str, object]] = []
+    for (task, family, metric), arms in sorted(groups.items()):
+        capability = _map(_map(capabilities.get(task)).get(family))
+        configured = not capability or readiness_state(capability) != "not_configured"
+        cells: dict[str, object] = {}
+        for arm, rows in sorted(arms.items()):
+            measured = sum(row["status"] == "measured" for row in rows)
+            reasons = sorted({str(row["reason"]) for row in rows if row["status"] != "measured"})
+            state = (
+                "not_configured"
+                if not configured
+                else "measured"
+                if measured == len(rows)
+                else "unknown"
+            )
+            text = (
+                state
+                if state != "unknown"
+                else f"unknown: {'; '.join(reasons)} ({measured} of {len(rows)} measured)"
+            )
+            cells[arm] = {
+                "state": state,
+                "measured": measured,
+                "assigned": len(rows),
+                "reasons": reasons,
+                "text": text,
+            }
+        matrix.append({"task": task, "family": family, "metric": metric, "cells": cells})
+    return matrix
 
 
 def _assigned_counts(
@@ -877,6 +916,9 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
     data["cost"] = _cost_rows(observations, prices) if "tokens" in selected else []
     data["measurement_completeness"] = _selected_completeness(
         data=data, projection=projection, selected=selected
+    )
+    data["completeness_matrix"] = _completeness_matrix(
+        observations, _map(config.get("measurement_capabilities"))
     )
     if config.get("review_projection") is not None:
         data["review_projection"] = config["review_projection"]
