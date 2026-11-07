@@ -94,7 +94,14 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> evaluation.Evalua
 def test_public_commands_cover_evaluations_reports_and_task_selection() -> None:
     result = CliRunner().invoke(cli.app, ["--help"])
     assert result.exit_code == 0
-    assert set(get_group(cli.app).commands) == {"check", "run", "stop", "report", "tasks"}
+    assert set(get_group(cli.app).commands) == {
+        "check",
+        "run",
+        "stop",
+        "report",
+        "compare",
+        "tasks",
+    }
     assert set(get_group(cli.tasks_app).commands) == {"pick"}
     assert CliRunner().invoke(cli.app, ["--version"]).stdout.strip() == "0.4.0"
 
@@ -1109,6 +1116,43 @@ def test_required_measure_that_is_not_configured_blocks_the_check(
     assert result.exit_code == 2
     assert "arbitrary-native-task: coverage is not_configured" in result.stderr
     assert not checkable["calls"]
+
+
+def test_run_measures_a_task_that_has_no_collector_beside_a_covered_task(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # check passed this config, then measurement refused it: the task without coverage had
+    # no collectors, so the saved profiles left it out.
+    raw = yaml.safe_load(checkable["path"].read_text())
+    calls: list[str] = []
+    reviews: list[str] = []
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=raw["timeout_seconds"], interrupt_at=None
+    )
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    root = checkable["output"]
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["run", str(checkable["path"]), "--output", str(root), "--yes", "--foreground"],
+    )
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    data = json.loads((root / "report/results.json").read_text())
+    coverage = [row for row in data["observations"] if row["metric"] == "Line coverage %"]
+    assert {row["task"] for row in coverage if row["status"] == "measured"} == {
+        "covered-native-task"
+    }
+    matrix = {(row["task"], row["metric"]): row["cells"] for row in data["completeness_matrix"]}
+    assert {
+        cell["state"] for cell in matrix["arbitrary-native-task", "Line coverage %"].values()
+    } == {"not_configured"}
+    assert {
+        row["task"]
+        for row in data["observations"]
+        if row["metric"] == "Source lines added" and row["status"] == "measured"
+    } == {"covered-native-task", "arbitrary-native-task"}
 
 
 def _failing_reference_agents(oracle: dict[str, object], nop: dict[str, object]) -> Any:

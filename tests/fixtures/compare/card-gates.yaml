@@ -1,0 +1,66 @@
+# The engineering guidance climb card's gates 1-3 (gate 4 runs validators outside PluginBench).
+count_overlap_passes: true  # card Amendment 1
+splits:
+  climb:
+    - true-myth-iterable-collection-combinators
+    - csstree-shorthand-expansion-compression
+    - happy-dom-abort-pending-body-reads
+    - adaptix-name-mapping-aliases
+  holdout:
+    - testem-per-launcher-reports
+    - dateutil-rfc5545-timezone-interop
+gates:
+  - name: passes
+    correctness: passes
+    against: vanilla
+    direction: higher
+    tolerance: 1
+  - name: passes per task
+    correctness: passes
+    per_task: true
+    against: vanilla
+    direction: higher
+    tolerance: 1
+  - name: unknown correctness
+    correctness: unknown
+    against: vanilla
+    direction: lower
+    tolerance: 1
+  - name: tokens
+    metrics: [Input tokens, Output tokens]
+    statistic: mean_of_task_medians
+    against: vanilla
+    direction: lower
+    factor: 1.3
+  - name: cognitive ratio to reference
+    metrics: [Net cognitive complexity added]
+    statistic: mean_of_task_median_ratios
+    against: workflow-main
+    direction: lower
+    factor: 1.1
+  - name: complexity hotspots
+    metrics: [Complexity hotspots added]
+    statistic: total
+    against: workflow-main
+    direction: lower
+  - name: introduced dead findings
+    metrics: [Introduced dead findings]
+    statistic: total
+    against: workflow-main
+    direction: lower
+  - name: duplicated test lines
+    metrics: [Duplicated added test lines]
+    statistic: total
+    against: workflow-main
+    direction: lower
+  - name: changed-line coverage
+    metrics: [Changed-line coverage %]
+    statistic: mean_of_task_medians
+    against: workflow-main
+    direction: higher
+    tolerance: 10
+  - name: high and medium review findings
+    metrics: [P0 review findings, P1 review findings, P2 review findings]
+    statistic: total
+    against: workflow-main
+    direction: lower

@@ -72,6 +72,10 @@ class CollectedInput:
     outcomes: dict[str, object]
 
 
+# A task with no collector has two empty repeats and no family outcome.
+_NOTHING_COLLECTED = CollectedInput(repeats=[{}, {}], outcomes={})
+
+
 @dataclass(frozen=True)
 class MeasurementInput:
     index: int
@@ -501,11 +505,13 @@ def propose_remeasurement(
         raise ValueError(
             "measurement revision parent must be a real directory inside its native study"
         )
-    if not profiles or any(
-        not collectors or len({item.kind for item in collectors}) != len(collectors)
+    # A task may have no collector, such as one without a coverage tool when only coverage needs
+    # one; its measures stay not configured. At least one task must have something to collect.
+    if not any(profiles.values()) or any(
+        len({item.kind for item in collectors}) != len(collectors)
         for collectors in profiles.values()
     ):
-        raise ValueError("each task needs nonempty, uniquely named collectors")
+        raise ValueError("collectors must be uniquely named, and at least one task needs one")
     run, manifest, original = _native_state(root)
     if set(profiles) != {record.task_id for record in manifest.records}:
         raise ValueError("replacement profiles must cover every native task exactly")
@@ -567,7 +573,7 @@ def propose_remeasurement(
                     snapshot_ref.sha256,
                     record.before.sha256,
                 )
-                if key not in input_indices:
+                if frozen[record.task_id] and key not in input_indices:
                     index = len(inputs)
                     input_indices[key] = index
                     inputs.append(
@@ -658,7 +664,7 @@ def propose_remeasurement(
         bindings = []
         proposed_records = {record.id: record for record in revised.records}
         for attempt_id, stage_id, snapshot_digest, before_digest, key in cases:
-            collected = observations[key]
+            collected = observations[key] if frozen[key[0]] else _NOTHING_COLLECTED
             repeats = collected.repeats
             bindings.append(
                 {

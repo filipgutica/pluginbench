@@ -6,7 +6,7 @@ import json
 import statistics
 from pathlib import Path
 
-from pluginbench.measurement_profiles import REMOVED_TEST_OVERLAP
+from pluginbench.measurement_profiles import REMOVED_TEST_OVERLAP, readiness_state
 from pluginbench.assessment_charts import (
     DIAGNOSTIC_PANELS,
     METRICS,
@@ -133,6 +133,31 @@ PROVENANCE_FIELDS = (
     "execution_reason",
 )
 
+TRUSTED_TEST_OVERLAP = "trusted verifier tests overwrite authored patch paths"
+
+
+def correctness_state(status: object, grading: object) -> str:
+    """Correctness of one attempt, separating overlap passes from unknowns.
+
+    PluginBench withholds confirmation when trusted verifier tests overwrite paths the agent
+    changed. The verifier still grades the agent's production code against its own tests, so
+    reward 1 with every fail-to-pass and pass-to-pass test passing is an overlap pass, and
+    reward 0 is a fail. Any other withheld result stays unknown.
+    """
+    grading = _map(grading)
+    if status != "unknown" or grading.get("reason") != TRUSTED_TEST_OVERLAP:
+        return str(status)
+    rewards = _map(_map(grading.get("native_verifier_result")).get("rewards"))
+    if rewards.get("reward") == 0:
+        return "fail"
+    every_test_passed = all(
+        isinstance(rewards.get(f"{kind}_total"), int)
+        and rewards.get(f"{kind}_passed") == rewards.get(f"{kind}_total")
+        for kind in ("f2p", "p2p")
+    )
+    return "overlap_pass" if rewards.get("reward") == 1 and every_test_passed else "unknown"
+
+
 COMPLETENESS_COUNTS = {
     "tokens": "Input/output tokens",
     "lines": "Source/test lines added/removed",
@@ -205,6 +230,45 @@ def _selected_completeness(
             }
         )
     return results
+
+
+def _completeness_matrix(
+    observations: list[dict[str, object]], capabilities: dict[str, object]
+) -> list[dict[str, object]]:
+    """Task × measure × arm: measured, unknown with its reasons, or not configured for the task."""
+    groups: dict[tuple[str, str, str], dict[str, list[dict[str, object]]]] = {}
+    for row in observations:
+        key = (str(row["task"]), str(row["family"]), str(row["metric"]))
+        groups.setdefault(key, {}).setdefault(str(row["arm"]), []).append(row)
+    matrix: list[dict[str, object]] = []
+    for (task, family, metric), arms in sorted(groups.items()):
+        capability = _map(_map(capabilities.get(task)).get(family))
+        configured = not capability or readiness_state(capability) != "not_configured"
+        cells: dict[str, object] = {}
+        for arm, rows in sorted(arms.items()):
+            measured = sum(row["status"] == "measured" for row in rows)
+            reasons = sorted({str(row["reason"]) for row in rows if row["status"] != "measured"})
+            state = (
+                "not_configured"
+                if not configured
+                else "measured"
+                if measured == len(rows)
+                else "unknown"
+            )
+            text = (
+                state
+                if state != "unknown"
+                else f"unknown: {'; '.join(reasons)} ({measured} of {len(rows)} measured)"
+            )
+            cells[arm] = {
+                "state": state,
+                "measured": measured,
+                "assigned": len(rows),
+                "reasons": reasons,
+                "text": text,
+            }
+        matrix.append({"task": task, "family": family, "metric": metric, "cells": cells})
+    return matrix
 
 
 def _assigned_counts(
@@ -686,6 +750,18 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
     )
     projection = chart_data(projection_source)
     guide = _map(projection["metric_guide"])
+    handoffs = {
+        attempt.get("id"): next(
+            row for row in _rows(attempt.get("stages")) if row.get("id") == attempt.get("handoff")
+        )
+        for attempt in _rows(report.get("attempts"))
+    }
+    states = {
+        attempt_id: correctness_state(
+            _map(stage.get("correctness")).get("status", "unknown"), stage.get("task_result")
+        )
+        for attempt_id, stage in handoffs.items()
+    }
     observations = []
     for source in _rows(projection["observations"]):
         if source.get("metric") not in families:
@@ -693,6 +769,8 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         metric = str(source["metric"])
         row = {field: source.get(field) for field in OBSERVATION_FIELDS}
         row.update(family=families[metric], unit=_map(guide.get(metric)).get("unit"))
+        if row.get("role") == "handoff" and row.get("attempt_id") in states:
+            row["correctness"] = states[row["attempt_id"]]
         capability = _map(
             _map(_map(config.get("measurement_capabilities")).get(str(row.get("task")))).get(
                 families[metric]
@@ -709,9 +787,7 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
     attempts = []
     origins = _map(report.get("baseline_origin"))
     for attempt in _rows(report.get("attempts")):
-        stage = next(
-            row for row in _rows(attempt.get("stages")) if row.get("id") == attempt.get("handoff")
-        )
+        stage = handoffs[attempt.get("id")]
         provenance = _map(attempt.get("provenance"))
         execution = _map(stage.get("execution_provenance"))
         attempts.append(
@@ -729,7 +805,7 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
                 }
                 if str(attempt.get("id")) in origins
                 else None,
-                "correctness": _map(stage.get("correctness")).get("status", "unknown"),
+                "correctness": states[attempt.get("id")],
                 "native_grading": stage.get("task_result"),
                 "execution": {
                     **execution_outcome(execution),
@@ -840,6 +916,9 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
     data["cost"] = _cost_rows(observations, prices) if "tokens" in selected else []
     data["measurement_completeness"] = _selected_completeness(
         data=data, projection=projection, selected=selected
+    )
+    data["completeness_matrix"] = _completeness_matrix(
+        observations, _map(config.get("measurement_capabilities"))
     )
     if config.get("review_projection") is not None:
         data["review_projection"] = config["review_projection"]

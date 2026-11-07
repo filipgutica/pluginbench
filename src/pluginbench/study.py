@@ -33,6 +33,7 @@ from pluginbench.run_lock import RunMoved
 from pluginbench.parallel import run_jobs, validate_jobs
 from pluginbench.assessment import _correctness, build_assessment, write_assessment
 from pluginbench.assessment_metrics import EXCLUDED_NAMES, inspect_snapshot
+from pluginbench.evaluation_report import TRUSTED_TEST_OVERLAP
 from pluginbench.assessment_models import (
     ArtifactRef,
     AssessmentInput,
@@ -364,7 +365,7 @@ def _native_grade_binding(
         "measured_source_digest": source["snapshot_digest"],
     }
     if source["trusted_test_overlap"]:
-        result["reason"] = "trusted verifier tests overwrite authored patch paths"
+        result["reason"] = TRUSTED_TEST_OVERLAP
         return result
     result["binding"] = "model.patch reconstructs measured source"
     result["pass"] = _binary_native_reward(verifier)

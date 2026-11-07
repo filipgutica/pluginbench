@@ -350,10 +350,12 @@ function taskCheckSummary(attempts) {
   const completed = attempts.filter(row => !executions.includes(row));
   const passed = completed.filter(row => row.correctness === "pass").length;
   const failed = completed.filter(row => row.correctness === "fail" && row.execution?.status === "complete").length;
-  const unknown = attempts.length - passed - failed - executions.length;
+  // Overlap passes: the verifier passed every test, but trusted tests overwrote files the agent changed.
+  const overlap = completed.filter(row => row.correctness === "overlap_pass").length;
+  const unknown = attempts.length - passed - failed - overlap - executions.length;
   return {
     passed: passed + "/" + attempts.length + " attempts passed",
-    remainder: failed + " failed task check" + (failed === 1 ? "" : "s") + " · " + executions.length + " execution failure" + (executions.length === 1 ? "" : "s") + " · " + unknown + " unknown",
+    remainder: failed + " failed task check" + (failed === 1 ? "" : "s") + (overlap ? " · " + overlap + " overlap pass" + (overlap === 1 ? "" : "es") : "") + " · " + executions.length + " execution failure" + (executions.length === 1 ? "" : "s") + " · " + unknown + " unknown",
   };
 }
 // Overview: equal-weight mean of per-task ratios. Task view: this task's ratio, or a difference when the reference is zero.
@@ -490,6 +492,19 @@ function showCompleteness() {
     const tr = create("tr", undefined, table);
     create("th", metric, tr);
     create("td", rows.filter(row => row.counts[metric]).length + "/" + rows.length + " complete", tr);
+  }
+  // Task × measure × package: measured, unknown with its reason, or not configured for the task.
+  const matrix = (data.completeness_matrix || []).filter(row => !taskSelect.value || row.task === taskSelect.value);
+  if (!matrix.length) return;
+  const arms = unique(matrix.flatMap(row => Object.keys(row.cells)));
+  const grid = create("table", undefined, body);
+  const head = create("tr", undefined, grid);
+  for (const label of ["Task", "Measure", ...arms.map(armLabel)]) create("th", label, head);
+  for (const row of matrix) {
+    const tr = create("tr", undefined, grid);
+    create("td", row.task, tr);
+    create("td", row.metric, tr);
+    for (const arm of arms) create("td", row.cells[arm] ? row.cells[arm].text : "", tr);
   }
 }
 function showCollectionStatus() {
