@@ -12,18 +12,19 @@ Requires Python 3.12+, Git, Docker with Linux containers, Compose, Buildx, and a
 
 ```sh
 pip install -e '.[harbor]'
-cp examples/evaluation.yaml evaluation.yaml
-# Edit evaluation.yaml: replace the treatment and review paths.
-pluginbench run --config evaluation.yaml --dry-run
-pluginbench check evaluation.yaml
-pluginbench run evaluation.yaml
-pluginbench stop runs/<run>
-pluginbench run runs/<run>
+pluginbench init                                    # write evaluation.yaml to edit
+pluginbench check evaluation.yaml                   # every check that needs no model
+pluginbench run evaluation.yaml                     # check, then run in the background
+pluginbench status runs/<run> --watch               # follow it
+pluginbench stop runs/<run>                         # stop it; `run runs/<run>` resumes it
+pluginbench compare runs/<run> --gates gates.yaml   # gate table
+pluginbench report runs/<run>                       # rebuild the report
+pluginbench review runs/<run> --revision review-2   # review again with the same reviewer
 ```
 
-`check` makes no model calls. It prepares each task and exits 2 when the run would fail or lose data. `run` runs the same checks in the foreground, then continues in the background and prints the run directory. Follow it in `runs/<run>/events.jsonl`. `stop` interrupts only the process group recorded in the run's `run.lock`. `run runs/<run>` resumes a stopped or crashed run. Add `--foreground` to keep a run in the terminal.
+`init` writes a starter config; replace its `/path/to` placeholders. `check` makes no model calls. It prepares each task and exits 2 when the run would fail or lose data. `run` runs the same checks in the foreground, then continues in the background and prints the run directory and the `status` command. `run --dry-run` shows the plan without preparing anything. `status` shows the phase, outcomes, tokens, vanilla reuse, and measures; `--json` prints them for dashboards. `stop` interrupts only the process group recorded in the run's `run.lock`. `run runs/<run>` resumes a stopped or crashed run. Add `--foreground` to keep a run in the terminal.
 
-Choose **runner**, **treatments**, **tasks**, **measurements**, and optional **reviewer** in [the config](examples/evaluation.yaml), or use CLI flags (`pluginbench run --help`). Preparation and measurement happen automatically.
+Choose **runner**, **treatments**, **tasks**, **measurements**, and optional **reviewer** in the config. Every setting lives there; the command line takes none. Preparation and measurement happen automatically.
 
 To choose tasks interactively, install `fzf` and run:
 
@@ -33,7 +34,7 @@ pluginbench tasks pick --dataset datacurve/deep-swe-1-1 --copy
 
 Search task names, preview the prompt, and press Tab to select multiple tasks. Enter prints a pinned `tasks:` YAML block. `--copy` also copies it; paste the block into your evaluation config. Escape cancels. Configs also accept [GitHub task-folder links](docs/running-evaluations.md#choose-inputs). Downloads are cached automatically.
 
-Harbor runs each attempt and the task's own correctness checks. PluginBench freezes the starting code and submission, then measures both with the same settings. Each attempt gets fresh isolation. Concurrency defaults to two jobs, with at most four. A `jobs` value above Docker capacity fails the check instead of being lowered. Use `--jobs 1` to run one at a time.
+Harbor runs each attempt and the task's own correctness checks. PluginBench freezes the starting code and submission, then measures both with the same settings. Each attempt gets fresh isolation. Concurrency defaults to two jobs, with at most four. A `jobs` value above Docker capacity fails the check instead of being lowered. Set `jobs: 1` in the config to run one at a time.
 
 Compatible vanilla submissions are reused automatically from `$XDG_CACHE_HOME/pluginbench` (default `~/.cache/pluginbench`), so any output folder can reuse them. `pluginbench check` shows a hit or miss for every vanilla attempt. Reports identify reuse; grading and selected measurements run again.
 

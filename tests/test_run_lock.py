@@ -133,3 +133,19 @@ def test_second_owner_and_moved_root_are_refused(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="delete .*run.lock"):
         with run_lock.hold(tmp_path / "moved"):
             pass
+
+
+def test_a_brief_status_probe_does_not_refuse_a_run_starting_at_that_moment(
+    tmp_path: Path,
+) -> None:
+    # `status` checks ownership with a short shared flock; a writer starting then must wait.
+    import fcntl
+    import threading
+
+    (tmp_path / run_lock.LOCK_NAME).touch()
+    probe = os.open(tmp_path / run_lock.LOCK_NAME, os.O_RDONLY)
+    fcntl.flock(probe, fcntl.LOCK_SH)
+    threading.Timer(0.1, os.close, args=(probe,)).start()
+
+    with run_lock.hold(tmp_path):
+        assert run_lock.owner(tmp_path) is not None

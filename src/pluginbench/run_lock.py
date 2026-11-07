@@ -11,6 +11,7 @@ import json
 import os
 import signal
 import subprocess
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from pathlib import Path
 from types import FrameType
 
 LOCK_NAME = "run.lock"
+_PROBE_GRACE = 0.5
 
 
 class RunMoved(ValueError):
@@ -84,12 +86,18 @@ def hold(root: Path) -> Iterator[RunLock]:
     root = root.resolve()
     fd = os.open(root / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o644)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise ValueError(
-                f"run is already active: {root}; stop it with `pluginbench stop {root}`"
-            ) from exc
+        # `status` probes ownership with a brief shared flock; wait that out, not a real owner.
+        deadline = time.monotonic() + _PROBE_GRACE
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() > deadline:
+                    raise ValueError(
+                        f"run is already active: {root}; stop it with `pluginbench stop {root}`"
+                    ) from exc
+                time.sleep(0.02)
         previous = _owner(fd)
         if previous is not None and previous.get("root") != str(root):
             raise ValueError(

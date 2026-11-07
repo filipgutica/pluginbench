@@ -105,6 +105,29 @@ class Ledger:
             raise ValueError(f"unsupported ledger schema version {version}")
         return cls(connection)
 
+    @classmethod
+    def read(cls, path: Path) -> Ledger:
+        """Open read-only, for observers such as `status`; any write raises sqlite3.Error.
+
+        PluginBench ledgers use the rollback journal. A WAL database is refused, because even a
+        read-only connection to one creates -wal and -shm files.
+        """
+        with path.open("rb") as stream:
+            header = stream.read(20)
+        # Bytes 18 and 19 are the write and read format versions: 2 means WAL.
+        if len(header) == 20 and header[18:20] != b"\x01\x01":
+            raise ValueError(f"ledger is not in rollback-journal mode: {path}")
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
+        try:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+        except sqlite3.Error:
+            connection.close()
+            raise
+        if version != SCHEMA_VERSION:
+            connection.close()
+            raise ValueError(f"unsupported ledger schema version {version}")
+        return cls(connection)
+
     def close(self) -> None:
         self._db.close()
 
