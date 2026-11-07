@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import os
 import signal
+import sqlite3
 import sys
 import threading
+import types
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +24,7 @@ from native_support import (
     synthetic_contract,
     task_entry,
 )
-from pluginbench import harbor_backend, ledger, study, submissions
+from pluginbench import baselines, harbor_backend, ledger, study, submissions
 from pluginbench.datasets import native_identity, portable_native_identity
 
 # Where the child kills itself, relative to its Nth native call or Nth completed attempt.
@@ -33,10 +35,15 @@ BOUNDARIES = {
     "after-record": "after the record receipt, before the ledger marks it complete",
     "after-ledger": "after the ledger marks it complete, before run.json is rewritten",
     "two-in-flight": "while two native calls run at once (jobs=2)",
+    "after-plan-write": "right after a resume rewrites plan.json",
+    "ledger-insert": "after a new ledger has its schema, before its attempt rows",
+    "before-publish": "after the ledger marks a vanilla attempt complete, before it is cached",
 }
 
 
-def recipe(directory: Path, *, tasks: int, treatments: int, repeats: int, jobs: int) -> Path:
+def recipe(
+    directory: Path, *, tasks: int, treatments: int, repeats: int, jobs: int, seed: int = 42
+) -> Path:
     suite = directory / "suite"
     suite.mkdir(parents=True)
     entries = [task_entry(suite, f"task-{index}") for index in range(tasks)]
@@ -56,6 +63,7 @@ def recipe(directory: Path, *, tasks: int, treatments: int, repeats: int, jobs: 
                 "harness_version": "1.2.3",
                 "repeats": repeats,
                 "jobs": jobs,
+                "seed": seed,
             }
         )
     )
@@ -80,7 +88,7 @@ def install(
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
     lock = threading.Lock()
     pair = threading.Barrier(2)
-    counts = {"receipt": 0, "verify": 0, "complete": 0}
+    counts = {"receipt": 0, "verify": 0, "complete": 0, "publish": 0}
 
     def counted(name: str) -> int:
         with lock:
@@ -122,6 +130,47 @@ def install(
         if boundary == "after-ledger" and ordinal == at:
             _kill()
 
+    write = study._write
+
+    def write_file(path: Path, value: object) -> None:
+        write(path, value)
+        if boundary == "after-plan-write" and path.name == "plan.json":
+            _kill()
+
+    class _KilledBeforeRows:
+        """A real connection that dies when the ledger inserts its attempt rows."""
+
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def __enter__(self) -> Any:
+            self._connection.__enter__()
+            return self
+
+        def __exit__(self, *details: Any) -> Any:
+            return self._connection.__exit__(*details)
+
+        def executemany(self, *args: Any) -> None:
+            _kill()
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._connection, name)
+
+    publish = baselines.BaselineCache.publish
+
+    def publish_attempt(self: baselines.BaselineCache, record: dict[str, Any]) -> None:
+        if boundary == "before-publish" and counted("publish") == at:
+            _kill()
+        publish(self, record)
+
+    if boundary == "after-plan-write":
+        monkeypatch.setattr(study, "_write", write_file)
+    if boundary == "ledger-insert":
+        killing = types.SimpleNamespace(
+            connect=lambda path: _KilledBeforeRows(sqlite3.connect(path))
+        )
+        monkeypatch.setattr(ledger, "sqlite3", killing)
+    monkeypatch.setattr(baselines.BaselineCache, "publish", publish_attempt)
     monkeypatch.setattr(harbor_backend, "assert_runtime", assert_runtime)
     monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
     monkeypatch.setattr(study, "_verify_snapshot", verify_snapshot)
@@ -153,3 +202,11 @@ def child() -> None:
         baseline_identity=vanilla_identity(resolved) if cache else None,
     )
     raise SystemExit("the study finished without reaching its kill boundary")
+
+
+def child_resume() -> None:
+    """argv: run, boundary. Resumes a study and kills itself at `boundary`."""
+    root, boundary = sys.argv[1:3]
+    install(pytest.MonkeyPatch(), [], boundary=boundary, at=1)
+    study.resume_study(Path(root))
+    raise SystemExit("the resume finished without reaching its kill boundary")

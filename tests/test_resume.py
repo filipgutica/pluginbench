@@ -268,3 +268,147 @@ def test_vanilla_attempts_finished_before_a_kill_are_already_cached(
     )
     assert not set(calls) & finished
     assert len(list(cache.glob("*/*/manifest.json"))) == 6
+
+
+def _killed_resume(root: Path, boundary: str) -> None:
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import resume_support; resume_support.child_resume()",
+            str(root),
+            boundary,
+        ],
+        env={**os.environ, "PYTHONPATH": _PATH},
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert child.returncode == -signal.SIGKILL, child.stderr
+
+
+def _as_legacy_run(root: Path) -> None:
+    """Remove what the ledger added, leaving states only in run.json as older runs had."""
+    (root / "ledger.sqlite").unlink()
+    shutil.rmtree(root / "records")
+    run = _json(root / "run.json")
+    run.pop("discarded_attempts")
+    (root / "run.json").write_text(json.dumps(run))
+
+
+def test_resume_killed_while_it_rewrites_the_plan_can_resume_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _killed_run(tmp_path, boundary="during-call", at=3)
+    finished = [entry["id"] for entry in _json(root / "plan.json")["entries"][:2]]
+    _killed_resume(root, "after-plan-write")
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+
+    study.resume_study(root)
+
+    run = _json(root / "run.json")
+    assert run["status"] == "complete" and len(run["discarded_attempts"]) == 1
+    assert len(calls) == 10 and not set(calls) & set(finished)
+
+
+def test_resume_killed_while_it_builds_a_legacy_ledger_recovers_every_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _killed_run(tmp_path, boundary="during-call", at=3)
+    _as_legacy_run(root)
+    finished = [entry["id"] for entry in _json(root / "plan.json")["entries"][:2]]
+    _killed_resume(root, "ledger-insert")
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+
+    study.resume_study(root)
+
+    run = _json(root / "run.json")
+    assert run["status"] == "complete" and Counter(run["attempt_states"].values()) == {
+        "complete": 12
+    }
+    assert len(calls) == 10 and not set(calls) & set(finished)
+
+
+def test_moving_the_run_during_a_call_never_writes_to_the_old_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pluginbench import run_lock
+
+    recipe = resume_support.recipe(tmp_path / "config", tasks=1, treatments=1, repeats=1, jobs=1)
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+    invoke = harbor_backend.invoke_native
+    owned, moved = tmp_path / "run", tmp_path / "moved"
+    owned.mkdir()
+
+    def moving(**kwargs: Any) -> dict[str, Any]:
+        result = invoke(**kwargs)
+        owned.rename(moved)  # The operator moves the run while its call runs.
+        return result
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", moving)
+    with run_lock.hold(owned) as lock:
+        with pytest.raises(run_lock.RunMoved):
+            study.run_study(
+                study.load_study(recipe), owned / "evidence", guard=lock.assert_in_place
+            )
+    assert not owned.exists()
+    # The call started before the move, so its receipt is in the moved run; resume discards it.
+    assert (moved / "evidence/invocations" / calls[0] / "handoff.json").is_file()
+    (moved / "run.lock").unlink()
+    resume_support.install(monkeypatch, calls)
+    study.resume_study(moved / "evidence")
+    assert set(_json(moved / "evidence/run.json")["discarded_attempts"]) == {calls[0]}
+
+
+def test_vanilla_attempt_killed_before_it_was_cached_is_cached_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A seed whose last attempt is vanilla, so the kill leaves no coding to resume.
+    seed = next(
+        seed
+        for seed in range(100)
+        if study.plan_study(
+            study.load_study(
+                resume_support.recipe(
+                    tmp_path / f"probe-{seed}", tasks=2, treatments=1, repeats=3, jobs=1, seed=seed
+                )
+            )
+        )["entries"][-1]["arm"]
+        == "baseline"
+    )
+    recipe = resume_support.recipe(
+        tmp_path / "config-seeded", tasks=2, treatments=1, repeats=3, jobs=1, seed=seed
+    )
+    cache, root = tmp_path / "cache", tmp_path / "run"
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import resume_support; resume_support.child()",
+            str(recipe),
+            str(root),
+            "before-publish",
+            "12",
+            str(cache),
+        ],
+        env={**os.environ, "PYTHONPATH": _PATH},
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert child.returncode == -signal.SIGKILL, child.stderr
+    assert len(list(cache.glob("*/*/manifest.json"))) == 5
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+
+    study.resume_study(
+        root,
+        baseline_cache=cache,
+        baseline_identity=resume_support.vanilla_identity(study._frozen_study(root)),
+    )
+
+    assert calls == []
+    assert len(list(cache.glob("*/*/manifest.json"))) == 6

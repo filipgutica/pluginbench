@@ -429,7 +429,14 @@ def _execute_stage(
     prompt: str,
     on_native_start: Callable[[], None],
     expected_runtime: dict[str, object],
+    guard: Callable[[], None] = lambda: None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run one native invocation and persist its evidence under root.
+
+    `guard` runs before each write to root. A run moved during the call therefore writes
+    nothing more to its old path; that call's evidence is lost with its temporary work area,
+    and resume discards the attempt by its invocation receipt.
+    """
     _assert_frozen(root)
     interrupted: KeyboardInterrupt | None = None
     try:
@@ -487,6 +494,7 @@ def _execute_stage(
         execution.update(successful_native_completion=False, error=f"{type(exc).__name__}: {exc}")
         if isinstance(exc, KeyboardInterrupt):
             interrupted = exc
+    guard()
     target = root / "attempts" / entry["id"] / stage_id
     target.mkdir(parents=True)
     artifacts = area / "artifacts"
@@ -622,6 +630,7 @@ def _execute_stage(
             },
             execution,
         )
+    guard()
     stage = _verify_snapshot(
         root=root,
         snapshot=snapshot,
@@ -684,7 +693,10 @@ def _verify_snapshot(
 def _versioned_artifact(path: Path) -> Path:
     version = path.with_name(path.stem + "." + _digest(path).removeprefix("sha256:") + path.suffix)
     if not version.exists():
-        shutil.copyfile(path, version)
+        # Copy, then rename, so a killed copy never leaves a partial version that looks whole.
+        temporary = version.with_name(version.name + ".tmp")
+        shutil.copyfile(path, temporary)
+        temporary.replace(version)
     return version
 
 
@@ -708,6 +720,8 @@ def _checkpoint(
     _write(root / "assessment-input.json", manifest)
     checkpoint_input = _versioned_artifact(root / "assessment-input.json")
     checkpoint_preflight = _versioned_artifact(root / "runtime-preflight.json")
+    # plan.json is rewritten on resume; run.json binds the version this checkpoint used.
+    checkpoint_plan = _versioned_artifact(root / "plan.json")
     executions: dict[str, dict[str, dict[str, str]]] = {}
     verifier_results: dict[str, dict[str, dict[str, str]]] = {}
     submission_errors: dict[str, dict[str, dict[str, str]]] = {}
@@ -753,7 +767,7 @@ def _checkpoint(
             "jobs": study.recipe.jobs,
             "call_unit": "native invocation requests; startup may fail before a model call",
             "assessment_input": _reference(root, checkpoint_input),
-            "plan": _reference(root, root / "plan.json"),
+            "plan": _reference(root, checkpoint_plan),
             "runtime_preflight": _reference(root, checkpoint_preflight),
             "task_provenance": {
                 task.task_id: task.provenance for task in study.tasks if task.provenance is not None
@@ -1093,6 +1107,10 @@ def _run_attempts(
             plan["baseline_cache"] = decisions
             _write(root / "plan.json", plan)
             _checkpoint(root, frozen, manifest, states, status="preflight")
+            # A kill between completion and publication leaves a finished repeat uncached.
+            for record in records:
+                if states[record["id"]] == "complete":
+                    cache.publish(record)
         preflight = harbor_backend.preflight(
             jobs=frozen.recipe.jobs,
             cpus=frozen.recipe.container_cpus,
@@ -1159,10 +1177,16 @@ def _run_attempts(
             stage_id = "handoff"
             completed = False
 
+            def unmoved() -> None:
+                # Workers check too: evidence they write must never recreate a moved run's path.
+                if guard:
+                    guard()
+
             def started() -> None:
                 if cancelled.is_set():
                     raise CancelledError("attempt cancelled before its next native invocation")
                 harbor_backend.assert_runtime(expected_runtime)
+                unmoved()
                 receipt = root / "invocations" / entry["id"] / f"{stage_id}.json"
                 _write(
                     receipt,
@@ -1175,6 +1199,7 @@ def _run_attempts(
                 emit(partial(invoked, index, copy.deepcopy(record), stage_id))
 
             try:
+                unmoved()
                 attempt_dir = root / "attempts" / entry["id"]
                 imported = cache.import_attempt(entry) if cache is not None else None
                 if imported is not None:
@@ -1206,6 +1231,7 @@ def _run_attempts(
                                 if regraded.get("exception_info") is None
                                 else None,
                             )
+                            unmoved()
                             _write(target / "execution.json", execution)
                             verified = _verify_snapshot(
                                 root=root,
@@ -1234,6 +1260,7 @@ def _run_attempts(
                         prompt="",
                         on_native_start=started,
                         expected_runtime=expected_runtime,
+                        guard=unmoved,
                     )
                     record.update(
                         stages=[stage],

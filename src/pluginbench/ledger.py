@@ -59,10 +59,18 @@ class Ledger:
     def create(
         cls, path: Path, entries: Iterable[dict[str, Any]], states: dict[str, str]
     ) -> Ledger:
-        """A new ledger with one row per plan entry, in plan (slot) order."""
+        """A new ledger with one row per plan entry, in plan (slot) order.
+
+        It is built in a temporary file and renamed into place, so a killed build never leaves
+        a ledger that looks valid but lacks attempts.
+        """
         if path.exists():
             raise ValueError(f"ledger already exists: {path}")
-        connection = sqlite3.connect(path)
+        temporary = path.with_name(f".{path.name}.tmp")
+        # Left by a build that was killed; a stale journal must not roll into the new file.
+        temporary.unlink(missing_ok=True)
+        temporary.with_name(temporary.name + "-journal").unlink(missing_ok=True)
+        connection = sqlite3.connect(temporary)
         with connection:
             connection.executescript(_SCHEMA)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -82,7 +90,9 @@ class Ledger:
                     for slot, entry in enumerate(entries)
                 ],
             )
-        return cls(connection)
+        connection.close()
+        temporary.replace(path)
+        return cls.open(path)
 
     @classmethod
     def open(cls, path: Path) -> Ledger:
