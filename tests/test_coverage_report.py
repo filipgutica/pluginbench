@@ -251,6 +251,30 @@ def test_python_per_test_numbits_are_validated_and_kept_compact(
             python_report(tmp_path, source, data)
 
 
+def test_python_module_entry_line_of_an_empty_module_is_accepted(
+    tmp_path: Path, source: Path
+) -> None:
+    # coverage.py reports line 0, the module entry, as executed for a file without statements.
+    (source / "src/__init__.py").write_text("")
+    data = python_data()
+    data["files"]["src/__init__.py"] = {
+        "executed_lines": [0],
+        "missing_lines": [],
+        "excluded_lines": [],
+        "summary": {
+            "num_statements": 0, "covered_lines": 0, "missing_lines": 0, "excluded_lines": 0,
+            "num_branches": 0, "covered_branches": 0, "missing_branches": 0,
+        },
+        "executed_branches": [],
+        "missing_branches": [],
+    }
+    data["per_test_numbits"] = {"src/__init__.py": {"test_a": lines_to_numbits({0})}}
+    report = python_report(tmp_path, source, data)
+    assert isinstance(report["lines"], dict)
+    assert report["lines"]["total"] == [f"src/value.py:{line}" for line in range(1, 5)]
+    assert "per_test_numbits" not in report
+
+
 def test_python_statement_coordinates_exclude_traced_nonstatements(
     tmp_path: Path, source: Path
 ) -> None:

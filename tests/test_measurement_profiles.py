@@ -1,8 +1,10 @@
 import json
+import platform
 import hashlib
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -333,10 +335,25 @@ def observer_stub(cache: Path) -> Path:
     (cache / "package-lock.json").write_bytes(lock.read_bytes())
     (package / "package.json").write_text(json.dumps({"version": "0.126.0", "type": "module"}))
     (package / "src-js/index.js").write_text("export const parseSync = () => ({ errors: [] });")
-    binding = modules / "@oxc-parser/binding-darwin-arm64"
+    install_binding(modules, runtime_binding())
+    return modules
+
+
+def runtime_binding() -> str:
+    """The binding oxc-parser loads here, named as npm installs it."""
+    arch = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64"}.get(
+        platform.machine().lower(), platform.machine().lower()
+    )
+    libc = ""
+    if sys.platform == "linux":
+        libc = "-gnu" if platform.libc_ver()[0] == "glibc" else "-musl"
+    return f"binding-{sys.platform}-{arch}{libc}"
+
+
+def install_binding(modules: Path, name: str) -> None:
+    binding = modules / "@oxc-parser" / name
     binding.mkdir(parents=True)
     (binding / "binding.node").write_bytes(b"fixture binding")
-    return modules
 
 
 def test_oxc_observer_and_python_dependency_digest_match_path_order_and_links(
@@ -371,6 +388,27 @@ def test_oxc_observer_and_python_dependency_digest_match_path_order_and_links(
     (modules / "changed.js").write_text("modified")
     execution = subprocess.run(command, capture_output=True, text=True)
     assert execution.returncode != 0 and "observer dependency cache changed" in execution.stderr
+
+
+def test_oxc_observer_accepts_the_other_libc_binding_npm_also_installs(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    modules = observer_stub(cache)
+    other = "binding-linux-x64-musl" if runtime_binding().endswith("-gnu") else "binding-linux-x64-gnu"
+    install_binding(modules, other)
+    inputs = tmp_path / "inputs.json"
+    inputs.write_text('{"files": [], "file_count": 0}')
+    output = tmp_path / "parsed.json"
+    command = [
+        "node",
+        str(profiles.ROOT / "fallow_parse.mjs"),
+        str(cache),
+        str(tmp_path),
+        str(inputs),
+        str(output),
+        profiles.dependency_digest(modules),
+    ]
+    execution = subprocess.run(command, capture_output=True, text=True)
+    assert execution.returncode == 0, execution.stderr
 
 
 def test_non_analyzer_selection_does_not_prepare_observers(
