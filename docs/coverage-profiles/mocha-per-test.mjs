@@ -5,13 +5,12 @@
 // without c8, with this file as the first Mocha `--require`:
 //   PLUGINBENCH_PER_TEST_DIR=/tmp/pb node --no-opt --no-maglev node_modules/mocha/bin/_mocha \
 //     --require <this file> ...
-// and finally write the sidecar beside the LCOV report:
-//   node <this file> <lcov report> /tmp/pb
+// and finally write the sidecar beside the LCOV report with per-test-finalize.mjs.
 //
 // Each test's sample is converted with c8's own v8-to-istanbul. Any problem leaves no sidecar, so
 // redundancy stays unknown; the hook never fails a test or changes which tests run.
 import { Session } from "node:inspector/promises";
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -103,7 +102,7 @@ async function hooks(output) {
     afterAll() {
       try {
         const record = failure === undefined ? { tests } : { failure };
-        writeFileSync(join(output, `mocha-${process.pid}.json`), JSON.stringify(record), { flag: "wx" });
+        writeFileSync(join(output, `record-${process.pid}.json`), JSON.stringify(record), { flag: "wx" });
       } catch (error) {
         console.error(`PluginBench per-test coverage not recorded: ${error.message}`);
       }
@@ -111,54 +110,9 @@ async function hooks(output) {
   };
 }
 
-function finalize(report, directory) {
-  if (existsSync(`${report}.per-test.json`)) throw new Error("per-test sidecar already exists");
-  const records = readdirSync(directory).filter((name) => /^mocha-\d+\.json$/.test(name));
-  if (records.length !== 1) {
-    throw new Error(`expected one Mocha per-test record, found ${records.length}; parallel mode is unsupported`);
-  }
-  const { failure, tests } = JSON.parse(readFileSync(join(directory, records[0]), "utf8"));
-  if (failure !== undefined) throw new Error(failure);
-  // Absolute source path -> LCOV's own SF spelling and executed lines.
-  const covered = new Map();
-  let lines;
-  for (const row of readFileSync(report, "utf8").split("\n")) {
-    if (row.startsWith("SF:")) covered.set(resolve(row.slice(3)), { sf: row.slice(3), lines: (lines = new Set()) });
-    if (row.startsWith("DA:") && Number(row.split(",")[1]) > 0) lines.add(Number(row.slice(3).split(",")[0]));
-  }
-  if (covered.size === 0) throw new Error("LCOV report names no sources");
-  const perTest = {};
-  for (const [name, files] of Object.entries(tests)) {
-    let recorded = false;
-    for (const [path, executed] of Object.entries(files)) {
-      const source = covered.get(path);
-      if (source === undefined) continue; // outside the LCOV source scope
-      // The LCOV comes from the c8 run; a line it never saw executed means the runs diverged.
-      const outside = executed.filter((line) => !source.lines.has(line));
-      if (outside.length) throw new Error(`${name} executed ${path} lines LCOV reports unexecuted: ${outside}`);
-      const bits = Buffer.alloc((Math.max(...executed) >> 3) + 1);
-      for (const line of executed) bits[line >> 3] |= 1 << (line & 7);
-      (perTest[source.sf] ??= {})[name] = bits.toString("base64");
-      recorded = true;
-    }
-    // Tests that reach no measured source are still recorded, with an empty bitset.
-    if (!recorded) (perTest[covered.values().next().value.sf] ??= {})[name] = "";
-  }
-  writeFileSync(`${report}.per-test.json`, JSON.stringify({ per_test_numbits: perTest }), { flag: "wx" });
-}
-
-const isFinalize = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (isFinalize) {
-  try {
-    finalize(...process.argv.slice(2, 4));
-  } catch (error) {
-    console.error(`PluginBench per-test coverage unavailable: ${error.message}`);
-  }
-}
-
 const { PLUGINBENCH_PER_TEST_DIR: output, NODE_V8_COVERAGE: v8Output } = process.env;
 if (output && v8Output) {
   console.error("PluginBench per-test coverage disabled: its resets would corrupt NODE_V8_COVERAGE (c8)");
 }
 // Without a record, finalize leaves redundancy unknown.
-export const mochaHooks = !isFinalize && output && !v8Output ? await hooks(output) : {};
+export const mochaHooks = output && !v8Output ? await hooks(output) : {};

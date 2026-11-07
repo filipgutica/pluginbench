@@ -16,6 +16,7 @@ from pluginbench.coverage_report import numbits_to_lines, parse_lcov
 
 PROFILES = Path(__file__).parents[1] / "docs/coverage-profiles"
 HOOK = PROFILES / "mocha-per-test.mjs"
+FINALIZE = PROFILES / "per-test-finalize.mjs"
 
 # v8-to-istanbul 9.3's rule: every line starts at 1; each range sets the lines it fully spans;
 # "(empty-report)" zeroes the file.
@@ -124,7 +125,7 @@ def run_hook(
     report.parent.mkdir()
     report.write_text(lcov(project, set(executed)))
     finalized = subprocess.run(
-        ["node", str(HOOK), str(report), str(records)],
+        ["node", str(FINALIZE), str(report), str(records)],
         cwd=project,
         capture_output=True,
         text=True,
@@ -176,8 +177,18 @@ def test_hook_writes_no_sidecar_when_attribution_is_unsound(
     assert reason in stderr
 
 
-def test_documented_csstree_profile_embeds_the_hook_verbatim() -> None:
-    (profile,) = yaml.safe_load((PROFILES / "csstree.yaml").read_text()).values()
-    script = profile["command"][2]
-    start = script.index("<<'JS'\n") + len("<<'JS'\n")
-    assert script[start : script.index("\nJS\n", start) + 1] == HOOK.read_text()
+@pytest.mark.parametrize(
+    ("profile", "embedded"),
+    [
+        ("csstree.yaml", {"mocha-per-test.mjs", "per-test-finalize.mjs"}),
+        (
+            "true-myth.yaml",
+            {"vitest-per-test-provider.mjs", "vitest-per-test-setup.mjs", "per-test-finalize.mjs"},
+        ),
+    ],
+)
+def test_documented_profiles_embed_the_scripts_verbatim(profile: str, embedded: set[str]) -> None:
+    (entry,) = yaml.safe_load((PROFILES / profile).read_text()).values()
+    heredocs = entry["command"][2].split("<<'JS'\n")[1:]
+    bodies = {heredoc[: heredoc.index("\nJS\n") + 1] for heredoc in heredocs}
+    assert {name for name in embedded if (PROFILES / name).read_text() in bodies} == embedded

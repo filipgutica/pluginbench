@@ -146,9 +146,10 @@ retains it as `report.raw.per-test.json` beside `report.raw`.
 
 The [JavaScript inspector spike](../tests/fixtures/js-per-test-coverage/README.md)
 demonstrates serial plain JavaScript and awaited async work with `node:test`.
-[Coverage profiles](coverage-profiles/README.md) has a Mocha hook for c8 suites
-and the csstree profile that uses it. Vitest TypeScript source-map remapping
-remains unverified.
+[Coverage profiles](coverage-profiles/README.md) has per-test helpers for Mocha
+with c8 and for Vitest's v8 provider, with the csstree and true-myth profiles
+that use them. Vitest needs AST-aware remapping: its default remapping reports
+never-called TypeScript lines as executed.
 
 Changed-line coverage is incomplete when an added source file is missing from the coverage report. Configure coverage to report every source file, for example coverage.py `--source=<package>` or c8 `--all`.
 

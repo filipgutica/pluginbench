@@ -49,6 +49,9 @@ with bit n representing line n, as in coverage.py.
 
 ## Vitest and TypeScript: proposed next experiment
 
+[`docs/coverage-profiles`](../../../docs/coverage-profiles/README.md) now runs
+this experiment for true-myth. It works only with AST-aware remapping.
+
 Vitest's [V8 provider](https://vitest.dev/guide/coverage.html) uses AST-based
 coverage remapping. A TypeScript experiment must retain each worker's transformed
 JavaScript, script identity, and composed Vite source maps. Take per-test V8
