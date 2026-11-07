@@ -353,7 +353,8 @@ def cohort_contexts(
         }
         coding["native_task_identity"] = portable_native_identity(native_identity(task))
         contexts[task.task_id] = {
-            "protocol": "native-harbor-baseline-cohort-v3",
+            # v4 caches each repeat in its own entry under the cohort key.
+            "protocol": "native-harbor-baseline-cohort-v4",
             "source_policy": submissions.SOURCE_POLICY,
             "coding": coding,
             "task_id": task.task_id,
@@ -388,7 +389,9 @@ def preview(
         {
             "task_id": entry["task_id"],
             "repeat": entry["attempt"],
-            "status": "hit" if (path / keys[entry["task_id"]]).is_dir() else "miss",
+            "status": "hit"
+            if (path / keys[entry["task_id"]] / str(entry["attempt"])).is_dir()
+            else "miss",
             "cache_key": keys[entry["task_id"]],
         }
         for entry in entries
@@ -396,7 +399,11 @@ def preview(
 
 
 class BaselineCache:
-    """Reserve all missing keys before calls; hold each lock until atomic publication."""
+    """Reserve every cohort key before calls; publish each finished vanilla attempt as it ends.
+
+    A cohort key names one task's vanilla context. Each repeat is its own entry,
+    `<key>/<repeat>`, so a run that stops midway still caches the repeats it finished.
+    """
 
     def __init__(
         self,
@@ -413,7 +420,7 @@ class BaselineCache:
         self.entries = [entry for entry in entries if entry["arm"] == "baseline"]
         self.contexts = cohort_contexts(tasks=tasks, entries=self.entries, identity=identity)
         self.keys = {task_id: _hash(context) for task_id, context in self.contexts.items()}
-        self.hits: dict[str, dict[str, Any]] = {}
+        self.hits: dict[tuple[str, int], dict[str, Any]] = {}
         self._resources = ExitStack()
 
     def reserve(self) -> BaselineCache:
@@ -428,18 +435,25 @@ class BaselineCache:
                 if lock_path.is_symlink():
                     raise ValueError("baseline cache lock must not follow symlinks")
                 lock = self._resources.enter_context(lock_path.open("a"))
-                cached = self.path / key
-                if cached.is_symlink():
+                cohort = self.path / key
+                if cohort.is_symlink():
                     raise ValueError("baseline cache cohort must not follow symlinks")
+                repeats = self.contexts[task_id]["repeats"]
+                cached = {repeat: cohort / str(repeat) for repeat in repeats}
+                if any(path.is_symlink() for path in cached.values()):
+                    raise ValueError("baseline cache entry must not follow symlinks")
                 try:
-                    mode = fcntl.LOCK_SH if cached.exists() else fcntl.LOCK_EX
+                    # Exclusive while this run may still publish a missing repeat.
+                    complete = all(path.exists() for path in cached.values())
+                    mode = fcntl.LOCK_SH if complete else fcntl.LOCK_EX
                     fcntl.flock(lock, mode | fcntl.LOCK_NB)
                 except BlockingIOError as exc:
                     raise ValueError(
                         f"baseline cache cohort is in use: {key}; wait for its owning run to finish"
                     ) from exc
-                if cached.exists():
-                    self.hits[task_id] = self._validate(task_id, cached)
+                for repeat, path in cached.items():
+                    if path.exists():
+                        self.hits[(task_id, repeat)] = self._validate(task_id, path)
         except BaseException:
             self.close()
             raise
@@ -449,8 +463,9 @@ class BaselineCache:
         self._resources.close()
 
     def _validate(self, task_id: str, cached: Path) -> dict[str, Any]:
+        """Check one `<key>/<repeat>` entry: a single complete, eligible vanilla attempt."""
         if cached.is_symlink() or not cached.is_dir():
-            raise ValueError("baseline cache cohort must be a directory")
+            raise ValueError("baseline cache entry must be a directory")
         manifest: dict[str, Any] = json.loads((cached / "manifest.json").read_text())
         if (
             manifest["context"] != self.contexts[task_id]
@@ -466,7 +481,7 @@ class BaselineCache:
                     raise ValueError(
                         "baseline cache artifact identity must be a single path component"
                     )
-        if sorted(record["attempt"] for record in records) != manifest["context"]["repeats"] or any(
+        if [record["attempt"] for record in records] != [int(cached.name)] or any(
             record["task_id"] != task_id
             or record["arm"] != "baseline"
             or not _eligible(
@@ -486,34 +501,28 @@ class BaselineCache:
         decisions = {}
         for entry in self.entries:
             task_id = entry["task_id"]
-            hit = self.hits.get(task_id)
-            old = (
-                next((row for row in hit["records"] if row["attempt"] == entry["attempt"]), None)
-                if hit
-                else None
-            )
+            hit = self.hits.get((task_id, entry["attempt"]))
             # Relative to the cache root, so moving the cache or this run keeps it resolvable.
             # Historical decisions held an absolute `origin_run` path instead.
             decisions[entry["id"]] = {
                 "status": "hit" if hit else "miss",
                 "cache_key": self.keys[task_id],
-                "origin_cohort": f"{self.path.name}/{self.keys[task_id]}" if hit else None,
-                "origin_attempt": old["id"] if old else None,
+                "origin_cohort": f"{self.path.name}/{self.keys[task_id]}/{entry['attempt']}"
+                if hit
+                else None,
+                "origin_attempt": hit["records"][0]["id"] if hit else None,
             }
         return decisions
 
     def import_attempt(self, entry: dict[str, Any]) -> dict[str, Any] | None:
         if entry["arm"] != "baseline":
             return None
-        manifest = self.hits.get(entry["task_id"])
+        manifest = self.hits.get((entry["task_id"], entry["attempt"]))
         if manifest is None:
             return None
-        record: dict[str, Any] = copy.deepcopy(
-            next(row for row in manifest["records"] if row["attempt"] == entry["attempt"])
-        )
+        record: dict[str, Any] = copy.deepcopy(manifest["records"][0])
         old_id = record["id"]
-        key = self.keys[entry["task_id"]]
-        cached = self.path / key
+        cached = self.path / self.keys[entry["task_id"]] / str(entry["attempt"])
         attempt = self.root / "attempts" / entry["id"]
         attempt.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(cached / "attempts" / old_id, attempt, symlinks=True)
@@ -577,54 +586,44 @@ class BaselineCache:
             stage.update(correctness=None, evidence=None)
         return record
 
-    def publish(self, records: list[dict[str, Any]], tasks: tuple[TaskSpec, ...]) -> None:
-        task_digests = {task.task_id: task.digest for task in tasks}
-        for task_id, key in self.keys.items():
-            if task_id in self.hits:
-                continue
-            cohort = [
-                record
-                for record in records
-                if record["arm"] == "baseline" and record["task_id"] == task_id
-            ]
-            if not all(
-                _eligible(
-                    attempt=self.root / "attempts" / record["id"],
-                    record=record,
-                    coding=self.contexts[task_id]["coding"],
-                    task=self.tasks[task_id],
+    def publish(self, record: dict[str, Any]) -> None:
+        """Cache one finished vanilla attempt now, unless it is a hit or not eligible."""
+        task_id = record["task_id"]
+        if record["arm"] != "baseline" or (task_id, record["attempt"]) in self.hits:
+            return
+        key = self.keys[task_id]
+        if not _eligible(
+            attempt=self.root / "attempts" / record["id"],
+            record=record,
+            coding=self.contexts[task_id]["coding"],
+            task=self.tasks[task_id],
+        ):
+            return
+        cohort = self.path / key
+        cohort.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=f".{record['attempt']}-", dir=cohort) as temporary:
+            staged = Path(temporary) / str(record["attempt"])
+            (staged / "attempts").mkdir(parents=True)
+            (staged / "native-starts").mkdir()
+            _copy_attempt(self.root / "attempts" / record["id"], staged / "attempts" / record["id"])
+            receipts = {
+                stage["id"]: json.loads(
+                    (self.root / "invocations" / record["id"] / f"{stage['id']}.json").read_text()
                 )
-                for record in cohort
-            ):
-                continue
-            with tempfile.TemporaryDirectory(prefix=f".{key}-", dir=self.path) as temporary:
-                staged = Path(temporary) / "cohort"
-                (staged / "attempts").mkdir(parents=True)
-                (staged / "native-starts").mkdir()
-                for record in cohort:
-                    _copy_attempt(
-                        self.root / "attempts" / record["id"], staged / "attempts" / record["id"]
-                    )
-                    receipts = {
-                        stage["id"]: json.loads(
-                            (
-                                self.root / "invocations" / record["id"] / f"{stage['id']}.json"
-                            ).read_text()
-                        )
-                        for stage in record["stages"]
-                    }
-                    (staged / "native-starts" / f"{record['id']}.json").write_text(
-                        json.dumps(receipts, indent=2, sort_keys=True) + "\n"
-                    )
-                manifest = {
-                    "context": self.contexts[task_id],
-                    "records": cohort,
-                    "origin_status": "complete",
-                    "task_digest": task_digests[task_id],
-                    "inventory": _inventory(staged),
-                }
-                (staged / "manifest.json").write_text(
-                    json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-                )
-                self._validate(task_id, staged)
-                staged.rename(self.path / key)
+                for stage in record["stages"]
+            }
+            (staged / "native-starts" / f"{record['id']}.json").write_text(
+                json.dumps(receipts, indent=2, sort_keys=True) + "\n"
+            )
+            manifest = {
+                "context": self.contexts[task_id],
+                "records": [record],
+                "origin_status": "complete",
+                "task_digest": self.tasks[task_id].digest,
+                "inventory": _inventory(staged),
+            }
+            (staged / "manifest.json").write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+            )
+            self._validate(task_id, staged)
+            staged.rename(cohort / staged.name)

@@ -94,7 +94,7 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> evaluation.Evalua
 def test_public_commands_cover_evaluations_reports_and_task_selection() -> None:
     result = CliRunner().invoke(cli.app, ["--help"])
     assert result.exit_code == 0
-    assert set(get_group(cli.app).commands) == {"check", "run", "report", "tasks"}
+    assert set(get_group(cli.app).commands) == {"check", "run", "stop", "report", "tasks"}
     assert set(get_group(cli.tasks_app).commands) == {"pick"}
     assert CliRunner().invoke(cli.app, ["--version"]).stdout.strip() == "0.4.0"
 
@@ -104,9 +104,13 @@ def test_config_dry_run_includes_fresh_vanilla_and_every_package(
 ) -> None:
     path = tmp_path / "eval.yaml"
     path.write_text(yaml.safe_dump(config.model_dump(mode="json")))
-    monkeypatch.setattr(cli, "run_evaluation", lambda *args: pytest.fail("dry run cannot execute"))
+    monkeypatch.setattr(
+        cli, "prepare_evaluation", lambda *args, **kwargs: pytest.fail("dry run cannot execute")
+    )
     result = CliRunner().invoke(cli.app, ["run", "--config", str(path), "--dry-run"])
     assert result.exit_code == 0, result.stderr
+    positional = CliRunner().invoke(cli.app, ["run", str(path), "--dry-run"])
+    assert positional.exit_code == 0 and positional.stdout == result.stdout
     plan = json.loads(result.stdout)
     assert plan["coding_calls"] == 9 and plan["review_calls"] == 0
     assert set(plan["treatments"]) == {"superpowers", "workflow"}
@@ -747,10 +751,10 @@ def test_integrated_evaluation_and_report_regeneration(
         # Resumed reviews get the same sandbox probe before their first call.
         with monkeypatch.context() as patched:
             patched.setattr(isolation, "codex_code_mode_host", missing_host)
-            blocked = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes"])
+            blocked = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes", "--foreground"])
         assert blocked.exit_code == 2 and "codex-code-mode-host" in blocked.stderr
         assert len(calls) == 9 and not judge_calls
-        result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes"])
+        result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes", "--foreground"])
         assert result.exit_code == 0, result.stderr
         assert "0 coding attempts +" in result.stdout
         failed = root / "evidence/observer-revisions/measurements/revision.json"
@@ -942,7 +946,7 @@ def test_integrated_evaluation_and_report_regeneration(
         assert len(calls) == len(judge_calls) == 9
         assert (root / "report/results.json").read_bytes() == original
     if citation_error:
-        result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes"])
+        result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes", "--foreground"])
         assert result.exit_code == 0, result.stderr
         assert "0 coding attempts + 0 review calls" in result.stdout
         assert (root / "report/results.json").read_bytes() == original
@@ -951,7 +955,7 @@ def test_integrated_evaluation_and_report_regeneration(
         saved["pending_measurement_revision"] = saved["measurement_revision"]
         saved["measurement_revision"] = None
         evaluation._save_selection(root, saved)
-        result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes"])
+        result = CliRunner().invoke(cli.app, ["run", "--resume", str(root), "--yes", "--foreground"])
         assert result.exit_code == 0, result.stderr
         assert "0 coding attempts + 0 review calls" in result.stdout
         assert (root / "report/results.json").read_bytes() == original
@@ -1287,7 +1291,7 @@ def test_new_output_folder_keeps_comparison_identity_and_cache_decisions(
     assert {row["status"] for row in rows} == {"miss"}
     # Once a cohort is published under that key, a third folder sees every attempt as a hit.
     for row in rows:
-        (second.caches.vanilla / row["cache_key"]).mkdir(parents=True, exist_ok=True)
+        (second.caches.vanilla / row["cache_key"] / str(row["repeat"])).mkdir(parents=True)
     third = evaluation.check_evaluation(config, tmp_path / "c/run")
     assert [row["status"] for row in third["vanilla_cache"]] == ["hit"] * config.repeats
     assert len(built) == 1 and len(qualified) == 1
@@ -1383,15 +1387,19 @@ def test_check_prints_a_hit_or_miss_for_every_vanilla_attempt(
     assert len(rows) == 2 * 3 and {row["status"] for row in rows} == {"miss"}
     assert "Vanilla cache: 0 of 6 attempts hit" in result.stdout
     covered = next(row for row in rows if row["task_id"] == "covered-native-task")
-    (isolated_cache / "pluginbench/vanilla" / covered["cache_key"]).mkdir(parents=True)
+    # Each repeat is its own cache entry, so a stopped run's finished repeats are hits.
+    for repeat in (1, 2):
+        (isolated_cache / "pluginbench/vanilla" / covered["cache_key"] / str(repeat)).mkdir(
+            parents=True
+        )
     again = CliRunner().invoke(
         cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"]) + "-2"]
     )
     assert again.exit_code == 0, again.stderr
-    assert "Vanilla cache: 3 of 6 attempts hit" in again.stdout
+    assert "Vanilla cache: 2 of 6 attempts hit" in again.stdout
     for repeat in (1, 2, 3):
-        hit = f"covered-native-task repeat {repeat}: hit ({covered['cache_key'][:12]})"
-        assert hit in again.stdout
+        status = "miss" if repeat == 3 else f"hit ({covered['cache_key'][:12]})"
+        assert f"covered-native-task repeat {repeat}: {status}" in again.stdout
         assert f"arbitrary-native-task repeat {repeat}: miss" in again.stdout
 
 
@@ -1415,3 +1423,217 @@ def test_parser_only_change_keeps_the_vanilla_cache_identity(
     launcher = package / "codex.py"
     launcher.write_text(launcher.read_text() + "\n# a launch change\n")
     assert identity() != original
+
+
+def _coding_and_review_backend(
+    calls: list[str], reviews: list[str], *, timeout: int, interrupt_at: int | None
+) -> Any:
+    usage = {"input_tokens": 10, "output_tokens": 5}
+
+    def invoke(**kwargs: Any) -> dict[str, Any]:
+        area = kwargs["area"]
+        if kwargs.get("output_schema") is not None:
+            packet = json.loads((area / "workspace/packet.json").read_text())
+            reviews.append(packet["packet_id"])
+            return {
+                "successful_native_completion": True,
+                "actual_primary_models": ["gpt-6-astra"],
+                "runtime_effort_evidence": ["high"],
+                "command_items": [],
+                "usage": {"input_tokens": 50, "output_tokens": 10},
+                "startup": [{"type": "session_meta", "payload": {"cli_version": "judge-version"}}],
+                "final": json.dumps(
+                    {
+                        "packet_id": packet["packet_id"],
+                        "status": "reviewed",
+                        "issues": [],
+                        "limitations": ["Fixture only"],
+                        "outside_packet_access": False,
+                    }
+                ),
+            }
+        calls.append(kwargs["entry"]["id"])
+        if len(calls) == interrupt_at:
+            # As `stop` does: SIGTERM becomes KeyboardInterrupt after some usage was saved.
+            (area / "artifacts").mkdir()
+            (area / "artifacts/execution.json").write_text(json.dumps({"usage": usage}))
+            raise KeyboardInterrupt("stopped by SIGTERM")
+        (area / "workspace/src/answer.py").write_text("answer = 1\n")
+        result = native_execution(
+            area,
+            kwargs["protocol"]["native_task_identity"],
+            reward=1,
+            timeout=timeout,
+            version="0.167.0",
+        )
+        result["startup"] = [{"type": "session_meta", "payload": {"cli_version": "0.167.0"}}]
+        return result
+
+    return invoke
+
+
+def _measured_and_reviewed(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> evaluation.Evaluation:
+    """One task, coverage and a Codex reviewer, one job, with offline preparation."""
+    from pluginbench.measurement_profiles import CoverageSettings
+
+    standards = tmp_path / "review-standards.md"
+    standards.write_text("Report actionable correctness findings only.\n")
+    config.jobs = 1
+    config.measurements += ["coverage", "review"]
+    config.measurement_settings.coverage = CoverageSettings(
+        command=["python3", "-m", "coverage"],
+        report_path="coverage/lcov.info",
+        tool_version="fixture-1",
+    )
+    config.reviewer = evaluation.Reviewer(
+        harness="codex", model="gpt-6-astra", reasoning="high", guidance=[standards]
+    )
+    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.167.0"})
+    monkeypatch.setattr(codex, "runtime_environment", lambda *args, **kwargs: ({}, ()))
+    monkeypatch.setattr(harbor_backend, "prepare_native_task", _prepare_fixture_task)
+    monkeypatch.setattr(harbor_backend, "run_native_command", _lcov)
+    return config
+
+
+def test_run_on_a_stopped_run_codes_only_unfinished_slots_then_measures_and_reviews(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _measured_and_reviewed(config, tmp_path, monkeypatch)
+    calls: list[str] = []
+    reviews: list[str] = []
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=config.timeout_seconds, interrupt_at=3
+    )
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    root = tmp_path / "run"
+    with pytest.raises(KeyboardInterrupt):
+        evaluation.run_evaluation(config, root)
+    stopped = json.loads((root / "evidence/run.json").read_text())
+    states = stopped["attempt_states"]
+    finished = {key for key, state in states.items() if state == "complete"}
+    assert stopped["status"] == "interrupted" and len(states) == 9
+    assert len(finished) == 2 and states[calls[2]] == "interrupted"
+    assert evaluation.plan_resume(root)["coding_calls"] == 7
+    interrupted = calls[2]
+    calls.clear()
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=config.timeout_seconds, interrupt_at=None
+    )
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+
+    result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert result.stdout.startswith("7 coding attempts")
+    run = json.loads((root / "evidence/run.json").read_text())
+    assert run["status"] == "complete"
+    assert set(run["attempt_states"].values()) == {"complete"} and len(run["attempt_states"]) == 9
+    assert len(calls) == 7 and not set(calls) & (finished | {interrupted})
+    discarded = run["discarded_attempts"][interrupted]
+    assert discarded["replaced_by"] in calls
+    assert discarded["stages"]["handoff"]["work"]["tokens"] == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+    }
+    # Measurement and review run on the replaced attempt identities.
+    selection = evaluation._load_selection(root)
+    assert selection["measurement_revision"] == "measurements"
+    assert selection["review_revision"] == "review"
+    assert len(reviews) == 9
+    assert (root / "report/report.html").is_file()
+    events = [json.loads(line)["event"] for line in (root / "events.jsonl").read_text().splitlines()]
+    assert events[0] == "started" and events[-1] == "finished"
+
+
+def test_run_interrupted_after_its_last_attempt_finishes_measurement_and_reviews(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _measured_and_reviewed(config, tmp_path, monkeypatch)
+    calls: list[str] = []
+    reviews: list[str] = []
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=config.timeout_seconds, interrupt_at=None
+    )
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    checkpoint = study._checkpoint
+
+    def stopped_at_the_end(*args: Any, status: str, **kwargs: Any) -> None:
+        if status == "complete":
+            raise KeyboardInterrupt("stopped by SIGTERM")
+        checkpoint(*args, status=status, **kwargs)
+
+    root = tmp_path / "run"
+    with monkeypatch.context() as patched:
+        patched.setattr(study, "_checkpoint", stopped_at_the_end)
+        with pytest.raises(KeyboardInterrupt):
+            evaluation.run_evaluation(config, root)
+    run = json.loads((root / "evidence/run.json").read_text())
+    assert run["status"] == "interrupted" and set(run["attempt_states"].values()) == {"complete"}
+    assert evaluation.plan_resume(root)["coding_calls"] == 0
+    coded = len(calls)
+
+    result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert len(calls) == coded and len(reviews) == 9
+    assert json.loads((root / "evidence/run.json").read_text())["status"] == "complete"
+    assert evaluation._load_selection(root)["review_revision"] == "review"
+
+
+def _stopped_after_two_attempts(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, list[str], list[str]]:
+    config = _measured_and_reviewed(config, tmp_path, monkeypatch)
+    calls: list[str] = []
+    reviews: list[str] = []
+    for interrupt_at in (3, None):
+        backend = _coding_and_review_backend(
+            calls, reviews, timeout=config.timeout_seconds, interrupt_at=interrupt_at
+        )
+        monkeypatch.setattr(codex, "invoke", backend)
+        monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+        if interrupt_at:
+            with pytest.raises(KeyboardInterrupt):
+                evaluation.run_evaluation(config, tmp_path / "run")
+    return tmp_path / "run", calls, reviews
+
+
+def test_resume_refuses_before_coding_what_would_fail_after_it(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, calls, _ = _stopped_after_two_attempts(config, tmp_path, monkeypatch)
+    coded = len(calls)
+    profiles = root / "inputs/profiles.json"
+    saved = profiles.read_bytes()
+    profiles.unlink()  # As in runs prepared before profiles were saved, like the pilot.
+    old = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+    assert old.exit_code == 2 and "predates saved measurement profiles" in old.stderr
+    profiles.write_bytes(saved)
+
+    def missing_host() -> Path:
+        raise ValueError("Codex reviews need an executable codex-code-mode-host")
+
+    monkeypatch.setattr(isolation, "codex_code_mode_host", missing_host)
+    blocked = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+    assert blocked.exit_code == 2 and "codex-code-mode-host" in blocked.stderr
+    assert len(calls) == coded
+
+
+def test_stopped_run_copied_to_a_new_path_resumes_there(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, calls, reviews = _stopped_after_two_attempts(config, tmp_path, monkeypatch)
+    moved = tmp_path / "moved"
+    shutil.copytree(root, moved, symlinks=True)
+    shutil.rmtree(root)
+    coded = len(calls)
+    result = CliRunner().invoke(cli.app, ["run", str(moved), "--yes", "--foreground"])
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert len(calls) == coded + 7 and len(reviews) == 9
+    assert json.loads((moved / "evidence/run.json").read_text())["status"] == "complete"
+    assert not root.exists()
