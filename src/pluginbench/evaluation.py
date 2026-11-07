@@ -17,10 +17,10 @@ from collections.abc import Callable
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
-from pluginbench import claude, codex, harbor_backend, isolation, submissions
+from pluginbench import baselines, claude, codex, harbor_backend, isolation, submissions
 from pluginbench.treatments import Treatment, resolve_treatment, treatment_inventory
 from pluginbench.native_treatments import NativeCapabilities, DELIVERY_POLICY, admit
-from pluginbench.task_sources import Tasks
+from pluginbench.task_sources import Tasks, cache_root
 from pluginbench.measurement_profiles import (
     REMOVED_TEST_OVERLAP,
     MeasurementSettings,
@@ -31,7 +31,7 @@ from pluginbench.measurement_profiles import (
     readiness_state,
 )
 from pluginbench.assessment_metrics import scoped_code_size, scoped_test_size
-from pluginbench.datasets import TaskCatalog, TaskEntry, portable_native_identity
+from pluginbench.datasets import TaskCatalog, TaskEntry, load_tasks, portable_native_identity
 from pluginbench.collectors import Collector
 from pluginbench.evaluation_report import write_evaluation_report
 from pluginbench.remeasure import (
@@ -98,7 +98,9 @@ class Evaluation(BaseModel):
     repeats: int = Field(default=3, strict=True, ge=1)
     seed: int = Field(default=42, strict=True)
     timeout_seconds: int = Field(default=1800, strict=True, ge=1)
-    jobs: int = Field(default_factory=lambda: min(4, os.cpu_count() or 1), strict=True, ge=1, le=16)
+    # A fixed default keeps the comparison identity the same on every machine; 4 is the
+    # most harbor_backend.capacity_jobs ever allows.
+    jobs: int = Field(default=2, strict=True, ge=1, le=4)
     container_cpus: int | None = Field(default=None, strict=True, ge=1)
     container_memory_mb: int | None = Field(default=None, strict=True, ge=256)
 
@@ -243,7 +245,14 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
                 "reason": "grader baseline and frozen fixture must be qualified before coding",
             }
     limits = _container_limits(config, declared)
-    jobs = min(config.jobs, harbor_backend.capacity_jobs(**limits))
+    capacity = harbor_backend.capacity_jobs(**limits)
+    if config.jobs > capacity:
+        # jobs is part of the comparison and vanilla cache identity, so it is never lowered.
+        raise ValueError(
+            f"jobs={config.jobs} does not fit Docker capacity for containers of "
+            f"{limits['cpus']} CPUs and {limits['memory_mb']} MB; set jobs: {capacity} or fewer"
+        )
+    jobs = config.jobs
     criteria = (
         _fixed_criteria([file.read_text() for file in config.reviewer.guidance])
         if config.reviewer
@@ -307,6 +316,117 @@ def _write(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
+@dataclass(frozen=True)
+class _Caches:
+    """Caches every output folder shares, so a new output folder reuses their entries."""
+
+    native: Path
+    vanilla: Path
+    reference_agents: Path
+
+
+def _caches(output: Path) -> _Caches:
+    """Resolve the cache root and check where it leads before anything is prepared.
+
+    A symlinked cache location is followed here once, so the later no-symlink checks in each
+    cache see its real path. A symlink inside the root, or a root that overlaps the output,
+    fails now instead of after image preparation.
+    """
+    base = cache_root().parent.resolve()
+    run = output.resolve()
+    if run.is_relative_to(base) or base.is_relative_to(run):
+        raise ValueError(f"output {run} must not overlap the PluginBench cache {base}")
+    caches = _Caches(
+        native=base / "prepared-images/native",
+        vanilla=base / "vanilla",
+        reference_agents=base / "reference-agents",
+    )
+    for path in (caches.native, caches.vanilla, caches.reference_agents):
+        if path.resolve() != path:
+            raise ValueError(f"PluginBench cache directories must not be symlinks: {path}")
+    return caches
+
+
+# Modules that decide how a coding attempt is launched. Session parsing lives in
+# codex_events.py, outside this list, so a parser-only change keeps every vanilla cache key.
+_LAUNCHER_MODULES = (
+    "codex.py",
+    "harbor_backend.py",
+    "processes.py",
+    "native_treatments.py",
+    "native_treatment_runtime.js",
+    "treatments.py",
+)
+
+
+def _launcher_sha256(harness: str) -> dict[str, str]:
+    names = (*_LAUNCHER_MODULES, *(["claude.py"] if harness == "claude" else []))
+    return {
+        name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
+        for name in names
+    }
+
+
+def _vanilla_identity(
+    config: Evaluation,
+    comparison: dict[str, object],
+    harness_version: str,
+    task_environment: dict[str, object],
+) -> dict[str, object]:
+    """Everything a vanilla cohort's cache key binds; `check` previews with the run's own key."""
+    return {
+        "delivery": DELIVERY_POLICY,
+        "capabilities": config.capabilities.model_dump(mode="json"),
+        "task_assets": comparison["tasks"],
+        "task_environment": task_environment,
+        "runner": comparison["runner"],
+        "harness_version": harness_version,
+        "isolation": comparison["isolation"],
+        "timeout_seconds": config.timeout_seconds,
+        "jobs": config.jobs,
+        "seed": config.seed,
+        "launcher_sha256": _launcher_sha256(config.runner.harness),
+        # run_study binds the same settings from its frozen recipe.
+        "study": {
+            "harness": config.runner.harness,
+            "model": config.runner.model,
+            "reasoning": config.runner.reasoning,
+            "jobs": config.jobs,
+            "timeout_seconds": config.timeout_seconds,
+            "seed": config.seed,
+        },
+    }
+
+
+def _reference_agents(
+    identity: dict[str, object], destination: Path, cache: Path
+) -> dict[str, dict[str, object]]:
+    """Oracle and nop qualify a preparation, not a run: reuse a pass for the same preparation.
+
+    Only passing results are kept, so a broken or flaky result is always retried.
+    """
+    key = str(identity["preparation_key"])
+    images = {
+        name: _object(identity[name])["image_id"]
+        for name in ("image_identity", "grader_image_identity")
+    }
+    entry = cache / f"{key}.json"
+    if entry.is_file():
+        saved = _object(json.loads(entry.read_text()))
+        if saved.get("preparation_key") != key:
+            raise ValueError(f"reference agent cache entry changed: {entry}")
+        # A re-prepared image under the same key has not been qualified yet.
+        if saved.get("images") == images:
+            return TypeAdapter(dict[str, dict[str, object]]).validate_python(saved["rows"])
+    rows = _reference_agent_rows(harbor_backend.run_reference_agents(identity, destination))
+    if all(row["state"] != "broken" for row in rows.values()):
+        cache.mkdir(parents=True, exist_ok=True)
+        temporary = cache / f".{key}.{os.getpid()}.tmp"
+        _write(temporary, {"preparation_key": key, "images": images, "rows": rows})
+        temporary.replace(entry)
+    return rows
+
+
 class CheckFailed(ValueError):
     """A blocking check finding; no coding call was made. `report` holds the whole matrix."""
 
@@ -330,6 +450,8 @@ class _Checked:
     scopes: dict[str, object]
     task_environment: dict[str, object]
     capabilities: dict[str, object]
+    caches: _Caches
+    vanilla_identity: dict[str, object]
     report: dict[str, object]
 
 
@@ -400,6 +522,7 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
     root = output.expanduser().absolute()
     if root.exists():
         raise ValueError(f"output must be a new directory: {root}")
+    caches = _caches(root)
     harbor_backend.preflight(jobs=config.jobs, **limits)
     harness_versions: dict[str, str] = {
         harness: _harness_version(harness)
@@ -442,7 +565,7 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
             harness=config.runner.harness,
             version=harness_versions[config.runner.harness],
             limits={**limits, "setup_timeout": effective["build_timeout_seconds"]},
-            cache=root.parent / ".prepared-images/native",
+            cache=caches.native,
         )
         native_task = Path(str(identity["task_dir"]))
         fixture = Path(str(identity["fixture_dir"]))
@@ -510,9 +633,7 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
             _object(coding_images[task]), harbor_backend.probe_coding_environment(identity)
         )
         matrix[task].update(
-            _reference_agent_rows(
-                harbor_backend.run_reference_agents(identity, root / "check" / task)
-            )
+            _reference_agents(identity, root / "check" / task, caches.reference_agents)
         )
         if progress:
             for name, row in matrix[task].items():
@@ -523,6 +644,15 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
         TaskCatalog(schema_version=1, tasks=entries).model_dump(mode="json"),
     )
     _write(root / "measurement-readiness.json", capabilities)
+    vanilla_identity = _vanilla_identity(
+        config, comparison, harness_versions[config.runner.harness], task_environment
+    )
+    vanilla_cache = baselines.preview(
+        path=caches.vanilla,
+        tasks=tuple(load_tasks(prepared / "tasks.json")),
+        repeats=config.repeats,
+        identity=vanilla_identity,
+    )
     findings = blocking_findings(matrix, require_ready=config.measurement_settings.require_ready)
     report: dict[str, object] = {
         "status": "blocked" if findings else "ready",
@@ -533,6 +663,7 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
         "warnings": warnings,
         "findings": findings,
         "matrix": matrix,
+        "vanilla_cache": vanilla_cache,
     }
     _write(root / "check.json", report)
     if findings:
@@ -546,6 +677,8 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
         scopes=scopes,
         task_environment=task_environment,
         capabilities=capabilities,
+        caches=caches,
+        vanilla_identity=vanilla_identity,
         report=report,
     )
 
@@ -620,36 +753,12 @@ def run_evaluation(
         "review_revision": None,
     }
     _save_selection(root, selection)
-    coding_identity = {
-        "delivery": DELIVERY_POLICY,
-        "capabilities": config.capabilities.model_dump(mode="json"),
-        "task_assets": comparison["tasks"],
-        "task_environment": task_environment,
-        "runner": comparison["runner"],
-        "harness_version": harness_versions[config.runner.harness],
-        "isolation": comparison["isolation"],
-        "timeout_seconds": config.timeout_seconds,
-        "jobs": config.jobs,
-        "seed": config.seed,
-        "launcher_sha256": {
-            name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-            for name in (
-                "codex.py",
-                "harbor_backend.py",
-                "processes.py",
-                "native_treatments.py",
-                "native_treatment_runtime.js",
-                "treatments.py",
-                *(["claude.py"] if config.runner.harness == "claude" else []),
-            )
-        },
-    }
     run_study(
         load_study(prepared / "study.json"),
         evidence,
         progress=progress,
-        baseline_cache=root.parent / ".baseline-cache",
-        baseline_identity=coding_identity,
+        baseline_cache=checked.caches.vanilla,
+        baseline_identity=checked.vanilla_identity,
     )
     # Measurement contexts refer to the same run-owned frozen task assets as grading/review.
     frozen_catalog = TaskCatalog.model_validate_json((evidence / "frozen/tasks.json").read_text())

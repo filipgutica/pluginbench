@@ -131,8 +131,10 @@ def test_reused_baseline_is_disclosed_without_recounting_original_calls() -> Non
     assert isinstance(limitations, list)
     assert "reused" in " ".join(str(row) for row in limitations)
     row = next(row for row in _rows(data, "attempts") if row["id"] == "baseline-0")
+    # A historical origin keeps its origin_run; newer runs record origin_cohort instead.
     assert row["baseline_origin"] == {
         "cache_key": "key",
+        "origin_cohort": None,
         "origin_run": "earlier",
         "origin_attempt": "old",
         "evidence": None,

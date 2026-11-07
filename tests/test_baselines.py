@@ -510,7 +510,11 @@ def test_reuse_regrades_without_replaying_models_and_retains_failures(
     assert baseline[1]["stages"][0]["work"]["tokens"] == {"input_tokens": 13}
     correctness = second / baseline[0]["stages"][0]["correctness"]["path"]
     assert json.loads(correctness.read_text())["checks"]["native_completion"] is False
-    assert all(item["origin_run"] == str(first) for item in run["baseline_origin"].values())
+    # Origins name their cohort relative to the cache root, never the origin run's path.
+    assert all(
+        item["origin_cohort"] == "cache/" + item["cache_key"] and "origin_run" not in item
+        for item in run["baseline_origin"].values()
+    )
     for record in baseline:
         if unsupported_patch and record["attempt"] == 2:
             assert record["stages"][0]["snapshot"] is None
@@ -526,3 +530,31 @@ def test_reuse_regrades_without_replaying_models_and_retains_failures(
         snapshot = second / record["stages"][0]["snapshot"]["path"]
         assert not (snapshot / "dist/temporary.js").exists()
         assert (snapshot.parent / "diagnostic-source/dist/temporary.js").is_file()
+
+
+def test_moved_cache_and_run_keep_their_cache_decisions_readable(tmp_path: Path) -> None:
+    first, tasks, records = _cohort(tmp_path / "first", tmp_path / "cache-a/vanilla")
+    _publish(first, tasks, records)
+    (tmp_path / "cache-a").rename(tmp_path / "cache-b")
+    second, _, entries = _cohort(tmp_path / "second", tmp_path / "cache-b/vanilla")
+    shutil.rmtree(second.root)
+    second.root.mkdir()
+    try:
+        second.reserve()
+        decisions = second.decisions()
+        for entry in entries:
+            second.import_attempt(entry)
+    finally:
+        second.close()
+    moved = tmp_path / "moved-run"
+    second.root.rename(moved)
+    for identifier, decision in decisions.items():
+        assert decision["status"] == "hit"
+        assert not any(
+            isinstance(value, str) and value.startswith("/") for value in decision.values()
+        )
+        cohort = tmp_path / "cache-b" / str(decision["origin_cohort"])
+        assert (cohort / "attempts" / str(decision["origin_attempt"])).is_dir()
+        origin = json.loads((moved / "baseline-evidence" / identifier / "origin.json").read_text())
+        assert {key: origin[key] for key in decision} == decision
+        assert all((moved / row["path"]).is_file() for row in origin["historical_evidence"])

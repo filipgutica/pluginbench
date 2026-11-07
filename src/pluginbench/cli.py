@@ -82,6 +82,17 @@ def _readiness_table(report: dict[str, object]) -> str:
     )
 
 
+def _vanilla_cache_lines(report: dict[str, object]) -> list[str]:
+    """One line per vanilla attempt: would `run` reuse it from the cache?"""
+    rows = report["vanilla_cache"]
+    assert isinstance(rows, list)
+    hits = sum(row["status"] == "hit" for row in rows)
+    return [f"Vanilla cache: {hits} of {len(rows)} attempts hit"] + [
+        f"  {row['task_id']} repeat {row['repeat']}: {row['status']} ({row['cache_key'][:12]})"
+        for row in rows
+    ]
+
+
 def _new_run_directory(prefix: str = "") -> Path:
     return Path("runs") / (prefix + datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ"))
 
@@ -174,8 +185,8 @@ def run(
         None,
         "--jobs",
         min=1,
-        max=16,
-        help="Maximum jobs per phase; Harbor coding is bounded by Docker CPU/memory capacity (up to 4).",
+        max=4,
+        help="Jobs per phase (default 2, at most 4); fails if Docker capacity is lower.",
     ),
     dry_run: bool = typer.Option(
         False,
@@ -310,6 +321,7 @@ def check(
     try:
         destination = output or _new_run_directory("check-")
         report = check_evaluation(load_evaluation(config), destination, progress=typer.echo)
+        typer.echo("\n".join(_vanilla_cache_lines(report)))
         typer.echo(_readiness_table(report))
         typer.echo(f"Ready. Check: {destination / 'check.json'}")
     except (OSError, ValueError, yaml.YAMLError, subprocess.SubprocessError) as exc:

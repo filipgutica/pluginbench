@@ -722,7 +722,10 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
                 "guidance": attempt.get("arm"),
                 "baseline_origin": {
                     key: _map(origins.get(str(attempt.get("id")))).get(key)
-                    for key in ("cache_key", "origin_run", "origin_attempt", "evidence")
+                    # origin_run is the absolute path historical runs recorded.
+                    for key in (
+                        "cache_key", "origin_cohort", "origin_run", "origin_attempt", "evidence"
+                    )
                 }
                 if str(attempt.get("id")) in origins
                 else None,
