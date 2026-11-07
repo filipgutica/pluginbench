@@ -132,8 +132,13 @@ form and uses the same redundancy calculation. Named tests with empty bitsets
 are retained; the empty context name is ignored.
 
 The producer must record all measured test cases, including cases that reach no
-source lines, and use stable, unique identities across snapshots. Generate both
-reports from the same run and original-source line population. A missing sidecar
+source lines, and use stable, unique identities across snapshots. Use the
+report's original-source line population. Generate both reports from the same
+run when per-test sampling leaves the report unchanged. V8 inspector coverage
+cannot: its counter resets are isolate-wide, so sampling inside c8 or Vitest's
+v8 provider changes the report. Such a command may take per-test samples in a
+second run of the same suite. Every per-test line must then be executed in the
+report, or the command writes no sidecar. A missing sidecar
 or one without named test contexts leaves redundancy unknown with a reason; file-level hits never substitute
 for per-test data. Both snapshots need per-test data. The frozen input must not
 already contain the sidecar, to prevent stale attribution. Native collection
@@ -141,7 +146,9 @@ retains it as `report.raw.per-test.json` beside `report.raw`.
 
 The [JavaScript inspector spike](../tests/fixtures/js-per-test-coverage/README.md)
 demonstrates serial plain JavaScript and awaited async work with `node:test`.
-Mocha integration and Vitest TypeScript source-map remapping remain unverified.
+[Coverage profiles](coverage-profiles/README.md) has a Mocha hook for c8 suites
+and the csstree profile that uses it. Vitest TypeScript source-map remapping
+remains unverified.
 
 Changed-line coverage is incomplete when an added source file is missing from the coverage report. Configure coverage to report every source file, for example coverage.py `--source=<package>` or c8 `--all`.
 
