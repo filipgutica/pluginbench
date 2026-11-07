@@ -1,0 +1,244 @@
+"""Resume keeps every finished attempt, discards only started ones, and never replays a call.
+
+Killed runs come from a child process that SIGKILLs itself at a named boundary, so no except
+or finally block runs, as when the interrupted pilot was killed.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+import pluginbench
+import resume_support
+from native_support import execution as native_execution
+from pluginbench import harbor_backend, parallel, study
+from pluginbench.ledger import Ledger
+
+_PATH = os.pathsep.join([str(Path(pluginbench.__file__).parents[1]), str(Path(__file__).parent)])
+
+
+def _killed_run(
+    tmp_path: Path,
+    *,
+    boundary: str,
+    at: int,
+    tasks: int = 2,
+    treatments: int = 1,
+    repeats: int = 3,
+    jobs: int = 1,
+) -> Path:
+    recipe = resume_support.recipe(
+        tmp_path / "config", tasks=tasks, treatments=treatments, repeats=repeats, jobs=jobs
+    )
+    root = tmp_path / "run"
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import resume_support; resume_support.child()",
+            str(recipe),
+            str(root),
+            boundary,
+            str(at),
+        ],
+        env={**os.environ, "PYTHONPATH": _PATH},
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert child.returncode == -signal.SIGKILL, child.stderr
+    return root
+
+
+def _json(path: Path) -> Any:
+    return json.loads(path.read_text())
+
+
+@pytest.mark.parametrize(
+    ("boundary", "kept", "discarded"),
+    [
+        ("before-receipt", 2, 0),
+        ("during-call", 2, 1),
+        ("after-execution", 2, 1),
+        ("after-record", 3, 0),
+        ("after-ledger", 3, 0),
+    ],
+)
+def test_resume_after_sigkill_at_each_stage_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str, kept: int, discarded: int
+) -> None:
+    root = _killed_run(tmp_path, boundary=boundary, at=3)
+    assert _json(root / "run.json")["status"] == "running"
+    killed = _json(root / "plan.json")["entries"]
+    finished = [entry["id"] for entry in killed[:kept]]
+    receipts = {key: (root / "records" / f"{key}.json").read_bytes() for key in finished}
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+
+    study.resume_study(root)
+
+    run = _json(root / "run.json")
+    plan = _json(root / "plan.json")
+    assert run["status"] == "complete"
+    assert Counter(run["attempt_states"].values()) == {"complete": 12}
+    # Finished attempts keep their receipts and are never coded again.
+    assert not set(calls) & set(finished)
+    assert len(calls) == len(set(calls)) == 12 - kept
+    assert {key: (root / "records" / f"{key}.json").read_bytes() for key in finished} == receipts
+    assert len(run["discarded_attempts"]) == discarded
+    third = killed[2]
+    if discarded:
+        old = run["discarded_attempts"][third["id"]]
+        assert old["state"] == "discarded-interrupted"
+        stage = old["stages"]["handoff"]
+        if boundary == "during-call":
+            assert stage["usage_status"].startswith("unknown") and stage["work"] is None
+        else:
+            assert stage["usage_status"] == "saved before the interruption"
+            assert stage["work"]["tokens"] is not None
+        replacement = plan["entries"][2]
+        assert old["replaced_by"] == replacement["id"] != third["id"]
+        assert {key: replacement[key] for key in ("task_id", "arm", "attempt")} == {
+            key: third[key] for key in ("task_id", "arm", "attempt")
+        }
+        assert replacement["id"] in calls
+    else:
+        assert plan["entries"][2]["id"] == third["id"]
+        assert (third["id"] in calls) is (kept == 2)
+    rows = Ledger.open(root / "ledger.sqlite").attempts()
+    assert Counter(row["state"] for row in rows) == {
+        "complete": 12,
+        **({"discarded-interrupted": discarded} if discarded else {}),
+    }
+    report = _json(root / "report/assessment-report.json")
+    assert len(report["attempts"]) == 12
+    assert set(report["discarded_attempts"]) == set(run["discarded_attempts"])
+
+
+def test_interrupted_pilot_shape_resumes_without_recoding_complete_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pilot's shape: 4 tasks x 3 arms x 3 repeats, killed with 2 calls in flight."""
+    root = _killed_run(
+        tmp_path, boundary="two-in-flight", at=20, tasks=4, treatments=2, repeats=3, jobs=2
+    )
+    # Runs from before the ledger kept their states only in run.json.
+    (root / "ledger.sqlite").unlink()
+    shutil.rmtree(root / "records")
+    killed = _json(root / "run.json")
+    killed.pop("discarded_attempts")
+    (root / "run.json").write_text(json.dumps(killed))
+    states = killed["attempt_states"]
+    assert killed["status"] == "running"
+    assert Counter(states.values()) == {"complete": 19, "running": 2, "pending": 15}
+    running = sorted(key for key, state in states.items() if state == "running")
+    complete = {key for key, state in states.items() if state == "complete"}
+    assert all((root / "invocations" / key / "handoff.json").is_file() for key in running)
+    assert not any((root / "attempts" / key).exists() for key in running)
+    saved = {
+        record["id"]: record
+        for record in study._bound_document(root, killed["assessment_input"])["records"]
+    }
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+
+    study.resume_study(root)
+
+    run = _json(root / "run.json")
+    assert run["status"] == "complete"
+    assert len(calls) == 17 and not set(calls) & complete
+    assert sorted(run["discarded_attempts"]) == running
+    assert all(
+        row["state"] == "discarded-interrupted"
+        and row["stages"]["handoff"]["usage_status"].startswith("unknown")
+        and row["replaced_by"] in calls
+        for row in run["discarded_attempts"].values()
+    )
+    assert Counter(run["attempt_states"].values()) == {"complete": 36}
+    resumed = {
+        record["id"]: record
+        for record in study._bound_document(root, run["assessment_input"])["records"]
+    }
+    assert all(resumed[key] == saved[key] for key in complete)
+    assert run["actual_calls"] == 21 + 17
+
+
+def test_work_finished_while_a_stop_drains_is_kept_with_interrupted_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from threading import Barrier, Event, Lock
+
+    recipe = resume_support.recipe(tmp_path / "config", tasks=2, treatments=1, repeats=1, jobs=2)
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+    gate, lock = Barrier(2), Lock()
+    cancellation = Event()
+    monkeypatch.setattr(parallel, "Event", lambda: cancellation)
+    usage = {"input_tokens": 10, "output_tokens": 5}
+
+    def invoke(**kwargs: Any) -> dict[str, Any]:
+        with lock:
+            calls.append(kwargs["entry"]["id"])
+            ordinal = len(calls)
+        gate.wait(timeout=5)
+        area = kwargs["area"]
+        if ordinal == 1:
+            (area / "artifacts").mkdir()
+            (area / "artifacts/execution.json").write_text(json.dumps({"usage": usage}))
+            raise KeyboardInterrupt("stopped by SIGTERM")
+        assert cancellation.wait(timeout=5)
+        (area / "workspace/src/answer.py").write_text("answer = 1\n")
+        return native_execution(area, kwargs["protocol"]["native_task_identity"], reward=1)
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
+    root = tmp_path / "run"
+    with pytest.raises(KeyboardInterrupt):
+        study.run_study(study.load_study(recipe), root)
+    states = _json(root / "run.json")["attempt_states"]
+    stopped, drained = calls
+    assert states[stopped] == "interrupted"
+    assert states[drained] == "complete"
+
+    calls.clear()
+    monkeypatch.setattr(parallel, "Event", Event)  # The captured event is already set.
+    resume_support.install(monkeypatch, calls)
+    study.resume_study(root)
+    run = _json(root / "run.json")
+    assert drained not in calls and len(calls) == 3
+    assert run["discarded_attempts"][stopped]["stages"]["handoff"]["work"]["tokens"] == usage
+    assert Counter(run["attempt_states"].values()) == {"complete": 4}
+
+
+def test_resume_reads_a_moved_copy_from_its_own_frozen_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = _killed_run(tmp_path, boundary="during-call", at=2)
+    moved = tmp_path / "moved"
+    shutil.copytree(original, moved, symlinks=True)
+    # Anything still read from the original location would now fail.
+    shutil.rmtree(tmp_path / "config")
+    shutil.rmtree(original)
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+    paths: list[str] = []
+    invoke = harbor_backend.invoke_native
+
+    def recording(**kwargs: Any) -> dict[str, Any]:
+        paths.append(str(kwargs["task_dir"]))
+        paths.append(str(kwargs["protocol"]["native_task_identity"]["task_dir"]))
+        return invoke(**kwargs)
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", recording)
+    study.resume_study(moved)
+    assert len(calls) == 11
+    assert paths and all(path.startswith(str(moved.resolve())) for path in paths)

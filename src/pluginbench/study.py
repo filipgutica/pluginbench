@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import json
 import os
@@ -27,6 +28,8 @@ from pluginbench.treatments import (
 )
 from pluginbench.native_treatments import NativeCapabilities, DELIVERY_POLICY, admit
 from pluginbench.baselines import BaselineCache
+from pluginbench.ledger import LEDGER_NAME, Ledger
+from pluginbench.run_lock import RunMoved
 from pluginbench.parallel import run_jobs, validate_jobs
 from pluginbench.assessment import _correctness, build_assessment, write_assessment
 from pluginbench.assessment_metrics import EXCLUDED_NAMES, inspect_snapshot
@@ -768,8 +771,38 @@ def _checkpoint(
                 }
                 for path in sorted((root / "baseline-evidence").glob("*/origin.json"))
             },
+            # Interrupted attempts a resume replaced; their calls stay in actual_calls.
+            "discarded_attempts": {
+                path.stem: {**json.loads(path.read_text()), "evidence": _reference(root, path)}
+                for path in sorted((root / "discarded").glob("*.json"))
+            },
         },
     )
+
+
+def _pending_record(entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **{key: entry[key] for key in ("id", "task_id", "attempt", "arm")},
+        "model": None,
+        "stages": [{"id": "handoff", "snapshot": None, "work": None}],
+    }
+
+
+@dataclass
+class _Run:
+    """The state one coding pass shares; only the coordinator thread changes it."""
+
+    root: Path
+    study: ResolvedStudy
+    plan: dict[str, Any]
+    manifest: dict[str, Any]
+    states: dict[str, str]
+    ledger: Ledger
+
+    @property
+    def records(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = self.manifest["records"]
+        return records
 
 
 def run_study(
@@ -779,6 +812,7 @@ def run_study(
     progress: Callable[[str], None] | None = None,
     baseline_cache: Path | None = None,
     baseline_identity: dict[str, object] | None = None,
+    guard: Callable[[], None] | None = None,
 ) -> Path:
     validate_jobs(study.recipe.jobs)
     for treatment in study.treatments.values():
@@ -794,21 +828,217 @@ def run_study(
     _write(root / "plan.json", plan)
     preflight: dict[str, Any] = {"status": "not started"}
     _write(root / "runtime-preflight.json", preflight)
-    records: list[dict[str, Any]] = [
-        {
-            **{key: entry[key] for key in ("id", "task_id", "attempt", "arm")},
-            "model": None,
-            "stages": [{"id": "handoff", "snapshot": None, "work": None}],
-        }
-        for entry in plan["entries"]
-    ]
     states = {entry["id"]: "pending" for entry in plan["entries"]}
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "name": study.recipe.name,
-        "records": records,
+        "records": [_pending_record(entry) for entry in plan["entries"]],
     }
     _checkpoint(root, frozen, manifest, states, status="preflight")
+    ledger = Ledger.create(root / LEDGER_NAME, plan["entries"], states)
+    return _run_attempts(
+        _Run(root, frozen, plan, manifest, states, ledger),
+        progress=progress,
+        baseline_cache=baseline_cache,
+        baseline_identity=baseline_identity,
+        guard=guard,
+    )
+
+
+def _frozen_study(root: Path) -> ResolvedStudy:
+    """The study frozen in `root`, at root's current path.
+
+    Saved absolute paths may name the location where the run started. Tasks and treatments are
+    read from this copy instead, so a moved, stopped run never uses another run's files.
+    """
+    frozen = root / "frozen"
+    saved = json.loads((frozen / "resolved-recipe.json").read_text())
+    source = StudyRecipe.model_validate(yaml.safe_load((frozen / "source-recipe.yaml").read_text()))
+    auth_file = source.auth_file.expanduser()
+    if not auth_file.is_absolute():
+        raise ValueError("resuming a study needs an absolute auth_file in its source recipe")
+    recipe = StudyRecipe.model_validate(
+        {**saved, "tasks": frozen / "tasks.json", "auth_file": auth_file}
+    )
+    for collector in recipe.collectors:
+        if not collector.config.resolve().is_relative_to(frozen.resolve()):
+            raise ValueError("study collectors were frozen at another path; resume them there")
+    recipe.treatments = {
+        name: resolve_treatment(item, frozen, recipe.harness)
+        for name, item in recipe.treatments.items()
+    }
+    tasks = tuple(
+        dataclasses.replace(
+            task,
+            provenance={
+                **task.provenance,
+                "native_task_identity": json.dumps(
+                    {
+                        **native_identity(task),
+                        "task_dir": str(task.native_task),
+                        "fixture_dir": str(task.fixture),
+                    }
+                ),
+            },
+        )
+        for task in _load_tasks(recipe)
+    )
+    return ResolvedStudy(
+        recipe,
+        tasks,
+        recipe.treatments,
+        frozen / "source-recipe.yaml",
+        json.loads((frozen / "treatment-selection.json").read_text()),
+    )
+
+
+def _replacement(plan: dict[str, Any], slot: int, discarded: dict[str, Any]) -> dict[str, Any]:
+    """Same task, arm, repeat and slot as the discarded attempt, under a new derived ID."""
+    entry = {key: discarded[key] for key in ("task_id", "arm", "attempt")}
+    identity = json.dumps([plan["seed"], slot, entry, "replaces", discarded["id"]], sort_keys=True)
+    return {**entry, "id": hashlib.sha256(identity.encode()).hexdigest()[:16]}
+
+
+def _discard(root: Path, slot: int, entry: dict[str, Any], replacement: str) -> None:
+    """Write the discarded attempt's receipt: its started invocations and any saved usage."""
+    starts = sorted((root / "invocations" / entry["id"]).glob("*.json"))
+    stages = {}
+    for marker in starts:
+        execution = root / "attempts" / entry["id"] / marker.stem / "execution.json"
+        saved = json.loads(execution.read_text()) if execution.is_file() else None
+        stages[marker.stem] = {
+            "invocation_start": _reference(root, marker),
+            "execution": _reference(root, execution) if saved is not None else None,
+            "work": _work(saved) if saved is not None else None,
+            "usage_status": "saved before the interruption"
+            if saved is not None
+            else "unknown: the run was killed before this attempt saved an execution receipt",
+        }
+    _write(
+        root / "discarded" / f"{entry['id']}.json",
+        {
+            **{key: entry[key] for key in ("id", "task_id", "arm", "attempt")},
+            "slot": slot,
+            "state": "discarded-interrupted",
+            "replaced_by": replacement,
+            "stages": stages,
+        },
+    )
+
+
+def _reconcile(root: Path, run: dict[str, Any], ledger: Ledger) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+    """Plan, records and states for the next coding pass; never discards finished work.
+
+    - complete, or a record receipt on disk: kept as complete.
+    - started (an invocation receipt exists) but unfinished: discarded-interrupted, and its slot
+      gets a new pending attempt. Its model call is never replayed.
+    - never started: pending again; files it left are observer copies with no paid evidence.
+
+    Each receipt is written before the ledger changes, and the ledger decides which attempt owns
+    each slot, so a resume that is itself interrupted can run again.
+    """
+    plan = _bound_document(root, run["plan"])
+    checkpoint = _bound_document(root, run["assessment_input"])
+    saved = {record["id"]: record for record in checkpoint["records"]}
+    live = {row["slot"]: row for row in ledger.attempts() if row["state"] != "discarded-interrupted"}
+    if sorted(live) != list(range(len(plan["entries"]))):
+        raise ValueError("ledger slots differ from the saved study plan")
+    records = []
+    states: dict[str, str] = {}
+    for slot in range(len(plan["entries"])):
+        row = live[slot]
+        entry = {key: row[key] for key in ("id", "task_id", "arm", "attempt")}
+        receipt = root / "records" / f"{entry['id']}.json"
+        if row["state"] == "complete" or receipt.is_file():
+            if row["record"] is not None:
+                record = _bound_document(root, row["record"])
+            elif receipt.is_file():
+                record = json.loads(receipt.read_text())
+                ledger.complete(entry["id"], _reference(root, receipt), [stage["id"] for stage in record["stages"]])
+            else:
+                record = saved[entry["id"]]  # Older runs kept records only in assessment-input.json.
+            records.append(record)
+            states[entry["id"]] = "complete"
+        elif not list((root / "invocations" / entry["id"]).glob("*.json")):
+            if row["state"] != "pending":
+                for leftover in (root / "attempts" / entry["id"], root / "baseline-evidence" / entry["id"]):
+                    if leftover.exists():
+                        shutil.rmtree(leftover)
+                ledger.set_state(entry["id"], "pending")
+            records.append(_pending_record(entry))
+            states[entry["id"]] = "pending"
+        else:
+            replacement = _replacement(plan, slot, entry)
+            _discard(root, slot, entry, replacement["id"])
+            ledger.replace(entry["id"], replacement)
+            records.append(_pending_record(replacement))
+            states[replacement["id"]] = "pending"
+            entry = replacement
+        if plan["entries"][slot]["id"] != entry["id"]:
+            decisions = plan.get("baseline_cache")
+            if decisions and plan["entries"][slot]["id"] in decisions:
+                decisions[entry["id"]] = decisions.pop(plan["entries"][slot]["id"])
+            plan["entries"][slot] = entry
+    _write(root / "plan.json", plan)
+    return plan, {**checkpoint, "records": records}, states
+
+
+def resume_study(
+    output: Path,
+    *,
+    progress: Callable[[str], None] | None = None,
+    baseline_cache: Path | None = None,
+    baseline_identity: dict[str, object] | None = None,
+    guard: Callable[[], None] | None = None,
+) -> Path:
+    """Code every slot that has no complete attempt; keep complete attempts as they are."""
+    root = output.resolve()
+    if baseline_cache is not None and not baseline_identity:
+        raise ValueError("baseline reuse requires a fixed coding identity")
+    _assert_frozen(root)
+    run = json.loads((root / "run.json").read_text())
+    if run["status"] == "complete":
+        return root
+    frozen = _frozen_study(root)
+    validate_jobs(frozen.recipe.jobs)
+    for treatment in frozen.treatments.values():
+        admit(treatment, frozen.recipe.harness)
+    path = root / LEDGER_NAME
+    # Runs from before the ledger kept their states only in run.json.
+    ledger = Ledger.open(path) if path.exists() else Ledger.create(
+        path, _bound_document(root, run["plan"])["entries"], run["attempt_states"]
+    )
+    plan, manifest, states = _reconcile(root, run, ledger)
+    if progress:
+        kept = sum(state == "complete" for state in states.values())
+        discarded = len(list((root / "discarded").glob("*.json")))
+        progress(
+            f"Resuming: {kept} complete attempts kept, {len(states) - kept} to code, "
+            f"{discarded} interrupted attempts discarded"
+        )
+    _checkpoint(root, frozen, manifest, states, status="running")
+    return _run_attempts(
+        _Run(root, frozen, plan, manifest, states, ledger),
+        progress=progress,
+        baseline_cache=baseline_cache,
+        baseline_identity=baseline_identity,
+        guard=guard,
+    )
+
+
+def _run_attempts(
+    run: _Run,
+    *,
+    progress: Callable[[str], None] | None,
+    baseline_cache: Path | None,
+    baseline_identity: dict[str, object] | None,
+    guard: Callable[[], None] | None,
+) -> Path:
+    """Code every slot whose attempt is not complete, checkpointing each state change."""
+    root, frozen, plan, manifest, states, ledger = (
+        run.root, run.study, run.plan, run.manifest, run.states, run.ledger
+    )
+    records = run.records
     tasks = {task.task_id: task for task in frozen.tasks}
     cache = None
     try:
@@ -845,7 +1075,16 @@ def run_study(
                     },
                 },
             ).reserve()
-            plan["baseline_cache"] = cache.decisions()
+            # Decisions for complete attempts record what happened when they ran.
+            decisions = plan.get("baseline_cache", {})
+            decisions.update(
+                {
+                    attempt_id: decision
+                    for attempt_id, decision in cache.decisions().items()
+                    if states[attempt_id] != "complete"
+                }
+            )
+            plan["baseline_cache"] = decisions
             _write(root / "plan.json", plan)
             _checkpoint(root, frozen, manifest, states, status="preflight")
         preflight = harbor_backend.preflight(
@@ -865,17 +1104,41 @@ def run_study(
         )
 
         def commit(index: int, record: dict[str, Any], status: str) -> None:
+            if guard:
+                guard()
             records[index] = record
             states[record["id"]] = status
+            if status == "complete":
+                # The record receipt is on disk before the ledger calls the attempt complete.
+                receipt = root / "records" / f"{record['id']}.json"
+                _write(receipt, record)
+                ledger.complete(
+                    record["id"],
+                    _reference(root, receipt),
+                    [stage["id"] for stage in record["stages"]],
+                )
+            else:
+                ledger.set_state(record["id"], status)
+            _checkpoint(root, frozen, manifest, states, status="running")
+
+        def invoked(index: int, record: dict[str, Any], stage_id: str) -> None:
+            if guard:
+                guard()
+            records[index] = record
+            receipt = root / "invocations" / record["id"] / f"{stage_id}.json"
+            ledger.stage_started(record["id"], stage_id, _reference(root, receipt))
             _checkpoint(root, frozen, manifest, states, status="running")
 
         def submitted(index: int) -> None:
+            if guard:
+                guard()
             entry = plan["entries"][index]
             if progress:
                 progress(
                     f"Coding {index + 1}/{len(plan['entries'])}: {entry['task_id']} · {entry['arm']} · repeat {entry['attempt']}"
                 )
             states[entry["id"]] = "running"
+            ledger.set_state(entry["id"], "running")
             _checkpoint(root, frozen, manifest, states, status="running")
 
         def attempt(
@@ -900,7 +1163,7 @@ def run_study(
                         "status": "native invocation started",
                     },
                 )
-                emit(partial(commit, index, copy.deepcopy(record), "running"))
+                emit(partial(invoked, index, copy.deepcopy(record), stage_id))
 
             try:
                 attempt_dir = root / "attempts" / entry["id"]
@@ -967,9 +1230,9 @@ def run_study(
                         stages=[stage],
                         model=_consistent_observation([execution], "actual_primary_models"),
                         runtime={
-                            "harness": f"{study.recipe.harness}-cli",
+                            "harness": f"{frozen.recipe.harness}-cli",
                             "harness_version": _observed_harness_version([execution]),
-                            "requested_reasoning_effort": study.recipe.reasoning,
+                            "requested_reasoning_effort": frozen.recipe.reasoning,
                             "reasoning_effort": _consistent_observation(
                                 [execution], "runtime_effort_evidence"
                             ),
@@ -982,12 +1245,13 @@ def run_study(
                         commit,
                         index,
                         copy.deepcopy(record),
-                        "complete" if completed and not cancelled.is_set() else "interrupted",
+                        # Work that finished while a stop drained it is kept, not discarded.
+                        "complete" if completed else "interrupted",
                     )
                 )
 
         run_jobs(
-            list(range(len(plan["entries"]))),
+            [index for index, entry in enumerate(plan["entries"]) if states[entry["id"]] != "complete"],
             jobs=frozen.recipe.jobs,
             operation=attempt,
             on_submit=submitted,
@@ -995,10 +1259,13 @@ def run_study(
         _checkpoint(root, frozen, manifest, states, status="complete")
         if cache is not None:
             cache.publish(records, frozen.tasks)
+    except RunMoved:
+        raise  # Writing anything now would recreate the old path.
     except BaseException as exc:
         for attempt_id, state in states.items():
             if state == "running":
                 states[attempt_id] = "interrupted"
+                ledger.set_state(attempt_id, "interrupted")
         for record in records:
             observed = []
             for stage in record["stages"]:
@@ -1020,6 +1287,7 @@ def run_study(
     finally:
         if cache is not None:
             cache.close()
+        ledger.close()
     report_study(root)
     return root
 
@@ -1146,6 +1414,12 @@ def report_study(
         "error": run.get("error"),
     }
     report["baseline_origin"] = run.get("baseline_origin", {})
+    report["discarded_attempts"] = run.get("discarded_attempts", {})
+    for discarded in report["discarded_attempts"].values():
+        if _bound_document(root, discarded["evidence"]) != {
+            key: value for key, value in discarded.items() if key != "evidence"
+        }:
+            raise ValueError("discarded attempt differs from its bound evidence")
     for origin in report["baseline_origin"].values():
         if _bound_document(root, origin["evidence"]) != {
             key: value for key, value in origin.items() if key != "evidence"
