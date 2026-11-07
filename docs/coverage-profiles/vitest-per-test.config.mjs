@@ -11,7 +11,11 @@ const flags = ["--no-opt", "--no-maglev"];
 const config = mergeConfig(base, {
   test: {
     setupFiles: [helper("./seeded-random.mjs"), ...(perTest ? [helper("./setup.mjs")] : [])],
-    ...(perTest && { poolOptions: { forks: { execArgv: flags }, threads: { execArgv: flags } } }),
+    ...(perTest && {
+      // Same-title tests are identified by the source at their location.
+      includeTaskLocation: true,
+      poolOptions: { forks: { execArgv: flags }, threads: { execArgv: flags } },
+    }),
   },
 });
 // The per-test run's own report is discarded, so its thresholds would only add noise.

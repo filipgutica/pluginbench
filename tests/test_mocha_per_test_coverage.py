@@ -4,6 +4,7 @@ Mocha and c8 are not installed here, so a driver calls the hooks with `this.curr
 does, and a stand-in v8-to-istanbul applies its line rule. The task-image run covers the real tools.
 """
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ import subprocess
 import pytest
 import yaml
 
+from pluginbench import assessment_metrics
 from pluginbench.coverage_report import numbits_to_lines, parse_lcov
 
 PROFILES = Path(__file__).parents[1] / "docs/coverage-profiles"
@@ -62,26 +64,42 @@ export function negative() {
 }
 """
 
-# Calls the root hooks as Mocha does: the plugin loads first, then the spec imports, then each test.
+# Calls the root hooks as Mocha does: the plugin loads first, then the spec imports, then each test
+# of one registered suite, in order. Tests are [title, body] pairs; a body is a function source.
 DRIVER = """
 import { resolve } from "node:path";
 
 const { mochaHooks: hooks } = await import(process.argv[2]);
 const { positive, negative } = await import(resolve("lib/subject.js"));
-const run = async (title, body, { overlap = false } = {}) => {
-  const context = { currentTest: { file: resolve("test/a.spec.js"), fullTitle: () => title } };
-  await hooks.beforeEach?.call(context);
-  if (overlap) await hooks.beforeEach?.call(context);
-  await new Promise((done) => setImmediate(done));
-  body();
-  await hooks.afterEach?.call(context);
+const bodies = {
+  positive: () => positive(),
+  negative: () => negative(),
+  both: () => [positive(), negative()],
+  nothing: () => {},
 };
-await run("suite positive", positive);
-await run("suite positive #2", negative, { overlap: process.argv[3] === "overlap" });
-await run("suite positive", positive);
-await run("suite nothing", () => {});
+const root = { root: true, tests: [], suites: [] };
+const suite = { parent: root, tests: [], suites: [] };
+root.suites.push(suite);
+for (const [title, body] of JSON.parse(process.argv[4])) {
+  suite.tests.push({ file: resolve("test/a.spec.js"), fullTitle: () => title, fn: bodies[body], parent: suite });
+}
+for (const currentTest of suite.tests) {
+  const context = { currentTest };
+  await hooks.beforeEach?.call(context);
+  if (process.argv[3] === "overlap") await hooks.beforeEach?.call(context);
+  await new Promise((done) => setImmediate(done));
+  currentTest.fn();
+  await hooks.afterEach?.call(context);
+}
 hooks.afterAll?.();
 """
+
+TESTS = [
+    ("suite positive", "positive"),
+    ("suite positive #2", "negative"),
+    ("suite positive", "positive"),
+    ("suite nothing", "nothing"),
+]
 
 
 def lcov(project: Path, executed: set[int]) -> str:
@@ -93,7 +111,11 @@ def lcov(project: Path, executed: set[int]) -> str:
 
 
 def run_hook(
-    tmp_path: Path, *, scenario: str = "", executed: frozenset[int] = frozenset({2, 3, 5, 6})
+    tmp_path: Path,
+    *,
+    scenario: str = "",
+    executed: frozenset[int] = frozenset({2, 3, 5, 6}),
+    tests: list[tuple[str, str]] = TESTS,
 ) -> tuple[Path, Path, str]:
     project = tmp_path / "project"
     for relative, content in {
@@ -114,7 +136,7 @@ def run_hook(
         env["NODE_V8_COVERAGE"] = str(tmp_path / "v8")
     flags = [] if scenario == "jit" else ["--no-opt", "--no-maglev"]
     driven = subprocess.run(
-        ["node", *flags, "driver.mjs", str(HOOK), scenario],
+        ["node", *flags, "driver.mjs", str(HOOK), scenario, json.dumps(tests)],
         cwd=project,
         env=env,
         capture_output=True,
@@ -141,6 +163,7 @@ pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="the hook r
 
 def test_hook_attributes_each_tests_lines_and_keeps_identities_unique(tmp_path: Path) -> None:
     project, report, _ = run_hook(tmp_path)
+    body = hashlib.sha256(b"() => positive()").hexdigest()[:8]
     # Sorted keys make repeated runs byte-identical whatever order tests reported in.
     raw = json.loads(report.with_name("lcov.info.per-test.json").read_text())["per_test_numbits"]
     assert list(raw) == sorted(raw)
@@ -156,12 +179,46 @@ def test_hook_attributes_each_tests_lines_and_keeps_identities_unique(tmp_path: 
         name: {line for bits in files.values() for line in numbits_to_lines(bits)}
         for name, files in parsed["per_test_numbits"].items()
     } == {
-        "test/a.spec.js::suite positive": {2, 3},
-        # A real "#2" title keeps its name; the repeated title skips to #3.
+        # Repeated titles carry a hash of the test's function source; identical bodies are then
+        # numbered in run order. Unique titles, including a real "#2", stay bare.
+        f"test/a.spec.js::suite positive #{body}": {2, 3},
+        f"test/a.spec.js::suite positive #{body}-2": {2, 3},
         "test/a.spec.js::suite positive #2": {5, 6},
-        "test/a.spec.js::suite positive #3": {2, 3},
         "test/a.spec.js::suite nothing": set(),
     }
+
+
+def test_inserting_a_same_title_test_flags_the_new_test_not_the_old_one(tmp_path: Path) -> None:
+    """A new test that reuses an existing title must not take over the existing test's identity."""
+    measured = []
+    for name, tests in {
+        "before": [("suite check", "both")],
+        "after": [("suite check", "positive"), ("suite check", "both")],
+    }.items():
+        project, report, _ = run_hook(tmp_path / name, tests=tests)
+        parsed = parse_lcov(
+            report,
+            snapshot=project,
+            source_scope=["lib/**"],
+            test_scope=["test/**"],
+            workdir=str(project),
+        )
+        sources = {"lib/subject.js", "lib/unused.js"}
+        measured.append(assessment_metrics._coverage(parsed, sources, ["lib/**"]))
+    for name, source in (("old", ""), ("new", SUBJECT)):
+        (tmp_path / name / "lib").mkdir(parents=True)
+        (tmp_path / name / "lib/subject.js").write_text(source)
+    change = assessment_metrics.compare_snapshots(tmp_path / "old", tmp_path / "new")
+    changed = assessment_metrics._changed_line_coverage(*measured, change)
+    inserted = next(
+        name
+        for name, files in parsed["per_test_numbits"].items()
+        if {line for bits in files.values() for line in numbits_to_lines(bits)} == {2, 3}
+    )
+    # The inserted test reaches only lines the existing test also reaches, so it alone is
+    # redundant. The existing test is renamed too (bare title to hashed), so it also counts as added.
+    assert changed["redundant_added_test_names"] == [inserted]
+    assert changed["added_tests"] == 2
 
 
 @pytest.mark.parametrize(

@@ -34,13 +34,25 @@ the default tiers, two identical csstree runs disagreed on the lines of 235 of
 
 ### Identity
 
-A test's identity is its spec path relative to the working directory, then
-`::`, then Mocha's `fullTitle()`. Vitest uses its full test name (`suite >
-test`) in the same position. The first test with a title keeps the bare
-identity. Later tests with the same title get ` #2`, ` #3`, and so on, in run
-order. A suffix skips any identity that a real title already uses. csstree has
-8 repeated titles among 16,725 tests; true-myth has 3 among 564. A verbatim
-copy of a test is therefore a new test.
+A test's title is its spec path relative to the working directory, then `::`,
+then Mocha's `fullTitle()`. Vitest uses its full test name (`suite > test`) in
+the same position. A title that only one registered test uses is the identity.
+
+Tests that share a title get ` #` and the first 8 hex digits of a SHA-256 of
+their own source: the test function's source for Mocha, and the `test(...)`
+call expression at the test's location for Vitest, which keeps only a wrapper
+of the function. Adding a test therefore does not rename a different test with
+the same title. Tests with the same title and the same source, such as tests
+generated in a loop, are then numbered `-2`, `-3`, and so on in run order. A
+duplicate identity leaves no sidecar. csstree has 18 such tests in 6 groups
+among 16,725 tests; true-myth has 6 in 3 groups among 564.
+
+When a new test reuses a title that one existing test had, the existing test
+changes from the bare title to a hashed identity, so both tests count as added.
+Redundancy is still right when the new test reaches a strict subset of the
+existing test's added lines: the smaller test is checked first and flagged.
+When the new test reaches more, the existing test can be flagged instead. An
+edited test keeps its identity unless its title is repeated.
 
 ### Limits
 
@@ -49,7 +61,8 @@ copy of a test is therefore a new test.
 - Work that a test leaves running after it finishes is counted in a later test.
   Suite-level `before` and `after` hooks belong to no test. `beforeEach` and
   `afterEach` hooks belong to their test.
-- Retried tests get a new ordinal identity for each attempt.
+- Retries are not supported. A retried test with a unique title leaves no
+  sidecar; one with a repeated title gets a numbered identity per attempt.
 - Worker threads and child processes are not sampled.
 - Order-dependent state stays in the measurement. A test that reuses a warm
   cache does not get the lines that built the cache. Running each test alone
@@ -123,3 +136,6 @@ Limits beyond the Mocha ones:
 - Typecheck-only tests have no runtime sample and are not recorded.
 - Seeding changes `Math.random` for the whole suite, including tests that a
   submission adds.
+- Repeated titles need the project's `typescript` package to find the test's
+  call expression. Without it, the per-test run records a failure and writes no
+  sidecar.
