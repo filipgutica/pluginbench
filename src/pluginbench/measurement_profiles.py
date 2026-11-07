@@ -177,7 +177,9 @@ def _fallow_capability(language: str) -> tuple[str | None, str | None]:
     if shutil.which("fallow") is None or shutil.which("node") is None:
         return "Fallow and Node are required for source analysis", None
     try:
-        version = subprocess.check_output(["fallow", "--version"], text=True, timeout=5).strip()
+        output = subprocess.check_output(["fallow", "--version"], text=True, timeout=5)
+        # The npm launcher appends a `verified: ...` status line after the version.
+        version = (output.strip().splitlines() or [""])[0].strip()
     except (OSError, subprocess.SubprocessError) as exc:
         return f"Could not determine Fallow version: {exc}", None
     if version != "fallow 3.18.0":

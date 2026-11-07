@@ -57,7 +57,10 @@ if (expectedDependencyDigest && observedDependencyDigest !== expectedDependencyD
   throw new Error('observer dependency cache changed');
 }
 const bindings = Object.entries(lock.packages).filter(([name]) => name.startsWith('node_modules/@oxc-parser/binding-'));
-const installedBindings = bindings.filter(([name]) => Object.keys(packageHashes).some(key => key.startsWith(name.slice('node_modules/'.length) + '/')));
+// npm installs every libc variant on Linux; oxc-parser loads the one for this runtime.
+const libc = process.platform === 'linux' ? (process.report.getReport().header.glibcVersionRuntime ? '-gnu' : '-musl') : '';
+const runtimeBinding = `node_modules/@oxc-parser/binding-${process.platform}-${process.arch}${libc}`;
+const installedBindings = bindings.filter(([name]) => name === runtimeBinding && Object.keys(packageHashes).some(key => key.startsWith(name.slice('node_modules/'.length) + '/')));
 if (installedBindings.length !== 1 || installedBindings[0][1].version !== version || !installedBindings[0][1].integrity) {
   throw new Error('observer requires exactly one pinned native Oxc binding');
 }

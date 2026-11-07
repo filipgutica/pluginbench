@@ -449,6 +449,10 @@ def _token_usage(value: object) -> dict[str, int] | None:
     return value
 
 
+# Codex versions whose forked-child rollout layout has been checked against real traces.
+_INHERITED_HISTORY_VERSIONS = frozenset({"0.162.1", "0.167.0"})
+
+
 def _session_history(
     events: list[dict[str, Any]], reasons: set[str]
 ) -> tuple[dict[str, Any], list[dict[str, Any]], bool] | None:
@@ -467,6 +471,7 @@ def _session_history(
 
     # 0.162.1 protocol.rs defines this ordinal as the first own-history record.
     # Earlier records are inherited model context, including other session headers.
+    # 0.167.0 child rollouts keep the same header fields, boundary, and ordinals.
     assert isinstance(first, dict)
     boundary = first.get("subagent_history_start_ordinal")
     source = first.get("source")
@@ -475,7 +480,7 @@ def _session_history(
     parent = first.get("parent_thread_id")
     path = first.get("agent_path")
     valid = (
-        first.get("cli_version") == "0.162.1"
+        first.get("cli_version") in _INHERITED_HISTORY_VERSIONS
         and first.get("history_mode") == "paginated"
         and first.get("history_base") is None
         and isinstance(parent, str)
