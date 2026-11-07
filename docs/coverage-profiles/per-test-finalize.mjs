@@ -39,7 +39,10 @@ function finalize(report, directory) {
     // Tests that reach no measured source are still recorded, with an empty bitset.
     if (!recorded) (perTest[covered.values().next().value.sf] ??= {})[name] = "";
   }
-  writeFileSync(`${report}.per-test.json`, JSON.stringify({ per_test_numbits: perTest }), { flag: "wx" });
+  // Sorted keys keep the bytes independent of the order in which workers reported.
+  const sorted = (object) => Object.fromEntries(Object.entries(object).sort(([a], [b]) => (a < b ? -1 : 1)));
+  const numbits = sorted(Object.fromEntries(Object.entries(perTest).map(([path, names]) => [path, sorted(names)])));
+  writeFileSync(`${report}.per-test.json`, JSON.stringify({ per_test_numbits: numbits }), { flag: "wx" });
 }
 
 try {

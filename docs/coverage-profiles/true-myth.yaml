@@ -1,14 +1,64 @@
-# coverage_profiles entry. Heredocs are vitest-per-test-provider.mjs, vitest-per-test-setup.mjs and per-test-finalize.mjs; see README.md.
+# coverage_profiles entry. Heredocs are the vitest-*.mjs files and per-test-finalize.mjs; see README.md.
 https://github.com/true-myth/true-myth:
   command:
     - bash
     - -c
     - |
-      npx vitest run --coverage.enabled=true --coverage.provider=v8 --coverage.reporter=lcovonly --coverage.reportsDirectory=coverage \
-        "--coverage.include=src/**" "--coverage.exclude=pluginbench-excludes-nothing/**" --coverage.experimentalAstAwareRemapping=true
-      status=$?
-      # Helpers live under the report directory so they resolve the project's vitest packages.
+      # Helpers live under the report directory so they resolve the project's vitest packages;
+      # the coverage run therefore must not clean that directory.
       mkdir -p coverage/pluginbench /tmp/pluginbench-per-test
+      cat > coverage/pluginbench/vitest.config.mjs <<'JS'
+      // Wrapper around the project's Vitest config for both coverage runs; the profile writes it to
+      // coverage/pluginbench/. Both runs seed Math.random. With PLUGINBENCH_PER_TEST_DIR set, the
+      // per-test run also samples each test and starts workers without optimizing compilers.
+      import { mergeConfig } from "vitest/config";
+      import base from "../../vitest.config.ts";
+
+      const helper = (name) => new URL(name, import.meta.url).pathname;
+      const perTest = Boolean(process.env.PLUGINBENCH_PER_TEST_DIR);
+      const flags = ["--no-opt", "--no-maglev"];
+
+      const config = mergeConfig(base, {
+        test: {
+          setupFiles: [helper("./seeded-random.mjs"), ...(perTest ? [helper("./setup.mjs")] : [])],
+          ...(perTest && { poolOptions: { forks: { execArgv: flags }, threads: { execArgv: flags } } }),
+        },
+      });
+      // The per-test run's own report is discarded, so its thresholds would only add noise.
+      if (perTest) delete config.test.coverage.thresholds;
+      export default config;
+      JS
+      cat > coverage/pluginbench/seeded-random.mjs <<'JS'
+      // Vitest setup file that makes Math.random repeatable per test, so the coverage run and the
+      // per-test run execute the same branches. Each test reseeds from its own identity, so its values do
+      // not depend on run order or on which other tests ran.
+      import { beforeEach, expect } from "vitest";
+      import { relative } from "node:path";
+
+      let state = 0;
+
+      // FNV-1a: a 32-bit seed from the test identity.
+      const seedFrom = (text) => {
+        let hash = 0x811c9dc5;
+        for (let index = 0; index < text.length; index += 1) {
+          hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193);
+        }
+        return hash >>> 0;
+      };
+
+      // mulberry32, a small seeded generator with Math.random's range [0, 1).
+      Math.random = () => {
+        state = (state + 0x6d2b79f5) | 0;
+        let mixed = Math.imul(state ^ (state >>> 15), 1 | state);
+        mixed = (mixed + Math.imul(mixed ^ (mixed >>> 7), 61 | mixed)) ^ mixed;
+        return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
+      };
+
+      beforeEach(() => {
+        const { testPath, currentTestName } = expect.getState();
+        state = seedFrom(`${relative(process.cwd(), testPath)}::${currentTestName}`);
+      });
+      JS
       cat > coverage/pluginbench/provider.mjs <<'JS'
       // Vitest custom coverage provider that records per-test lines for PluginBench (Vitest 3.2).
       //
@@ -179,23 +229,10 @@ https://github.com/true-myth/true-myth:
         }
       });
       JS
-      cat > coverage/pluginbench/vitest.config.mjs <<'JS'
-      import { mergeConfig } from "vitest/config";
-      import base from "../../vitest.config.ts";
-
-      const config = mergeConfig(base, {
-        test: {
-          setupFiles: [new URL("./setup.mjs", import.meta.url).pathname],
-          poolOptions: {
-            forks: { execArgv: ["--no-opt", "--no-maglev"] },
-            threads: { execArgv: ["--no-opt", "--no-maglev"] },
-          },
-        },
-      });
-      // This run's own report is discarded, so its thresholds would only add noise.
-      delete config.test.coverage.thresholds;
-      export default config;
-      JS
+      npx vitest run --config coverage/pluginbench/vitest.config.mjs --coverage.clean=false \
+        --coverage.enabled=true --coverage.provider=v8 --coverage.reporter=lcovonly --coverage.reportsDirectory=coverage \
+        "--coverage.include=src/**" "--coverage.exclude=pluginbench-excludes-nothing/**" --coverage.experimentalAstAwareRemapping=true
+      status=$?
       cat > /tmp/pluginbench-per-test-finalize.mjs <<'JS'
       // Writes PluginBench's per-test sidecar beside an LCOV report from the single record that a per-test
       // run left in <record dir> (mocha-per-test.mjs or vitest-per-test-provider.mjs):
@@ -238,7 +275,10 @@ https://github.com/true-myth/true-myth:
           // Tests that reach no measured source are still recorded, with an empty bitset.
           if (!recorded) (perTest[covered.values().next().value.sf] ??= {})[name] = "";
         }
-        writeFileSync(`${report}.per-test.json`, JSON.stringify({ per_test_numbits: perTest }), { flag: "wx" });
+        // Sorted keys keep the bytes independent of the order in which workers reported.
+        const sorted = (object) => Object.fromEntries(Object.entries(object).sort(([a], [b]) => (a < b ? -1 : 1)));
+        const numbits = sorted(Object.fromEntries(Object.entries(perTest).map(([path, names]) => [path, sorted(names)])));
+        writeFileSync(`${report}.per-test.json`, JSON.stringify({ per_test_numbits: numbits }), { flag: "wx" });
       }
 
       try {

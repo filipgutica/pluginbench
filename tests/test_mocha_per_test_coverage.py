@@ -4,6 +4,7 @@ Mocha and c8 are not installed here, so a driver calls the hooks with `this.curr
 does, and a stand-in v8-to-istanbul applies its line rule. The task-image run covers the real tools.
 """
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -140,6 +141,10 @@ pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="the hook r
 
 def test_hook_attributes_each_tests_lines_and_keeps_identities_unique(tmp_path: Path) -> None:
     project, report, _ = run_hook(tmp_path)
+    # Sorted keys make repeated runs byte-identical whatever order tests reported in.
+    raw = json.loads(report.with_name("lcov.info.per-test.json").read_text())["per_test_numbits"]
+    assert list(raw) == sorted(raw)
+    assert all(list(names) == sorted(names) for names in raw.values())
     parsed = parse_lcov(
         report,
         snapshot=project,
@@ -183,7 +188,13 @@ def test_hook_writes_no_sidecar_when_attribution_is_unsound(
         ("csstree.yaml", {"mocha-per-test.mjs", "per-test-finalize.mjs"}),
         (
             "true-myth.yaml",
-            {"vitest-per-test-provider.mjs", "vitest-per-test-setup.mjs", "per-test-finalize.mjs"},
+            {
+                "vitest-per-test.config.mjs",
+                "vitest-seeded-random.mjs",
+                "vitest-per-test-provider.mjs",
+                "vitest-per-test-setup.mjs",
+                "per-test-finalize.mjs",
+            },
         ),
     ],
 )

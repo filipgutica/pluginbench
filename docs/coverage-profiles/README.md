@@ -61,33 +61,56 @@ copy of a test is therefore a new test.
   90 seconds instead of under 2 seconds. The sidecar is about 26 MB, and it is
   copied into the evaluation evidence.
 
-## Vitest with the v8 provider: `vitest-per-test-*.mjs`
+## Vitest with the v8 provider: `vitest-*.mjs`
 
-[`true-myth.yaml`](true-myth.yaml) also runs the suite twice:
+[`true-myth.yaml`](true-myth.yaml) writes its helpers to
+`coverage/pluginbench/`, where they resolve the project's `vitest` packages,
+and runs the suite twice through the wrapper config
+`vitest-per-test.config.mjs`:
 
-1. The coverage run writes `coverage/lcov.info`. Its exit status is the
+1. The coverage run writes `coverage/lcov.info` with
+   `--coverage.clean=false`, so it keeps the helpers. Its exit status is the
    command's status.
-2. The helpers are written to `coverage/pluginbench/`, where they resolve the
-   project's `vitest` packages. A wrapper config adds the setup file and starts
-   workers with `--no-opt --no-maglev`. The run uses the custom provider and a
-   throwaway reports directory. The setup file samples each test in its
-   worker. The provider subclasses the stock `V8CoverageProvider` and converts
-   each sample with that provider's `convertCoverage` and source-map
-   transform, which is the pipeline that produced the LCOV report.
+2. The per-test run sets `PLUGINBENCH_PER_TEST_DIR`. The wrapper then adds the
+   per-test setup file and starts workers with `--no-opt --no-maglev`. The
+   setup file samples each test in its worker. The custom provider subclasses
+   the stock `V8CoverageProvider` and converts each sample with that
+   provider's `convertCoverage` and source-map transform, which is the
+   pipeline that produced the LCOV report. Its own report is discarded.
 3. `per-test-finalize.mjs` writes the sidecar, as for Mocha.
 
-Both runs pass `--coverage.experimentalAstAwareRemapping=true`. This changes
-the existing true-myth profile, so measure both snapshots with the new profile.
-The default v8-to-istanbul remapping starts every line at one hit, and Vite's
-source maps rarely let a range span a whole TypeScript line. In the true-myth
-image, a never-called function added to `src/unit.ts` reported its lines as
-executed. 889 of 1,114 LCOV lines had exactly one hit. Per-test lines from that
-pipeline were nearly file-level: every test that touched `src/maybe.ts`
-received 215 of its 223 lines. With AST-aware remapping, the uncalled lines
-report zero hits. On the starting repository, the report has 436 statement
-lines with real counts instead of 1,114 lines, 159 branches instead of 277, and
-103 functions instead of 50. A function header or an `if` line can leave the
-line population; it stays covered by the statements inside it.
+Both runs load `vitest-seeded-random.mjs`. It replaces `Math.random` with a
+seeded generator and reseeds it before each test from the test's identity, so a
+test draws the same values in both runs and in any order. 18 true-myth tests
+choose branches with `Math.random()`; without seeding, their lines differed
+between runs. With seeding, two runs of the profile produced byte-identical
+LCOV reports and sidecars. Other sources of variation, such as `Date.now()` or
+`crypto.randomUUID()`, are not seeded.
+
+### AST-aware remapping
+
+Both runs pass `--coverage.experimentalAstAwareRemapping=true`. The default
+v8-to-istanbul remapping starts every line at one hit, and Vite's source maps
+rarely let a range span a whole TypeScript line, so it reports code that never
+ran as executed:
+
+- A never-called function added to `src/unit.ts` reported its lines as executed.
+- In a partly covered `if`/`else`, the untaken `else` line reported one hit.
+- 889 of 1,114 LCOV lines had exactly one hit, and every test that touched
+  `src/maybe.ts` received 215 of its 223 lines as per-test lines.
+
+With AST-aware remapping, those lines report zero hits, and the untaken arm is
+missing from the test's per-test lines. On the starting repository the report
+has 436 statement lines instead of 1,114, 159 branches instead of 277, and 103
+functions instead of 50. In both modes, function declarations and `if`
+statements produce no function or branch entries. In AST mode their header
+lines leave the line population; the statements inside them stay measured.
+
+**Earlier true-myth coverage is withdrawn.** The default profile read 100% on
+every population: 1,114 of 1,114 lines, 277 of 277 branches, and 50 of 50
+functions. Those numbers cannot show uncovered code, so earlier true-myth
+coverage results need a remeasure with this profile. Measure both snapshots of
+a comparison with the same profile.
 
 The provider and setup file depend on Vitest 3.2 internals:
 `readCoverageFiles`, `convertCoverage`, the worker `takeCoverage` options, and
@@ -96,12 +119,7 @@ Vitest upgrade. The remapping option is labelled experimental.
 
 Limits beyond the Mocha ones:
 
-- 18 true-myth tests choose branches with `Math.random()`. Their lines differ
-  between runs, and run 2 can execute a line that run 1 did not, which leaves
-  that snapshot's redundancy unknown. All other tests recorded identical lines
-  in repeated runs.
-- Readiness probes compare whole coverage metrics, including per-test lines,
-  across two runs. The random tests make true-myth fail that comparison, so
-  `measurement_settings.require_ready: true` stops before coding.
 - `test.concurrent` and other overlapping tests leave no sidecar.
 - Typecheck-only tests have no runtime sample and are not recorded.
+- Seeding changes `Math.random` for the whole suite, including tests that a
+  submission adds.
