@@ -1144,9 +1144,10 @@ def test_run_measures_a_task_that_has_no_collector_beside_a_covered_task(
     assert {row["task"] for row in coverage if row["status"] == "measured"} == {
         "covered-native-task"
     }
-    assert all(
-        row["status"] != "measured" for row in coverage if row["task"] == "arbitrary-native-task"
-    )
+    matrix = {(row["task"], row["metric"]): row["cells"] for row in data["completeness_matrix"]}
+    assert {
+        cell["state"] for cell in matrix["arbitrary-native-task", "Line coverage %"].values()
+    } == {"not_configured"}
     assert {
         row["task"]
         for row in data["observations"]
