@@ -330,11 +330,12 @@ https://github.com/true-myth/true-myth:
         console.error(`PluginBench per-test coverage unavailable: ${error.message}`);
       }
       JS
+      # A failed sampling run may leave a partial record, so only a clean run writes the sidecar.
       PLUGINBENCH_PER_TEST_DIR=/tmp/pluginbench-per-test npx vitest run --config coverage/pluginbench/vitest.config.mjs \
         --coverage.enabled=true --coverage.provider=custom --coverage.customProviderModule=coverage/pluginbench/provider.mjs \
         --coverage.reporter=lcovonly --coverage.reportsDirectory=/tmp/pluginbench-vitest-coverage \
-        "--coverage.include=src/**" "--coverage.exclude=pluginbench-excludes-nothing/**" --coverage.experimentalAstAwareRemapping=true
-      node /tmp/pluginbench-per-test-finalize.mjs coverage/lcov.info /tmp/pluginbench-per-test
+        "--coverage.include=src/**" "--coverage.exclude=pluginbench-excludes-nothing/**" --coverage.experimentalAstAwareRemapping=true \
+        && node /tmp/pluginbench-per-test-finalize.mjs coverage/lcov.info /tmp/pluginbench-per-test
       exit $status
   report_path: coverage/lcov.info
   tool_version: "@vitest/coverage-v8 3.2.4"

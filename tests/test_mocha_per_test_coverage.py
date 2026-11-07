@@ -260,3 +260,51 @@ def test_documented_profiles_embed_the_scripts_verbatim(profile: str, embedded: 
     heredocs = entry["command"][2].split("<<'JS'\n")[1:]
     bodies = {heredoc[: heredoc.index("\nJS\n") + 1] for heredoc in heredocs}
     assert {name for name in embedded if (PROFILES / name).read_text() in bodies} == embedded
+
+
+# Stands in for c8 and `npx vitest`: the coverage run writes LCOV and exits 3; the sampling run
+# leaves a well-formed record, then fails, as a run cut short after recording would.
+RUNNER_STUB = """#!/bin/sh
+if [ -n "${PLUGINBENCH_PER_TEST_DIR:-}" ]; then
+  echo '{"tests": {"partial": {}}}' > "$PLUGINBENCH_PER_TEST_DIR/record-1.json"
+  exit 1
+fi
+mkdir -p coverage
+printf 'SF:%s/lib/a.js\\nDA:1,1\\nend_of_record\\n' "$PWD" > coverage/lcov.info
+exit 3
+"""
+MOCHA_STUB = """require("node:fs").writeFileSync(
+  `${process.env.PLUGINBENCH_PER_TEST_DIR}/record-1.json`, '{"tests": {"partial": {}}}'
+);
+process.exit(1);
+"""
+
+
+@pytest.mark.parametrize("profile", ["csstree.yaml", "true-myth.yaml"])
+def test_profiles_write_no_sidecar_when_the_sampling_run_fails(
+    tmp_path: Path, profile: str
+) -> None:
+    (entry,) = yaml.safe_load((PROFILES / profile).read_text()).values()
+    project, bin_dir = tmp_path / "project", tmp_path / "bin"
+    for path, content in {
+        bin_dir / "npx": RUNNER_STUB,
+        project / "node_modules/.bin/c8": RUNNER_STUB,
+        project / "node_modules/mocha/bin/_mocha": MOCHA_STUB,
+    }.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        path.chmod(0o755)
+    (tmp_path / "tmp").mkdir()
+    command = entry["command"][2].replace("/tmp/", f"{tmp_path}/tmp/")
+    result = subprocess.run(
+        ["bash", "-c", command],
+        cwd=project,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    # The coverage run's status is the profile's status; its LCOV stays usable.
+    assert result.returncode == 3, result.stderr
+    assert (project / "coverage/lcov.info").exists()
+    assert not (project / "coverage/lcov.info.per-test.json").exists()

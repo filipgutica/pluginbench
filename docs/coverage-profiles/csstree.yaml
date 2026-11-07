@@ -197,9 +197,10 @@ https://github.com/csstree/csstree:
         node_modules/.bin/mocha lib/__tests --require lib/__tests/helpers/setup.js --reporter dot
       status=$?
       mkdir -p /tmp/pluginbench-per-test
+      # A failed sampling run may leave a partial record, so only a clean run writes the sidecar.
       PLUGINBENCH_PER_TEST_DIR=/tmp/pluginbench-per-test node --no-opt --no-maglev node_modules/mocha/bin/_mocha lib/__tests \
-        --require /tmp/pluginbench-mocha-per-test.mjs --require lib/__tests/helpers/setup.js --reporter dot
-      node /tmp/pluginbench-per-test-finalize.mjs coverage/lcov.info /tmp/pluginbench-per-test
+        --require /tmp/pluginbench-mocha-per-test.mjs --require lib/__tests/helpers/setup.js --reporter dot \
+        && node /tmp/pluginbench-per-test-finalize.mjs coverage/lcov.info /tmp/pluginbench-per-test
       exit $status
   report_path: coverage/lcov.info
   tool_version: "c8 11.0.0"

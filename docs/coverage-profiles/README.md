@@ -18,10 +18,11 @@ script.
    the first `--require`. Before each test, the hook resets V8's precise
    coverage. After each test, it converts that test's sample with c8's own
    `v8-to-istanbul`.
-3. `node per-test-finalize.mjs coverage/lcov.info <dir>` writes
-   `coverage/lcov.info.per-test.json`. It keeps only LCOV sources, records
-   tests that reach none of them with an empty bitset, and writes nothing if
-   any per-test line was not executed in the LCOV run.
+3. If run 2 exits with status 0, `node per-test-finalize.mjs
+   coverage/lcov.info <dir>` writes `coverage/lcov.info.per-test.json`. It
+   keeps only LCOV sources, records tests that reach none of them with an empty
+   bitset, and writes nothing if any per-test line was not executed in the LCOV
+   run. A failed run 2 can leave a partial record, so it gets no sidecar.
 
 Why two runs: inspector counter resets are isolate-wide. In one c8 run they
 lowered hit counts, and the interval samples split ranges into extra branches.
@@ -70,6 +71,8 @@ edited test keeps its identity unless its title is repeated.
 - The two runs must execute the same code. If run 2 executes a line that the
   LCOV run did not, finalize writes no sidecar. A line that only run 1 executed
   is missing from every test, so that check cannot catch it.
+- A failing test in run 2 leaves no sidecar, so redundancy is unknown for a
+  snapshot whose suite fails.
 - The per-test pass makes the suite slower. For csstree, the profile took about
   90 seconds instead of under 2 seconds. The sidecar is about 26 MB, and it is
   copied into the evaluation evidence.
@@ -90,10 +93,11 @@ and runs the suite twice through the wrapper config
    the stock `V8CoverageProvider` and converts each sample with that
    provider's `convertCoverage` and source-map transform, which is the
    pipeline that produced the LCOV report. Its own report is discarded.
-3. `per-test-finalize.mjs` writes the sidecar, as for Mocha.
+3. If the per-test run exits with status 0, `per-test-finalize.mjs` writes
+   the sidecar, as for Mocha.
 
 Both runs load `vitest-seeded-random.mjs`. It replaces `Math.random` with a
-seeded generator and reseeds it before each test from the test's identity, so a
+seeded generator and reseeds it before each test from the test's title, so a
 test draws the same values in both runs and in any order. 18 true-myth tests
 choose branches with `Math.random()`; without seeding, their lines differed
 between runs. With seeding, two runs of the profile produced byte-identical
