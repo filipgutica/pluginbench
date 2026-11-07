@@ -1111,6 +1111,42 @@ def test_required_measure_that_is_not_configured_blocks_the_check(
     assert not checkable["calls"]
 
 
+def test_run_measures_a_task_that_has_no_collector_beside_a_covered_task(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # check passed this config, then measurement refused it: the task without coverage had
+    # no collectors, so the saved profiles left it out.
+    raw = yaml.safe_load(checkable["path"].read_text())
+    calls: list[str] = []
+    reviews: list[str] = []
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=raw["timeout_seconds"], interrupt_at=None
+    )
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    root = checkable["output"]
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["run", str(checkable["path"]), "--output", str(root), "--yes", "--foreground"],
+    )
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    data = json.loads((root / "report/results.json").read_text())
+    coverage = [row for row in data["observations"] if row["metric"] == "Line coverage %"]
+    assert {row["task"] for row in coverage if row["status"] == "measured"} == {
+        "covered-native-task"
+    }
+    assert all(
+        row["status"] != "measured" for row in coverage if row["task"] == "arbitrary-native-task"
+    )
+    assert {
+        row["task"]
+        for row in data["observations"]
+        if row["metric"] == "Source lines added" and row["status"] == "measured"
+    } == {"covered-native-task", "arbitrary-native-task"}
+
+
 def _failing_reference_agents(oracle: dict[str, object], nop: dict[str, object]) -> Any:
     return lambda identity, destination: {"oracle": oracle, "nop": nop}
 

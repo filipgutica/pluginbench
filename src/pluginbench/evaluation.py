@@ -771,8 +771,8 @@ def prepare_evaluation(
                 }
                 for collector in collectors
             ]
+            # A task with no collector stays listed: it gets every measure except the missing ones.
             for task, collectors in profiles.items()
-            if collectors
         },
     )
     _save_selection(root, selection)
