@@ -110,6 +110,39 @@ A coverage profile's `source_scope` declares its measured package independently 
 
 Redundant added tests need per-test coverage. For coverage.py, run with `[run] dynamic_context = test_function`, then have the reporting step add `per_test_numbits` to the JSON report: for each measured file, map each context name to its executed lines in coverage.py numbits form (base64), using `CoverageData.contexts_by_lineno`. Do not use `coverage json --show-contexts`; on large suites its output can reach hundreds of megabytes. PluginBench ignores the empty context (code run outside a test). Parametrized cases share one test-function context, so redundancy is per test function. Without per-test data, redundant added tests are unknown.
 
+For LCOV, the same command can generate `<report_path>.per-test.json` next to its
+report. For example, `coverage/lcov.info` uses `coverage/lcov.info.per-test.json`:
+
+```json
+{
+  "per_test_numbits": {
+    "src/example.js": {
+      "test/example.test.js::suite > case": "Bg=="
+    }
+  }
+}
+```
+
+`Bg==` encodes lines 1 and 2: bit n represents source line n. Paths follow the
+LCOV source-path rules. Each set bit must name a line LCOV records as executed;
+unmeasured files, uncovered lines, invalid base64, and duplicate keys are errors.
+Unlike coverage.py's module-entry convention, LCOV sidecars cannot include line 0.
+PluginBench normalizes this file-to-test mapping to the existing test-to-file
+form and uses the same redundancy calculation. Named tests with empty bitsets
+are retained; the empty context name is ignored.
+
+The producer must record all measured test cases, including cases that reach no
+source lines, and use stable, unique identities across snapshots. Generate both
+reports from the same run and original-source line population. A missing sidecar
+or one without named test contexts leaves redundancy unknown with a reason; file-level hits never substitute
+for per-test data. Both snapshots need per-test data. The frozen input must not
+already contain the sidecar, to prevent stale attribution. Native collection
+retains it as `report.raw.per-test.json` beside `report.raw`.
+
+The [JavaScript inspector spike](../tests/fixtures/js-per-test-coverage/README.md)
+demonstrates serial plain JavaScript and awaited async work with `node:test`.
+Mocha integration and Vitest TypeScript source-map remapping remain unverified.
+
 Changed-line coverage is incomplete when an added source file is missing from the coverage report. Configure coverage to report every source file, for example coverage.py `--source=<package>` or c8 `--all`.
 
 LCOV callbacks can share names. When mixed hit counts cannot be matched to source lines, function coverage for those files stays unknown, with a reason. Line and branch coverage remain available.
