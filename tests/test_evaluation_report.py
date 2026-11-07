@@ -676,6 +676,57 @@ def test_writer_headlines_separate_task_check_failures_from_execution_failures(
     assert report == original
 
 
+def _overlap_grading(reward: int, f2p_passed: int = 4) -> dict[str, object]:
+    rewards = {"reward": reward, "f2p_passed": f2p_passed, "f2p_total": 4}
+    rewards.update(p2p_passed=9, p2p_total=9)
+    return {
+        "pass": None,
+        "reason": "trusted verifier tests overwrite authored patch paths",
+        "native_verifier_result": {"rewards": rewards},
+    }
+
+
+def test_trusted_test_overlap_with_every_test_passing_is_an_overlap_pass(
+    tmp_path: Path,
+) -> None:
+    # The agent edited test files that the verifier overwrites, so confirmation was withheld.
+    report = _token_report()
+    cases = {
+        "overlap-reward-1": ("unknown", _overlap_grading(1)),
+        "overlap-reward-0": ("unknown", _overlap_grading(0, f2p_passed=3)),
+        "overlap-missing-test": ("unknown", _overlap_grading(1, f2p_passed=3)),
+        "confirmed": ("pass", None),
+    }
+    attempts: list[dict[str, object]] = []
+    for name, (status, grading) in cases.items():
+        attempt = copy.deepcopy(_attempt(report, 0))
+        attempt["id"] = name
+        stage = attempt["stages"][0]  # type: ignore[index]
+        stage["correctness"] = {"status": status}
+        stage["task_result"] = grading
+        stage["execution_provenance"].update(  # type: ignore[union-attr]
+            successful_native_completion=True, timed_out=False, exit_code=0
+        )
+        attempts.append(attempt)
+    report["attempts"] = attempts
+
+    data = json.loads(write_evaluation_report(report, _config("tokens"), tmp_path).read_text())
+
+    states = {row["id"]: row["correctness"] for row in _rows(data, "attempts")}
+    assert states == {
+        "overlap-reward-1": "overlap_pass",
+        "overlap-reward-0": "fail",
+        "overlap-missing-test": "unknown",
+        "confirmed": "pass",
+    }
+    assert {
+        (row["attempt_id"], row["correctness"]) for row in _rows(data, "observations")
+    } == set(states.items())
+    visible = _outcome_text(data, tmp_path, package=True)
+    assert "1/4 attempts passed" in visible
+    assert "1 failed task check · 1 overlap pass · 0 execution failures · 1 unknown" in visible
+
+
 @pytest.mark.parametrize("execution_state", ["provider", "timeout", "complete", "missing"])
 @pytest.mark.parametrize("measurement", ["tokens", "lines"])
 def test_writer_json_csv_and_echarts_share_exact_selected_values(

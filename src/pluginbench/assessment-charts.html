@@ -350,10 +350,12 @@ function taskCheckSummary(attempts) {
   const completed = attempts.filter(row => !executions.includes(row));
   const passed = completed.filter(row => row.correctness === "pass").length;
   const failed = completed.filter(row => row.correctness === "fail" && row.execution?.status === "complete").length;
-  const unknown = attempts.length - passed - failed - executions.length;
+  // Overlap passes: the verifier passed every test, but trusted tests overwrote files the agent changed.
+  const overlap = completed.filter(row => row.correctness === "overlap_pass").length;
+  const unknown = attempts.length - passed - failed - overlap - executions.length;
   return {
     passed: passed + "/" + attempts.length + " attempts passed",
-    remainder: failed + " failed task check" + (failed === 1 ? "" : "s") + " · " + executions.length + " execution failure" + (executions.length === 1 ? "" : "s") + " · " + unknown + " unknown",
+    remainder: failed + " failed task check" + (failed === 1 ? "" : "s") + (overlap ? " · " + overlap + " overlap pass" + (overlap === 1 ? "" : "es") : "") + " · " + executions.length + " execution failure" + (executions.length === 1 ? "" : "s") + " · " + unknown + " unknown",
   };
 }
 // Overview: equal-weight mean of per-task ratios. Task view: this task's ratio, or a difference when the reference is zero.
