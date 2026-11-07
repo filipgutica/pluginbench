@@ -98,7 +98,9 @@ class Evaluation(BaseModel):
     repeats: int = Field(default=3, strict=True, ge=1)
     seed: int = Field(default=42, strict=True)
     timeout_seconds: int = Field(default=1800, strict=True, ge=1)
-    jobs: int = Field(default_factory=lambda: min(4, os.cpu_count() or 1), strict=True, ge=1, le=16)
+    # A fixed default keeps the comparison identity the same on every machine; 4 is the
+    # most harbor_backend.capacity_jobs ever allows.
+    jobs: int = Field(default=2, strict=True, ge=1, le=4)
     container_cpus: int | None = Field(default=None, strict=True, ge=1)
     container_memory_mb: int | None = Field(default=None, strict=True, ge=256)
 

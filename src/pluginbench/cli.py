@@ -185,8 +185,8 @@ def run(
         None,
         "--jobs",
         min=1,
-        max=16,
-        help="Maximum jobs per phase; Harbor coding is bounded by Docker CPU/memory capacity (up to 4).",
+        max=4,
+        help="Jobs per phase (default 2, at most 4); fails if Docker capacity is lower.",
     ),
     dry_run: bool = typer.Option(
         False,

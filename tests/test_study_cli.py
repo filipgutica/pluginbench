@@ -415,10 +415,11 @@ def test_config_and_overrides_fail_clearly(tmp_path: Path) -> None:
     )
 
 
-@pytest.mark.parametrize("cores,expected", [(None, 1), (1, 1), (2, 2), (18, 4)])
-def test_default_jobs_are_resolved_from_cpu_capacity(
-    config: evaluation.Evaluation, monkeypatch: pytest.MonkeyPatch, cores: int | None, expected: int
+@pytest.mark.parametrize("cores", [None, 1, 18])
+def test_default_jobs_is_two_on_every_machine_and_at_most_four(
+    config: evaluation.Evaluation, monkeypatch: pytest.MonkeyPatch, cores: int | None
 ) -> None:
+    # jobs is part of the comparison identity, so its default must not depend on the machine.
     monkeypatch.setattr(os, "cpu_count", lambda: cores)
     raw = config.model_dump(mode="json")
     raw.pop("jobs")
@@ -426,8 +427,9 @@ def test_default_jobs_are_resolved_from_cpu_capacity(
     plan = evaluation.plan_evaluation(selected)
     identity = plan["comparison_identity"]
     assert isinstance(identity, dict)
-    assert selected.jobs == plan["jobs"] == identity["jobs"] == expected
-    assert plan["coding_calls"] == evaluation.plan_evaluation(config)["coding_calls"]
+    assert selected.jobs == plan["jobs"] == identity["jobs"] == 2
+    with pytest.raises(ValueError, match="less than or equal to 4"):
+        evaluation.resolve_evaluation({**raw, "jobs": 5}, Path.cwd())
 
 
 def test_jobs_override_works_with_config_and_is_visible_in_dry_run(

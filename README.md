@@ -31,7 +31,7 @@ pluginbench tasks pick --dataset datacurve/deep-swe-1-1 --copy
 
 Search task names, preview the prompt, and press Tab to select multiple tasks. Enter prints a pinned `tasks:` YAML block. `--copy` also copies it; paste the block into your evaluation config. Escape cancels. Configs also accept [GitHub task-folder links](docs/running-evaluations.md#choose-inputs). Downloads are cached automatically.
 
-Harbor runs each attempt and the task's own correctness checks. PluginBench freezes the starting code and submission, then measures both with the same settings. Each attempt gets fresh isolation. Concurrency defaults to at most four jobs. A `jobs` value above Docker capacity fails the check instead of being lowered. Use `--jobs 2` to request fewer.
+Harbor runs each attempt and the task's own correctness checks. PluginBench freezes the starting code and submission, then measures both with the same settings. Each attempt gets fresh isolation. Concurrency defaults to two jobs, with at most four. A `jobs` value above Docker capacity fails the check instead of being lowered. Use `--jobs 1` to run one at a time.
 
 Compatible vanilla submissions are reused automatically from `$XDG_CACHE_HOME/pluginbench` (default `~/.cache/pluginbench`), so any output folder can reuse them. `pluginbench check` shows a hit or miss for every vanilla attempt. Reports identify reuse; grading and selected measurements run again.
 

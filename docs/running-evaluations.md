@@ -192,7 +192,7 @@ Unknown values are never zero. A complete scan of a submission that changed no f
 
 ## Concurrency and resume
 
-Coding attempts, measurement inputs, and reviews run concurrently within their phases. Docker capacity allows at most four jobs, bounded by Docker CPU capacity and an 80% Docker memory budget. A requested or default `jobs` value above that capacity fails before preparation instead of being lowered, because jobs is part of the comparison identity. Preparation and each snapshot's two measurement repeats stay sequential. Jobs affect scheduling and comparison identity, not the number of coding attempts. Subagents can make additional model requests.
+Coding attempts, measurement inputs, and reviews run concurrently within their phases. `jobs` defaults to 2 on every machine and accepts 1 to 4. Docker capacity is bounded by Docker CPU capacity and an 80% Docker memory budget. A `jobs` value above that capacity fails before preparation instead of being lowered, because jobs is part of the comparison identity. Preparation and each snapshot's two measurement repeats stay sequential. Jobs affect scheduling and comparison identity, not the number of coding attempts. Subagents can make additional model requests.
 
 On interruption or fatal failure, new jobs stop. Active jobs finish or time out; their receipts remain. Resume requires a completed coding phase:
 
