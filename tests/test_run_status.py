@@ -398,3 +398,24 @@ def test_a_discarded_attempt_keeps_its_observed_lower_bound(tmp_path: Path) -> N
     assert status["discarded"][0]["tokens"]["total_tokens"] == 1050
     assert status["discarded"][0]["tokens_status"] == "lower_bound"
     assert status["tokens"]["total_tokens"] == 1050 + 1050
+
+
+@pytest.mark.parametrize(("reward", "outcome"), [(1, "overlap_pass"), (0, "fail")])
+def test_a_withheld_result_gets_the_report_s_outcome(
+    tmp_path: Path, reward: int, outcome: str
+) -> None:
+    root = _run(tmp_path / "run", states={**STATES, "a3": "complete"}, ledger=True)
+    _finished(root / "evidence", "a3", behavior=None, usage=USAGE)
+    rewards = {"reward": reward, "f2p_passed": 3, "f2p_total": 3, "p2p_passed": 9, "p2p_total": 9}
+    _write(
+        root / "evidence/attempts/a3/handoff/verifier-result.json",
+        {
+            "patch_sha256": "ab" * 32,
+            "reason": "trusted verifier tests overwrite authored patch paths",
+            "native_verifier_result": {"rewards": rewards},
+        },
+    )
+
+    row = next(row for row in run_status.run_status(root)["attempts"] if row["id"] == "a3")
+
+    assert (row["outcome"], row["outcome_reason"]) == (outcome, None)

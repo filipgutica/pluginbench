@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from pluginbench import run_lock
+from pluginbench.evaluation_report import correctness_state
 from pluginbench.ledger import LEDGER_NAME, Ledger
 
 # Bump on any change that removes or renames a field; adding a field keeps the version.
@@ -80,7 +81,7 @@ def _tokens(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _outcome(handoff: Path) -> tuple[str, str | None]:
-    """pass, fail, empty, or unknown with the verifier's reason, from the attempt's receipts."""
+    """pass, overlap_pass, fail, empty, or unknown with the verifier's reason, from the receipts."""
     verifier = _read(handoff / "verifier-result.json") or {}
     if verifier.get("patch_sha256") == _EMPTY_PATCH:
         return "empty", None
@@ -89,6 +90,9 @@ def _outcome(handoff: Path) -> tuple[str, str | None]:
         return "pass", None
     if behavior is False:
         return "fail", None
+    outcome = correctness_state("unknown", verifier)
+    if outcome != "unknown":
+        return outcome, None
     return "unknown", verifier.get("reason") or "no correctness receipt"
 
 
@@ -373,7 +377,7 @@ def _age(seconds: int) -> str:
     return f"{seconds // 3600}h"
 
 
-_RESULTS = ("pass", "fail", "unknown", "empty", "running", "interrupted", "pending")
+_RESULTS = ("pass", "overlap_pass", "fail", "unknown", "empty", "running", "interrupted", "pending")
 
 
 def _result(row: dict[str, Any], active: bool) -> str:
