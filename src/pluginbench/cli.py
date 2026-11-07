@@ -466,6 +466,23 @@ def stop(
         )
 
 
+@app.command("compare")
+def compare(
+    runs: list[str] = typer.Argument(
+        ...,
+        help="Evaluation directories. DIR=ARM,ARM takes only those packages from DIR.",
+    ),
+    gates: Path = typer.Option(..., "--gates", help="Gates YAML: splits and gate rules."),
+) -> None:
+    """Print per-package measures and gate results from saved reports; no model calls."""
+    from pluginbench.compare import compare as compare_runs
+
+    try:
+        typer.echo(compare_runs(runs, gates))
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        _error(exc)
+
+
 @app.command("report")
 def report(directory: Path = typer.Argument(..., help="A saved evaluation directory.")) -> None:
     """Rebuild JSON, CSV and charts from saved evidence; no model calls."""

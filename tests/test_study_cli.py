@@ -94,7 +94,14 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> evaluation.Evalua
 def test_public_commands_cover_evaluations_reports_and_task_selection() -> None:
     result = CliRunner().invoke(cli.app, ["--help"])
     assert result.exit_code == 0
-    assert set(get_group(cli.app).commands) == {"check", "run", "stop", "report", "tasks"}
+    assert set(get_group(cli.app).commands) == {
+        "check",
+        "run",
+        "stop",
+        "report",
+        "compare",
+        "tasks",
+    }
     assert set(get_group(cli.tasks_app).commands) == {"pick"}
     assert CliRunner().invoke(cli.app, ["--version"]).stdout.strip() == "0.4.0"
 
