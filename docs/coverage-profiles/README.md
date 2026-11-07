@@ -45,7 +45,7 @@ call expression at the test's location for Vitest, which keeps only a wrapper
 of the function. Adding a test therefore does not rename a different test with
 the same title. Tests with the same title and the same source, such as tests
 generated in a loop, are then numbered `-2`, `-3`, and so on in run order. A
-duplicate identity leaves no sidecar. csstree has 18 such tests in 6 groups
+duplicate identity leaves no sidecar. csstree has 18 such tests in 8 groups
 among 16,725 tests; true-myth has 6 in 3 groups among 564.
 
 When a new test reuses a title that one existing test had, the existing test
