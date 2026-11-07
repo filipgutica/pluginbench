@@ -1,5 +1,8 @@
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 from typing import NotRequired, TypedDict
 
 import pytest
@@ -82,6 +85,169 @@ def test_source_bound_coordinates_and_unexecuted_branches(tmp_path: Path, source
     }
     assert report["files_measured"] == ["src/index.ts"]
     assert "per_test" not in report
+
+
+def test_lcov_sidecar_normalizes_file_contexts_and_preserves_empty_tests(
+    tmp_path: Path, source: Path
+) -> None:
+    sidecar = tmp_path / "lcov.info.per-test.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "per_test_numbits": {
+                    "/app/src/index.ts": {
+                        "suite.test.ts::suite > one": lines_to_numbits({1, 2}),
+                        "suite.test.ts::suite > no source calls": lines_to_numbits(set()),
+                        "": lines_to_numbits({1}),
+                    },
+                }
+            }
+        )
+    )
+    report = read_report(tmp_path, source, REPORT)
+    assert report["per_test_numbits"] == {
+        "suite.test.ts::suite > one": {"src/index.ts": lines_to_numbits({1, 2})},
+        "suite.test.ts::suite > no source calls": {"src/index.ts": ""},
+    }
+    sidecar.write_text('{"per_test_numbits": {}}')
+    assert "per_test_numbits" not in read_report(tmp_path, source, REPORT)
+    sidecar.unlink()
+    assert "per_test_numbits" not in read_report(tmp_path, source, REPORT)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"per_test_numbits": {}, "per_test_numbits": {}}',
+        "{}",
+        '{"per_test_numbits": []}',
+        '{"per_test_numbits": {"src/index.ts": {"a": "Ag==", "a": "Ag=="}}}',
+        json.dumps({"per_test_numbits": {"src/missing.ts": {"a": "Ag=="}}}),
+        json.dumps({"per_test_numbits": {"../src/index.ts": {"a": "Ag=="}}}),
+        json.dumps({"per_test_numbits": {"src/index.ts": {"a": 3}}}),
+        json.dumps({"per_test_numbits": {"src/index.ts": {"a": "!"}}}),
+        json.dumps({"per_test_numbits": {"src/index.ts": {"a": lines_to_numbits({0})}}}),
+        json.dumps({"per_test_numbits": {"src/index.ts": {"a": lines_to_numbits({2})}}}),
+        json.dumps({"per_test_numbits": {"src/index.ts": {"a": lines_to_numbits({3})}}}),
+        json.dumps({"per_test_numbits": {"src/index.ts": {"a": lines_to_numbits({4})}}}),
+        json.dumps({"per_test_numbits": {"src/other.ts": {"a": "Ag=="}}}),
+        json.dumps(
+            {
+                "per_test_numbits": {
+                    "src/index.ts": {"a": "Ag=="},
+                    "/app/src/index.ts": {"b": "Ag=="},
+                }
+            }
+        ),
+    ],
+)
+def test_lcov_sidecar_rejects_invalid_or_uncovered_coordinates(
+    tmp_path: Path, source: Path, content: str
+) -> None:
+    (source / "src/other.ts").write_text("export const other = 1;\n")
+    (tmp_path / "lcov.info.per-test.json").write_text(content)
+    with pytest.raises(ValueError):
+        read_report(tmp_path, source, "SF:src/index.ts\nDA:1,1\nDA:2,0\nend_of_record\n")
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="inspector spike requires Node")
+@pytest.mark.parametrize("with_per_test", [True, False])
+def test_inspector_fixture_feeds_existing_redundancy_measure(
+    tmp_path: Path, with_per_test: bool
+) -> None:
+    from pluginbench import assessment_metrics
+
+    fixture = Path(__file__).parent / "fixtures/js-per-test-coverage"
+    result = subprocess.run(
+        ["node", "--test", str(fixture / "suite.test.mjs")],
+        env={**os.environ, "PLUGINBENCH_SPIKE_OUTPUT": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    raw = json.loads((tmp_path / "lcov.info.per-test.json").read_text())
+    expected = {
+        "suite.test.mjs::classification > positive": {2, 3},
+        "suite.test.mjs::classification > redundant positive": {2, 3},
+        "suite.test.mjs::classification > distinct async": {2, 5, 9, 10},
+    }
+    assert {
+        name: numbits_to_lines(bits)
+        for name, bits in raw["per_test_numbits"]["subject.mjs"].items()
+    } == expected
+
+    before, after = tmp_path / "before", tmp_path / "after"
+    before.mkdir()
+    after.mkdir()
+    (before / "subject.mjs").write_text("export const old = 0;\n")
+    shutil.copyfile(fixture / "subject.mjs", after / "subject.mjs")
+    change = assessment_metrics.compare_snapshots(before, after)
+    if not with_per_test:
+        (tmp_path / "lcov.info.per-test.json").unlink()
+    parsed = parse_coverage(
+        "lcov",
+        tmp_path / "lcov.info",
+        snapshot=after,
+        source_scope=["*.mjs"],
+        test_scope=["*.test.mjs"],
+        workdir="/app",
+    )
+    metrics = assessment_metrics._coverage(parsed, {"subject.mjs"}, ["*.mjs"])
+    provenance = {
+        "tool": "inspector",
+        "tool_version": "spike",
+        "config_digest": "same",
+        "scope": ["*.mjs"],
+    }
+    (tmp_path / "before.info").write_text("SF:subject.mjs\nDA:1,1\nend_of_record\n")
+    (tmp_path / "before.info.per-test.json").write_text(
+        json.dumps(
+            {
+                "per_test_numbits": {
+                    "subject.mjs": {
+                        "suite.test.mjs::classification > positive": lines_to_numbits({1})
+                    },
+                }
+            }
+        )
+    )
+    starting = assessment_metrics._coverage(
+        parse_coverage(
+            "lcov",
+            tmp_path / "before.info",
+            snapshot=before,
+            source_scope=["*.mjs"],
+            test_scope=["*.test.mjs"],
+            workdir="/app",
+        ),
+        {"subject.mjs"},
+        ["*.mjs"],
+    )
+    compared = assessment_metrics.compare_evidence(
+        {
+            "coverage": {"provenance": provenance, "metrics": starting},
+            "snapshot_digest": change["before_digest"],
+        },
+        {
+            "coverage": {"provenance": provenance, "metrics": metrics},
+            "snapshot_digest": change["after_digest"],
+        },
+        change=change,
+    )
+    changed = compared["coverage"]["changed_lines"]
+    if with_per_test:
+        assert changed["added_tests"] == 2
+        assert changed["redundant_added_test_names"] == [
+            "suite.test.mjs::classification > redundant positive",
+        ]
+        assert changed["redundant_added_tests"] == 1
+    else:
+        assert "per_test_numbits" not in parsed
+        assert changed["redundant_added_tests"] is None
+        assert changed["redundancy_reason"] == (
+            "per-test line coverage was not recorded for both snapshots"
+        )
 
 
 @pytest.mark.parametrize("path", ["/private/index.ts", "../src/index.ts", "src/missing.ts"])

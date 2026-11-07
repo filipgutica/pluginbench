@@ -220,7 +220,51 @@ def parse_lcov(
         result[kind] = _population(total, covered, [record.path for record in measured], kind)
     if not any(kind in result for kind in ("lines", "branches", "functions")):
         raise CoveragePopulationUnavailable("LCOV contains no explicit coverage populations")
+    per_test = _lcov_per_test(
+        report.with_name(report.name + ".per-test.json"),
+        records=records,
+        inventory=inventory,
+        source_scope=source_scope,
+        workdir=workdir,
+    )
+    if per_test:
+        result["per_test_numbits"] = per_test
     return result
+
+
+def _lcov_per_test(
+    sidecar: Path,
+    *,
+    records: list[_Record],
+    inventory: dict[str, object],
+    source_scope: list[str],
+    workdir: str,
+) -> dict[str, dict[str, str]]:
+    """Validate file-to-context numbits against LCOV's executed line population."""
+    if not sidecar.exists():
+        return {}
+    data = _json_object(json.loads(sidecar.read_text(), object_pairs_hook=_json_pairs), "sidecar")
+    raw_files = _json_object(data.get("per_test_numbits"), "LCOV per-test numbits")
+    measured = {record.path: record for record in records}
+    seen: set[str] = set()
+    per_test: dict[str, dict[str, str]] = {}
+    for raw_path, contexts in raw_files.items():
+        path = _source_path(raw_path, set(inventory), source_scope, workdir)
+        if path not in measured:
+            raise ValueError(f"LCOV per-test coverage names an unmeasured source: {path}")
+        if path in seen:
+            raise ValueError(f"LCOV per-test source is duplicated: {path}")
+        seen.add(path)
+        covered = {line for line, count in measured[path].lines.items() if count}
+        for name, encoded in _json_object(contexts, "LCOV per-test contexts").items():
+            if not isinstance(encoded, str):
+                raise ValueError("LCOV per-test numbits must be base64 strings")
+            lines = numbits_to_lines(encoded)
+            if not lines <= covered:
+                raise ValueError("LCOV per-test coverage names an unexecuted or unmeasured line")
+            if name:
+                per_test.setdefault(name, {})[path] = lines_to_numbits(lines)
+    return dict(sorted(per_test.items()))
 
 
 def _population(

@@ -334,6 +334,9 @@ def _native_coverage(
         raise ValueError("native coverage requires a frozen task identity")
     assert collector.command and collector.report_path and collector.tool_version
     assert collector.report_format is not None
+    sidecar_path = Path(collector.report_path + ".per-test.json")
+    if collector.report_format == "lcov" and (root / sidecar_path).exists():
+        raise ValueError("LCOV per-test sidecar must not exist in the frozen input snapshot")
     execution = run_native_command(
         snapshot=root,
         task_identity=identity,
@@ -360,6 +363,11 @@ def _native_coverage(
         or not all(isinstance(pattern, str) for pattern in test_scope)
     ):
         raise ValueError("native coverage identity requires workdir and explicit test_scope")
+    if collector.report_format == "lcov":
+        # The native source export already retains sibling report artifacts.
+        sidecar = destination / "after" / sidecar_path
+        if sidecar.is_file():
+            shutil.copyfile(sidecar, destination / "report.raw.per-test.json")
     try:
         report = parse_coverage(
             collector.report_format,

@@ -693,7 +693,18 @@ def test_trusted_adapter_outer_timeout_is_unclassified_and_fatal(
     assert not (tmp_path / "evidence/coverage/failure.json").exists()
 
 
-@pytest.mark.parametrize("outcome", ["complete", "line-only", "failed", "malformed"])
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "complete",
+        "line-only",
+        "failed",
+        "malformed",
+        "per-test",
+        "malformed-per-test",
+        "stale-per-test",
+    ],
+)
 def test_native_lcov_dispatch_preserves_runtime_unknown_and_integrity_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
@@ -717,6 +728,9 @@ def test_native_lcov_dispatch_preserves_runtime_unknown_and_integrity_failure(
         report_path="coverage/lcov.info",
         tool_version="coverage-tool 1",
     )
+    if outcome == "stale-per-test":
+        (snapshot / "coverage").mkdir()
+        (snapshot / "coverage/lcov.info.per-test.json").write_text('{"per_test_numbits": {}}')
     original = inspect_snapshot(snapshot)
 
     def execute(
@@ -728,11 +742,12 @@ def test_native_lcov_dispatch_preserves_runtime_unknown_and_integrity_failure(
         report_path: str,
         timeout: int,
     ) -> dict[str, object]:
+        assert outcome != "stale-per-test"  # Reject stale data before running a command.
         assert task_identity == identity and command == ["npm", "test"]
         assert report_path == "coverage/lcov.info"
         assert snapshot != tmp_path / "source"  # The archive is never the execution directory.
         report = "SF:/app/src/used.ts\nFN:1,value\nFNDA:1,value\nFNF:1\nFNH:1\nBRF:0\nBRH:0\nend_of_record\n"
-        if outcome == "line-only":
+        if outcome in {"line-only", "per-test", "malformed-per-test"}:
             report = "SF:/app/src/used.ts\nDA:1,1\nend_of_record\n"
         elif outcome == "malformed":
             report = report.replace("FNF:1", "FNF:2")
@@ -744,16 +759,35 @@ def test_native_lcov_dispatch_preserves_runtime_unknown_and_integrity_failure(
         (destination / "execution.json").write_text(json.dumps(receipt))
         if outcome != "failed":
             (destination / "report.raw").write_text(report)
+        if outcome in {"per-test", "malformed-per-test"}:
+            sidecar = destination / "after/coverage/lcov.info.per-test.json"
+            sidecar.parent.mkdir(parents=True)
+            sidecar.write_text(
+                json.dumps(
+                    {
+                        "per_test_numbits": {
+                            "src/used.ts": {
+                                "suite.test.ts::one": "Ag==" if outcome == "per-test" else "BA=="
+                            },
+                        }
+                    }
+                )
+            )
         return receipt
 
     monkeypatch.setattr(harbor_backend, "run_native_command", execute)
     evidence = tmp_path / "evidence"
-    if outcome == "malformed":
-        with pytest.raises(ValueError, match="summaries disagree"):
+    if outcome in {"malformed", "malformed-per-test", "stale-per-test"}:
+        reason = {
+            "malformed": "summaries disagree",
+            "malformed-per-test": "unexecuted",
+            "stale-per-test": "frozen input",
+        }[outcome]
+        with pytest.raises(ValueError, match=reason):
             collect_measurements(snapshot, evidence, [collector])
     else:
         result = collect_measurements(snapshot, evidence, [collector])
-        if outcome in {"complete", "line-only"}:
+        if outcome in {"complete", "line-only", "per-test"}:
             metrics = evaluate_evidence(snapshot, {"coverage": str(result["coverage"])}, evidence)
             coverage = metrics["coverage"]
             assert isinstance(coverage, dict)
@@ -763,6 +797,13 @@ def test_native_lcov_dispatch_preserves_runtime_unknown_and_integrity_failure(
                 assert coverage["metrics"]["line_total"] == 1
                 assert coverage["metrics"]["function_total"] is None
                 assert coverage["metrics"]["branch_total"] is None
+            if outcome == "per-test":
+                assert coverage["metrics"]["per_test_numbits"] == {
+                    "suite.test.ts::one": {"src/used.ts": "Ag=="},
+                }
+                assert (evidence / "coverage/report.raw.per-test.json").is_file()
+            else:
+                assert coverage["metrics"]["per_test_numbits"] is None
         else:
             assert result == {}
             failure = json.loads((evidence / "coverage/failure.json").read_text())
