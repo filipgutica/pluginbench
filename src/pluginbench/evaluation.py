@@ -645,6 +645,22 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
         TaskCatalog(schema_version=1, tasks=entries).model_dump(mode="json"),
     )
     _write(root / "measurement-readiness.json", capabilities)
+    # Saved here, and loaded back as a resumed run loads them, so check fails where run would.
+    _write(
+        prepared / _PROFILES,
+        {
+            task: [
+                {
+                    **collector.model_dump(mode="json"),
+                    "config": str(collector.config.relative_to(prepared)),
+                }
+                for collector in collectors
+            ]
+            # A task with no collector stays listed: it gets every measure except the missing ones.
+            for task, collectors in profiles.items()
+        },
+    )
+    _saved_profiles(root)
     vanilla_identity = _vanilla_identity(
         config, comparison, harness_versions[config.runner.harness], task_environment
     )
@@ -762,20 +778,6 @@ def prepare_evaluation(
         "review_revision": None,
     }
     _write(prepared / "vanilla-identity.json", checked.vanilla_identity)
-    _write(
-        prepared / _PROFILES,
-        {
-            task: [
-                {
-                    **collector.model_dump(mode="json"),
-                    "config": str(collector.config.relative_to(prepared)),
-                }
-                for collector in collectors
-            ]
-            # A task with no collector stays listed: it gets every measure except the missing ones.
-            for task, collectors in profiles.items()
-        },
-    )
     _save_selection(root, selection)
     return root
 
