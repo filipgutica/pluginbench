@@ -17,7 +17,10 @@ script.
    `node --no-opt --no-maglev node_modules/mocha/bin/_mocha`, with the hook as
    the first `--require`. Before each test, the hook resets V8's precise
    coverage. After each test, it converts that test's sample with c8's own
-   `v8-to-istanbul`.
+   `v8-to-istanbul`. Run 2 sets `--timeout 0`: converting a sample without
+   V8's optimizing compilers can take longer than Mocha's 2-second hook limit on
+   a busy machine, and one hook timeout would fail run 2. The collector's
+   timeout still bounds the command.
 3. If run 2 exits with status 0, `node per-test-finalize.mjs
    coverage/lcov.info <dir>` writes `coverage/lcov.info.per-test.json`. It
    keeps only LCOV sources, records tests that reach none of them with an empty
