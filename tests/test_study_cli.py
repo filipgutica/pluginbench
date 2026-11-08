@@ -1118,6 +1118,22 @@ def test_required_measure_that_is_not_configured_blocks_the_check(
     assert not checkable["calls"]
 
 
+def test_check_fails_when_a_run_could_not_load_the_saved_profiles(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # check passed a coverage profile that the background run then failed to load.
+    def unloadable(path: Path) -> object:
+        raise OSError(36, "File name too long", str(path))
+
+    monkeypatch.setattr(evaluation, "load_profiles", unloadable)
+    result = CliRunner().invoke(
+        cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"])]
+    )
+    assert result.exit_code == 2
+    assert "File name too long" in result.stderr
+    assert not checkable["calls"]
+
+
 def test_run_measures_a_task_that_has_no_collector_beside_a_covered_task(
     checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
