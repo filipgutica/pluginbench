@@ -357,7 +357,7 @@ pluginbench judge tally judging/r3
 - It reports weighted wins, correctness-decided pairs, judged pairs, and per-task results.
 - For each judge, it reports the side-A rate and its agreement. Agreement is the share of pairs where the judge's vote equals the verdict that more than half of the other judges gave.
 - Both judge measures cover every pair, including correctness-decided ones.
-- It refuses to tally while any judge lacks a verdict for any task.
+- It refuses to tally while any judge lacks a verdict for any task. That includes every judge `run` was asked for, even one that never started.
 
 ## Development
 
