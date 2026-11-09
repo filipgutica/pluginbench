@@ -1,0 +1,40 @@
+{
+  "config": "/home/filip/code/pluginbench/runs/egc-20261106/round-3.yaml",
+  "config_sha256": "baf1905d6d8ec815a594bf4b6cbabe9d999f9daad58eb371c564b99f3b605482",
+  "base_commit": "01597a8c8d04a3ecaa3aa52f09cd61d1845180ae",
+  "checks": {
+    "main": {
+      "status": "ready",
+      "model_calls": 0
+    },
+    "branch": {
+      "status": "ready",
+      "model_calls": 0
+    }
+  },
+  "same_cache_keys": true,
+  "attempt_decisions_compared": 12,
+  "tasks": {
+    "adaptix-name-mapping-aliases": {
+      "main": "e39f84afdaeb113e9a41c3948cc0c110da86d2ba5decc7f2e3e42e108b922e6a",
+      "branch": "e39f84afdaeb113e9a41c3948cc0c110da86d2ba5decc7f2e3e42e108b922e6a",
+      "repeats": 3
+    },
+    "csstree-shorthand-expansion-compression": {
+      "main": "4a1f7b96190b74857a434652597da2ce255e4b8eb54e56beecee7cf0dc7616d4",
+      "branch": "4a1f7b96190b74857a434652597da2ce255e4b8eb54e56beecee7cf0dc7616d4",
+      "repeats": 3
+    },
+    "happy-dom-abort-pending-body-reads": {
+      "main": "e721eb595367e8600ba195a6cc46d031ea96fa7a43633a01458fc0cbef09a179",
+      "branch": "e721eb595367e8600ba195a6cc46d031ea96fa7a43633a01458fc0cbef09a179",
+      "repeats": 3
+    },
+    "true-myth-iterable-collection-combinators": {
+      "main": "0e4717dd4ce30870d99024e59da412b1806d36372636dabf77aed64f530ddaa3",
+      "branch": "0e4717dd4ce30870d99024e59da412b1806d36372636dabf77aed64f530ddaa3",
+      "repeats": 3
+    }
+  },
+  "note": "Both checks used a scratch cache. No entries were written to the shared vanilla cache."
+}

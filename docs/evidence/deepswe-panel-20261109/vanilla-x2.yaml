@@ -1,0 +1,204 @@
+name: DeepSWE vanilla x2 candidate screen
+runner:
+  harness: codex
+  model: gpt-6.1-sol
+  reasoning: high
+treatments: {}
+capabilities:
+  subagents: true
+  max_threads: 4
+tasks:
+  source: /home/filip/.t3/worktrees/pluginbench/feat-deepswe-panel/.panel/tasks
+  ids:
+  - adaptix-name-mapping-aliases
+  - csstree-shorthand-expansion-compression
+  - go-critic-doc-link-checker
+  - oxvg-structural-selector-preservation
+  - termenv-preserve-ansi-resets
+  - ts-pattern-match-each
+  - cattrs-partial-structuring-recovery
+  - skrub-duration-encoding
+  - wasmi-trap-coredumps
+  - fd-deterministic-multi-key-sorting
+  - boa-hierarchical-evaluation-cancellation
+  - tengo-destructuring-bindings
+  - tomlkit-toml-table-converters
+  - abs-stepped-slices
+  - expr-try-catch-errors
+  - kysely-window-grouping-helpers
+  - actionlint-action-pinning-lint
+  - etree-xml-diff-patch
+  - returns-validated-error-accumulation
+  - anko-default-function-arguments
+  - textual-richlog-follow-state
+  - bandit-structured-nosec-directives
+  - anko-typed-variable-bindings
+  - yjs-map-conflict-detection
+  - sql-formatter-bigquery-pipe-formatting
+measurements:
+- tokens
+- lines
+- coverage
+measurement_settings:
+  require_ready: false
+  coverage_profiles:
+    https://github.com/csstree/csstree:
+      command:
+      - bash
+      - -c
+      - "cat > /tmp/pluginbench-mocha-per-test.mjs <<'JS'\n// Per-test line coverage\
+        \ for a Mocha suite, as the PluginBench sidecar of c8's LCOV report.\n//\n\
+        // Inspector coverage resets are isolate-wide, so per-test samples cannot\
+        \ be taken inside the c8\n// run without changing its report. Run the unchanged\
+        \ c8 command first, then the same suite again\n// without c8, with this file\
+        \ as the first Mocha `--require`:\n//   PLUGINBENCH_PER_TEST_DIR=/tmp/pb node\
+        \ --no-opt --no-maglev node_modules/mocha/bin/_mocha \\\n//     --require\
+        \ <this file> ...\n// and finally write the sidecar beside the LCOV report\
+        \ with per-test-finalize.mjs.\n//\n// Each test's sample is converted with\
+        \ c8's own v8-to-istanbul. Any problem leaves no sidecar, so\n// redundancy\
+        \ stays unknown; the hook never fails a test or changes which tests run.\n\
+        import { Session } from \"node:inspector/promises\";\nimport { readFileSync,\
+        \ writeFileSync } from \"node:fs\";\nimport { createRequire } from \"node:module\"\
+        ;\nimport { join, relative, resolve } from \"node:path\";\nimport { fileURLToPath\
+        \ } from \"node:url\";\n\nasync function hooks(output) {\n  const session\
+        \ = new Session();\n  const sources = new Map();\n  const tests = {};\n  let\
+        \ failure;\n  let activeTest;\n  let v8toIstanbul;\n\n  const fail = (error)\
+        \ => {\n    failure ??= String(error?.stack ?? error);\n  };\n  const executedLines\
+        \ = async ({ url, functions }) => {\n    const path = fileURLToPath(url);\n\
+        \    if (!sources.has(path)) sources.set(path, readFileSync(path, \"utf8\"\
+        ));\n    const source = sources.get(path);\n    const converter = v8toIstanbul(path,\
+        \ undefined, { source });\n    await converter.load();\n    // V8 omits uncalled\
+        \ functions under an uncalled parent, and v8-to-istanbul starts every line\
+        \ at\n    // one, so zero the whole file first, as c8 does for files that\
+        \ never loaded.\n    const zero = { startOffset: 0, endOffset: source.length,\
+        \ count: 0 };\n    converter.applyCoverage([\n      { functionName: \"(empty-report)\"\
+        , isBlockCoverage: true, ranges: [zero] },\n      ...functions,\n    ]);\n\
+        \    const { statementMap, s } = converter.toIstanbul()[path];\n    return\
+        \ Object.keys(s)\n      .filter((key) => s[key] > 0)\n      .map((key) =>\
+        \ statementMap[key].start.line);\n  };\n\n  try {\n    // Optimized code drops\
+        \ counts of inlined calls, so per-test samples randomly lose executed\n  \
+        \  // lines; csstree lost lines in 235 of 16,725 tests between two identical\
+        \ runs.\n    if (![\"--no-opt\", \"--no-maglev\"].every((flag) => process.execArgv.includes(flag)))\
+        \ {\n      throw new Error(\"run Mocha as `node --no-opt --no-maglev <mocha>/bin/_mocha`\"\
+        );\n    }\n    // Loaded before the suite's own setup files, which may guard\
+        \ Object.prototype.\n    v8toIstanbul = createRequire(resolve(\"node_modules/c8/package.json\"\
+        ))(\"v8-to-istanbul\");\n    // Starting coverage clears V8's invocation counts,\
+        \ so it must precede the spec imports.\n    session.connect();\n    await\
+        \ session.post(\"Profiler.enable\");\n    await session.post(\"Profiler.startPreciseCoverage\"\
+        , { callCount: true, detailed: true });\n  } catch (error) {\n    fail(error);\n\
+        \  }\n\n  return {\n    async beforeEach() {\n      try {\n        if (activeTest\
+        \ !== undefined) throw new Error(\"overlapping tests share coverage counters\"\
+        );\n        activeTest = `${relative(process.cwd(), this.currentTest.file)}::${this.currentTest.fullTitle()}`;\n\
+        \        // Taking coverage resets the counters, so the test's own sample\
+        \ starts here.\n        await session.post(\"Profiler.takePreciseCoverage\"\
+        );\n      } catch (error) {\n        fail(error);\n      }\n    },\n    async\
+        \ afterEach() {\n      try {\n        const { result } = await session.post(\"\
+        Profiler.takePreciseCoverage\");\n        // Tests that share a title are\
+        \ one test, as parametrized cases share one coverage.py\n        // context,\
+        \ so a repeated title adds its lines to the earlier test's.\n        const\
+        \ files = (tests[activeTest] ??= {});\n        for (const script of result)\
+        \ {\n          // c8 excludes node: internals and node_modules; finalize drops\
+        \ anything else LCOV lacks.\n          if (!script.url.startsWith(\"file:\"\
+        ) || script.url.includes(\"/node_modules/\")) continue;\n          if (!script.functions.some(({\
+        \ ranges }) => ranges.some(({ count }) => count > 0))) continue;\n       \
+        \   const lines = await executedLines(script);\n          const path = fileURLToPath(script.url);\n\
+        \          if (lines.length) files[path] = [...new Set([...(files[path] ??\
+        \ []), ...lines])];\n        }\n      } catch (error) {\n        fail(error);\n\
+        \      } finally {\n        activeTest = undefined;\n      }\n    },\n   \
+        \ afterAll() {\n      try {\n        const record = failure === undefined\
+        \ ? { tests } : { failure };\n        writeFileSync(join(output, `record-${process.pid}.json`),\
+        \ JSON.stringify(record), { flag: \"wx\" });\n      } catch (error) {\n  \
+        \      console.error(`PluginBench per-test coverage not recorded: ${error.message}`);\n\
+        \      }\n    },\n  };\n}\n\nconst { PLUGINBENCH_PER_TEST_DIR: output, NODE_V8_COVERAGE:\
+        \ v8Output } = process.env;\nif (output && v8Output) {\n  console.error(\"\
+        PluginBench per-test coverage disabled: its resets would corrupt NODE_V8_COVERAGE\
+        \ (c8)\");\n}\n// Without a record, finalize leaves redundancy unknown.\n\
+        export const mochaHooks = output && !v8Output ? await hooks(output) : {};\n\
+        JS\ncat > /tmp/pluginbench-per-test-finalize.mjs <<'JS'\n// Writes PluginBench's\
+        \ per-test sidecar beside an LCOV report from the single record that a per-test\n\
+        // run left in <record dir> (mocha-per-test.mjs or vitest-per-test-provider.mjs):\n\
+        //   node per-test-finalize.mjs <lcov report> <record dir>\n// The record\
+        \ maps test identity -> absolute source path -> executed lines. Any problem\
+        \ leaves no\n// sidecar, so redundancy stays unknown.\nimport { existsSync,\
+        \ readdirSync, readFileSync, writeFileSync } from \"node:fs\";\nimport { join,\
+        \ resolve } from \"node:path\";\n\nfunction finalize(report, directory) {\n\
+        \  if (existsSync(`${report}.per-test.json`)) throw new Error(\"per-test sidecar\
+        \ already exists\");\n  const records = readdirSync(directory).filter((name)\
+        \ => /^record-\\d+\\.json$/.test(name));\n  if (records.length !== 1) {\n\
+        \    throw new Error(`expected one per-test record, found ${records.length};\
+        \ tests must report from one process`);\n  }\n  const { failure, tests } =\
+        \ JSON.parse(readFileSync(join(directory, records[0]), \"utf8\"));\n  if (failure\
+        \ !== undefined) throw new Error(failure);\n  // Absolute source path -> LCOV's\
+        \ own SF spelling and executed lines.\n  const covered = new Map();\n  let\
+        \ lines;\n  for (const row of readFileSync(report, \"utf8\").split(\"\\n\"\
+        )) {\n    if (row.startsWith(\"SF:\")) covered.set(resolve(row.slice(3)),\
+        \ { sf: row.slice(3), lines: (lines = new Set()) });\n    if (row.startsWith(\"\
+        DA:\") && Number(row.split(\",\")[1]) > 0) lines.add(Number(row.slice(3).split(\"\
+        ,\")[0]));\n  }\n  if (covered.size === 0) throw new Error(\"LCOV report names\
+        \ no sources\");\n  const perTest = {};\n  for (const [name, files] of Object.entries(tests))\
+        \ {\n    let recorded = false;\n    for (const [path, executed] of Object.entries(files))\
+        \ {\n      const source = covered.get(path);\n      if (source === undefined)\
+        \ continue; // outside the LCOV source scope\n      // The LCOV comes from\
+        \ the coverage run; a line it never saw executed means the runs diverged.\n\
+        \      const outside = executed.filter((line) => !source.lines.has(line));\n\
+        \      if (outside.length) throw new Error(`${name} executed ${path} lines\
+        \ LCOV reports unexecuted: ${outside}`);\n      const bits = Buffer.alloc((Math.max(...executed)\
+        \ >> 3) + 1);\n      for (const line of executed) bits[line >> 3] |= 1 <<\
+        \ (line & 7);\n      (perTest[source.sf] ??= {})[name] = bits.toString(\"\
+        base64\");\n      recorded = true;\n    }\n    // Tests that reach no measured\
+        \ source are still recorded, with an empty bitset.\n    if (!recorded) (perTest[covered.values().next().value.sf]\
+        \ ??= {})[name] = \"\";\n  }\n  // Sorted keys keep the bytes independent\
+        \ of the order in which workers reported.\n  const sorted = (object) => Object.fromEntries(Object.entries(object).sort(([a],\
+        \ [b]) => (a < b ? -1 : 1)));\n  const numbits = sorted(Object.fromEntries(Object.entries(perTest).map(([path,\
+        \ names]) => [path, sorted(names)])));\n  writeFileSync(`${report}.per-test.json`,\
+        \ JSON.stringify({ per_test_numbits: numbits }), { flag: \"wx\" });\n}\n\n\
+        try {\n  finalize(...process.argv.slice(2, 4));\n} catch (error) {\n  console.error(`PluginBench\
+        \ per-test coverage unavailable: ${error.message}`);\n}\nJS\nnode_modules/.bin/c8\
+        \ --reporter=lcovonly --report-dir=coverage --all --include 'lib/**' --exclude\
+        \ 'lib/__tests/**' \\\n  node_modules/.bin/mocha lib/__tests --require lib/__tests/helpers/setup.js\
+        \ --reporter dot\nstatus=$?\nmkdir -p /tmp/pluginbench-per-test\n# A failed\
+        \ sampling run may leave a partial record, so only a clean run writes the\
+        \ sidecar.\nPLUGINBENCH_PER_TEST_DIR=/tmp/pluginbench-per-test node --no-opt\
+        \ --no-maglev node_modules/mocha/bin/_mocha lib/__tests \\\n  --require /tmp/pluginbench-mocha-per-test.mjs\
+        \ --require lib/__tests/helpers/setup.js --reporter dot --timeout 0 \\\n \
+        \ && node /tmp/pluginbench-per-test-finalize.mjs coverage/lcov.info /tmp/pluginbench-per-test\n\
+        exit $status\n"
+      report_path: coverage/lcov.info
+      tool_version: c8 11.0.0
+      source_scope:
+      - lib/**
+    https://github.com/reagento/adaptix:
+      command:
+      - bash
+      - -c
+      - "printf '[run]\\ndynamic_context = test_function\\nsource = src/adaptix\\\
+        n' > /tmp/egc.covrc\nCOVERAGE_RCFILE=/tmp/egc.covrc python -m coverage run\
+        \ -m pytest tests -q -p no:cacheprovider\npython - /tmp/egc.covrc coverage.json\
+        \ <<'PY'\n# Writes coverage.json for PluginBench from a coverage.py data file\
+        \ recorded with\n# dynamic_context = test_function. It adds the statement\
+        \ coordinates and per-test numbits that\n# PluginBench's running-evaluations\
+        \ guide describes, so redundant added tests are measurable.\nimport json\n\
+        import os\nimport sys\n\nimport coverage\nfrom coverage.numbits import nums_to_numbits\n\
+        import base64\n\nrcfile, outfile = sys.argv[1], sys.argv[2]\ncov = coverage.Coverage(config_file=rcfile)\n\
+        cov.load()\ncov.json_report(outfile=outfile)\ndata = cov.get_data()\nwith\
+        \ open(outfile) as handle:\n    report = json.load(handle)\n\nreport[\"meta\"\
+        ][\"statement_lines_source\"] = \"coverage.Coverage.analysis2\"\nper_test\
+        \ = {}\nfor path, entry in report[\"files\"].items():\n    absolute = os.path.abspath(path)\n\
+        \    entry[\"statement_lines\"] = sorted(cov.analysis2(absolute)[1])\n   \
+        \ executed = set(entry[\"executed_lines\"])\n    contexts = {}\n    for line,\
+        \ names in data.contexts_by_lineno(absolute).items():\n        if line not\
+        \ in executed:\n            continue\n        for name in names:\n       \
+        \     if name:\n                contexts.setdefault(name, []).append(line)\n\
+        \    if contexts:\n        per_test[path] = {\n            name: base64.b64encode(nums_to_numbits(sorted(lines))).decode()\n\
+        \            for name, lines in sorted(contexts.items())\n        }\nreport[\"\
+        per_test_numbits\"] = per_test\n\nwith open(outfile, \"w\") as handle:\n \
+        \   json.dump(report, handle)\nPY\n"
+      format: coverage-py-json
+      report_path: coverage.json
+      tool_version: 7.6.9
+      source_scope:
+      - src/adaptix/**
+repeats: 2
+seed: 42
+jobs: 2
+timeout_seconds: 1800

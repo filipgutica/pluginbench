@@ -35,6 +35,52 @@ _REVIEWED_TESTS = {
     # happy-dom-abort-pending-body-reads and testem-per-launcher-reports at DeepSWE 0b9fabbb.
     "9d5f5c01aeb6935be963a7858beeacc97f231b92ccd34925a94ba5a46454673c": "82a0888cb2c87a6123e05424b528f8e8c9b3e426",
     "eda69e4b08e0976c74e59f4556e97ac0721b0ff0e154f58b6c3ec20b52249f10": "158f61ea91c9613d2011c41ee9be40ada1d7a307",
+    # go-critic-doc-link-checker at DeepSWE 0b9fabbb.
+    "7aadc441e56f0c2a29a10e560a04720c2e41a71751b67d2a93981ce9edcbdcb1": "9aea378c4dccd6f4394196ad8f0873b3e84678c8",
+    # oxvg-structural-selector-preservation at DeepSWE 0b9fabbb.
+    "f34b8dfebb3f2a53d473f0b7914a4afe8fae1ca6003fbd0b12ed80dd1cdd5f4d": "1fd7fab851ecc975e008be0e3e279568ce4e2b51",
+    # termenv-preserve-ansi-resets at DeepSWE 0b9fabbb.
+    "02d9f47229ee4e271c31e627484f0182ed0a37ad75ee2af65590f6817a640bc1": "368a3572b8146cc038b3f240da6792003d7e42c5",
+    # ts-pattern-match-each at DeepSWE 0b9fabbb.
+    "5ac2f376722eda2df307bfa4c86ba1fd3e93267928a212da5840c9f7f11f851e": "f66fc061fde4f764b113ededa09be63dae564159",
+    # cattrs-partial-structuring-recovery at DeepSWE 0b9fabbb.
+    "62c19e25862ba6465d0fba5be783857e4b874457850813b5d8fe588146d3e70c": "6bc4708fb9b2ac52d9a18997e923da6a58916102",
+    # skrub-duration-encoding at DeepSWE 0b9fabbb.
+    "6a75f354bd229f0f45b7b51ee9fb74fb6d40de576ae9ec707a870cfeafd8879c": "24c4466fea94f551fb73d21eba54038dc5b346d3",
+    # wasmi-trap-coredumps at DeepSWE 0b9fabbb.
+    "b93c2efb48680988a72a0c617ec66d81b0e4d9ccd9a5432052183011d9bd12d9": "e1f76e285b9ad68a952b7cf5297bbb7ab91e6028",
+    # fd-deterministic-multi-key-sorting at DeepSWE 0b9fabbb.
+    "29a16328fb01fb1deec3abde7c841279169ac5eca614d9293131f5261f055390": "227883606023d62275fb48701aeac90f2b604143",
+    # boa-hierarchical-evaluation-cancellation at DeepSWE 0b9fabbb.
+    "70754686d59a946aa5823e134462a23b300687db4e4b7bffe756258fa667a959": "70409a5052984325dccfdc5f6520818568a81f39",
+    # tengo-destructuring-bindings at DeepSWE 0b9fabbb.
+    "277fcdba6cd4102362294c1f44fda1fe6fdd7a7bb6fe1bfc7b8bb6e6401fab66": "3cad0da7a51b1206c6f01e3f4fbb44b976d5275c",
+    # tomlkit-toml-table-converters at DeepSWE 0b9fabbb.
+    "263d0a5fb6423b68487bed4a9de25c1cfeb73960732dcd33534ef9615c15cc8d": "dd05eebc8ed9e30fc6c223088a5a450cb54c1cab",
+    # abs-stepped-slices at DeepSWE 0b9fabbb.
+    "39effb9fa65a618d116f608e75b3e49c220b58e9a4441f3329f28c8d2ea9a7b7": "cb1b3b671d0ee9fa9da9f7b02f86967953ffd10a",
+    # expr-try-catch-errors at DeepSWE 0b9fabbb.
+    "98c702c7f932c4407d44448022978af1d5cb73cd1bf8cc80dd8bbbb77a9d2475": "851b241a301f7c74646e65e4009c69cf290993a8",
+    # kysely-window-grouping-helpers at DeepSWE 0b9fabbb.
+    "a9ced82977aea08738b3d6b865be2cd1cc63709f31aa872c9d23854f6d40f10f": "91cf3733b2a419f5b17dff118cedb7052ab5300d",
+    # actionlint-action-pinning-lint at DeepSWE 0b9fabbb.
+    "5762d47f0d98aebf38297b3fc166b270237e94e72e02a9b588b3bbf9d7ca6d8b": "0bdc95715fa58f64e3fd6e63b0f89be8733cbbab",
+    # etree-xml-diff-patch at DeepSWE 0b9fabbb.
+    "cc9c0afada1f2fb84ef17c9ad7832090d385fc8803e5b1b4f0d476ccae84a1d3": "4032e04c8f2e2f35e43ce5d772fcef14a5df4d74",
+    # returns-validated-error-accumulation at DeepSWE 0b9fabbb.
+    "e92a9be1e52f9fb15aef1d6264122298a88c5d9f9c80d68fe2fcf2cd48fb424b": "41607fae1289de2787523c452d75212206b9c7c0",
+    # anko-default-function-arguments at DeepSWE 0b9fabbb.
+    "7b9bfaaa953eef4e6052b163b2004dc18f072f0b9b465348ba1976db9ba050d5": "9d2d84bb1564e9513287998c56ccf16c01c19008",
+    # textual-richlog-follow-state at DeepSWE 0b9fabbb.
+    "078133321f346427078548e9f0f21aa45b0b28d3ead4fc6df918dfd5522ace51": "0f0849fd37fbd0d4d6f81889476c22340129df67",
+    # bandit-structured-nosec-directives at DeepSWE 0b9fabbb.
+    "ad33fe4854693f57f9ba084d7e4443e9513524051ea8401e1f2ea778ab86dcc4": "b46fa3a2723635aa29cc012538df4867ac2ac006",
+    # anko-typed-variable-bindings at DeepSWE 0b9fabbb.
+    "ed5a0a7465b87cdeedc4e27e5d68c8daf6e399495da52364868e59cb4fe42ea9": "3f269a72ff69398b1250c584171f32d12c0d8085",
+    # yjs-map-conflict-detection at DeepSWE 0b9fabbb.
+    "656e5337e72b1e03aa3f870f99d8387caad74613fc8eb157e9d09ce8933761f1": "7795050a749bd1111cbbdd9d0219b27226a8e710",
+    # sql-formatter-bigquery-pipe-formatting at DeepSWE 0b9fabbb.
+    "2d470eedde92f4ce193c895b3eb851dd794ff188d6321e77c70756d7b471c7dc": "954e5a474b9e3d45ca58f02a3a4eac8e1947acc5",
 }
 PATCH_ARTIFACT = "logs/artifacts/model.patch"
 

@@ -1,0 +1,33 @@
+Evaluation: DeepSWE vanilla x2 candidate screen
+Runner: codex gpt-6.1-sol, reasoning high
+Arms: vanilla
+Tasks (25): adaptix-name-mapping-aliases, csstree-shorthand-expansion-compression, go-critic-doc-link-checker, oxvg-structural-selector-preservation, termenv-preserve-ansi-resets, ts-pattern-match-each, cattrs-partial-structuring-recovery, skrub-duration-encoding, wasmi-trap-coredumps, fd-deterministic-multi-key-sorting, boa-hierarchical-evaluation-cancellation, tengo-destructuring-bindings, tomlkit-toml-table-converters, abs-stepped-slices, expr-try-catch-errors, kysely-window-grouping-helpers, actionlint-action-pinning-lint, etree-xml-diff-patch, returns-validated-error-accumulation, anko-default-function-arguments, textual-richlog-follow-state, bandit-structured-nosec-directives, anko-typed-variable-bindings, yjs-map-conflict-detection, sql-formatter-bigquery-pipe-formatting
+Repeats: 2
+Jobs: 2
+Coding attempts: 50   Review calls: 0
+Measurements: tokens, lines, coverage
+Unavailable measurements:
+  go-critic-doc-link-checker: coverage: Coverage requires an explicit test command, report format/path and tool version
+  oxvg-structural-selector-preservation: coverage: Coverage requires an explicit test command, report format/path and tool version
+  termenv-preserve-ansi-resets: coverage: Coverage requires an explicit test command, report format/path and tool version
+  ts-pattern-match-each: coverage: Coverage requires an explicit test command, report format/path and tool version
+  cattrs-partial-structuring-recovery: coverage: Coverage requires an explicit test command, report format/path and tool version
+  skrub-duration-encoding: coverage: Coverage requires an explicit test command, report format/path and tool version
+  wasmi-trap-coredumps: coverage: Coverage requires an explicit test command, report format/path and tool version
+  fd-deterministic-multi-key-sorting: coverage: Coverage requires an explicit test command, report format/path and tool version
+  boa-hierarchical-evaluation-cancellation: coverage: Coverage requires an explicit test command, report format/path and tool version
+  tengo-destructuring-bindings: coverage: Coverage requires an explicit test command, report format/path and tool version
+  tomlkit-toml-table-converters: coverage: Coverage requires an explicit test command, report format/path and tool version
+  abs-stepped-slices: coverage: Coverage requires an explicit test command, report format/path and tool version
+  expr-try-catch-errors: coverage: Coverage requires an explicit test command, report format/path and tool version
+  kysely-window-grouping-helpers: coverage: Coverage requires an explicit test command, report format/path and tool version
+  actionlint-action-pinning-lint: coverage: Coverage requires an explicit test command, report format/path and tool version
+  etree-xml-diff-patch: coverage: Coverage requires an explicit test command, report format/path and tool version
+  returns-validated-error-accumulation: coverage: Coverage requires an explicit test command, report format/path and tool version
+  anko-default-function-arguments: coverage: Coverage requires an explicit test command, report format/path and tool version
+  textual-richlog-follow-state: coverage: Coverage requires an explicit test command, report format/path and tool version
+  bandit-structured-nosec-directives: coverage: Coverage requires an explicit test command, report format/path and tool version
+  anko-typed-variable-bindings: coverage: Coverage requires an explicit test command, report format/path and tool version
+  yjs-map-conflict-detection: coverage: Coverage requires an explicit test command, report format/path and tool version
+  sql-formatter-bigquery-pipe-formatting: coverage: Coverage requires an explicit test command, report format/path and tool version
+Reuse: reuse a verified isolated vanilla cohort when available; otherwise fresh vanilla attempts; native built-in instructions remain

@@ -132,6 +132,32 @@ def test_config_dry_run_includes_fresh_vanilla_and_every_package(
     assert not summary.stdout.lstrip().startswith("{")
 
 
+def test_vanilla_only_config_plans_two_attempts_without_treatments(
+    config: evaluation.Evaluation, tmp_path: Path
+) -> None:
+    raw = config.model_dump(mode="json")
+    raw.update(treatments={}, repeats=2)
+    path = tmp_path / "vanilla.yaml"
+    path.write_text(yaml.safe_dump(raw))
+
+    result = CliRunner().invoke(cli.app, ["run", str(path), "--dry-run", "--json"])
+
+    assert result.exit_code == 0, result.output
+    plan = json.loads(result.output)
+    assert plan["treatments"] == {}
+    assert plan["coding_calls"] == 2
+    assert plan["review_calls"] == 0
+    # Execution reloads the evaluation's frozen settings through StudyRecipe.
+    recipe = study.StudyRecipe(
+        schema_version=2,
+        name="vanilla screen",
+        tasks=tmp_path / "tasks.json",
+        treatments={},
+        repeats=2,
+    )
+    assert recipe.treatments == {}
+
+
 def test_init_writes_a_starter_config_that_plans_once_its_paths_are_filled(
     config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

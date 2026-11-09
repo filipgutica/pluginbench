@@ -90,7 +90,7 @@ class Evaluation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(default="evaluation", min_length=1)
     runner: Runner
-    treatments: dict[str, Treatment] = Field(min_length=1)
+    treatments: dict[str, Treatment]
     capabilities: NativeCapabilities = Field(default_factory=NativeCapabilities)
     tasks: Tasks
     measurements: list[Measurement] = Field(min_length=1)

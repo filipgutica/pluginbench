@@ -40,7 +40,7 @@ capabilities:
   max_threads: 4
 ```
 
-Vanilla is included automatically. The task prompt is identical across arms. Guidance files become the attempt's private native global `AGENTS.md`; they are never appended to the task prompt or written into the source repository. Combined guidance is limited to 32,768 bytes, including separators, to prevent native truncation.
+Vanilla is included automatically. Use `treatments: {}` for a vanilla-only screen. The task prompt is identical across arms. Guidance files become the attempt's private native global `AGENTS.md`; they are never appended to the task prompt or written into the source repository. Combined guidance is limited to 32,768 bytes, including separators, to prevent native truncation.
 
 Skills retain their complete directories, including scripts, references, and executable modes. Plugins retain their manifests and full package trees and install through a private local marketplace. Git internals are excluded. Symlinks, nonregular assets, and ambient dotenv files are rejected. Skill dependencies, MCP servers, apps, custom agents, commands, plugin dependencies, asynchronous hooks, and non-command hooks are currently unsupported. Admission rejects declared unsupported components.
 
@@ -62,7 +62,7 @@ Every task, guidance package, and repeat gets a fresh coding container. PluginBe
 
 Fresh repository exports omit generated `.pytest_cache` directories and record those exclusions. Archived snapshots keep their original bytes and hashes; measurement replays do not apply this cleanup.
 
-Canonical submission support currently covers four reviewed DeepSWE verifier contracts: True Myth iterable collection combinators, CSSTree shorthand expansion/compression, Adaptix name-mapping aliases, and Dateutil RFC5545 timezone interoperability. Admission checks the complete trusted verifier payload and exact artifact-collection command. Preparation rejects grader entrypoints or path settings that could redirect verification. It also checks the grader image's starting source, Git base inventory, file modes, and verifier payload against the frozen inputs, then records cleanup.
+Canonical submission support covers the explicitly reviewed DeepSWE verifier contracts in [`submissions.py`](../src/pluginbench/submissions.py). The [panel manifest](evidence/deepswe-panel-20261109/manifest.json) records the additional contracts reviewed at DeepSWE commit `0b9fabbb`. Admission checks the complete trusted verifier payload and exact artifact-collection command. Preparation rejects grader entrypoints or path settings that could redirect verification. It also checks the grader image's starting source, Git base inventory, file modes, and verifier payload against the frozen inputs, then records cleanup.
 
 For these contracts, PluginBench reconstructs the hash-bound `model.patch` over the frozen starting source. That reconstruction supplies measurements and review. Generated files present only in the stopped working tree remain diagnostics; files included in the patch remain part of the submission. Unsupported contracts, missing preparation proof, or unsafe/unverifiable patches produce no canonical submission. They never fall back to the diagnostic tree.
 
