@@ -224,6 +224,75 @@ def test_work_finished_while_a_stop_drains_is_kept_with_interrupted_usage(
     assert Counter(run["attempt_states"].values()) == {"complete": 4}
 
 
+def test_backend_failure_before_the_first_turn_stops_the_run_unscored_and_uncached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A seed whose first attempt is vanilla, so a scored failure would be cached.
+    seed = next(
+        seed
+        for seed in range(100)
+        if study.plan_study(
+            study.load_study(
+                resume_support.recipe(
+                    tmp_path / f"probe-{seed}", tasks=2, treatments=1, repeats=3, jobs=1, seed=seed
+                )
+            )
+        )["entries"][0]["arm"]
+        == "baseline"
+    )
+    recipe = resume_support.recipe(
+        tmp_path / "config", tasks=2, treatments=1, repeats=3, jobs=1, seed=seed
+    )
+    resolved = study.load_study(recipe)
+    cache, root = tmp_path / "cache", tmp_path / "run"
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+
+    def outage(**kwargs: Any) -> dict[str, Any]:
+        # The shape of a Codex session cut off from its backend: an empty patch, no usage.
+        calls.append(kwargs["entry"]["id"])
+        execution = native_execution(
+            kwargs["area"], kwargs["protocol"]["native_task_identity"], reward=0
+        )
+        execution.update(
+            usage=None,
+            timed_out=False,
+            successful_native_completion=False,
+            stream_errors=[
+                {"type": "error", "message": "workspace routing discovery failed"},
+                {"type": "turn.failed", "error": {"message": "workspace routing discovery failed"}},
+            ],
+        )
+        return execution
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", outage)
+    with pytest.raises(study.BackendUnavailable, match="workspace routing discovery failed"):
+        study.run_study(
+            resolved,
+            root,
+            baseline_cache=cache,
+            baseline_identity=resume_support.vanilla_identity(resolved),
+        )
+    [failed] = calls
+    assert _json(root / "run.json")["attempt_states"][failed] == "interrupted"
+    assert not (root / "records" / f"{failed}.json").exists()
+    assert not list(cache.glob("*/*/manifest.json"))
+
+    calls.clear()
+    resume_support.install(monkeypatch, calls)
+    study.resume_study(
+        root,
+        baseline_cache=cache,
+        baseline_identity=resume_support.vanilla_identity(study._frozen_study(root)),
+    )
+    run = _json(root / "run.json")
+    assert list(run["discarded_attempts"]) == [failed]
+    assert run["discarded_attempts"][failed]["replaced_by"] in calls
+    assert len(calls) == 12 and failed not in calls
+    assert Counter(run["attempt_states"].values()) == {"complete": 12}
+    assert len(list(cache.glob("*/*/manifest.json"))) == 6
+
+
 def test_resume_reads_a_moved_copy_from_its_own_frozen_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

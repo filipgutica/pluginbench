@@ -414,6 +414,22 @@ def test_cached_artifact_tampering_is_rejected_before_import(tmp_path: Path) -> 
         second.reserve()
 
 
+def test_session_that_never_reached_the_model_is_not_published(tmp_path: Path) -> None:
+    # Runs from before the coding pass stopped on such a session recorded it as complete.
+    path = tmp_path / "cache"
+    cache, _, records = _cohort(tmp_path / "run", path)
+    receipt = cache.root / "attempts/baseline-1/handoff/execution.json"
+    execution = json.loads(receipt.read_text())
+    execution.update(
+        usage=None,
+        timed_out=False,
+        stream_errors=[{"type": "turn.failed", "error": {"message": "backend unreachable"}}],
+    )
+    receipt.write_text(json.dumps(execution))
+    _publish(cache, records)
+    assert [entry.name for entry in (path / cache.keys["answer"]).iterdir()] == ["2"]
+
+
 def test_cohort_lock_and_each_published_repeat_is_its_own_hit(tmp_path: Path) -> None:
     path = tmp_path / "cache"
     first, tasks, records = _cohort(tmp_path / "first", path)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -237,14 +238,39 @@ def _worker_argv(root: Path, *, notify: bool) -> list[str]:
 
 
 _DETACH_TIMEOUT = 30.0
+_SYSTEMD_SCOPE = ["systemd-run", "--user", "--scope", "--collect"]
+
+
+def _systemd_scope() -> list[str]:
+    """`systemd-run` arguments that start a command in its own user scope, if this host can.
+
+    A scope keeps the command's PID, environment, and output, but moves it out of the
+    launcher's cgroup, so stopping the launching terminal, agent session, or service does not
+    kill the run. Hosts without a reachable systemd user manager get an empty list.
+    """
+    if shutil.which(_SYSTEMD_SCOPE[0]) is None:
+        return []
+    try:
+        probe = subprocess.run(
+            [*_SYSTEMD_SCOPE, "--quiet", "true"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return _SYSTEMD_SCOPE if probe.returncode == 0 else []
 
 
 def _detach(root: Path, *, notify: bool) -> None:
-    """Start the run in its own session and return once that process holds run.lock."""
+    """Start the run in its own session and user scope; return once it holds run.lock."""
     log = root / "run.log"
+    scope = _systemd_scope()
     with log.open("ab") as output:
+        # systemd-run execs the worker in place, so the child's PID is the worker's.
         child = subprocess.Popen(
-            _worker_argv(root, notify=notify),
+            [*scope, *_worker_argv(root, notify=notify)],
             stdin=subprocess.DEVNULL,
             stdout=output,
             stderr=subprocess.STDOUT,
@@ -259,7 +285,8 @@ def _detach(root: Path, *, notify: bool) -> None:
         if time.monotonic() > deadline:
             raise ValueError(f"background run did not start within {_DETACH_TIMEOUT:g}s; see {log}")
         time.sleep(0.05)
-    typer.echo(f"Started run {root} in the background (process group {child.pid}).")
+    where = "a systemd user scope" if scope else "a new session"
+    typer.echo(f"Started run {root} in the background (process group {child.pid}, in {where}).")
     typer.echo(f"Watch it: pluginbench status {root} --watch")
     typer.echo(f"Events: {root / 'events.jsonl'}   Log: {log}")
     typer.echo(f"Stop it: pluginbench stop {root}")

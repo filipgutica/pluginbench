@@ -174,6 +174,27 @@ def parse_events(
     return result
 
 
+def failed_before_first_turn(execution: dict[str, Any]) -> str | None:
+    """The error of a Codex session that failed before any model turn, else None.
+
+    Such a session, typically a network or backend outage, never let the agent work, so its
+    empty submission is not an outcome. A timeout, or a failure after any usage, command, or
+    agent message, is the agent's attempt and stays scored.
+    """
+    if (
+        execution.get("timed_out") is True
+        or execution.get("usage") is not None
+        or any(execution.get(key) for key in ("partial_usage", "command_items", "agent_messages"))
+    ):
+        return None
+    for error in execution.get("stream_errors") or []:
+        if isinstance(error, dict) and error.get("type") == "turn.failed":
+            detail = error.get("error")
+            message = detail.get("message") if isinstance(detail, dict) else None
+            return message if isinstance(message, str) and message else "turn.failed"
+    return None
+
+
 def _sum_usage(totals: list[dict[str, int]]) -> dict[str, int] | None:
     if not totals:
         return None
