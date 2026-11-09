@@ -76,7 +76,7 @@ class StudyRecipe(BaseModel):
     harness_version: str | None = None
     container_cpus: int = Field(default=1, strict=True, ge=1)
     container_memory_mb: int = Field(default=2048, strict=True, ge=256)
-    treatments: dict[str, Treatment] = Field(min_length=1)
+    treatments: dict[str, Treatment]
     capabilities: NativeCapabilities = Field(default_factory=NativeCapabilities)
     model: str = Field(default="gpt-6.1-sol", min_length=1)
     reasoning: Literal["minimal", "low", "medium", "high", "xhigh", "max", "ultra"] = "medium"

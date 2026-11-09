@@ -1,0 +1,50 @@
+{
+  "base_commit": "01597a8c8d04a3ecaa3aa52f09cd61d1845180ae",
+  "ruff": "passed",
+  "mypy": {
+    "errors": 17,
+    "matches_main": true,
+    "normalization": "line numbers and diagnostic ordering"
+  },
+  "pytest": {
+    "passed": 1207,
+    "failed": 3,
+    "skipped": 7,
+    "baseline_passed": 1206,
+    "baseline_failed": 3,
+    "baseline_skipped": 7,
+    "known_baseline_failures": [
+      "tests/test_codex.py::test_readonly_invocation_uses_one_sandbox_and_cannot_escape_packet",
+      "tests/test_isolation.py::test_owned_job_cannot_read_shared_files_or_follow_an_escape",
+      "tests/test_isolation.py::test_runtime_identity_tracks_replacement_of_selected_executable"
+    ]
+  },
+  "focused": {
+    "command": "pytest tests/test_study_cli.py tests/test_submissions.py tests/test_measurement_profiles.py",
+    "passed": 159,
+    "skipped": 4
+  },
+  "regression": "The one new vanilla-only test failed before the schema change and passed after it.",
+  "preparation": "All 39 complete task payloads reproduced with identical native_task_assets, including neutral identity and executable modes.",
+  "reference_qualification": {
+    "selected_tasks": 25,
+    "oracle_reward": 1,
+    "nop_reward": 0,
+    "source_qualification": "complete",
+    "trusted_digests_match_manifest": true,
+    "canonical_reconstruction": "complete",
+    "cleanup": "complete"
+  },
+  "panel_check": {
+    "status": "ready",
+    "model_calls": 0,
+    "tasks": 25,
+    "coverage": {
+      "ready": 2,
+      "not_configured": 23
+    },
+    "reference_preparation_keys_match": true,
+    "config_sha256": "e365b4c0cccb665d70b7a7ded3db69e8ee07f46780214af6223be24755e32379",
+    "raw_report": "/home/filip/.t3/worktrees/pluginbench/feat-deepswe-panel/.panel/check-panel-qualified/check.json"
+  }
+}

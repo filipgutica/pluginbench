@@ -1,0 +1,3804 @@
+{
+  "schema_version": 1,
+  "dataset": "https://github.com/datacurve-ai/deep-swe",
+  "dataset_commit": "0b9fabbb63b9104d678fe965e1632f2dd9eaa2ea",
+  "prepared_tasks": "/home/filip/.t3/worktrees/pluginbench/feat-deepswe-panel/.panel/tasks",
+  "tasks": [
+    {
+      "task": "adaptix-name-mapping-aliases",
+      "repository": "https://github.com/reagento/adaptix",
+      "language": "python",
+      "base_commit": "a691069fcadf9131e5f7a5a130a022dc678f3e1d",
+      "tests_sha256": "0eaf29b862c00fe04c8d5f76b63297fd15e8193da13b548f9a68e57b8ccf276d",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Literal aliases, collision errors, extras, trails, schema and style fallback match instruction; in-memory pytest cases.",
+      "f2p_count": 44,
+      "p2p_count": 2738,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "9365c46099b0571c2bad87c5e3d35e491ca817ecadb7b1876946f684d4de2cc3",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "ad871fc46f60c2a3f7cd3127321dfc259db434cda099cc0bf5e3637a3eb2eda5",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "e9ea26e7b29f431bbeff3aa7230f7b384f0fd3100b8de5ad00f56c42fab9281f",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "66cf913bf92b41e0b675428e5a7b70caa8198059cb19dc2332be5309e495a4ad",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 33000,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "ready",
+          "reason": null
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:34482162ee6a016378697d922d0b11ab1a050cf1d1f0664f68b4d5ec0000ac53",
+            "author": "Task Developer <developer@example.invalid> 1794257355 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/adaptix-name-mapping-aliases",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "csstree-shorthand-expansion-compression",
+      "repository": "https://github.com/csstree/csstree",
+      "language": "javascript",
+      "base_commit": "88e3d965c0b1628642a30a841745b410d6835052",
+      "tests_sha256": "9caf86b1898a4e1f9077e7ea9ed7f7e46c16bec89526916cf56a1d50187acfb5",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Expansion, compression, keyword/null cases, round trips and fork behavior match instruction; no I/O.",
+      "f2p_count": 79,
+      "p2p_count": 16715,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "a038169d3661f0fd9bdc7cead44fad1d41d42358e9ae9f07bd7f7422421a266e",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "569c1c8e0db40506847f74bef946775a6f3cb777078513b6798dbb90b296d50a",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "8d7175cbea6420d5eb0511cbce41cdba865de1ea676a41aa31352e569fb4dd0a",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "6e409ebeebde2c5739e7dec243c2ac70a3c9d26dd7540b4660ea972b50c534ab",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 20074,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "ready",
+          "reason": null
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:b6fb3505fd7412fe9ed4e7236a7581a2cb0c2c52640ac3fd4d340dd3a8a6561e",
+            "author": "Task Developer <developer@example.invalid> 1794257608 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/csstree-shorthand-expansion-compression",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "superjson-error-stack-serialization",
+      "repository": "https://github.com/flightcontrolhq/superjson.git",
+      "language": "typescript",
+      "base_commit": "010c4bdb4b8758844fd44eacf38e42b22eba8aea",
+      "tests_sha256": "f8a51ea729b2fd34d6a927a5029dc5b408399f7a728f1f5cac71d7426b2f7c0f",
+      "grader_ok": true,
+      "contract_reviewed": false,
+      "contract_notes": null,
+      "f2p_count": 80,
+      "p2p_count": 116,
+      "rejection_reason": "Deferred from this bounded panel: stack parsing, restoration, cause handling and sanitization form a broad API expansion with a 60 KB hidden patch. Complete contract review not completed; no digest admitted.",
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "7790db88edd471c9581c2c2625a687eae80aa97b61bf859c6197156090dd10b0",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "a41f9692b871c6e515e4215f8a2531df9fb0c0e65a482796230acb209040a52d",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "1107931e0442dc35b9bf9d2c647b35ac93d44c52607eb5733511faae99f78398",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "a49e97fe46c86e5137ac6bbad00bcbfea2fde0bdbfe9023c35745ff2c7f95f42",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "not_run",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": null,
+      "reference_ready": false,
+      "selected_for_screen": false,
+      "qualification_directory": ".panel/qualification/superjson-error-stack-serialization",
+      "admitted": false,
+      "source_qualification": {
+        "status": "not_run",
+        "reason": null
+      },
+      "canonical_ready": false,
+      "check_report": null
+    },
+    {
+      "task": "ts-pattern-match-each",
+      "repository": "https://github.com/gvergnaud/ts-pattern",
+      "language": "typescript",
+      "base_commit": "f66fc061fde4f764b113ededa09be63dae564159",
+      "tests_sha256": "5ac2f376722eda2df307bfa4c86ba1fd3e93267928a212da5840c9f7f11f851e",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Runtime arrays, guards, taps, compiled functions, independent selections and compile-time exhaustiveness match instruction; pure Jest cases.",
+      "f2p_count": 85,
+      "p2p_count": 6,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "83b81c9c226619bdf9de0c768a7725ba16f7743d86e797c04880049c7b082f42",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "babb0b7ab6db73e1fef3a813b3e59c948d3c678f4498bb2d50c33ae9b078cf31",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "6638df983f8d1dd49b0c38afe0a8026a778151931889e9fc5253c5fb1f6b319c",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "5c41ab58c7428a1161edf18d840692d40a169bac6b2eee3ea10fedb72340904c",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 20929,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:55df2f99db58a44e161209bbef338f26c8891fc81ff83768259d187badf582fe",
+            "author": "Task Developer <developer@example.invalid> 1794257619 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/ts-pattern-match-each",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "valibot-recursive-schema-composition",
+      "repository": "https://github.com/open-circle/valibot",
+      "language": "typescript",
+      "base_commit": "50016c77c808f9ca80391cf1abc96cc5416cf57d",
+      "tests_sha256": "9d1436a51154d4780929987bf9731a02ee0a3a21caf1d26596a5261717376d32",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Sync/async recursive containers and transformed input/output inference use pure schemas; tsc gates enforce unresolved-placeholder rejection.",
+      "f2p_count": 10,
+      "p2p_count": 209,
+      "rejection_reason": "Runtime preparation rejected source symlink README.md; canonical export policy is unchanged.",
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "b1297d45fc2a641cba7425c814192ada4e9bbe8a1e0f8344eeecb4c66dcf99fd",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "d527d41666f9aa46167728d83ee77484a4b795613a3f0035593750e3cc9c7a7e",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "a72a56cc06aee332199e463df66507357db4351610d8ef4bf33a17768c1b2707",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "6c461a60770b7518cec591b7948fbcf1af187e4c50cc7cbb1d6753d865bf3df9",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "not_run",
+      "qualification_error": "Native source contains a symlink: README.md",
+      "qualification": {
+        "oracle": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": null,
+      "reference_ready": false,
+      "selected_for_screen": false,
+      "qualification_directory": ".panel/qualification/valibot-recursive-schema-composition",
+      "admitted": false,
+      "source_qualification": {
+        "status": "not_run",
+        "reason": null
+      },
+      "canonical_ready": false,
+      "check_report": null
+    },
+    {
+      "task": "meriyah-explicit-resource-declarations",
+      "repository": "https://github.com/meriyah/meriyah",
+      "language": "typescript",
+      "base_commit": "d141eb14a40b79c04d1b1db5c20c6afa3844c0d9",
+      "tests_sha256": "7e476f929233ec98e31800eb3f65ec35e85e26f80f4b6cc7857bb5c7cdb89569",
+      "grader_ok": true,
+      "contract_reviewed": false,
+      "contract_notes": null,
+      "f2p_count": 49,
+      "p2p_count": 51469,
+      "rejection_reason": "Instruction both permits using at script top-level and requires a script-global error; hidden test explicitly rejects that scope. Ambiguous contract.",
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "c0acd01d13712e67e8b6b29e9a777bbaf782674b263f0b438ab9a31a776c7cea",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "3c3f0aa5fead486cf8e4e96882db3e930c8023ef4b289eae19a923bde3638d0f",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "295fa1d4bb16409303a13b5252641b439cb4e3e19c65fade6341c01a00581395",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "2541c912d82661288d00d9c396b59d766fa84876a659662d58ba7043306571c3",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "not_run",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": null,
+      "reference_ready": false,
+      "selected_for_screen": false,
+      "qualification_directory": ".panel/qualification/meriyah-explicit-resource-declarations",
+      "admitted": false,
+      "source_qualification": {
+        "status": "not_run",
+        "reason": null
+      },
+      "canonical_ready": false,
+      "check_report": null
+    },
+    {
+      "task": "clack-async-autocomplete-options",
+      "repository": "https://github.com/bombshell-dev/clack",
+      "language": "typescript",
+      "base_commit": "8a96e2dcd7f821d1250b58cf71c327679f94de25",
+      "tests_sha256": "49111a02f74d97cbf38f597bf6e2d8d2bfe124f3718d372a64618fe43ed96123",
+      "grader_ok": true,
+      "contract_reviewed": false,
+      "contract_notes": null,
+      "f2p_count": 82,
+      "p2p_count": 643,
+      "rejection_reason": "Deferred: 84 KB hidden patch spans debouncing, caching, SWR, retries, loading duration, cancellation and two UI wrappers. Complete contract review not completed; no digest admitted.",
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "f9f060804da06d2ed40954ec21c5f41a6eb3e2541f0a0e270638a4c548edbd32",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "68f5bdaa5ed70850c3e4f3e8f97328a86bac535f6cd325b9111207d1b0f86bed",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "bf6aaeaac58a1093d509332cd3f36562c6c8c61f41fa84178d87afcf50de9ab8",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "121e16f34db26fc1799f8c28db93eb33228d3d54fcd997d13b4b85277d06e18f",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "not_run",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": null,
+      "reference_ready": false,
+      "selected_for_screen": false,
+      "qualification_directory": ".panel/qualification/clack-async-autocomplete-options",
+      "admitted": false,
+      "source_qualification": {
+        "status": "not_run",
+        "reason": null
+      },
+      "canonical_ready": false,
+      "check_report": null
+    },
+    {
+      "task": "optique-conditional-option-dependencies",
+      "repository": "https://github.com/dahlia/optique",
+      "language": "typescript",
+      "base_commit": "14bbe4efc7ded67932771b9ca18d9d637bb4cf27",
+      "tests_sha256": "ff7baae2990174764a3fe7912597fb6c0d8c62f999d646e9dc07a5b6f79fba79",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Required/optional compound dependencies, wrapped state, visibility, completion and helper exports match instruction; pure parser calls.",
+      "f2p_count": 36,
+      "p2p_count": 2034,
+      "rejection_reason": "Runtime preparation rejected source symlink .cursorrules; canonical export policy is unchanged.",
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "6e03d7edbcff8b85ca51c2356826a2d0208b44e4a0f4d9a9daea3a7e8fa3298b",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "9834dc7684dcb9bb9cfa99f17648850b71e8b24ae42b4ede2fab01c86c50b96f",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "0f1c2133c2c749365028a9a6896893394256542ec57b55adf59eb67ff4b42af1",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "78aa2f7b8be06086b0b69638fdc523d965f016fb6b002a81cf656585825c9d4b",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "not_run",
+      "qualification_error": "Native source contains a symlink: .cursorrules",
+      "qualification": {
+        "oracle": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": null,
+      "reference_ready": false,
+      "selected_for_screen": false,
+      "qualification_directory": ".panel/qualification/optique-conditional-option-dependencies",
+      "admitted": false,
+      "source_qualification": {
+        "status": "not_run",
+        "reason": null
+      },
+      "canonical_ready": false,
+      "check_report": null
+    },
+    {
+      "task": "kysely-window-grouping-helpers",
+      "repository": "https://github.com/kysely-org/kysely",
+      "language": "typescript",
+      "base_commit": "91cf3733b2a419f5b17dff118cedb7052ab5300d",
+      "tests_sha256": "a9ced82977aea08738b3d6b865be2cd1cc63709f31aa872c9d23854f6d40f10f",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Four dialect compilers use DummyDriver without databases; exact SQL/parameter assertions and build-time type checks cover windows, grouping and simplification.",
+      "f2p_count": 254,
+      "p2p_count": 22,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "d2768a461663aa40405d6cc1fa0d976f5d73bb3fe0194a7a4831381b219f80bb",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "a6454a3aa832579bed3c45f7698c16e76def9514db4847149284df96948948c2",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "ddfb6a402bceb390dca9066749028c0737d6c09c650670ef22f3af6356e6ace0",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "658c4a54b468d4b4702cf92c5c19f39fa670b5292c45186fc06fed7b5ee5e5bf",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 37128,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:786b950a1f8e469b57cf21e7f505eccbaea9f5df595d64222be68d76c05f734d",
+            "author": "Task Developer <developer@example.invalid> 1794257684 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/kysely-window-grouping-helpers",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "cattrs-partial-structuring-recovery",
+      "repository": "https://github.com/python-attrs/cattrs",
+      "language": "python",
+      "base_commit": "6bc4708fb9b2ac52d9a18997e923da6a58916102",
+      "tests_sha256": "62c19e25862ba6465d0fba5be783857e4b874457850813b5d8fe588146d3e70c",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Nested/default recovery, atomic collections, TypedDict/dataclass/attrs support, refinement and extra-key behavior match instruction; local pytest only.",
+      "f2p_count": 69,
+      "p2p_count": 7,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "bdca07e5a8e64ab175c28a2fa0d53d2225ae439abe6f0723213cd99ffdfb5228",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "d32fbbb9320863afda4000a3b87efbe1a1eb36565c474fbc37eb400d6301d62c",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "50154d90fca5e57254affc3a5378082a6782cb4d7e27182a7860a5827b8afef9",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "f17974eb262c2263c538fd31d62ff40597674ce4bc70084abad190885862e481",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 24810,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:18a30e8e57e5bfd45088f9f7e5bcffb73d9498fb6ce1f80e70ea2abbf5cc5f7c",
+            "author": "Task Developer <developer@example.invalid> 1794257620 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/cattrs-partial-structuring-recovery",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "mashumaro-flattened-dataclass-fields",
+      "repository": "https://github.com/Fatal1ty/mashumaro",
+      "language": "python",
+      "base_commit": "de139fd51c4d347666d109a8aea9d25451d908f6",
+      "tests_sha256": "79c3151c0605ceff38611b42c0fcbd08aaa11974b691e0b80e36877d350f9b94",
+      "grader_ok": true,
+      "contract_reviewed": false,
+      "contract_notes": null,
+      "f2p_count": 66,
+      "p2p_count": 30014,
+      "rejection_reason": "Deferred from this bounded panel: broad flatten/prefix/rename compatibility surface with a 62 KB hidden patch. Complete contract review not completed; no digest admitted.",
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "d4a69044b937698ecdd82f60fc26580578451c0a3d41ccbf9fe2e754ab11803b",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "93129d2c6ef2531a12d2dd9ff3fcf158525114367b0cb494912af83c37f80332",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "0a35d05bf2ee1e3ef9b8f4c8765725218ad6e9695dc094ded8a3899372731d4e",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "9875ee2d2ecae63d0bbbe037aff1be899f37ca3cf84f230efa51ac591aeea40f",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "not_run",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": null,
+      "reference_ready": false,
+      "selected_for_screen": false,
+      "qualification_directory": ".panel/qualification/mashumaro-flattened-dataclass-fields",
+      "admitted": false,
+      "source_qualification": {
+        "status": "not_run",
+        "reason": null
+      },
+      "canonical_ready": false,
+      "check_report": null
+    },
+    {
+      "task": "returns-validated-error-accumulation",
+      "repository": "https://github.com/dry-python/returns",
+      "language": "python",
+      "base_commit": "41607fae1289de2787523c452d75212206b9c7c0",
+      "tests_sha256": "e92a9be1e52f9fb15aef1d6264122298a88c5d9f9c80d68fe2fcf2cd48fb424b",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Pure container values cover applicative accumulation, short-circuit bind, conversions, decorators, pattern matching, Fold and interface law integration; Hypothesis uses 25 examples.",
+      "f2p_count": 159,
+      "p2p_count": 61,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "26dd2766c4eb5c1f5b3ebcbd82ee073c8221b886e526c3bedaa8e7abb9fc9e5c",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "060f07ca8a5c74c88f3e253a4b72eb44fadd9f82f28884fc786f37eaa8b6d471",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "d4f92adfa57f16c3a05b6990022f4e9cd75979ef63e8f9ee10eb63fe313847d3",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "f89501a3d1145d80c7d5bb79aea3638296f1c379f8e305801e90500bc33dceab",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 36040,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:dbd10c40ea8d5cd2f4906598461f446679c1c3c43cba51d110b87049ccae3f8f",
+            "author": "Task Developer <developer@example.invalid> 1794257691 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/returns-validated-error-accumulation",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "tomlkit-toml-table-converters",
+      "repository": "https://github.com/python-poetry/tomlkit",
+      "language": "python",
+      "base_commit": "dd05eebc8ed9e30fc6c223088a5a450cb54c1cab",
+      "tests_sha256": "263d0a5fb6423b68487bed4a9de25c1cfeb73960732dcd33534ef9615c15cc8d",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "String TOML fixtures test each in-place conversion, value round trips, comment placement, depth limits and ConversionError paths.",
+      "f2p_count": 60,
+      "p2p_count": 964,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "1a004252c203ce62f4e83350d946013d3238ab8201fc59db56c82237dbb45c05",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "4d87f2da8504baf7fcbbc5b2859560df0c56e4596026ff2767361732f6f8a7b5",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "a587bd8a6bc35b9ec149a8f097ca2f06cee1aac53d20ac1a3576e79993a3fef5",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "eeab3b4d7463a2a3df9874a7dbd77af3b37d064c67b7bc313359655615e090b7",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 21412,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:ef82237794523baca0ae0adae6fe23a85a658aa3fae8cb970bcec690e93d6f42",
+            "author": "Task Developer <developer@example.invalid> 1794257679 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/tomlkit-toml-table-converters",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "sqlfmt-create-table-ddl-formatting",
+      "repository": "https://github.com/tconbeer/sqlfmt",
+      "language": "python",
+      "base_commit": "da140993a4547170ef85dc5ce7ce1c270f4322b3",
+      "tests_sha256": "c438a9f588d20e6b9ca18d76bc6355bf1f776c44976cd32d8d400322cc57d91c",
+      "grader_ok": true,
+      "contract_reviewed": false,
+      "contract_notes": null,
+      "f2p_count": 32,
+      "p2p_count": 1273,
+      "rejection_reason": "Deferred from this bounded panel: combines DDL parsing models and formatting with a 70 KB hidden patch. Complete contract review not completed; no digest admitted.",
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "cb23eee8568d6e157cd0fa3faa2400ae7171506aef6e4caec92bd68e19a5e50d",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "9e7cbc59d12769f766cd04fc580972d214ee3772fd92b13398c41494c78ec8b9",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "2c4e74afb5bd957ff90a043c2fe8e8313382b64106dd839322068e77b37a1b6e",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "5f8d66ffade496f1af12f8864e4a515a5d537ecc2cb2ca7bfa2ade9adb729054",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "not_run",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": null,
+      "reference_ready": false,
+      "selected_for_screen": false,
+      "qualification_directory": ".panel/qualification/sqlfmt-create-table-ddl-formatting",
+      "admitted": false,
+      "source_qualification": {
+        "status": "not_run",
+        "reason": null
+      },
+      "canonical_ready": false,
+      "check_report": null
+    },
+    {
+      "task": "skrub-duration-encoding",
+      "repository": "https://github.com/skrub-data/skrub",
+      "language": "python",
+      "base_commit": "24c4466fea94f551fb73d21eba54038dc5b346d3",
+      "tests_sha256": "6a75f354bd229f0f45b7b51ee9fb74fb6d40de576ae9ec707a870cfeafd8879c",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Fixed duration columns exercise resolution, components, scaling, nulls, selectors and routing across pandas/polars; fetching tests excluded.",
+      "f2p_count": 130,
+      "p2p_count": 2784,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "702a66e37c5ea5d7a0eaf4510ea5927502b19add30ca20e32a87bfa7c588cae3",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "1047edcb6c6af650cafbba6d015b0db12e33a0ebcedb1f3c720b95b2b8fc7469",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "e59bf620b171ab8ead1f288c5cb24e85df61d5ba254028290a4ea3a0dbcdab8f",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "c46dfa388313f5ef8f95310906ef30ed68d53a255d381eaf9ba7a79c073b87bc",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 31594,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:5c47baf0cd5606b9efdd5c1f23a7d85d2c1f1fa039b4fb06c063d48c67c6a944",
+            "author": "Task Developer <developer@example.invalid> 1794257622 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/skrub-duration-encoding",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "httpx-deterministic-cookie-store",
+      "repository": "https://github.com/encode/httpx",
+      "language": "typescript",
+      "base_commit": "b5addb64f0161ff6bfe94c124ef76f6a1fba5254",
+      "tests_sha256": "2be40b27ac54dc542c32b025577b06be512d8a3b72817e3375027bea0f1fa0fe",
+      "grader_ok": true,
+      "contract_reviewed": false,
+      "contract_notes": null,
+      "f2p_count": 115,
+      "p2p_count": 1281,
+      "rejection_reason": "One-second Max-Age test uses the real clock without freezing it; visible timing dependence. Upstream language metadata also incorrectly says TypeScript for Python.",
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "860e97dc73215d6681683fcbde86d7c9725c56615683c480636a7494138aad3c",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "7878b7c49f92222e1114759f85809023939e104fdeb7743708e72055dbae7549",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "aeb6ad57532b08b38229ea05fda43a81ae3bb8a7ae702bddfb031ef51afc0443",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "937aed0e11cecfc1c91964a79f7278dfd6b2cc7d70e93f1ea3b4f1a7d0c4cddb",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "not_run",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": null,
+      "reference_ready": false,
+      "selected_for_screen": false,
+      "qualification_directory": ".panel/qualification/httpx-deterministic-cookie-store",
+      "admitted": false,
+      "source_qualification": {
+        "status": "not_run",
+        "reason": null
+      },
+      "canonical_ready": false,
+      "check_report": null
+    },
+    {
+      "task": "actionlint-action-pinning-lint",
+      "repository": "https://github.com/rhysd/actionlint",
+      "language": "go",
+      "base_commit": "0bdc95715fa58f64e3fd6e63b0f89be8733cbbab",
+      "tests_sha256": "5762d47f0d98aebf38297b3fc166b270237e94e72e02a9b588b3bbf9d7ca6d8b",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Literal workflow YAML and temporary config files test strictness, scope/CLI overrides, allow/deny precedence and diagnostics; known-action suggestions use bundled data.",
+      "f2p_count": 55,
+      "p2p_count": 145,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "0b9bdabc3f18bafa78d129d076c3464c5a8d9d52d4b1f07ff58603c85ca3e89e",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "003e2833f422b8c74af29572915c0c020466255dd5125ed33e8587e7ef60cf17",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "608be125ea90894b68b06e664229b6de7911403695132fc0ff794ceefa39a856",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "ad32349418c97fe12a090d09ddb5c3880b1b992500c2f69275ef702b52c6e0e3",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 27751,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:b5835f23bc756c95fce6a3f2a62cc4953b48c79fe6aef4f42d4d879efb7810a4",
+            "author": "Task Developer <developer@example.invalid> 1794257688 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/actionlint-action-pinning-lint",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "expr-try-catch-errors",
+      "repository": "https://github.com/expr-lang/expr",
+      "language": "go",
+      "base_commit": "851b241a301f7c74646e65e4009c69cf290993a8",
+      "tests_sha256": "98c702c7f932c4407d44448022978af1d5cb73cd1bf8cc80dd8bbbb77a9d2475",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Deterministic expressions and synchronous failing callbacks cover lazy fallback, try/catch/finally, error filters, throw and bounded retry counts; flaky vendored self-tests excluded.",
+      "f2p_count": 79,
+      "p2p_count": 66265,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "0a0e3016434f05f233f2af6215a2df509de25cdc8aa47f69d6f1625a03a92488",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "91d9f4547c567e798644c3ad80016ad2745db3184df82440e8b93b9b6d163fd6",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "4f3f19e8f52c0e10cf4fe194b7adbf84f59541576e2f557d0624ce9af5aa3eb7",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "2340ff25d99a8ced4acdfd1fa5e11dca45990265b58c37744f0fd96afd3521af",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 17947,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:ad40af136a58543de3301769ecae30d9af814aa530c1990a00acd43d072adc59",
+            "author": "Task Developer <developer@example.invalid> 1794257682 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/expr-try-catch-errors",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "etree-xml-diff-patch",
+      "repository": "https://github.com/beevik/etree",
+      "language": "go",
+      "base_commit": "4032e04c8f2e2f35e43ce5d772fcef14a5df4d74",
+      "tests_sha256": "cc9c0afada1f2fb84ef17c9ad7832090d385fc8803e5b1b4f0d476ccae84a1d3",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "In-memory XML fixtures test diff/apply/reverse/merge, identity/options, metadata and nil handling; verifier removes authored root tests before new-suite grading, a limitation recorded for the screen.",
+      "f2p_count": 52,
+      "p2p_count": 15,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "00a5d767a216d14966d0653d70e84148b9fe0b33518e6ef099be029a39fdb78d",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "bbe92b48c36a9cd3f868d95238c281e876f278c5262d793a01a9a3e2ad2d41d6",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "7cab6711718deca89a068e57146c28b490e77320144b413061fab2333b1f8c88",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "ffb75d0fa4c759ded3186c1ec49c533db27ec34776a6ae829de5a4692337099a",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 45435,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:16f162e1efbeef826deebe37942ac736d1abf1a8587d93f1bbf2cd728a8b157a",
+            "author": "Task Developer <developer@example.invalid> 1794257689 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/etree-xml-diff-patch",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "participle-grammar-conflict-analysis",
+      "repository": "https://github.com/alecthomas/participle.git",
+      "language": "go",
+      "base_commit": "1051d4767b5a469936daf5f1cebb63da6c9fb776",
+      "tests_sha256": "fdb824c6fe2280b555d3fcec2570881ed2f356c144359850ccef967f4ac75c34",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Literal grammars and standalone compile probes test conflict semantics, immutable reports and analyze build-tag wiring; no external services.",
+      "f2p_count": 91,
+      "p2p_count": 153,
+      "rejection_reason": "Runtime preparation rejected source symlink bin/.go-1.23.5.pkg; canonical export policy is unchanged.",
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "286d7361bd798c97a3a248a80445735eaefe37ff3a672f9ee08fdad7ceddc451",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "2cddad1b73db6dbb89d1aa69dc7295f1b5566b38ca6b2c96e132f0c486cd5d05",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "ceeca49eb1da519269be4ca93770bb53d8b628bdd12cf12841b980d703be4ace",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "b2ecdefd02ff259baa21ff354f60d63ef265397f740a558685877690b7388934",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "not_run",
+      "qualification_error": "Native source contains a symlink: bin/.go-1.23.5.pkg",
+      "qualification": {
+        "oracle": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": null,
+      "reference_ready": false,
+      "selected_for_screen": false,
+      "qualification_directory": ".panel/qualification/participle-grammar-conflict-analysis",
+      "admitted": false,
+      "source_qualification": {
+        "status": "not_run",
+        "reason": null
+      },
+      "canonical_ready": false,
+      "check_report": null
+    },
+    {
+      "task": "termenv-preserve-ansi-resets",
+      "repository": "https://github.com/muesli/termenv",
+      "language": "go",
+      "base_commit": "368a3572b8146cc038b3f240da6792003d7e42c5",
+      "tests_sha256": "02d9f47229ee4e271c31e627484f0182ed0a37ad75ee2af65590f6817a640bc1",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "ANSI controls, Unicode widths, resets, hyperlinks and templates use literal strings and buffers; no terminal dependence.",
+      "f2p_count": 35,
+      "p2p_count": 87,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "18c4b47718a3a7b37c4b94b669dc6a9fab5d2762982b80bde69bdede57163e7b",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "3620a08de2d43a7e9ec4bf1f8fe95fe942edbadaa0d858dd896e34ad1e71acc4",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "f91b88ccf484320e612cc8f46827f5db261669bc9307de5b2c5954309a843913",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "bbf57c30b394173f6ae521434b1aa7d42212d44dfad1094d14b46a3cb0df125b",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 15103,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:e200dcff9ad07d80048330ad623bfbce0d706d7dd4a19d73f5ceaf40b95a6fd3",
+            "author": "Task Developer <developer@example.invalid> 1794257617 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/termenv-preserve-ansi-resets",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "tengo-destructuring-bindings",
+      "repository": "https://github.com/d5/tengo",
+      "language": "go",
+      "base_commit": "3cad0da7a51b1206c6f01e3f4fbb44b976d5275c",
+      "tests_sha256": "277fcdba6cd4102362294c1f44fda1fe6fdd7a7bb6fe1bfc7b8bb6e6401fab66",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Pure script literals test positional/key binding, lazy defaults, rest placement, closures and parameter patterns; tagged hidden suite and local regressions.",
+      "f2p_count": 91,
+      "p2p_count": 132,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "e62428f4147a28ca812d27bf0732ca094b4f8a3f1acff5dfea85ea2046f69a5d",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "89e5ddcc41b9426e7b352afe90f2ddee33af390f61a6d80f6ab3b39e8ced4e46",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "f04b5cbd01ed5065bae760ad4d411e048003ecb9f3898558edd1061ff8a193a0",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "06fccdf3e04f6e5aa5f1adc27b59d37a12b2382868bfcae06f78fd23eff47c93",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 24281,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:e99bbb6b9fb567341ed5a065c411fb8409a6a6c58c55281f2637c8dbc1936fc6",
+            "author": "Task Developer <developer@example.invalid> 1794257677 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/tengo-destructuring-bindings",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "task-task-graph-export",
+      "repository": "https://github.com/go-task/task",
+      "language": "go",
+      "base_commit": "54bdcba369357b47e19066b57badfb216a4c8d95",
+      "tests_sha256": "415317a4990e3c0622157875f0d855f4f27b57ff40ed249ec14ac865ebe6fa1c",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Local YAML fixtures test graph shape, formats, cycles, aliases, reverse traversal and status; build gate keeps CLI wiring valid.",
+      "f2p_count": 20,
+      "p2p_count": 17,
+      "rejection_reason": "Runtime preparation rejected source symlink testdata/evaluate_symlinks_in_paths/src/shared; canonical export policy is unchanged.",
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "a22e752994dea258a9420b27db38821f54fba60ae4fdec58dda31fac503787d9",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "33f778b6aec9552d34ff67dfd91fe7625e8250810a7350a5c3f15ad0cb98104e",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "9ef1a056726c9fa0e540e4ed4d98d8fafdd5f2915a498218bef496cb53fe502a",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "b20c3efff6caeee00d75011c67889fb9941707cdf635d50623b11ac4dfc949e7",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "not_run",
+      "qualification_error": "Native source contains a symlink: testdata/evaluate_symlinks_in_paths/src/shared",
+      "qualification": {
+        "oracle": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": null,
+      "reference_ready": false,
+      "selected_for_screen": false,
+      "qualification_directory": ".panel/qualification/task-task-graph-export",
+      "admitted": false,
+      "source_qualification": {
+        "status": "not_run",
+        "reason": null
+      },
+      "canonical_ready": false,
+      "check_report": null
+    },
+    {
+      "task": "go-critic-doc-link-checker",
+      "repository": "https://github.com/go-critic/go-critic",
+      "language": "go",
+      "base_commit": "9aea378c4dccd6f4394196ad8f0873b3e84678c8",
+      "tests_sha256": "7aadc441e56f0c2a29a10e560a04720c2e41a71751b67d2a93981ce9edcbdcb1",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Doc link diagnostics use local type/import information; test helper preserves doc comments and removes expectation directives.",
+      "f2p_count": 3,
+      "p2p_count": 16,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "0d52e408cf95708965457f3a1424f48904d7faf24e9b459f31e72cd9157cebfc",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "cbe8ca67bbba86fd3a0f925b7d80d94a8b0f1e40ea6937a8a11bca6c630076ff",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "72b0856bd4b8ba3429955c94a16105fcb1a94a55a416dc6f8329eb47bcebd106",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "57f1b844634b36b7951787eda1440438d6d70c7f795dc9798b4d26be0baba55c",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 27328,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:71dcde66338b2e7cf4176d288898f675f6173dab305b8794ef208aefab018bae",
+            "author": "Task Developer <developer@example.invalid> 1794257610 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/go-critic-doc-link-checker",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "fd-deterministic-multi-key-sorting",
+      "repository": "https://github.com/sharkdp/fd",
+      "language": "rust",
+      "base_commit": "227883606023d62275fb48701aeac90f2b604143",
+      "tests_sha256": "29a16328fb01fb1deec3abde7c841279169ac5eca614d9293131f5261f055390",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Filesystem sorting fixtures preserve line order, set mtime/atime explicitly, derive created-time expectations and seed random ordering; no external services.",
+      "f2p_count": 43,
+      "p2p_count": 109,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "445062ca923bc0c1b83c2271c42a5ab5eb682e5c4c571adbd9a5f99402e7c580",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "b230517bac266c9f135daf0f2c1edfe2f03625210711efdabb59c1a6e09bb51f",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "a2cad74364a51fc25fc4dfa9aac7edfaf18ba88aa8b0f51ea04e7152959cf2b6",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "21d2943bf6cf9ec67600daa5bb9ecb7483bb69a8850e72e78b05451cf93a2cde",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 26288,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:1fbc85ac76d1a5d633c0e79c6090c7445fec473efde943419b3e90f27635c59d",
+            "author": "Task Developer <developer@example.invalid> 1794257637 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/fd-deterministic-multi-key-sorting",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "pest-character-class-coalescing",
+      "repository": "https://github.com/pest-parser/pest",
+      "language": "rust",
+      "base_commit": "79dd30d11aab6f0fba3cd79bd48f456209b966b3",
+      "tests_sha256": "b902eeafcab24b13bc6b9666a02d679d3a02e213026c55b26987ab62521aca47",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Pure optimizer-expression fixtures cover beneficial full/partial runs, range merging, case folding, wrappers, negative classes and pass ordering.",
+      "f2p_count": 104,
+      "p2p_count": 250,
+      "rejection_reason": "Image pull initially rate-limited; retry succeeded, then runtime preparation rejected source symlink debugger/_README.md. Canonical export policy is unchanged.",
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "78a0a672c83df85a639466b07fd72fd27f9aa45353e17a41185af7a31826e175",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "3fa5b7f456d3527539878ae5df3b82f9c08e8446ff6ac421addddc82c80984d0",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "e415499694272a9e232b8e824306093996cae3a6d8783656464f1c4eedfdc9d5",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "a65c498000b2b71fdc1249152cd6ea54223232db203dc15fa88706cdbf428dbb",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "not_run",
+      "qualification_error": "Native source contains a symlink: debugger/_README.md",
+      "qualification": {
+        "oracle": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": null,
+      "reference_ready": false,
+      "selected_for_screen": false,
+      "qualification_directory": ".panel/qualification/pest-character-class-coalescing",
+      "admitted": false,
+      "source_qualification": {
+        "status": "not_run",
+        "reason": null
+      },
+      "canonical_ready": false,
+      "check_report": null
+    },
+    {
+      "task": "oxvg-structural-selector-preservation",
+      "repository": "https://github.com/noahbald/oxvg",
+      "language": "rust",
+      "base_commit": "1fd7fab851ecc975e008be0e3e279568ce4e2b51",
+      "tests_sha256": "f34b8dfebb3f2a53d473f0b7914a4afe8fae1ca6003fbd0b12ed80dd1cdd5f4d",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "In-memory SVG fixtures test selector anchors and unrelated subtree optimization.",
+      "f2p_count": 6,
+      "p2p_count": 62,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "061917cc091b1a8cd46852c4f50febf09a6467f8b87a591192b1ddb80dd3c533",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "04fc572bcc90d3e8e23b948e68ee19ca337151fea85893164a1e6b3e49d3dbfd",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "e5f182a2b2c14b2c1be8899cdafaabac2d5b41cfd4b6edf3fcb1a905d070fe2c",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "5f7468f0e7b6edb21c7f843cb56bd9982015ac5a8e224d3ebdf6a2788dc96459",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 28798,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:af89bbff9979b417e2c896562f227a7ed958a319ddfc4a63ade40f6958b93006",
+            "author": "Task Developer <developer@example.invalid> 1794257616 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/oxvg-structural-selector-preservation",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "wasmi-trap-coredumps",
+      "repository": "https://github.com/wasmi-labs/wasmi",
+      "language": "rust",
+      "base_commit": "e1f76e285b9ad68a952b7cf5297bbb7ab91e6028",
+      "tests_sha256": "b93c2efb48680988a72a0c617ec66d81b0e4d9ccd9a5432052183011d9bd12d9",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Pure Wasm modules and local binary decoder test section encoding, typed locals, memory/globals, frame order and reentry; no wall-clock or network inputs.",
+      "f2p_count": 22,
+      "p2p_count": 58,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "018f0a33b68ad28abdb3fb2264a6364ded157d37bbbfe830bedd02def70a8c38",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "54b18f54af4c9bc0fcc0a124182ab37e16a12271bd4a6d82089e959761c0351d",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "502f598d21ecafb81f1e749c8c2a24c4be3ece4ff49881ee0049a850da8b9be1",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "8f16e87ebcad4af24cc913c00470150a8fac1142255e830395b8b2898ae601f3",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 31108,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:e70607a4aea7d826ef2dcee0ff9412c954c3f69b34cbd0adebaa660250a0c373",
+            "author": "Task Developer <developer@example.invalid> 1794257630 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/wasmi-trap-coredumps",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "boa-hierarchical-evaluation-cancellation",
+      "repository": "https://github.com/boa-dev/boa",
+      "language": "rust",
+      "base_commit": "70409a5052984325dccfdc5f6520818568a81f39",
+      "tests_sha256": "70754686d59a946aa5823e134462a23b300687db4e4b7bffe756258fa667a959",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Cancellation is triggered synchronously by callbacks and ordered jobs, including zero-delay timeout jobs; first-wins inheritance, phases and reentry match the instruction.",
+      "f2p_count": 17,
+      "p2p_count": 7,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "4a6b549c44184290c6318acc0f747923459ded18aad1076946c54037424dd983",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "078a67abf9a790dcfd1c2bb9de140bee33b0405c353762eda275ae3c17a607a0",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "1c72b2542ed76a17eefcc2b623d4927d20f68e6d371c76b6e27210c65f00d07f",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "1ed7e5e530c945362eb083f1a54563cba7673b01b2f837354fe0b956b258c20c",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 28679,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:e4ef7bd80f8baf6ba760bd8a7b3f2bf03a07363d3ef00ce3539d54539bdf6149",
+            "author": "Task Developer <developer@example.invalid> 1794257675 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/boa-hierarchical-evaluation-cancellation",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "python-statemachine-state-data-scoping",
+      "repository": "https://github.com/fgmacedo/python-statemachine",
+      "language": "python",
+      "base_commit": "8d17ba9f6ba8420cf05fddb94013bc221ed9a222",
+      "tests_sha256": "8a7fbeeffb4f0904d944d4bd1c2a59baacc906e2293b9b96288859590b098dc0",
+      "grader_ok": true,
+      "contract_reviewed": false,
+      "contract_notes": null,
+      "f2p_count": 72,
+      "p2p_count": 1286,
+      "rejection_reason": "Fresh-list tests compare id() values after exit discards the old list without retaining it. Python may reuse its address for the next entry, so a correct implementation can fail.",
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "f7c574cf212a62954cd96de929254e567263b90cdd3e87482e049a016be71c0c",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "1e80a71d50ca26e61d859d2593af7fd7e1018dc0dd09dc884256ebaa2c01573d",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "fcf7628db832d77da0f31fb287d5f016e27c02550ca54aa6fd19c9aa4d8bf0ec",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "862042ae6ce0f2d7683bb6f6f8d8e1b40dfaee4f63b250b6c08b1d64dd4130dc",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "not_run",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": null,
+      "reference_ready": false,
+      "selected_for_screen": false,
+      "qualification_directory": ".panel/qualification/python-statemachine-state-data-scoping",
+      "admitted": false,
+      "source_qualification": {
+        "status": "not_run",
+        "reason": null
+      },
+      "canonical_ready": false,
+      "check_report": null
+    },
+    {
+      "task": "abs-stepped-slices",
+      "repository": "https://github.com/abs-lang/abs",
+      "language": "go",
+      "base_commit": "cb1b3b671d0ee9fa9da9f7b02f86967953ffd10a",
+      "tests_sha256": "39effb9fa65a618d116f608e75b3e49c220b58e9a4441f3329f28c8d2ea9a7b7",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Pure evaluator/parser table cases cover stepped reads, Unicode runes, assignments, omitted bounds and error contracts.",
+      "f2p_count": 6,
+      "p2p_count": 6,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "4e7ed635af4e4d6f724df880b305e66b39bf9f34505a4f20df366a4a65dea6a5",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "15ca12416a45068f4b0f235130bb3375d6e2251e8bd8a67bf40edd3a0c0fe80f",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "bf9eab2e681531d83c458e7ad45e4a2fecf622c0ccaee6a9581d32875c45ecc9",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "35a161fde459979916c034055c4559cbf38ff742591175be97111a60bb617a19",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 19908,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:610005f5701261d42dbe71edc1eaef82f7fc19c2964a0e1cb3208cd3e6661f7f",
+            "author": "Task Developer <developer@example.invalid> 1794257680 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": true,
+      "qualification_directory": ".panel/qualification/abs-stepped-slices",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "psd-tools-blend-range-api",
+      "repository": "https://github.com/psd-tools/psd-tools",
+      "language": "python",
+      "base_commit": "c5e03189188daa3c5589326a9d74506d7dc48bc9",
+      "tests_sha256": "e1bd2c8f794b93c52b892502fabb3f0f6c73055b36412b3cf91de6b70e9d7583",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Numeric arrays and a bundled PSD fixture test slider encoding, save round trips, write validation and compositor visibility; no external resources.",
+      "f2p_count": 45,
+      "p2p_count": 979,
+      "rejection_reason": "Oracle/nop rewards are 1/0, but source qualification is unknown: native grader initial source differs from frozen coding fixture. Canonical reconstruction is skipped; excluded without weakening source policy.",
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "453af07d6f03d33595befb56b8f592159103d6b34ac190a25bb80a1f90ea9312",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "80ee7decc21f15c78887a4d59ff14208d4dd2c17718ed43253a11c5d0da0f720",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "4816d794589fa15547ba819f591d8211b0a1d1f7f9fd6902d985ab74565ede9c",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "69d2132262265cdac82af21251827871226645b0fe2f431df5e5956663e395e9",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 27075,
+          "reconstruction": "skipped",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "skipped",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "broken",
+          "reason": "native grader initial source differs from frozen coding fixture"
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:36f187c0a9a0c2d81c09e5a01db52eb91d942191f4500f7d38891fce91941849",
+            "author": "Task Developer <developer@example.invalid> 1794257548 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "selected_for_screen": false,
+      "qualification_directory": ".panel/qualification/psd-tools-blend-range-api",
+      "admitted": false,
+      "source_qualification": {
+        "status": "unknown",
+        "reason": "native grader initial source differs from frozen coding fixture"
+      },
+      "canonical_ready": false,
+      "check_report": ".panel/check-panel-final/check.json"
+    },
+    {
+      "task": "query-persist-restored-query-state",
+      "repository": "https://github.com/TanStack/query",
+      "language": "typescript",
+      "base_commit": "1047cdc393fac7c98822c993d70c28f58833c63d",
+      "tests_sha256": "b78336b59b740e30e5ed133f8f754242e3c14e39cf4b63ab5b047990e7b66be9",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Map-backed storage and mocked time exercise full query-state restoration, merge freshness, observer metadata and Preact public results.",
+      "f2p_count": 8,
+      "p2p_count": 42,
+      "rejection_reason": "Runtime preparation rejected source symlink packages/angular-query-experimental/root.eslint.config.js; canonical export policy is unchanged.",
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "89f16ba3ad86e063fa2acf415ee47b684810f78b7630003ae04a5ab54f2c4f27",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "3be4ee52eff3096e9292fd6b357e6bbc8fd46f190897d577747a59d6dcca33be",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "873954d4d1240a64e4f338627fe65c0d124b256311998339507ddddd1943fbc9",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "b7b1bbc059c2c12ec60f66c66e584eaee9bb70825e0f16b666c887703b061926",
+          "mode": "0o755"
+        }
+      },
+      "git_probe": "not_run",
+      "qualification_error": "Native source contains a symlink: packages/angular-query-experimental/root.eslint.config.js",
+      "qualification": {
+        "oracle": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "not_run",
+          "reward": null,
+          "patch_bytes": null,
+          "reconstruction": null,
+          "cleanup": null,
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": null,
+      "reference_ready": false,
+      "selected_for_screen": false,
+      "qualification_directory": ".panel/qualification/query-persist-restored-query-state",
+      "admitted": false,
+      "source_qualification": {
+        "status": "not_run",
+        "reason": null
+      },
+      "canonical_ready": false,
+      "check_report": null
+    },
+    {
+      "task": "anko-default-function-arguments",
+      "repository": "https://github.com/mattn/anko",
+      "language": "go",
+      "base_commit": "9d2d84bb1564e9513287998c56ccf16c01c19008",
+      "tests_sha256": "7b9bfaaa953eef4e6052b163b2004dc18f072f0b9b465348ba1976db9ba050d5",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Call-time defaults, left-to-right bindings, closures, module/load calls, variadics and declaration errors match the instruction; local Go tests with explicit build tags.",
+      "f2p_count": 2,
+      "p2p_count": 119,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "1c1927f7e36b2fb20066fec160e8956584ac331a6daf9740b1671a6a910eaede",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "d3c466ba8c75740c49bd3abe360f0b93d1810e529c1d76565339f17bb56252d4",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "5666585ad86381c2d1439f0628abdb20532dd380d614c8b957b1ca37e36b01ec",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "6950b56a00ba6a197ab6b0a613af12ad39187ef201abc0aeb86045712ad2b0e9",
+          "mode": "0o755"
+        }
+      },
+      "selected_for_screen": true,
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 12710,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:7787ccecb21f17a04f6986cb1656aa96020d294212edbc42ecd70f5e4a265459",
+            "author": "Task Developer <developer@example.invalid> 1794257692 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "qualification_directory": ".panel/qualification-mode-fixed/anko-default-function-arguments",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "textual-richlog-follow-state",
+      "repository": "https://github.com/Textualize/textual",
+      "language": "python",
+      "base_commit": "0f0849fd37fbd0d4d6f81889476c22340129df67",
+      "tests_sha256": "078133321f346427078548e9f0f21aa45b0b28d3ead4fc6df918dfd5522ace51",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Follow-state API/events, viewport and pruning stability, expanded reflow and example buttons match the instruction; headless run_test event pumps, no external services; async waits have a three-second deadline.",
+      "f2p_count": 20,
+      "p2p_count": 6,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "00fbb36ecc17dbb199a86f8d1a4fb73028098caf0214dd7f87f40032e2cf1958",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "9831d9684d4ccb0546f9d38ea5154b4a9515c925a25ede57717ccb59e4ce636b",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "9d04aa13fca9e60c306f5127e911da237d2e153b0afc88da12e6004c35d404e8",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "5a331b0c2049e33bbf5b80709bfa693114421fff5a5dca3c909850dd6bbf0484",
+          "mode": "0o755"
+        }
+      },
+      "selected_for_screen": true,
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 31716,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:225256667b30d9e25047105180d4f04bce51b5ec64de31033e5aec40c7e49964",
+            "author": "Task Developer <developer@example.invalid> 1794257696 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "qualification_directory": ".panel/qualification-mode-fixed/textual-richlog-follow-state",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "bandit-structured-nosec-directives",
+      "repository": "https://github.com/PyCQA/bandit.git",
+      "language": "python",
+      "base_commit": "b46fa3a2723635aa29cc012538df4867ac2ac006",
+      "tests_sha256": "ad33fe4854693f57f9ba084d7e4443e9513524051ea8401e1f2ea778ab86dcc4",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Region/next-statement suppression, selector algebra, metrics, dedent boundaries and ignore-nosec match the instruction; temporary local source is analyzed without executing its subprocess calls.",
+      "f2p_count": 69,
+      "p2p_count": 282,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "89a85e13a98f496c3a509ad43eaf62b20b5e6dc95a67422ac2fe5cd6c3e41e78",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "0b614af60ffde18e0a7e91fe3c81af8a62eca7e05646b1044ab91b45f0913961",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "433d6b981ac0c768176e1d326daa1848c6cb8f4431d1bd6bdc78485b7d0ac30f",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "de0e216c64b696e7e70a1c4d28b5cb47543586d265b582f622252a383879dbae",
+          "mode": "0o755"
+        }
+      },
+      "selected_for_screen": true,
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 24581,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:9d1e2fce2d66af262cd95d481504bcaeb9b51098414224cc6973e8794563ac7b",
+            "author": "Task Developer <developer@example.invalid> 1794257697 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "qualification_directory": ".panel/qualification-mode-fixed/bandit-structured-nosec-directives",
+      "admitted": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "anko-typed-variable-bindings",
+      "repository": "https://github.com/mattn/anko",
+      "language": "go",
+      "base_commit": "3f269a72ff69398b1250c584171f32d12c0d8085",
+      "tests_sha256": "ed5a0a7465b87cdeedc4e27e5d68c8daf6e399495da52364868e59cb4fe42ea9",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Typed declarations, nil/zero values, scoped assignment, shadowing, diagnostics and disabled mode match the instruction; verifier regenerates parser from grammar .y and grades that codegen gate.",
+      "f2p_count": 9,
+      "p2p_count": 94,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "e5c7d7da5f841382ec5187fefb132a804c83b3c44623c38ca9ddaf5493200cf9",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "0f11e7c3d5aec8fbfe3e431d246e1b7b8a0ebf2326d7feafa39f389e248ebe48",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "91aa103ce3d2a7978588a19aa33e6dbbb95f418fd5fc1e2d21bd40a376b5078a",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "3c022205d73128934751dbddac8136f25e8fa6b436243557730742f5186dda01",
+          "mode": "0o755"
+        }
+      },
+      "qualification_directory": ".panel/qualification/anko-typed-variable-bindings",
+      "selected_for_screen": true,
+      "admitted": true,
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 14776,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:b39834f369d0fadbfe536259b92d9f1f303c77edb17f5fe63a4061e7dbc48cf6",
+            "author": "Task Developer <developer@example.invalid> 1794257699 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "yjs-map-conflict-detection",
+      "repository": "https://github.com/yjs/yjs",
+      "language": "javascript",
+      "base_commit": "7795050a749bd1111cbbdd9d0219b27226a8e710",
+      "tests_sha256": "656e5337e72b1e03aa3f870f99d8387caad74613fc8eb157e9d09ce8933761f1",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Fixed-client-ID transactions and merged updates cover allow/collect/error policies, atomicity, summaries, local conflicts and ambiguous Yjs/subdoc values; custom lib0 adapter records each per-test outcome and skips explicitly.",
+      "f2p_count": 9,
+      "p2p_count": 231,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "9d41f12270bf5b53d2bfe5aa13909a1a82abb6c9e6fdfd1c978dea32dc4840d7",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "13dc8b9683de0a41ca6ba76239f69a4aeff09b50bea9899ffb65ef2df677a4a4",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "fc133287f93c4073bd26d6d8648ccad14561c5a57812f4ab452a4225dc7774a7",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "1c23ca5323c12c4cde313203f771700ff19c994778db7cf0d43ead43ce69e5a3",
+          "mode": "0o755"
+        }
+      },
+      "qualification_directory": ".panel/qualification/yjs-map-conflict-detection",
+      "selected_for_screen": true,
+      "admitted": true,
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 27009,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:9e245b8dbc40618e64d9e764b70180b2bac431bf038a0a6dc1f8ef643fd314e3",
+            "author": "Task Developer <developer@example.invalid> 1794257700 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    },
+    {
+      "task": "sql-formatter-bigquery-pipe-formatting",
+      "repository": "https://github.com/sql-formatter-org/sql-formatter",
+      "language": "typescript",
+      "base_commit": "954e5a474b9e3d45ca58f02a3a4eac8e1947acc5",
+      "tests_sha256": "2d470eedde92f4ce193c895b3eb851dd794ff188d6321e77c70756d7b471c7dc",
+      "grader_ok": true,
+      "contract_reviewed": true,
+      "contract_notes": "Local string comparisons cover pipe clause indentation, aggregate grouping, JOIN/LIMIT/AS, case options, nesting, mixed statements, semicolons and bitwise OR; pinned nearley codegen and Jest reporter run offline.",
+      "f2p_count": 26,
+      "p2p_count": 5709,
+      "rejection_reason": null,
+      "verifier_files": {
+        "Dockerfile": {
+          "sha256": "1fc125877eb33433562050e31698287133e2a2e7a0e77cf93f01c89c068c32f5",
+          "mode": "0o644"
+        },
+        "config.json": {
+          "sha256": "0af646b326f51c6a1fc45820b4ac0b50aba223378d2debdf2129a653a8d82dcc",
+          "mode": "0o644"
+        },
+        "grader.py": {
+          "sha256": "47cc9eaadf21e636323c360ec4fa786f0733ec9fd1d21ea5a5717ff9f8c4077c",
+          "mode": "0o644"
+        },
+        "test.patch": {
+          "sha256": "aaec334430305f12ae1d0fa410a010724169f44dc5dc5600acdef5fb49766e7b",
+          "mode": "0o644"
+        },
+        "test.sh": {
+          "sha256": "4130d8f51e26e56b3641cbbe0fdfdbb101a50dec57f803b0229f7893858e2899",
+          "mode": "0o755"
+        }
+      },
+      "qualification_directory": ".panel/qualification/sql-formatter-bigquery-pipe-formatting",
+      "selected_for_screen": true,
+      "admitted": true,
+      "git_probe": "passed",
+      "qualification_error": null,
+      "qualification": {
+        "oracle": {
+          "status": "complete",
+          "reward": 1,
+          "patch_bytes": 24587,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        },
+        "nop": {
+          "status": "complete",
+          "reward": 0,
+          "patch_bytes": 0,
+          "reconstruction": "complete",
+          "cleanup": "complete",
+          "exception_info": null,
+          "reason": null
+        }
+      },
+      "check_readiness": {
+        "coverage": {
+          "state": "not_configured",
+          "reason": "Coverage requires an explicit test command, report format/path and tool version"
+        },
+        "lines": {
+          "state": "ready",
+          "reason": null
+        },
+        "tokens": {
+          "state": "ready",
+          "reason": null
+        },
+        "submission_source": {
+          "state": "ready",
+          "reason": null
+        },
+        "coding_environment": {
+          "state": "ready",
+          "reason": null,
+          "image_source": "prebuilt",
+          "ignored_dockerfile": "environment/Dockerfile",
+          "git_probe": {
+            "status": "passed",
+            "image_id": "sha256:02330293fd06595639a45ed8220d3377d1472718dbd8bee8990e262650982310",
+            "author": "Task Developer <developer@example.invalid> 1794257702 +0000",
+            "cleanup": {
+              "status": "complete",
+              "residuals": {
+                "containers": [],
+                "networks": [],
+                "images": []
+              }
+            }
+          }
+        },
+        "oracle": {
+          "state": "ready",
+          "reason": null
+        },
+        "nop": {
+          "state": "ready",
+          "reason": null
+        }
+      },
+      "reference_ready": true,
+      "source_qualification": {
+        "status": "complete",
+        "reason": null
+      },
+      "canonical_ready": true,
+      "check_report": ".panel/check-panel-qualified/check.json"
+    }
+  ]
+}
