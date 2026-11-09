@@ -6,6 +6,8 @@ Reads each evaluation's report/results.json and nothing else: no rebuild, no mod
 from __future__ import annotations
 
 import json
+import math
+import random
 import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +21,10 @@ from pluginbench.evaluation_report import correctness_state
 # Older runs call the package without guidance "baseline".
 ARM_NAMES = {"baseline": "vanilla"}
 PASS_STATES = {"pass"}
+TOKEN_METRICS = ["Input tokens", "Output tokens"]
+BOOTSTRAP_DRAWS = 10_000
+BOOTSTRAP_SEED = 0
+MIN_PAIRED_TASKS = 6
 
 
 class Gate(BaseModel):
@@ -36,12 +42,41 @@ class Gate(BaseModel):
     reference_floor: float | None = None
     tolerance: float | None = Field(default=None, ge=0)
     factor: float | None = Field(default=None, gt=0)
+    bound: Literal["lower", "upper"] | None = None
+    margin: float | None = Field(default=None, ge=-1, le=1)
 
     @model_validator(mode="after")
     def one_measure(self) -> Gate:
         if (self.correctness is None) == (self.metrics is None):
             raise ValueError(f"gate {self.name!r} needs exactly one of correctness or metrics")
-        if (self.metrics is None) != (self.statistic is None):
+        if self.bound is not None:
+            if self.per_task or self.tolerance is not None or self.reference_floor is not None:
+                raise ValueError("bound gates cannot use per_task, tolerance, or reference_floor")
+            if self.statistic is not None:
+                raise ValueError("bound gates average repeats within task; omit statistic")
+            if self.correctness == "passes":
+                if (
+                    self.bound != "lower"
+                    or self.direction != "higher"
+                    or self.margin is None
+                    or self.factor is not None
+                ):
+                    raise ValueError(
+                        "pass-rate bounds need bound: lower, direction: higher, margin"
+                    )
+            elif self.metrics is not None and sorted(self.metrics) == sorted(TOKEN_METRICS):
+                if (
+                    self.bound != "upper"
+                    or self.direction != "lower"
+                    or self.factor is None
+                    or self.margin is not None
+                ):
+                    raise ValueError("token bounds need bound: upper, direction: lower, factor")
+            else:
+                raise ValueError("bound gates support correctness: passes or input/output tokens")
+        elif self.margin is not None:
+            raise ValueError("margin needs a bound gate")
+        elif (self.metrics is None) != (self.statistic is None):
             raise ValueError(f"gate {self.name!r}: metrics and statistic go together")
         if self.per_task and self.correctness is None:
             raise ValueError(f"gate {self.name!r}: per_task applies to correctness gates only")
@@ -99,6 +134,100 @@ class Measure:
     assigned: int
     # Measured repeats per task, so a comparison can show where the two sides differ.
     repeats: dict[str, int]
+
+
+@dataclass(frozen=True)
+class PairedMeasure:
+    """Equal task weights; each task contributes one difference or ratio."""
+
+    tasks: dict[str, float]
+    missing: dict[str, str]
+    value: float | None
+    interval: tuple[float, float] | None
+
+
+@dataclass(frozen=True)
+class PairedComparison:
+    passes: PairedMeasure
+    tokens: PairedMeasure
+
+
+def _paired_summary(
+    tasks: dict[str, float], missing: dict[str, str], *, ratio: bool = False
+) -> PairedMeasure:
+    # Sort before sampling so input order cannot change the deterministic interval.
+    values = [math.log(tasks[task]) if ratio else tasks[task] for task in sorted(tasks)]
+    value = statistics.mean(values) if values else None
+    interval = None
+    if len(values) >= MIN_PAIRED_TASKS:
+        rng = random.Random(BOOTSTRAP_SEED)
+        draws = [
+            statistics.mean(rng.choices(values, k=len(values))) for _ in range(BOOTSTRAP_DRAWS)
+        ]
+        quantiles = statistics.quantiles(draws, n=20, method="inclusive")
+        interval = (quantiles[0], quantiles[-1])
+    if ratio:
+        value = math.exp(value) if value is not None else None
+        interval = (math.exp(interval[0]), math.exp(interval[1])) if interval is not None else None
+    return PairedMeasure(tasks, missing, value, interval)
+
+
+def sign_test(differences: list[float]) -> float:
+    """Exact two-sided binomial sign test; ties do not count, all ties give p=1."""
+    positive = sum(value > 0 for value in differences)
+    negative = sum(value < 0 for value in differences)
+    n = positive + negative
+    return min(1.0, 2 * sum(math.comb(n, k) for k in range(min(positive, negative) + 1)) / (1 << n))
+
+
+def paired_comparison(
+    evidence: Evidence, gates: Gates, candidate: str, against: str, tasks: list[str]
+) -> PairedComparison:
+    """Match tasks, average each arm's repeats, then resample whole task pairs."""
+    differences: dict[str, float] = {}
+    ratios: dict[str, float] = {}
+    missing_passes: dict[str, str] = {}
+    missing_tokens: dict[str, str] = {}
+    states = PASS_STATES | ({"overlap_pass"} if gates.count_overlap_passes else set())
+    for task in sorted(set(tasks)):
+        sides = [
+            [row for row in evidence.attempts if row.arm == arm and row.task == task]
+            for arm in (candidate, against)
+        ]
+        if not all(sides):
+            why = "no attempts: " + ", ".join(
+                arm for arm, rows in zip((candidate, against), sides, strict=True) if not rows
+            )
+            missing_passes[task] = missing_tokens[task] = why
+            continue
+        if any(
+            row.correctness not in {"pass", "fail", "overlap_pass"}
+            for rows in sides
+            for row in rows
+        ):
+            missing_passes[task] = "unknown correctness on at least one attempt"
+        else:
+            rates = [sum(row.correctness in states for row in rows) / len(rows) for rows in sides]
+            differences[task] = rates[0] - rates[1]
+        totals = [[_sum(row.values, TOKEN_METRICS) for row in rows] for rows in sides]
+        if any(
+            value is None or not math.isfinite(value) or value < 0
+            for side in totals
+            for value in side
+        ):
+            missing_tokens[task] = (
+                "missing, nonfinite, or negative token total on at least one attempt"
+            )
+            continue
+        means = [statistics.mean(value for value in side if value is not None) for side in totals]
+        if min(means) <= 0:
+            missing_tokens[task] = "nonpositive mean tokens"
+            continue
+        ratios[task] = means[0] / means[1]
+    return PairedComparison(
+        _paired_summary(differences, missing_passes),
+        _paired_summary(ratios, missing_tokens, ratio=True),
+    )
 
 
 def load_gates(path: Path) -> Gates:
@@ -279,6 +408,30 @@ def _correctness_counts(
 def check_gate(
     evidence: Evidence, gates: Gates, gate: Gate, candidate: str, tasks: list[str]
 ) -> Verdict:
+    if gate.bound is not None:
+        paired = paired_comparison(evidence, gates, candidate, gate.against, tasks)
+        paired_measure = paired.passes if gate.correctness else paired.tokens
+        detail = (
+            f"{len(paired_measure.tasks)} of {len(set(tasks))} tasks; "
+            f"estimate {_stat_number(paired_measure.value)}"
+        )
+        limit = gate.margin if gate.correctness else gate.factor
+        if paired_measure.interval is None or paired_measure.missing:
+            reason = (
+                f"too few tasks for interval (need {MIN_PAIRED_TASKS})"
+                if paired_measure.interval is None
+                else "incomplete task pairs"
+            )
+            return Verdict(None, None, limit, "undetermined", f"{detail}; {reason}")
+        value = paired_measure.interval[0 if gate.bound == "lower" else 1]
+        assert limit is not None
+        return Verdict(
+            value,
+            None,
+            limit,
+            "pass" if _within(gate, value, limit) else "fail",
+            f"{detail}; {gate.bound} bound of two-sided 90% interval",
+        )
     if gate.correctness is not None:
         mine = _correctness_counts(evidence, gates, candidate, tasks, gate.correctness)
         theirs = _correctness_counts(evidence, gates, gate.against, tasks, gate.correctness)
@@ -351,6 +504,72 @@ def _number(value: float | None) -> str:
     return f"{value:.2f}"
 
 
+def _stat_number(value: float | None) -> str:
+    return "missing" if value is None else f"{value:.6g}"
+
+
+def _paired_section(
+    evidence: Evidence, gates: Gates, arms: list[str], tasks: list[str]
+) -> list[str]:
+    lines = [
+        "",
+        "Paired task statistics (candidate minus / divided by comparator)",
+        f"90% percentile bootstrap intervals; {BOOTSTRAP_DRAWS} task draws; seed {BOOTSTRAP_SEED}.",
+        f"Intervals need at least {MIN_PAIRED_TASKS} tasks; repeats are averaged within each task.",
+    ]
+    for against in dict.fromkeys(gate.against for gate in gates.gates):
+        for candidate in arms:
+            if candidate == against:
+                continue
+            paired = paired_comparison(evidence, gates, candidate, against, tasks)
+            lines += ["", f"{candidate} against {against}"]
+            summary = [
+                [
+                    "paired measure",
+                    "estimate",
+                    "90% interval",
+                    "tasks",
+                    "exact sign-test p (two-sided)",
+                ]
+            ]
+            for name, result in (
+                ("pass-rate difference", paired.passes),
+                ("geometric token ratio", paired.tokens),
+            ):
+                interval = (
+                    f"[{_stat_number(result.interval[0])}, {_stat_number(result.interval[1])}]"
+                    if result.interval is not None
+                    else "too few tasks"
+                )
+                summary.append(
+                    [
+                        name,
+                        _stat_number(result.value),
+                        interval,
+                        f"{len(result.tasks)}/{len(set(tasks))}",
+                        _stat_number(sign_test(list(result.tasks.values())))
+                        if name == "pass-rate difference" and result.tasks
+                        else "",
+                    ]
+                )
+            lines += _table(summary)
+            per_task = [["task", "pass-rate difference", "token ratio"]]
+            for task in sorted(set(tasks)):
+                per_task.append(
+                    [
+                        task,
+                        _stat_number(paired.passes.tasks.get(task)),
+                        _stat_number(paired.tokens.tasks.get(task)),
+                    ]
+                )
+            lines += ["", *_table(per_task)]
+            for name, result in (("passes", paired.passes), ("tokens", paired.tokens)):
+                lines += [
+                    f"  Excluded {name}, {task}: {why}" for task, why in result.missing.items()
+                ]
+    return lines
+
+
 def _table(rows: list[list[str]]) -> list[str]:
     widths = [max(len(row[index]) for row in rows) for index in range(len(rows[0]))]
     return [
@@ -395,7 +614,7 @@ def _section(evidence: Evidence, gates: Gates, split: str, tasks: list[str]) -> 
     notes: list[str] = []
     shown: set[tuple[object, ...]] = set()
     for gate in gates.gates:
-        if gate.metrics is None:
+        if gate.metrics is None or gate.bound is not None:
             continue
         key = (tuple(gate.metrics), gate.statistic, gate.reference_floor)
         if key in shown:
@@ -429,14 +648,15 @@ def _section(evidence: Evidence, gates: Gates, split: str, tasks: list[str]) -> 
             if candidate == gate.against:
                 continue
             verdict = check_gate(evidence, gates, gate, candidate, tasks)
+            number = _stat_number if gate.bound is not None else _number
             verdicts.append(
                 [
                     gate.name,
                     candidate,
                     gate.against,
-                    _number(verdict.candidate) if verdict.candidate is not None else "",
-                    _number(verdict.comparator) if verdict.comparator is not None else "",
-                    ("≤ " if gate.direction == "lower" else "≥ ") + _number(verdict.limit)
+                    number(verdict.candidate) if verdict.candidate is not None else "",
+                    number(verdict.comparator) if verdict.comparator is not None else "",
+                    ("≤ " if gate.direction == "lower" else "≥ ") + number(verdict.limit)
                     if verdict.limit is not None
                     else "",
                     verdict.result,
@@ -444,6 +664,7 @@ def _section(evidence: Evidence, gates: Gates, split: str, tasks: list[str]) -> 
                 ]
             )
     lines += ["", "Gates", *_table(verdicts)]
+    lines += _paired_section(evidence, gates, arms, tasks)
     return lines
 
 

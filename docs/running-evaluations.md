@@ -289,6 +289,38 @@ gates:
 
 Statistics are taken per task first, then averaged. A missing value is never 0: tasks without a value, and tasks measured on only some attempts, are listed under "Missing values" with their reasons. A `total` with any unmeasured attempt is `undetermined`. Each gate compares both sides over the tasks both have and says how many, and names tasks whose measured repeat counts differ.
 
+Each split also has a paired section for every package against each comparator named in the gates file. It matches tasks across runs, including inputs selected with `DIR=ARM,ARM`. For each task, it reports:
+
+- The candidate's pass rate minus the comparator's pass rate, using each arm's assigned repeats and the declared overlap-pass policy.
+- The candidate's mean input-plus-output tokens divided by the comparator's mean. Each arm averages its own repeats before division.
+
+Tasks have equal weight, even when their repeat counts differ. The summary reports the mean pass-rate difference and geometric-mean token ratio. It resamples whole task pairs with replacement, using 10,000 draws and seed 0. Two-sided 90% percentile intervals use linear interpolation at the 5th and 95th percentiles. The endpoints are one-sided 95% bounds. Token ratios are averaged and bootstrapped in log space, then exponentiated. Fewer than six usable task pairs produces `too few tasks` instead of an interval. These bootstrap bounds are estimates; six tasks is a reporting minimum, not a guarantee of statistical power or coverage.
+
+An exact two-sided sign test compares positive and negative task pass-rate differences against equal probability. Ties are excluded; all ties gives p=1. It tests direction across tasks, not a non-inferiority margin.
+
+The paired section lists excluded tasks and reasons. A task with any unknown correctness is excluded from pass-rate statistics. A task with any missing, nonfinite, or negative token total is excluded from token statistics. Both mean token totals must be positive. Missing attempts exclude the task from both statistics. Complete tasks remain visible, and exclusions are separate for correctness and tokens.
+
+Optional bound gates use these intervals instead of the existing point statistics:
+
+```yaml
+count_overlap_passes: true
+gates:
+  - name: correctness non-inferiority
+    correctness: passes
+    against: vanilla
+    direction: higher
+    bound: lower
+    margin: -0.05                 # lower pass-rate difference must be >= -5 percentage points
+  - name: token ceiling
+    metrics: [Input tokens, Output tokens]
+    against: vanilla
+    direction: lower
+    bound: upper
+    factor: 1.3                   # upper geometric-mean token ratio must be <= 1.3
+```
+
+Bound gates omit `statistic`: they always average repeats within task. They cannot use `per_task`, `tolerance`, or `reference_floor`. Correctness bounds require `bound: lower`, `direction: higher`, and `margin`. Token bounds require both token metrics, `bound: upper`, `direction: lower`, and `factor`. A bound gate is `undetermined` with fewer than six usable pairs or any excluded task in its split. Otherwise, `pass` means its endpoint meets the declared limit; `fail` means the bound does not establish that requirement. Gates without `bound` keep their existing behavior.
+
 ## Development
 
 ```sh
