@@ -370,6 +370,27 @@ def _validate_response(
     effort: str,
     harness: str = "codex",
 ) -> JudgeResponse:
+    final = verified_final(execution, model=model, effort=effort, harness=harness)
+    response = JudgeResponse.model_validate_json(final)
+    if response.packet_id != packet_id or response.outside_packet_access:
+        raise ValueError("judge packet identity mismatch or outside access disclosed")
+    check_read_only_trace(
+        execution,
+        harness=harness,
+        forbidden=(str(root), "../", "mapping.json", "run.json", "assessment-input"),
+    )
+    for issue in response.issues:
+        path = packet / "after" / issue.path
+        if not path.is_file() or path.is_symlink():
+            raise ValueError("judge finding has no bound source location")
+        lines = path.read_text().splitlines()
+        if issue.line > len(lines) or issue.evidence not in lines[issue.line - 1]:
+            raise ValueError("judge finding evidence does not match its source line")
+    return response
+
+
+def verified_final(execution: dict[str, object], *, model: str, effort: str, harness: str) -> str:
+    """The final message of a completed native call whose model and effort match the request."""
     if execution.get("successful_native_completion") is not True:
         raise ValueError("judge native completion failed")
     verified_effort = execution.get("runtime_effort_evidence") == [effort]
@@ -380,9 +401,13 @@ def _validate_response(
     final = execution.get("final")
     if not isinstance(final, str):
         raise ValueError("judge JSON response missing")
-    response = JudgeResponse.model_validate_json(final)
-    if response.packet_id != packet_id or response.outside_packet_access:
-        raise ValueError("judge packet identity mismatch or outside access disclosed")
+    return final
+
+
+def check_read_only_trace(
+    execution: dict[str, object], *, harness: str, forbidden: Sequence[str]
+) -> None:
+    """Refuse a trace with a non-read-only Claude tool or a command naming a forbidden string."""
     commands = execution.get("command_items")
     if not isinstance(commands, list):
         raise ValueError("judge command trace unavailable")
@@ -397,19 +422,8 @@ def _validate_response(
             "StructuredOutput",
         }:
             raise ValueError("judge invoked a tool outside its read-only tool set")
-        if any(
-            value in command
-            for value in (str(root), "../", "mapping.json", "run.json", "assessment-input")
-        ):
+        if any(value in command for value in forbidden):
             raise ValueError("judge trace accessed study identity material or outside paths")
-    for issue in response.issues:
-        path = packet / "after" / issue.path
-        if not path.is_file() or path.is_symlink():
-            raise ValueError("judge finding has no bound source location")
-        lines = path.read_text().splitlines()
-        if issue.line > len(lines) or issue.evidence not in lines[issue.line - 1]:
-            raise ValueError("judge finding evidence does not match its source line")
-    return response
 
 
 def _captured_execution(artifacts: Path, effort: str, harness: str = "codex") -> dict[str, object]:
