@@ -104,8 +104,10 @@ def test_public_commands_cover_evaluations_reports_and_task_selection() -> None:
         "report",
         "review",
         "tasks",
+        "judge",
     }
     assert set(get_group(cli.tasks_app).commands) == {"pick"}
+    assert set(get_group(cli.judge_app).commands) == {"prepare", "run", "tally"}
     assert CliRunner().invoke(cli.app, ["--version"]).stdout.strip() == "0.4.0"
 
 

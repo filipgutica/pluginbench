@@ -321,6 +321,44 @@ gates:
 
 Bound gates omit `statistic`: they always average repeats within task. They cannot use `per_task`, `tolerance`, or `reference_floor`. Correctness bounds require `bound: lower`, `direction: higher`, and `margin`. Token bounds require both token metrics, `bound: upper`, `direction: lower`, and `factor`. A bound gate is `undetermined` with fewer than six usable pairs or any excluded task in its split. Otherwise, `pass` means its endpoint meets the declared limit; `fail` means the bound does not establish that requirement. Gates without `bound` keep their existing behavior.
 
+## Judging
+
+`pluginbench judge` compares two arms with blind judges, one matched pair at a time: the same task and the same repeat in each arm. It makes no coding runs, and only `judge run` calls models.
+
+```sh
+pluginbench judge prepare runs/r3=workflow-r3 runs/r2=workflow-main \
+  --tasks task-a,task-b --exclude holdout-a,holdout-b \
+  --criteria review-standard.md --seed 11 --output judging/r3
+pluginbench judge run judging/r3 --judge codex:gpt-6-astra:high \
+  --judge claude:claude-opus-5-5:high --jobs 3
+pluginbench judge tally judging/r3
+```
+
+`prepare` takes two `RUN_DIR=ARM` specs. They can name one run or two runs, and `vanilla` matches the arm older runs call `baseline`. It reads each run's `report/results.json` and review packets and nothing else.
+- It refuses any task that `--exclude` lists. Put holdout tasks there.
+- Each submission's diff comes from its review packet. A run needs a finished review, and the packet must be bound to the attempt's submission and starting source.
+- Both sides of a pair must start from the same source. They must also have the same instruction.
+- Diff headers become `a/` and `b/` with no `index` lines, so neither side's tooling identifies it.
+- The seed randomizes A and B for each pair.
+- For each task, `task-N/` holds the pair diffs, the instruction, the criteria, the response schema, and a `source` link to the read-only starting source.
+- `task-N.brief.md` is the prompt, and `key.json` maps each side to its arm, attempt, and correctness. Both stay outside the task folders.
+
+`run` makes one read-only call per judge and task. It uses the same Codex or Claude launch and identity checks as reviews.
+- Each call's sandbox can read only a fresh copy of `task-N/`, with the source copied in. The key, arm names, traces, final messages, and verifier results are never inside it.
+- Raw evidence goes to `results/<judge>/task-N/call-K/`.
+- The verdict is saved to `results/<judge>/task-N.json` only after the model, the effort, the read-only trace, and the pair numbers check out.
+- A failed call leaves no verdict. `run` exits 2, and running it again retries only the missing calls.
+- Every pair goes to the judges, including pairs that correctness will decide, so the brief reveals nothing about correctness.
+- The brief asks for JSON in the final message. A hand-run prompt that asks judges to write a file needs that one change.
+
+`tally` unblinds the verdicts with the key and writes `tally.json` and a text table.
+- If exactly one side passed, that side wins without a vote. A pass is `pass` or an overlap pass. Unknown correctness does not count as a pass.
+- Otherwise, the side that more than half of the judges prefer wins. Anything else, including ties, scores half to each side.
+- It reports weighted wins, correctness-decided pairs, judged pairs, and per-task results.
+- For each judge, it reports the side-A rate and its agreement. Agreement is the share of pairs where the judge's vote equals the verdict that more than half of the other judges gave.
+- Both judge measures cover every pair, including correctness-decided ones.
+- It refuses to tally while any judge lacks a verdict for any task. That includes every judge `run` was asked for, even one that never started.
+
 ## Development
 
 ```sh

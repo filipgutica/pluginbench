@@ -1,4 +1,4 @@
-"""The pluginbench command line: init, check, run, status, stop, compare, report, review."""
+"""The pluginbench command line: init, check, run, status, stop, compare, report, review, judge."""
 
 from __future__ import annotations
 
@@ -39,6 +39,8 @@ app = typer.Typer(
 )
 tasks_app = typer.Typer(help="Browse tasks and emit a pinned evaluation YAML block.")
 app.add_typer(tasks_app, name="tasks")
+judge_app = typer.Typer(help="Blinded pairwise judging of two arms' matched submissions.")
+app.add_typer(judge_app, name="judge")
 
 
 @tasks_app.command("pick")
@@ -552,3 +554,79 @@ def _review(run: Path, revision: str) -> None:
         event("finished", command="review", revision=selected)
     typer.echo(f"Selected review revision {selected}.")
     typer.echo(f"Report: {run / 'report/report.html'}")
+
+
+@judge_app.command("prepare")
+def judge_prepare(
+    arms: list[str] = typer.Argument(
+        ..., help="Two RUN_DIR=ARM specs; both may name the same run."
+    ),
+    tasks: str = typer.Option(..., "--tasks", help="Comma-separated task names to judge."),
+    exclude: str = typer.Option(
+        "", "--exclude", help="Comma-separated task names to refuse, such as holdout tasks."
+    ),
+    criteria: Path = typer.Option(..., "--criteria", help="The review standard judges apply."),
+    seed: int = typer.Option(..., "--seed", help="Seed for each pair's A/B order."),
+    output: Path = typer.Option(..., "--output", help="New directory for briefs and the key."),
+) -> None:
+    """Write blinded judge briefs for each task and repeat both arms have; no model calls."""
+    from pluginbench.judge import prepare
+
+    def names(value: str) -> list[str]:
+        return [name.strip() for name in value.split(",") if name.strip()]
+
+    try:
+        directory = prepare(
+            arms=arms,
+            tasks=names(tasks),
+            exclude=names(exclude),
+            criteria=criteria,
+            seed=seed,
+            output=output,
+        )
+    except (OSError, ValueError, KeyError) as exc:
+        _error(exc)
+        return
+    typer.echo(f"Prepared {directory}. The key is {directory / 'key.json'}; keep it from judges.")
+
+
+@judge_app.command("run")
+def judge_run(
+    directory: Path = typer.Argument(..., help="A directory from `pluginbench judge prepare`."),
+    judges: list[str] = typer.Option(
+        ..., "--judge", help="HARNESS:MODEL:EFFORT, such as codex:gpt-6-astra:high; repeatable."
+    ),
+    timeout: int = typer.Option(900, "--timeout", help="Seconds per judge call."),
+    jobs: int = typer.Option(1, "--jobs", help="Judge calls at once, 1 to 16."),
+) -> None:
+    """Make one read-only call per judge and task; completed calls are skipped."""
+    from pluginbench.judge import run as run_judges
+
+    try:
+        failed = run_judges(
+            directory, judges=judges, timeout=timeout, jobs=jobs, progress=typer.echo
+        )
+    except (OSError, ValueError, KeyError) as exc:
+        _error(exc)
+        return
+    if failed:
+        typer.echo(f"{failed} judge calls failed; run again to retry them.", err=True)
+        raise typer.Exit(2)
+    typer.echo(f"All judge calls complete. Tally: pluginbench judge tally {directory}")
+
+
+@judge_app.command("tally")
+def judge_tally(
+    directory: Path = typer.Argument(..., help="A directory whose judge calls are complete."),
+) -> None:
+    """Unblind with the key and score each pair; writes tally.json; no model calls."""
+    from pluginbench.judge import format_tally, tally
+
+    try:
+        result = tally(directory)
+        (directory / "tally.json").write_text(json.dumps(result, indent=2) + "\n")
+    except (OSError, ValueError, KeyError) as exc:
+        _error(exc)
+        return
+    typer.echo(format_tally(result))
+    typer.echo(f"\nTally: {directory / 'tally.json'}")
