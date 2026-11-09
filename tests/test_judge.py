@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -378,6 +379,19 @@ def test_tally_refuses_a_partial_panel(tmp_path: Path) -> None:
     _votes(directory, {"j1": {}, "j2": {}})
     (directory / "results/j2/task-2.json").unlink()
     with pytest.raises(ValueError, match="judge results missing: j2 task-2"):
+        tally(directory)
+
+
+def test_tally_refuses_a_requested_judge_that_never_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _fake_judge(monkeypatch, {"m1": "A", "m2": "B"}, root=tmp_path)
+    judges = ["codex:m1:high", "codex:m2:high"]
+    assert judge.run(directory, judges=judges, timeout=60, jobs=1, progress=print) == 0
+    # As if the run stopped before the second judge's first call.
+    shutil.rmtree(directory / "results/codex-m2-high")
+    with pytest.raises(ValueError, match="judge results missing: codex-m2-high task-1"):
         tally(directory)
 
 

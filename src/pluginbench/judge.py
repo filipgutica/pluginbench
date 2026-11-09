@@ -32,6 +32,7 @@ from pluginbench.parallel import run_jobs, validate_jobs
 from pluginbench.study_review import check_read_only_trace, verified_final
 
 KEY = "key.json"
+PANEL = "panel.json"
 SCHEMA = "response-schema.json"
 # An overlap pass counts as a pass: the verifier graded the production code with its own tests.
 PASSING = {"pass", "overlap_pass"}
@@ -329,6 +330,11 @@ def _read_key(directory: Path) -> dict[str, Any]:
     return key
 
 
+def _panel(directory: Path) -> list[str]:
+    path = directory / PANEL
+    return list(json.loads(path.read_text())) if path.is_file() else []
+
+
 def _verdict_path(directory: Path, judge: str, task: str) -> Path:
     return directory / "results" / judge / f"{task}.json"
 
@@ -349,6 +355,8 @@ def run(
     if not panel or len({judge.label for judge in panel}) != len(panel):
         raise ValueError("give at least one --judge, each once")
     tasks = _read_key(directory)["tasks"]
+    # Record every requested judge before any call, so tally can refuse a panel cut short.
+    study._write(directory / PANEL, sorted(set(_panel(directory)) | {j.label for j in panel}))
     calls = [
         (judge, task)
         for judge in panel
@@ -428,9 +436,10 @@ def tally(directory: Path) -> dict[str, Any]:
     key = _read_key(directory)
     tasks: dict[str, Any] = key["tasks"]
     results = directory / "results"
-    judges = (
-        sorted(path.name for path in results.iterdir() if path.is_dir()) if results.is_dir() else []
+    started = (
+        {path.name for path in results.iterdir() if path.is_dir()} if results.is_dir() else set()
     )
+    judges = sorted(started | set(_panel(directory)))
     if not judges:
         raise ValueError(f"{directory} has no judge results; run `pluginbench judge run` first")
     missing = [
