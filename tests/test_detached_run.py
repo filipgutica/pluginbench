@@ -67,6 +67,64 @@ def test_run_returns_while_the_background_run_continues(
     _until(lambda: "KeyboardInterrupt: stopped by SIGTERM" in (tmp_path / "run.log").read_text())
 
 
+# Records the environment it started with, then owns the lock like _WORKER.
+_ENV_WORKER = """
+import os, sys, time
+from pathlib import Path
+from pluginbench import run_lock
+root = Path(sys.argv[1])
+(root / "worker-path").write_text(os.environ["PATH"])
+with run_lock.hold(root):
+    while True:
+        time.sleep(0.02)
+"""
+
+
+def _start_and_stop(root: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[str, str]:
+    """Start _ENV_WORKER in the background, then stop it; return the output and its cgroup."""
+    monkeypatch.setattr(
+        cli, "_worker_argv", lambda root, *, notify: [sys.executable, "-c", _ENV_WORKER, str(root)]
+    )
+    result = CliRunner().invoke(cli.app, ["run", str(root), "--yes"])
+    owner = run_lock.owner(root)
+    try:
+        assert result.exit_code == 0, result.output
+        assert owner and owner["pid"] == owner["pgid"] != os.getpgrp()
+        cgroup = Path(f"/proc/{owner['pid']}/cgroup")
+        cgroups = cgroup.read_text() if cgroup.is_file() else ""
+        _until(lambda: (root / "worker-path").is_file())
+    finally:
+        if owner and owner.get("pgid") != os.getpgrp():
+            run_lock.stop(root)
+    _until(lambda: run_lock.owner(root) is None)
+    return result.stdout, cgroups
+
+
+@pytest.mark.skipif(not cli._systemd_scope(), reason="needs a systemd user manager")
+def test_background_run_leaves_the_launcher_cgroup_and_keeps_its_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planned: None
+) -> None:
+    # Ending the launcher's cgroup, as an agent session restart does, must not end the run.
+    path = f"{tmp_path / 'launcher-bin'}{os.pathsep}{os.environ['PATH']}"
+    monkeypatch.setenv("PATH", path)
+    output, cgroup = _start_and_stop(tmp_path, monkeypatch)
+    assert "in a systemd user scope" in output
+    assert cgroup.strip().endswith(".scope")
+    assert cgroup != Path("/proc/self/cgroup").read_text()
+    assert (tmp_path / "worker-path").read_text() == path
+
+
+def test_background_run_without_systemd_starts_in_a_new_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planned: None
+) -> None:
+    (tmp_path / "empty").mkdir()
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    run = tmp_path / "run"
+    run.mkdir()
+    output, _ = _start_and_stop(run, monkeypatch)
+    assert "in a new session" in output
+
+
 def test_background_run_that_exits_before_it_starts_fails_the_command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planned: None
 ) -> None:
