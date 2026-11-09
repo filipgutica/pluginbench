@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from pluginbench import harbor_backend, submissions
+from pluginbench.codex_events import failed_before_first_turn
 from pluginbench.native_treatments import DELIVERY_POLICY, NativeCapabilities
 from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.assessment_models import AttemptInput
@@ -592,11 +593,21 @@ class BaselineCache:
         if record["arm"] != "baseline" or (task_id, record["attempt"]) in self.hits:
             return
         key = self.keys[task_id]
+        attempt = self.root / "attempts" / record["id"]
         if not _eligible(
-            attempt=self.root / "attempts" / record["id"],
+            attempt=attempt,
             record=record,
             coding=self.contexts[task_id]["coding"],
             task=self.tasks[task_id],
+        ):
+            return
+        # A session that never reached the model is no baseline. Runs from before the coding
+        # pass stopped on such a session recorded it as complete.
+        if any(
+            failed_before_first_turn(
+                json.loads((attempt / stage["id"] / "execution.json").read_text())
+            )
+            for stage in record["stages"]
         ):
             return
         cohort = self.path / key

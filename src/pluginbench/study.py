@@ -22,6 +22,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from pluginbench import codex, harbor_backend, submissions
+from pluginbench.codex_events import failed_before_first_turn
 from pluginbench.harbor_backend import binary_native_reward as _binary_native_reward
 from pluginbench.treatments import (
     Treatment, resolve_treatment, freeze_treatment, treatment_inventory,
@@ -419,6 +420,10 @@ def _observed_harness_version(executions: list[dict[str, Any]]) -> str | None:
     return versions[0] if versions and versions[0] and len(set(versions)) == 1 else None
 
 
+class BackendUnavailable(ValueError):
+    """A coding session failed before its first model turn; the run stops instead of scoring it."""
+
+
 def _execute_stage(
     *,
     root: Path,
@@ -526,6 +531,16 @@ def _execute_stage(
             {"status": "unsubmitted interrupted workspace; not graded"},
         )
         raise interrupted
+    backend_error = failed_before_first_turn(execution)
+    if backend_error is not None:
+        # Never recorded as complete: the attempt stays interrupted, so a resume discards it
+        # and codes its slot again, and it never reaches the vanilla cache.
+        raise BackendUnavailable(
+            f"{study.recipe.harness} failed before its first model turn in attempt {entry['id']} "
+            f"({entry['task_id']} · {entry['arm']} · repeat {entry['attempt']}): {backend_error}. "
+            "The attempt is not scored and the run stops. Resume the run once the backend is "
+            "reachable; this attempt is coded again"
+        )
     if artifact_error or execution.get("submission_collected") is not True:
         exported_digest = execution.get("submission_export_digest")
         if not artifact_error and isinstance(exported_digest, str):

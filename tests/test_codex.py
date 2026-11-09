@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from pluginbench import codex, processes, isolation
+from pluginbench import codex, codex_events, processes, isolation
 
 
 def test_codex_final_message_excludes_earlier_progress_for_structured_review() -> None:
@@ -930,3 +930,63 @@ def test_version_admission_rejects_versions_whose_usage_would_be_lost(version: s
     # 0.167.0 forked rollouts were silently recorded with no usage under a 0.162.1-only parser.
     with pytest.raises(ValueError, match=f"Codex CLI {version} is not supported"):
         codex.admit_version(version)
+
+
+# Minimized from a real attempt during a network outage: Codex retried, then failed the turn.
+_OUTAGE: list[dict[str, object]] = [
+    {"type": "thread.started", "thread_id": "01a1b94e-9994-7cd0-8426-bf37e4a00687"},
+    {"type": "item.completed", "item": {"id": "item_0", "type": "error", "message": "warning"}},
+    {"type": "turn.started"},
+    {"type": "error", "message": "Reconnecting... 5/5 (workspace routing discovery failed)"},
+    {"type": "error", "message": "workspace routing discovery failed"},
+    {"type": "turn.failed", "error": {"message": "workspace routing discovery failed"}},
+]
+_COMMAND: dict[str, object] = {
+    "type": "item.completed",
+    "item": {"type": "command_execution", "command": "ls"},
+}
+_USAGE_TRACE = stream(
+    {
+        "type": "event_msg",
+        "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 9}}},
+    }
+)
+
+
+def test_session_that_failed_before_its_first_model_turn_is_a_backend_failure() -> None:
+    execution = codex.parse_events(stream(*_OUTAGE), [], "codex")
+    execution["timed_out"] = False
+    assert codex_events.failed_before_first_turn(execution) == "workspace routing discovery failed"
+
+
+@pytest.mark.parametrize(
+    ("events", "traces", "timed_out"),
+    [
+        # Reconnected and finished the turn.
+        (
+            [*_OUTAGE[:4], {"type": "turn.completed", "usage": {"input_tokens": 9}}],
+            [],
+            False,
+        ),
+        # Timed out while waiting for the network: a scored timeout.
+        (_OUTAGE[:4], [], True),
+        # Failed after the model had already used tokens.
+        (_OUTAGE, [_USAGE_TRACE], False),
+        # Failed after the agent ran a command.
+        (
+            [
+                *_OUTAGE[:3],
+                _COMMAND,
+                *_OUTAGE[3:],
+            ],
+            [],
+            False,
+        ),
+    ],
+)
+def test_sessions_where_the_agent_worked_or_timed_out_are_not_backend_failures(
+    events: list[dict[str, object]], traces: list[str], timed_out: bool
+) -> None:
+    execution = codex.parse_events(stream(*events), traces, "codex")
+    execution["timed_out"] = timed_out
+    assert codex_events.failed_before_first_turn(execution) is None

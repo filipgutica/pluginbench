@@ -206,6 +206,8 @@ Coding attempts, measurement inputs, and reviews run concurrently within their p
 
 On interruption or fatal failure, new jobs stop. Active jobs finish or time out; their receipts remain, and an attempt that finishes while the run drains is kept as complete.
 
+A Codex session that fails before its first model turn is a fatal failure, not an outcome. This is a `turn.failed` event with no usage, commands, or agent messages, as when a network or backend outage cuts the container off from Codex. The run stops after the first one with an error that names the attempt and Codex's message. The attempt stays `interrupted` and never enters the vanilla cache. Resume once Codex is reachable: the attempt is discarded and its slot is coded again. Timeouts, and failures after the agent has used tokens, run a command, or sent a message, stay scored.
+
 `pluginbench run evaluation.yaml` checks in the foreground, then starts the run in the background and returns once the background process owns `runs/<run>/run.lock`. It prints the `pluginbench status runs/<run> --watch` command. The lock records the process ID, process group, start time, and run directory. The background process appends one JSON line per event to `events.jsonl` and writes its output to `run.log`. Use `--foreground` to run in the terminal instead.
 
 ```sh
