@@ -1412,13 +1412,18 @@ def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path
             json.loads(profile) for profile in sorted(judge_profiles)
         ]
     manifest = json.loads((evidence / "run.json").read_text())
+    if manifest["status"] != "complete":
+        # A run stopped during coding reports what it has, and the report says it is partial.
+        coded = list(manifest["attempt_states"].values())
+        config["unfinished_run"] = {"complete": coded.count("complete"), "assigned": len(coded)}
     input_path = evidence / manifest["assessment_input"]["path"]
     records = {row["id"]: row for row in json.loads(input_path.read_text())["records"]}
     for attempt in report["attempts"]:
         scope = _object(_object(config["task_scopes"])[attempt["task_id"]])
         # Canonical attempt contains digest only; bound input owns the snapshot paths.
         record = records[attempt["id"]]
-        if record["before"] is None:
+        # An attempt that is not coded yet has no starting snapshot.
+        if record.get("before") is None:
             continue
         before = input_path.parent / record["before"]["path"]
         for stage in attempt["stages"]:

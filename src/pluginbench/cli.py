@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -533,6 +534,15 @@ def report(
     try:
         path = regenerate_report(run)
         typer.echo(f"Report: {path.parent / 'report.html'}")
+        unfinished = json.loads(path.read_text()).get("unfinished_run")
+        if unfinished:
+            resume = shlex.join(["pluginbench", "run", str(run)])
+            typer.echo(
+                f"This run is not finished: {unfinished['complete']} of "
+                f"{unfinished['assigned']} attempts are complete, so the report is partial. "
+                f"Finish it with: {resume}",
+                err=True,
+            )
     except (OSError, ValueError, yaml.YAMLError) as exc:
         _error(exc)
 
