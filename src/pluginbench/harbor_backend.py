@@ -82,6 +82,21 @@ def _object(value: object, label: str) -> dict[str, Any]:
     return {key: item for key, item in value.items()}
 
 
+def _base_inventory_command(base: str) -> str:
+    """Shell that prints HEAD and the base tree; on failure it prints git's error instead.
+
+    `docker logs` returns only the container's standard output, and the inventory must stay free
+    of warnings, so git's standard error is held back and printed only when a command fails.
+    """
+    git = "git -c safe.directory=/app"
+    return (
+        "set -eu; exec 3>&1; "
+        f"error=$({{ {git} rev-parse --verify HEAD >&3 && "
+        f"{git} ls-tree -r -z --full-tree {base} >&3; }} 2>&1) "
+        '|| { code=$?; printf \'%s\\n\' "$error"; exit "$code"; }'
+    )
+
+
 def _docker(
     *arguments: str,
     timeout: int = _DOCKER_TIMEOUT,
@@ -1402,10 +1417,7 @@ def _qualify_native_source(
         startup = submissions.grader_startup(
             config=frozen_grader.get("Config"), image_id=grader["image_id"]
         )
-        command = (
-            "set -eu; git -c safe.directory=/app rev-parse --verify HEAD; "
-            "git -c safe.directory=/app ls-tree -r -z --full-tree " + base
-        )
+        command = _base_inventory_command(base)
         container_id = _docker(
             "create",
             "--label",
@@ -1904,13 +1916,17 @@ def _saved_preparation(
 SUPPLIED_GIT_IDENTITY = {"name": "PluginBench Agent", "email": "agent@pluginbench.invalid"}
 # The probe's exit status when git has no author or committer identity (git itself uses 1 and 128).
 _NO_GIT_IDENTITY_EXIT = "3"
+# The same, in a task that already sets the variable the supplied identity travels in.
+_GIT_PARAMETERS_SET_EXIT = "4"
 
 
 def supplied_git_env(identity: dict[str, object]) -> dict[str, str]:
     """The agent environment variables that carry the git identity PluginBench supplied, if any.
 
     A task with its own identity has no `supplied_git_identity` and gets nothing. The probe and
-    every agent launch take the identity from here, so they set the same variables.
+    every agent launch take the identity from here, so they set the same variables. The probe
+    supplies an identity only to a task that does not set GIT_CONFIG_PARAMETERS itself, so this
+    never replaces a task's own git settings.
     """
     if "supplied_git_identity" not in identity:
         return {}
@@ -1950,11 +1966,20 @@ def _git_probe(identity: dict[str, object]) -> tuple[dict[str, object], str | No
     resolve_env = importlib.import_module("harbor.utils.env").resolve_env_vars
     workdir = shlex.quote(str(identity["workdir"]))
     git = "git -c safe.directory=" + workdir
+    supplied_env = supplied_git_env(identity)
+    # Agent variables replace the task's own, so a task that sets GIT_CONFIG_PARAMETERS would
+    # lose its settings to a supplied identity. The task-only probe reports that case apart.
+    no_identity = f"exit {_NO_GIT_IDENTITY_EXIT}"
+    if not supplied_env:
+        no_identity = (
+            f'test -z "${{GIT_CONFIG_PARAMETERS:-}}" || exit {_GIT_PARAMETERS_SET_EXIT}; '
+            + no_identity
+        )
     # `git var` applies the same identity rules as `git commit`; its own message stays in the logs.
     command = (
         f"exec 2>&1; set -eu; cd {workdir}; before=$({git} rev-parse HEAD); "
         f"{git} var GIT_AUTHOR_IDENT >/dev/null && {git} var GIT_COMMITTER_IDENT >/dev/null "
-        f"|| exit {_NO_GIT_IDENTITY_EXIT}; "
+        f"|| {{ {no_identity}; }}; "
         f"{git} commit --allow-empty --no-verify -q -m pluginbench-git-probe; "
         f'test "$({git} rev-parse HEAD)" != "$before"; {git} var GIT_AUTHOR_IDENT'
     )
@@ -1975,8 +2000,7 @@ def _git_probe(identity: dict[str, object]) -> tuple[dict[str, object], str | No
         "--entrypoint",
         "bash",
     ]
-    # Harbor's precedence: agent variables override the task's own.
-    environment = {**resolve_env(task.config.environment.env), **supplied_git_env(identity)}
+    environment = {**resolve_env(task.config.environment.env), **supplied_env}
     for key, value in sorted(environment.items()):
         arguments.extend(["--env", f"{key}={value}"])
     if task.config.agent.user is not None:
@@ -1996,6 +2020,12 @@ def _git_probe(identity: dict[str, object]) -> tuple[dict[str, object], str | No
             receipt.update(status="passed", author=output.splitlines()[-1] if output else None)
         elif exit_code == _NO_GIT_IDENTITY_EXIT:
             receipt["reason"] = f"git has no author or committer identity in the coding image: {output}"
+        elif exit_code == _GIT_PARAMETERS_SET_EXIT:
+            receipt["reason"] = (
+                "git has no author or committer identity in the coding image, and PluginBench "
+                "cannot supply one because the task sets GIT_CONFIG_PARAMETERS. Add user.name "
+                f"and user.email to the task's git settings: {output}"
+            )
         else:
             receipt["reason"] = (
                 f"git commit failed in the coding image (exit {exit_code}): {output}"

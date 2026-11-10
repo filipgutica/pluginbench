@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import importlib
 import json
+import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1633,6 +1635,92 @@ def test_git_probe_supplies_the_neutral_identity_only_when_git_has_none(
             "with the git identity PluginBench supplied, git commit failed in the coding image "
             "(exit 128): fatal: unable to write new index file"
         )
+
+
+def _scratch_repository(path: Path) -> tuple[str, dict[str, str]]:
+    """A one-commit repository, its HEAD, and an environment in which git finds no identity."""
+    path.mkdir()
+    # `user.useConfigOnly` stops git from guessing an identity from the host name.
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(path),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "user.useConfigOnly",
+        "GIT_CONFIG_VALUE_0": "true",
+    }
+    (path / "code.py").write_text("value = 1\n")
+    for command in (
+        ["git", "init", "-q"],
+        ["git", "add", "code.py"],
+        ["git", "-c", "user.name=Setup", "-c", "user.email=setup@example.invalid", "commit", "-qm", "base"],
+    ):
+        subprocess.run(command, cwd=path, env=env, check=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=path, env=env, check=True, capture_output=True, text=True
+    )
+    return head.stdout.strip(), env
+
+
+@pytest.mark.parametrize("own_parameters", [None, "'commit.gpgsign=false'"])
+def test_git_probe_never_replaces_git_parameters_the_task_sets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, own_parameters: str | None
+) -> None:
+    task = native_task(tmp_path)
+    repository = tmp_path / "repository"
+    _, env = _scratch_repository(repository)
+    if own_parameters is not None:
+        env["GIT_CONFIG_PARAMETERS"] = own_parameters
+    scripts: list[str] = []
+
+    def docker(*arguments: str, **kwargs: object) -> str:
+        # Each probe script runs here under real bash and git, in place of the container.
+        if arguments[0] == "create":
+            scripts.append(arguments[-1])
+            supplied = [a for a in arguments if a.startswith("GIT_CONFIG_PARAMETERS=")]
+            launch = {**env, **dict(a.split("=", 1) for a in supplied)}
+            ran.append(
+                subprocess.run(["bash", "-c", scripts[-1]], env=launch, capture_output=True, text=True)
+            )
+            return "probe-container\n"
+        return {"wait": f"{ran[-1].returncode}\n", "logs": ran[-1].stdout}.get(arguments[0], "")
+
+    ran: list[subprocess.CompletedProcess[str]] = []
+    monkeypatch.setattr(harbor, "_docker", docker)
+    monkeypatch.setattr(harbor, "cleanup", lambda **kwargs: {"status": "complete"})
+    receipt = harbor.probe_coding_environment(
+        {**_prepared_identity(task), "workdir": str(repository)}
+    )
+    if own_parameters is None:
+        assert [run.returncode for run in ran] == [3, 0]
+        assert receipt["status"] == "passed"
+        assert str(receipt["author"]).startswith("PluginBench Agent <agent@pluginbench.invalid> ")
+    else:
+        # One probe only: supplying the identity would drop the task's own setting.
+        assert [run.returncode for run in ran] == [4]
+        assert receipt["status"] == "failed" and "supplied_git_identity" not in receipt
+        assert "the task sets GIT_CONFIG_PARAMETERS" in str(receipt["reason"])
+
+
+def test_base_inventory_command_prints_the_git_error_only_when_it_fails(tmp_path: Path) -> None:
+    head, env = _scratch_repository(tmp_path / "repository")
+
+    def inventory(base: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "-c", harbor._base_inventory_command(base)],
+            cwd=tmp_path / "repository",
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    found = inventory(head)
+    assert found.returncode == 0 and found.stderr == ""
+    assert found.stdout.startswith(head + "\n100644 blob ") and found.stdout.endswith("\tcode.py\0")
+    # Only standard output reaches `docker logs`, so the error must be there.
+    missing = inventory("a" * 40)
+    assert missing.returncode == 128 and missing.stderr == ""
+    assert missing.stdout == head + "\nfatal: not a tree object\n"
 
 
 @pytest.mark.parametrize("supplied", [True, False])
