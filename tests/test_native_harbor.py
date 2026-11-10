@@ -1567,6 +1567,120 @@ def test_git_probe_commits_in_the_coding_image_with_only_the_task_environment(
         assert "Author identity unknown" in str(receipt["reason"])
 
 
+SUPPLIED_ENV = "GIT_CONFIG_PARAMETERS='user.name=PluginBench Agent' 'user.email=agent@pluginbench.invalid'"
+
+
+@pytest.mark.parametrize("second_exit", ["0", "128"])
+def test_git_probe_supplies_the_neutral_identity_only_when_git_has_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, second_exit: str
+) -> None:
+    task = native_task(tmp_path)
+    creates: list[tuple[str, ...]] = []
+
+    def docker(*arguments: str, **kwargs: object) -> str:
+        if arguments[0] == "create":
+            creates.append(arguments)
+        supplied = SUPPLIED_ENV in creates[-1]
+        return {
+            "create": "probe-container\n",
+            # Exit 3 is the probe's own report that `git var` found no identity.
+            "wait": (second_exit if supplied else "3") + "\n",
+            "logs": "PluginBench Agent <agent@pluginbench.invalid> 1 +0000\n"
+            if supplied and second_exit == "0"
+            else ("fatal: unable to write new index file\n" if supplied else "Author identity unknown\n"),
+        }.get(arguments[0], "")
+
+    monkeypatch.setattr(harbor, "_docker", docker)
+    monkeypatch.setattr(harbor, "cleanup", lambda **kwargs: {"status": "complete"})
+    receipt = harbor.probe_coding_environment(_prepared_identity(task))
+    # The first probe has only the task's environment; the second adds exactly the launch env.
+    assert len(creates) == 2
+    assert not any(argument.startswith("GIT_CONFIG_PARAMETERS=") for argument in creates[0])
+    supplied = {"name": "PluginBench Agent", "email": "agent@pluginbench.invalid"}
+    assert receipt["supplied_git_identity"] == supplied
+    launch = harbor.supplied_git_env({"supplied_git_identity": supplied})
+    assert [f"{key}={value}" for key, value in launch.items()] == [SUPPLIED_ENV]
+    first = receipt["task_identity_probe"]
+    assert isinstance(first, dict) and first["status"] == "failed"
+    assert "no author or committer identity" in str(first["reason"])
+    if second_exit == "0":
+        assert receipt["status"] == "passed"
+        assert receipt["author"] == "PluginBench Agent <agent@pluginbench.invalid> 1 +0000"
+    else:
+        assert receipt["status"] == "failed"
+        assert receipt["reason"] == (
+            "with the git identity PluginBench supplied, git commit failed in the coding image "
+            "(exit 128): fatal: unable to write new index file"
+        )
+
+
+@pytest.mark.parametrize("supplied", [True, False])
+def test_coding_and_reference_agents_get_the_supplied_identity_and_nothing_otherwise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supplied: bool
+) -> None:
+    monkeypatch.setattr(submissions, "reviewed_contract", synthetic_contract)
+    identity = _reference_identity(tmp_path / "reference", solution=True)
+    if supplied:
+        identity["supplied_git_identity"] = dict(harbor.SUPPLIED_GIT_IDENTITY)
+    agents: list[dict[str, object]] = []
+
+    def process(**kwargs: object) -> dict[str, object]:
+        config = kwargs["config"]
+        assert isinstance(config, dict)
+        agents.append(config["agent"])
+        assert "env" not in config["environment"]
+        raise ValueError("stop after launch")
+
+    monkeypatch.setattr(harbor, "_native_process", process)
+    monkeypatch.setattr(harbor, "assert_runtime", lambda expected, **kwargs: expected)
+    monkeypatch.setattr(harbor, "_assert_native_image", lambda image, expected: None)
+    monkeypatch.setattr(
+        harbor,
+        "_native_submission",
+        lambda **kwargs: {"status": "complete", "snapshot_digest": "frozen-submission"},
+    )
+    monkeypatch.setattr(harbor, "_native_cleanup_projects", lambda **kwargs: {"status": "complete"})
+    monkeypatch.setattr(harbor, "cleanup", lambda **kwargs: {"status": "complete"})
+    harbor.run_reference_agents(identity, tmp_path / "check")
+    # A paid attempt, on a task with the separate verifier native execution requires.
+    task_dir = native_task(tmp_path)
+    coding = {
+        **{
+            key: identity[key]
+            for key in ("transport_policy", "toolchain_identity", "workdir", "source_digest")
+        },
+        **({"supplied_git_identity": identity["supplied_git_identity"]} if supplied else {}),
+        "task_assets_sha256": harbor.native_task_assets(task_dir),
+        "image_identity": {"image": "coding", "image_id": "coding"},
+        "grader_image_identity": {"image": "grader", "image_id": "grader"},
+    }
+    area = tmp_path / "attempt"
+    area.mkdir()
+    with pytest.raises(ValueError, match="stop after launch"):
+        harbor.invoke_native(
+            area=area,
+            task_dir=task_dir,
+            entry={"host": "codex"},
+            protocol={
+                "native_task_identity": coding,
+                "isolation": identity["isolation"],
+                "harness_version": "1.2.3",
+                "reasoning": "low",
+                "models": {"codex": "fake-model"},
+            },
+            prompt="",
+            timeout=600,
+        )
+    assert [agent["name"] for agent in agents] == ["oracle", "nop", "codex"]
+    for agent in agents:
+        if supplied:
+            env = agent["env"]
+            assert isinstance(env, dict)
+            assert [f"{key}={value}" for key, value in env.items()] == [SUPPLIED_ENV]
+        else:
+            assert "env" not in agent
+
+
 ORACLE_PATCH = """diff --git a/src/answer.py b/src/answer.py
 --- a/src/answer.py
 +++ b/src/answer.py

@@ -1514,6 +1514,76 @@ def test_reference_agents_reuse_only_a_pass_for_the_same_preparation_and_images(
     rebuilt = {**identity, "image_identity": {"image_id": "sha256:" + "3" * 64}}
     rows = evaluation._reference_agents(rebuilt, tmp_path / "3", cache)
     assert rows["oracle"]["state"] == "ready" and len(runs) == 3
+    # A pass without a supplied git identity does not qualify a task that is given one.
+    supplied = {**rebuilt, "supplied_git_identity": dict(harbor_backend.SUPPLIED_GIT_IDENTITY)}
+    results = iter([passing])
+    for index in (4, 5):
+        rows = evaluation._reference_agents(supplied, tmp_path / str(index), cache)
+        assert rows["oracle"]["state"] == "ready"
+    assert len(runs) == 4
+
+
+def test_check_records_a_supplied_git_identity_only_for_the_task_that_needed_it(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def keys(output: Path) -> dict[str, set[str]]:
+        rows = json.loads((output / "check.json").read_text())["vanilla_cache"]
+        return {
+            task: {row["cache_key"] for row in rows if row["task_id"] == task}
+            for task in ("arbitrary-native-task", "covered-native-task")
+        }
+
+    def prepared(output: Path) -> dict[str, dict[str, object]]:
+        catalog = json.loads((output / "inputs/tasks.json").read_text())
+        return {
+            task["id"]: json.loads(task["provenance"]["native_task_identity"])
+            for task in catalog["tasks"]
+        }
+
+    own = checkable["output"]
+    result = CliRunner().invoke(cli.app, ["check", str(checkable["path"]), "--output", str(own)])
+    assert result.exit_code == 0, result.stderr
+    assert not any("supplied_git_identity" in value for value in prepared(own).values())
+    supplied = dict(harbor_backend.SUPPLIED_GIT_IDENTITY)
+
+    def probe(identity: dict[str, object]) -> dict[str, object]:
+        if "arbitrary-native-task" not in str(identity["task_dir"]):
+            return passing_git_probe(identity)
+        return {**passing_git_probe(identity), "supplied_git_identity": supplied}
+
+    referenced: dict[str, object] = {}
+
+    def reference_agents(identity: dict[str, object], destination: Path) -> dict[str, object]:
+        referenced[destination.name] = identity.get("supplied_git_identity")
+        return passing_reference_agents(identity, destination)
+
+    monkeypatch.setattr(harbor_backend, "probe_coding_environment", probe)
+    monkeypatch.setattr(harbor_backend, "run_reference_agents", reference_agents)
+    output = Path(str(own) + "-supplied")
+    result = CliRunner().invoke(
+        cli.app, ["check", str(checkable["path"]), "--output", str(output)]
+    )
+    assert result.exit_code == 0, result.stderr
+    note = (
+        "the task sets no git identity, so PluginBench supplied "
+        "PluginBench Agent <agent@pluginbench.invalid> to its agents"
+    )
+    assert f"arbitrary-native-task: coding_environment ready — {note}" in result.stdout
+    assert "covered-native-task: coding_environment ready" not in result.stdout
+    matrix = json.loads((output / "check.json").read_text())["matrix"]
+    assert matrix["arbitrary-native-task"]["coding_environment"]["note"] == note
+    assert "note" not in matrix["covered-native-task"]["coding_environment"]
+    # Saved where a run and its resume read the prepared identity, and in the receipt.
+    identities = prepared(output)
+    assert identities["arbitrary-native-task"]["supplied_git_identity"] == supplied
+    receipt = output / "inputs/arbitrary-native-task/artifacts/native-preparation.json"
+    assert json.loads(receipt.read_text())["supplied_git_identity"] == supplied
+    assert referenced["arbitrary-native-task"] == supplied
+    assert referenced.get("covered-native-task") is None
+    # The task with its own identity keeps today's cache key; the other gets a new one.
+    assert "supplied_git_identity" not in identities["covered-native-task"]
+    assert keys(output)["covered-native-task"] == keys(own)["covered-native-task"]
+    assert keys(output)["arbitrary-native-task"].isdisjoint(keys(own)["arbitrary-native-task"])
 
 
 def test_check_prints_a_hit_or_miss_for_every_vanilla_attempt(
