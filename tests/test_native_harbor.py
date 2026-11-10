@@ -499,7 +499,7 @@ def test_native_measurement_uses_frozen_source_and_preserves_missing_reports(
         "image_identity": {"image_id": "sha256:frozen"},
         "workdir": "/app",
     }
-    monkeypatch.setattr(harbor, "assert_runtime", lambda expected: None)
+    monkeypatch.setattr(harbor, "assert_runtime", lambda expected, **kwargs: expected)
     monkeypatch.setattr(
         harbor, "_frozen_executable", lambda identity, label: {"resolved_path": "/frozen/docker"}
     )
@@ -643,7 +643,7 @@ def test_native_regrade_replays_verifier_without_agent_or_auth(
         "grader_image_identity": {"image": "sha256:grader", "image_id": "sha256:grader"},
         "toolchain_identity": {"harness": "codex", "harness_version": "0.208.0"},
     }
-    monkeypatch.setattr(harbor, "assert_runtime", lambda expected: None)
+    monkeypatch.setattr(harbor, "assert_runtime", lambda expected, **kwargs: expected)
     monkeypatch.setattr(harbor, "_inspect_image", lambda *args, **kwargs: {"Id": "sha256:grader"})
 
     def process(**kwargs: object) -> dict[str, object]:
@@ -983,7 +983,7 @@ def test_measurement_rejects_mutated_container_source_before_accepting_coverage(
         "image_identity": {"image_id": "sha256:frozen"},
         "workdir": "/app",
     }
-    monkeypatch.setattr(harbor, "assert_runtime", lambda expected: None)
+    monkeypatch.setattr(harbor, "assert_runtime", lambda expected, **kwargs: expected)
     monkeypatch.setattr(
         harbor, "_frozen_executable", lambda identity, label: {"resolved_path": "/frozen/docker"}
     )
@@ -1157,7 +1157,7 @@ def test_actual_native_invocation_does_not_publish_submission_when_cleanup_fails
         "reasoning": "low",
         "models": {"codex": "fake-model"},
     }
-    monkeypatch.setattr(harbor, "assert_runtime", lambda expected: None)
+    monkeypatch.setattr(harbor, "assert_runtime", lambda expected, **kwargs: expected)
     monkeypatch.setattr(harbor, "_assert_native_image", lambda image, expected: None)
 
     def process(**kwargs: object) -> dict[str, object]:
@@ -1206,7 +1206,9 @@ def test_measurement_report_cannot_overwrite_original_source(
     monkeypatch.setattr(
         harbor,
         "assert_runtime",
-        lambda expected: pytest.fail("unsafe report must be rejected before Docker admission"),
+        lambda expected, **kwargs: pytest.fail(
+            "unsafe report must be rejected before Docker admission"
+        ),
     )
     with pytest.raises(ValueError, match="overwrite original inputs"):
         harbor.run_native_command(
@@ -1277,7 +1279,7 @@ def test_measurement_reconstructs_removed_directories_and_preserves_dependency_t
         "image_identity": {"image_id": "sha256:frozen"},
         "workdir": "/app",
     }
-    monkeypatch.setattr(harbor, "assert_runtime", lambda expected: None)
+    monkeypatch.setattr(harbor, "assert_runtime", lambda expected, **kwargs: expected)
     monkeypatch.setattr(
         harbor, "_frozen_executable", lambda identity, label: {"resolved_path": "/frozen/docker"}
     )

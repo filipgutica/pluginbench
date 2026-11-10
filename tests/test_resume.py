@@ -20,6 +20,7 @@ import pytest
 
 import pluginbench
 import resume_support
+from legacy_support import current_runtime, legacy_json
 from native_support import execution as native_execution
 from pluginbench import harbor_backend, parallel, study
 from pluginbench.ledger import Ledger
@@ -508,3 +509,25 @@ def test_vanilla_attempt_killed_before_it_was_cached_is_cached_on_resume(
 
     assert calls == []
     assert len(list(cache.glob("*/*/manifest.json"))) == 6
+
+
+def test_a_942f12c_vanilla_run_resumes_after_docker_memory_moved_by_28_kib(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The incident: a resume with vanilla reuse was refused because Docker reported 28 KiB
+    # less memory than at preparation. Only the saved runtime check is real here.
+    cache = tmp_path / "cache"
+    root = _killed_run(tmp_path, boundary="during-call", at=7, cache=cache)
+    calls: list[str] = []
+    check = harbor_backend.assert_runtime
+    resume_support.install(monkeypatch, calls)
+    monkeypatch.setattr(harbor_backend, "assert_runtime", check)
+    saved = legacy_json("runtime.json")
+    current = current_runtime(saved)
+    current["docker_engine"]["id"] = "daemon-one"  # The engine the fixture tasks were prepared on.
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: current)
+    resolved = study._frozen_study(root)
+    identity = {**resume_support.vanilla_identity(resolved), "isolation": saved}
+    study.resume_study(root, baseline_cache=cache, baseline_identity=identity)
+    assert _json(root / "run.json")["status"] == "complete"
+    assert len(calls) == 6

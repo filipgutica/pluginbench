@@ -9,6 +9,7 @@ are removed. Source and graded-artifact evidence remain distinct.
 from __future__ import annotations
 
 import asyncio
+import copy
 import fcntl
 import hashlib
 import importlib
@@ -28,7 +29,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import uuid4
 
-from pluginbench import codex, isolation, submissions, native_treatments
+from pluginbench import codex, components, isolation, submissions, native_treatments
 from pluginbench.treatments import Treatment
 from pluginbench.native_treatments import NativeCapabilities
 from pluginbench.code_diff import _is_source_path, _is_test_path
@@ -305,6 +306,7 @@ def runtime_identity(*, cpus: int = 1, memory_mb: int = 2048) -> dict[str, objec
             "version": _CODEX_TRANSPORT_VERSION,
             "harbor_run_sha256": _assert_codex_transport_source(),
         },
+        "launcher_version": components.VERSIONS["launcher"],
         "implementation_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "docker_cli": _docker_cli(info),
         "docker_plugins": _docker_plugins(info),
@@ -324,21 +326,108 @@ def runtime_identity(*, cpus: int = 1, memory_mb: int = 2048) -> dict[str, objec
     }
 
 
-def assert_runtime(expected: dict[str, object]) -> None:
+# Saved for provenance and never compared: routine Docker and PluginBench updates change them.
+_RECORDED_RUNTIME = (
+    ("implementation_sha256",),
+    ("docker_cli",),
+    ("docker_plugins",),
+    ("docker_engine", "id"),
+    ("docker_engine", "version"),
+    ("docker_engine", "endpoint"),
+)
+# Checked as a fit for the run's containers, never compared: Docker reports memory that jitters.
+_FIT_RUNTIME = (("docker_engine", "capacity"),)
+
+
+def runtime_contract(identity: dict[str, object], *, launcher: bool = True) -> dict[str, Any]:
+    """The part of a runtime identity that must stay equal: all but recorded and fit fields.
+
+    Any field not listed above is compared, so a field added later is exact by default. A
+    runtime saved before declared versions gets its launcher version from its source hash,
+    and an unknown hash raises. `launcher=False` leaves the launcher version out, for work
+    that starts no coding agent.
+    """
+    contract = copy.deepcopy(identity)
+    version = contract.get("launcher_version")
+    if version is None:
+        version = components.saved_version(
+            "launcher", {"harbor_backend.py": contract.get("implementation_sha256")}
+        )
+    if launcher:
+        contract["launcher_version"] = version
+    else:
+        contract.pop("launcher_version", None)
+    for *parents, field in _RECORDED_RUNTIME + _FIT_RUNTIME:
+        node: object = contract
+        for key in parents:
+            node = node.get(key) if isinstance(node, dict) else None
+        if isinstance(node, dict):
+            node.pop(field, None)
+    return contract
+
+
+def runtime_changes(saved: dict[str, Any], current: dict[str, Any], prefix: str = "") -> list[str]:
+    """Each differing field of two runtime contracts, by dotted path, with both values."""
+    changes = []
+    for key in sorted(saved.keys() | current.keys()):
+        before, after = saved.get(key, _ABSENT), current.get(key, _ABSENT)
+        if isinstance(before, dict) and isinstance(after, dict):
+            changes.extend(runtime_changes(before, after, prefix + key + "."))
+        elif before != after:
+            changes.append(f"{prefix}{key} was {_shown(before)}, is now {_shown(after)}")
+    return changes
+
+
+_ABSENT = object()
+
+
+def _shown(value: object) -> str:
+    return "absent" if value is _ABSENT else json.dumps(value, sort_keys=True)
+
+
+def _fitting_jobs(capacity: dict[str, Any], *, cpus: int, memory_mb: int) -> int:
+    """How many containers of these limits Docker can hold, keeping 20% of memory free."""
+    return min(
+        int(capacity["cpus"]) // cpus,
+        int(int(capacity["memory_bytes"]) * 0.8) // (memory_mb * 1024**2),
+    )
+
+
+def assert_runtime(
+    expected: dict[str, object], *, jobs: int = 1, launcher: bool = True
+) -> dict[str, object]:
+    """Check the current runtime against a saved one, and return the current one.
+
+    Exact fields must be equal, Docker capacity must hold `jobs` containers, and recorded
+    fields may differ. Docker commands after this check use the returned identity, so an
+    updated Docker CLI or a restarted engine runs with what is installed now.
+    """
     resources = _object(expected.get("resources"), "container resources")
     cpus, memory = resources.get("cpus"), resources.get("memory_mb")
     if not isinstance(cpus, int) or not isinstance(memory, int):
         raise ValueError("Frozen container resource limits are missing")
+    saved = runtime_contract(expected, launcher=launcher)
     try:
         actual = runtime_identity(cpus=cpus, memory_mb=memory)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         raise isolation.RuntimeDriftError(
             "Cannot verify the frozen Harbor and Docker runtime"
         ) from error
-    if actual != expected:
+    changes = runtime_changes(saved, runtime_contract(actual, launcher=launcher))
+    if changes:
         raise isolation.RuntimeDriftError(
-            "Harbor or Docker runtime changed since evaluation preparation"
+            "Harbor or Docker runtime changed since this run was prepared: " + "; ".join(changes)
         )
+    current = _object(_object(actual["docker_engine"], "Docker engine")["capacity"], "capacity")
+    if _fitting_jobs(current, cpus=cpus, memory_mb=memory) < jobs:
+        engine = expected.get("docker_engine")
+        before = engine.get("capacity") if isinstance(engine, dict) else None
+        raise isolation.RuntimeDriftError(
+            f"Docker capacity no longer fits this run: {jobs} jobs of {cpus} CPUs and "
+            f"{memory} MB need {jobs * cpus} CPUs and {jobs * memory} MB within 80% of "
+            f"memory; docker_engine.capacity was {_shown(before)}, is now {_shown(current)}"
+        )
+    return actual
 
 
 def capacity_jobs(*, cpus: int = 1, memory_mb: int = 2048) -> int:
@@ -349,7 +438,12 @@ def capacity_jobs(*, cpus: int = 1, memory_mb: int = 2048) -> int:
     cpu_capacity, memory_capacity = info.get("NCPU"), info.get("MemTotal")
     if not isinstance(cpu_capacity, int) or not isinstance(memory_capacity, int):
         raise ValueError("Docker did not report CPU and memory capacity")
-    jobs = min(4, cpu_capacity // cpus, int(memory_capacity * 0.8) // (memory_mb * 1024**2))
+    jobs = min(
+        4,
+        _fitting_jobs(
+            {"cpus": cpu_capacity, "memory_bytes": memory_capacity}, cpus=cpus, memory_mb=memory_mb
+        ),
+    )
     if jobs < 1:
         raise ValueError(
             f"One coding container ({cpus} CPUs, {memory_mb} MB) does not fit within Docker capacity ({cpu_capacity} CPUs, {memory_capacity // 1024**2} MB; 80% memory budget)"
@@ -824,6 +918,27 @@ def _assert_native_image(identity: dict[str, object], expected: dict[str, object
             != identity["image_id"]
         ):
             raise ValueError("Frozen native image is unavailable or its reference was rebound")
+
+
+def engine_id(runtime: object) -> object:
+    engine = runtime.get("docker_engine") if isinstance(runtime, dict) else None
+    return engine.get("id") if isinstance(engine, dict) else None
+
+
+def assert_prepared_images(
+    identity: dict[str, object], runtime: dict[str, object], *, label: str
+) -> None:
+    """Check that the current engine holds a preparation's images; name both engines if not."""
+    for name in ("image_identity", "grader_image_identity"):
+        image = _native_object(identity[name], "prepared native image")
+        try:
+            _assert_native_image(image, runtime)
+        except ValueError as error:
+            raise ValueError(
+                f"{label} was prepared on Docker engine {engine_id(identity.get('isolation'))}; "
+                f"the current engine {engine_id(runtime)} does not hold its image "
+                f"{image['image_id']}. Restore that engine's images, or start a new run"
+            ) from error
 
 
 def _native_container(
@@ -2023,8 +2138,7 @@ def invoke_native(
     if native_task_assets(task_dir) != identity["task_assets_sha256"]:
         raise ValueError("Frozen native task assets changed")
     validate_native_task(task_dir)
-    expected = _native_object(protocol["isolation"], "native runtime")
-    assert_runtime(expected)
+    expected = assert_runtime(_native_object(protocol["isolation"], "native runtime"))
     image = _native_object(identity["image_identity"], "native coding image")
     grader = _native_object(identity["grader_image_identity"], "native grader image")
     for frozen_image in (image, grader):
@@ -2203,8 +2317,10 @@ def run_native_command(
         raise ValueError(
             "Native measurement report must not overwrite original inputs or source paths"
         )
-    expected = _native_object(task_identity["isolation"], "measurement runtime")
-    assert_runtime(expected)
+    # Measurement starts no coding agent, so the launcher version does not bind it.
+    expected = assert_runtime(
+        _native_object(task_identity["isolation"], "measurement runtime"), launcher=False
+    )
     image = _native_object(task_identity["image_identity"], "measurement image")
     workdir = str(task_identity["workdir"])
     limits = _native_object(expected["resources"], "measurement resources")
@@ -2519,8 +2635,10 @@ def regrade_native(
     if native_task_assets(task_dir) != identity["task_assets_sha256"]:
         raise ValueError("Native regrade task assets differ from the frozen task")
     validate_native_task(task_dir)
-    expected = _native_object(identity["isolation"], "native regrade runtime")
-    assert_runtime(expected)
+    # Regrading replays only the verifier, so the launcher version does not bind it.
+    expected = assert_runtime(
+        _native_object(identity["isolation"], "native regrade runtime"), launcher=False
+    )
     grader = _native_object(identity["grader_image_identity"], "native regrade grader")
     _assert_native_image(grader, expected)
     toolchain = _native_object(identity["toolchain_identity"], "native regrade toolchain")

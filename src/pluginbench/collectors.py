@@ -19,7 +19,7 @@ from pluginbench.assessment_metrics import (
     evaluate_evidence,
     inspect_snapshot,
 )
-from pluginbench import isolation
+from pluginbench import components, isolation
 
 
 class Collector(BaseModel):
@@ -182,9 +182,16 @@ def observer_identity() -> dict[str, str]:
 
 def _assert_observer(collector: Collector) -> None:
     assert collector.report_format is not None
-    expected = json.loads(collector.config.read_text()).get("implementation")
-    if expected != observer_identity():
-        raise ValueError("coverage observer implementation differs from its frozen profile")
+    config = json.loads(collector.config.read_text())
+    version = config.get("observer_version")
+    if version is None:
+        version = components.saved_version("coverage_observer", config.get("implementation") or {})
+    current = components.VERSIONS["coverage_observer"]
+    if version != current:
+        raise ValueError(
+            f"Coverage observer version {version} froze this profile; this PluginBench "
+            f"measures with version {current}"
+        )
 
 
 def collector_identity(collector: Collector) -> dict[str, object]:
@@ -402,10 +409,14 @@ def _run_collector(
     if collector.report_format is None:
         return _collect(root, collector, destination, baseline)
     _assert_observer(collector)
+    implementation = observer_identity()
     try:
         return _collect(root, collector, destination, baseline)
     finally:
-        _assert_observer(collector)
+        # The profile binds a version, not bytes: an edit during collection must not mix
+        # two implementations in one result.
+        if observer_identity() != implementation:
+            raise ValueError("Coverage observer bytes changed during execution")
 
 
 def _collect(

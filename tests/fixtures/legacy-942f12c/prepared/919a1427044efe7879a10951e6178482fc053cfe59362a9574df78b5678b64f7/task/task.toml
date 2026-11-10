@@ -1,0 +1,8 @@
+version = "1.0"
+[environment]
+cpus=1
+memory_mb=256
+[verifier]
+environment_mode="separate"
+[verifier.environment]
+docker_image="grader:1"

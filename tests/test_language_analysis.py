@@ -369,8 +369,13 @@ def test_analysis_settings_and_implementation_drift_are_fatal(tmp_path: Path) ->
     source = tmp_path / "source"
     source.mkdir()
     config = prepare_analysis_config("rust", ["*"], ["*"], {})
+    config["observer_version"] = 2
+    with pytest.raises(ValueError, match="observer version 2 froze this profile"):
+        collect_language_analysis(source, config, tmp_path / "evidence")
+    config = prepare_analysis_config("rust", ["*"], ["*"], {})
+    del config["observer_version"]
     config["implementation_sha256"] = "tampered"
-    with pytest.raises(ValueError, match="implementation changed"):
+    with pytest.raises(ValueError, match="language_analysis.py has sha256 tampered"):
         collect_language_analysis(source, config, tmp_path / "evidence")
     config = prepare_analysis_config("rust", ["*"], ["*"], {})
     config["settings"] = {"vulture_min_confidence": 100}

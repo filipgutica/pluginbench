@@ -19,6 +19,7 @@ import pytest
 import yaml
 
 from native_support import (
+    offline_runtime,
     execution as native_execution,
     runtime_identity,
     synthetic_contract,
@@ -83,7 +84,7 @@ def install(
 ) -> None:
     """Fake every Harbor entry point a study reaches; record each native call's attempt ID."""
     monkeypatch.setattr(submissions, "reviewed_contract", synthetic_contract)
-    identity = {"resources": {"cpus": 1, "memory_mb": 2048}, "offline": True}
+    identity = offline_runtime()
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: identity)
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
     lock = threading.Lock()
@@ -95,10 +96,11 @@ def install(
             counts[name] += 1
             return counts[name]
 
-    def assert_runtime(expected: dict[str, object]) -> None:
+    def assert_runtime(expected: dict[str, object], **kwargs: object) -> dict[str, object]:
         # study calls this just before it writes each invocation receipt.
         if boundary == "before-receipt" and counted("receipt") == at:
             _kill()
+        return expected
 
     def invoke(**kwargs: Any) -> dict[str, Any]:
         with lock:

@@ -19,6 +19,7 @@ from pluginbench import (
     claude,
     cli,
     codex,
+    components,
     evaluation,
     harbor_backend,
     isolation,
@@ -72,7 +73,7 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> evaluation.Evalua
             },
         },
     )
-    monkeypatch.setattr(harbor_backend, "assert_runtime", lambda expected: None)
+    monkeypatch.setattr(harbor_backend, "assert_runtime", lambda expected, **kwargs: expected)
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {})
     # Docker-backed checks pass here; tests that exercise a failing check replace one of these.
     monkeypatch.setattr(harbor_backend, "probe_coding_environment", passing_git_probe)
@@ -1529,7 +1530,7 @@ def test_parser_only_change_keeps_the_vanilla_cache_identity(
     # Every edit to codex.py once missed every cached vanilla attempt, parser fixes included.
     package = tmp_path / "pluginbench"
     shutil.copytree(Path(evaluation.__file__).parent, package)
-    monkeypatch.setattr(evaluation, "__file__", str(package / "evaluation.py"))
+    monkeypatch.setattr(components, "__file__", str(package / "components.py"))
     comparison = evaluation.plan_evaluation(config)["comparison_identity"]
     assert isinstance(comparison, dict)
 
@@ -1862,3 +1863,31 @@ def test_stopped_run_copied_to_a_new_path_resumes_there(
     assert len(calls) == coded + 7 and len(reviews) == 9
     assert json.loads((moved / "evidence/run.json").read_text())["status"] == "complete"
     assert not root.exists()
+
+
+@pytest.mark.parametrize(
+    ("saved", "message"),
+    [
+        ({"launcher_version": 2}, "launcher version 2, and this build's launcher is version 1"),
+        ({"launcher_sha256": {"codex.py": "f" * 64}}, "codex.py has sha256 ffffffffffff"),
+    ],
+)
+def test_resume_refuses_to_code_with_a_different_launcher(
+    config: evaluation.Evaluation,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    saved: dict[str, object],
+    message: str,
+) -> None:
+    # One comparison must never hold attempts from two launchers, and cached vanilla slots
+    # must not be coded and paid for again.
+    root, calls, _ = _stopped_after_two_attempts(config, tmp_path, monkeypatch)
+    coded = len(calls)
+    path = root / "inputs/vanilla-identity.json"
+    identity = json.loads(path.read_text())
+    identity.pop("launcher_version", None)
+    path.write_text(json.dumps({**identity, **saved}))
+    result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+    assert result.exit_code == 2
+    assert message in result.stderr and "start a new run" in result.stderr
+    assert len(calls) == coded

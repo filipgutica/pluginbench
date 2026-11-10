@@ -22,6 +22,7 @@ from pluginbench.assessment_metrics import (
     _object,
 )
 from pluginbench.code_diff import TEST_PATH_PATTERNS, _is_source_path, _is_test_path
+from pluginbench import components
 from pluginbench.collectors import Collector, collect_measurements, observer_identity
 
 ROOT = Path(__file__).resolve().parent
@@ -396,6 +397,7 @@ def prepare_profiles(
                 "source_scope": coverage_scope,
                 "test_scope": test_scope,
                 "coverage": coverage.model_dump(mode="json"),
+                "observer_version": components.VERSIONS["coverage_observer"],
                 "implementation": observer_identity(),
             },
         )

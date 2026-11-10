@@ -1085,8 +1085,18 @@ def _run_attempts(
             requested_runtime = baseline_identity.get("isolation")
             if not isinstance(requested_runtime, dict):
                 raise ValueError("baseline reuse requires a fixed filesystem isolation identity")
-            harbor_backend.assert_runtime(requested_runtime)
-            expected_runtime = requested_runtime
+            expected_runtime = harbor_backend.assert_runtime(
+                requested_runtime, jobs=frozen.recipe.jobs
+            )
+        current_engine = harbor_backend.engine_id(expected_runtime)
+        for task in frozen.tasks:
+            prepared = native_identity(task)
+            saved_engine = harbor_backend.engine_id(prepared.get("isolation"))
+            # A different engine may not hold the prepared images: find out before any call.
+            if None not in (saved_engine, current_engine) and saved_engine != current_engine:
+                harbor_backend.assert_prepared_images(
+                    prepared, expected_runtime, label=f"task {task.task_id}"
+                )
         if baseline_cache is not None:
             assert baseline_identity is not None
             cache = BaselineCache(
@@ -1203,7 +1213,7 @@ def _run_attempts(
             def started() -> None:
                 if cancelled.is_set():
                     raise CancelledError("attempt cancelled before its next native invocation")
-                harbor_backend.assert_runtime(expected_runtime)
+                harbor_backend.assert_runtime(expected_runtime, jobs=frozen.recipe.jobs)
                 unmoved()
                 receipt = root / "invocations" / entry["id"] / f"{stage_id}.json"
                 _write(

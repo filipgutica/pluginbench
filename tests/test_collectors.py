@@ -844,7 +844,7 @@ def test_native_observer_drift_is_rejected_before_command(
     monkeypatch.setattr(
         collectors, "_collect", lambda *args: pytest.fail("must not execute a changed observer")
     )
-    with pytest.raises(ValueError, match="implementation differs"):
+    with pytest.raises(ValueError, match="coverage_report.py has sha256 old"):
         collect_measurements(snapshot, tmp_path / "evidence", [collector])
     assert inspect_snapshot(snapshot)["source_lines"] == 1
 

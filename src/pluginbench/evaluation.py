@@ -17,7 +17,7 @@ from collections.abc import Callable
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
-from pluginbench import baselines, claude, codex, harbor_backend, isolation, submissions
+from pluginbench import baselines, claude, codex, components, harbor_backend, isolation, submissions
 from pluginbench.treatments import Treatment, resolve_treatment, treatment_inventory
 from pluginbench.native_treatments import NativeCapabilities, DELIVERY_POLICY, admit
 from pluginbench.task_sources import Tasks, cache_root
@@ -348,24 +348,36 @@ def _caches(output: Path) -> _Caches:
     return caches
 
 
-# Modules that decide how a coding attempt is launched. Session parsing lives in
-# codex_events.py, outside this list, so a parser-only change keeps every vanilla cache key.
-_LAUNCHER_MODULES = (
-    "codex.py",
-    "harbor_backend.py",
-    "processes.py",
-    "native_treatments.py",
-    "native_treatment_runtime.js",
-    "treatments.py",
-)
-
-
 def _launcher_sha256(harness: str) -> dict[str, str]:
-    names = (*_LAUNCHER_MODULES, *(["claude.py"] if harness == "claude" else []))
     return {
-        name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-        for name in names
+        name: components.source_sha256(name)
+        for name in components.FILES["launcher"]
+        if name != "claude.py" or harness == "claude"
     }
+
+
+def _assert_launcher(selection: dict[str, object], identity: dict[str, object] | None) -> None:
+    """Coding resumes only with the launcher version that coded the run's earlier attempts."""
+    current = components.VERSIONS["launcher"]
+    try:
+        if identity is None:
+            isolation = _object(_object(selection["comparison_identity"])["isolation"])
+            saved = harbor_backend.runtime_contract(isolation)["launcher_version"]
+        elif "launcher_version" in identity:
+            saved = identity["launcher_version"]
+        else:
+            saved = components.saved_version("launcher", _object(identity["launcher_sha256"]))
+    except components.UnknownSourceError as error:
+        raise ValueError(
+            f"{error}. This build's launcher is version {current}: resume this run with the "
+            "build that started it, or start a new run"
+        ) from error
+    if saved != current:
+        raise ValueError(
+            f"this run codes with PluginBench launcher version {saved}, and this build's "
+            f"launcher is version {current}: resume this run with the build that started it, "
+            "or start a new run"
+        )
 
 
 def _vanilla_identity(
@@ -386,6 +398,7 @@ def _vanilla_identity(
         "timeout_seconds": config.timeout_seconds,
         "jobs": config.jobs,
         "seed": config.seed,
+        "launcher_version": components.VERSIONS["launcher"],
         "launcher_sha256": _launcher_sha256(config.runner.harness),
         # run_study binds the same settings from its frozen recipe.
         "study": {
@@ -849,16 +862,8 @@ def _code(
                 f"{config.runner.harness} CLI is {version}, but this run codes with "
                 f"{recipe['harness_version']}; install that version to resume it"
             )
-    if (
-        resuming
-        and identity
-        and identity["launcher_sha256"] != _launcher_sha256(config.runner.harness)
-    ):
-        identity = None
-        if progress:
-            progress(
-                "Launcher code changed since this run started; new vanilla attempts are not cached"
-            )
+        # One comparison must not hold attempts coded by two launchers.
+        _assert_launcher(selection, identity)
     if resuming:
         resume_study(
             evidence,
