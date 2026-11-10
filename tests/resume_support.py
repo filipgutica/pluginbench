@@ -83,7 +83,7 @@ def install(
 ) -> None:
     """Fake every Harbor entry point a study reaches; record each native call's attempt ID."""
     monkeypatch.setattr(submissions, "reviewed_contract", synthetic_contract)
-    identity = {"resources": {"cpus": 1, "memory_mb": 2048}, "offline": True}
+    identity = runtime_identity()
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: identity)
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
     lock = threading.Lock()
@@ -95,10 +95,8 @@ def install(
             counts[name] += 1
             return counts[name]
 
-    def assert_runtime(expected: dict[str, object]) -> None:
-        # study calls this just before it writes each invocation receipt.
-        if boundary == "before-receipt" and counted("receipt") == at:
-            _kill()
+    def assert_runtime(expected: dict[str, object], **kwargs: object) -> dict[str, object]:
+        return expected
 
     def invoke(**kwargs: Any) -> dict[str, Any]:
         with lock:
@@ -133,6 +131,10 @@ def install(
     write = study._write
 
     def write_file(path: Path, value: object) -> None:
+        # An invocation receipt is `invocations/<attempt>/<stage>.json`.
+        receipt = path.parent.parent.name == "invocations"
+        if boundary == "before-receipt" and receipt and counted("receipt") == at:
+            _kill()
         write(path, value)
         if boundary == "after-plan-write" and path.name == "plan.json":
             _kill()
@@ -163,7 +165,7 @@ def install(
             _kill()
         publish(self, record)
 
-    if boundary == "after-plan-write":
+    if boundary in {"after-plan-write", "before-receipt"}:
         monkeypatch.setattr(study, "_write", write_file)
     if boundary == "ledger-insert":
         killing = types.SimpleNamespace(

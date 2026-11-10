@@ -19,7 +19,7 @@ from pluginbench.assessment_metrics import (
     evaluate_evidence,
     inspect_snapshot,
 )
-from pluginbench import isolation
+from pluginbench import components, isolation
 
 
 class Collector(BaseModel):
@@ -180,11 +180,39 @@ def observer_identity() -> dict[str, str]:
     return {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()}
 
 
+def container_runtime(collector: Collector) -> dict[str, object] | None:
+    """The saved runtime of the Docker container this collector starts, if it starts one.
+
+    Native coverage starts one, and so does Rust analysis for its unused diagnostics.
+    """
+    if collector.kind == "fallow" or (
+        collector.kind == "coverage" and collector.report_format is None
+    ):
+        return None
+    config = json.loads(collector.config.read_text())
+    if not isinstance(config, dict):
+        return None  # Measuring it refuses the profile by name.
+    if collector.kind == "analysis" and config.get("language") != "rust":
+        return None
+    identity = config.get("native_task_identity")
+    runtime = identity.get("isolation") if isinstance(identity, dict) else None
+    return runtime if isinstance(runtime, dict) else None
+
+
 def _assert_observer(collector: Collector) -> None:
     assert collector.report_format is not None
-    expected = json.loads(collector.config.read_text()).get("implementation")
-    if expected != observer_identity():
-        raise ValueError("coverage observer implementation differs from its frozen profile")
+    config = json.loads(collector.config.read_text())
+    if not isinstance(config, dict):
+        raise components.ObserverError(f"it is not a JSON object: {components.OBSERVER_NEXT_STEP}")
+    version = config.get("observer_version")
+    if version is None:
+        version = components.saved_version("coverage_observer", config.get("implementation") or {})
+    current = components.VERSIONS["coverage_observer"]
+    if version != current:
+        raise components.ObserverError(
+            f"coverage observer version {version} froze this profile, and this PluginBench "
+            f"measures with version {current}: {components.OBSERVER_NEXT_STEP}"
+        )
 
 
 def collector_identity(collector: Collector) -> dict[str, object]:
@@ -399,13 +427,34 @@ def _native_coverage(
 def _run_collector(
     root: Path, collector: Collector, destination: Path, baseline: Path | None
 ) -> tuple[dict[str, object], str, str]:
+    """Collect one measure; a profile this build's observer cannot measure is named."""
+    try:
+        return _observed(root, collector, destination, baseline)
+    except components.UnknownSourceError as error:
+        raise ValueError(
+            f"Measurement profile {collector.config}: {error}; {components.OBSERVER_NEXT_STEP}"
+        ) from error
+    except components.ObserverError as error:
+        raise ValueError(f"Measurement profile {collector.config}: {error}") from error
+
+
+def _observed(
+    root: Path, collector: Collector, destination: Path, baseline: Path | None
+) -> tuple[dict[str, object], str, str]:
     if collector.report_format is None:
         return _collect(root, collector, destination, baseline)
     _assert_observer(collector)
+    implementation = observer_identity()
     try:
         return _collect(root, collector, destination, baseline)
     finally:
-        _assert_observer(collector)
+        # The profile binds a version, not bytes: an edit during collection must not mix
+        # two implementations in one result.
+        if observer_identity() != implementation:
+            raise components.ObserverError(
+                "the coverage observer's bytes changed during execution: measure again with "
+                "an unchanged PluginBench"
+            )
 
 
 def _collect(

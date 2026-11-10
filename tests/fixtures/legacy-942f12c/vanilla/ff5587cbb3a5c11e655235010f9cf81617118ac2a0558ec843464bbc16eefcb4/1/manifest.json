@@ -1,0 +1,480 @@
+{
+  "context": {
+    "coding": {
+      "capabilities": {
+        "max_depth": 1,
+        "max_threads": 4,
+        "subagents": true
+      },
+      "delivery": "native-instructions-skills-plugins-v1",
+      "harness_version": "0.143.0",
+      "isolation": {
+        "codex_transport": {
+          "harbor_run_sha256": "5b14fbcc889a398f80c7b5f7e2a621efc1337ba72e748fafefbab2ad09ad86bd",
+          "version": "codex-stdout-stderr-v1"
+        },
+        "docker_cli": {
+          "path": "/fixture/bin/docker",
+          "resolved_path": "/fixture/bin/docker",
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "version": "29.0.0"
+        },
+        "docker_engine": {
+          "capacity": {
+            "cpus": 24,
+            "memory_bytes": 25198305280
+          },
+          "endpoint": "unix:///var/run/docker.sock",
+          "id": "fixture-engine-at-preparation",
+          "platform": "linux/x86_64",
+          "version": "29.0.0"
+        },
+        "docker_plugins": {
+          "buildx": {
+            "path": "/fixture/bin/docker-buildx",
+            "resolved_path": "/fixture/bin/docker-buildx",
+            "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            "version": "29.0.0"
+          },
+          "compose": {
+            "path": "/fixture/bin/docker-compose",
+            "resolved_path": "/fixture/bin/docker-compose",
+            "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "version": "29.0.0"
+          }
+        },
+        "harbor_version": "0.24.0",
+        "implementation_sha256": "066f9a3641d85ae8d109357b545e82973d4eb8a7bb7c5fbed4eed29c96df62b8",
+        "protocol": "harbor-docker-v1",
+        "resources": {
+          "cpu_enforcement": "limit",
+          "cpus": 1,
+          "memory_enforcement": "limit",
+          "memory_mb": 2048
+        },
+        "submission_receipt_version": 2
+      },
+      "jobs": 2,
+      "launcher_sha256": {
+        "codex.py": "6b1d892b37ea5e33337a469923762fe71130e22c840859771367cf34fa66b21f",
+        "harbor_backend.py": "066f9a3641d85ae8d109357b545e82973d4eb8a7bb7c5fbed4eed29c96df62b8",
+        "native_treatment_runtime.js": "229d01b78fd893b8e502139507b74d18f0147079c58f15f90b0548b5520e67c5",
+        "native_treatments.py": "dcb11553bc9bd2ea7a15ff3293d3ec74617565f89c3c2d156f714acade8b73a8",
+        "processes.py": "0170e0a4902fc610d19b50ed5656c601474adad97b9b8d6fb5b08c6ab6ad00d1",
+        "treatments.py": "e807503ac1809dd1030a6805702fe23da0d4cd07eb2d9f52d12069ae85f1926f"
+      },
+      "native_task_identity": {
+        "grader_image_identity": {
+          "image": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "image_id": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "platform": "linux/arm64",
+          "workdir": "/app"
+        },
+        "image_identity": {
+          "image": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "image_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "platform": "linux/arm64",
+          "workdir": "/app"
+        },
+        "isolation": {
+          "codex_transport": {
+            "harbor_run_sha256": "5b14fbcc889a398f80c7b5f7e2a621efc1337ba72e748fafefbab2ad09ad86bd",
+            "version": "codex-stdout-stderr-v1"
+          },
+          "docker_cli": {
+            "path": "/fixture/bin/docker",
+            "resolved_path": "/fixture/bin/docker",
+            "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "version": "29.0.0"
+          },
+          "docker_engine": {
+            "capacity": {
+              "cpus": 24,
+              "memory_bytes": 25198305280
+            },
+            "endpoint": "unix:///var/run/docker.sock",
+            "id": "fixture-engine-at-preparation",
+            "platform": "linux/x86_64",
+            "version": "29.0.0"
+          },
+          "docker_plugins": {
+            "buildx": {
+              "path": "/fixture/bin/docker-buildx",
+              "resolved_path": "/fixture/bin/docker-buildx",
+              "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+              "version": "29.0.0"
+            },
+            "compose": {
+              "path": "/fixture/bin/docker-compose",
+              "resolved_path": "/fixture/bin/docker-compose",
+              "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+              "version": "29.0.0"
+            }
+          },
+          "harbor_version": "0.24.0",
+          "implementation_sha256": "066f9a3641d85ae8d109357b545e82973d4eb8a7bb7c5fbed4eed29c96df62b8",
+          "protocol": "harbor-docker-v1",
+          "resources": {
+            "cpu_enforcement": "limit",
+            "cpus": 1,
+            "memory_enforcement": "limit",
+            "memory_mb": 2048
+          },
+          "submission_receipt_version": 2
+        },
+        "original_task_assets_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "preparation_key": "6666666666666666666666666666666666666666666666666666666666666666",
+        "preparation_policy": "native-task-and-clean-guidance-source-v1",
+        "resources": {
+          "cpus": 1,
+          "memory_mb": 2048
+        },
+        "source_digest": "sha256:6dc78bb33b9e134d53a63475e593779b85f688fd2c56bdea2f8e3be878029960",
+        "source_policy": "reviewed-native-patch-source-v2",
+        "source_qualification": {
+          "base_tree_sha256": "fb3edd35801dec68226b01d0401b1a8ca27495ad3150bce592ddbb99ca04fac2",
+          "cleanup_status": "complete",
+          "coding_image_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "contract": {
+            "base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "collection": [],
+            "grader_sha256": "offline fixture",
+            "patch_artifact": "logs/artifacts/model.patch",
+            "tests_sha256": "a4fa5d65aaf67ab6ad8d3f65e8057e57df7630e883ec6ca6d8130c0ef79eed7e",
+            "verifier_payload": {
+              "test.patch": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "test.sh": "306c6ca7407560340797866e077e053627ad409277d1b9da58106fce4cf717cb"
+            }
+          },
+          "fixture_digest": "sha256:6dc78bb33b9e134d53a63475e593779b85f688fd2c56bdea2f8e3be878029960",
+          "fixture_metadata_digest": "754f32346f89b87c9443ba8f5da3577a12570cc09fd12b87e1366eb5b97ef45e",
+          "grader_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "grader_image_id": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "grader_startup": {
+            "entrypoint": [],
+            "environment": {},
+            "image_id": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "policy": "reviewed-native-grader-startup-v1",
+            "workdir": "/app"
+          },
+          "grader_tests_sha256": "a5c14196a2ebc19594ed55641c8ea1a01f5d8cff6729a0008b9ae4d3cfe717b2",
+          "source_policy": "reviewed-native-patch-source-v2",
+          "status": "complete"
+        },
+        "task_assets_sha256": "c6be52dec7f662de8df19398b01f14f443986206be0185e0026a63d3f90cbeb7",
+        "toolchain_identity": {
+          "base_image_identity": {
+            "image": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "image_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "platform": "linux/arm64",
+            "workdir": "/app"
+          },
+          "harness": "codex",
+          "harness_version": "0.143.0",
+          "image_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "install_policy": "harbor-native-install-only-v1",
+          "platform": "linux/arm64"
+        },
+        "transport_policy": {
+          "name": "native-cli-provider-hosts-v1",
+          "provider_hosts": [
+            "api.openai.com",
+            "chatgpt.com",
+            "auth.openai.com"
+          ]
+        },
+        "trusted_tests_sha256": "a4fa5d65aaf67ab6ad8d3f65e8057e57df7630e883ec6ca6d8130c0ef79eed7e",
+        "verifier_test_delivery": "native-image",
+        "workdir": "/app"
+      },
+      "runner": {
+        "harness": "codex",
+        "model": "gpt-6.1-sol",
+        "reasoning": "medium"
+      },
+      "seed": 42,
+      "study": {
+        "harness": "codex",
+        "jobs": 2,
+        "model": "gpt-6.1-sol",
+        "reasoning": "medium",
+        "seed": 42,
+        "timeout_seconds": 1800
+      },
+      "task_assets": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "task_environment": {
+        "grader_image_identity": {
+          "image": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "image_id": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "platform": "linux/arm64",
+          "workdir": "/app"
+        },
+        "image_identity": {
+          "image": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "image_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "platform": "linux/arm64",
+          "workdir": "/app"
+        },
+        "isolation": {
+          "codex_transport": {
+            "harbor_run_sha256": "5b14fbcc889a398f80c7b5f7e2a621efc1337ba72e748fafefbab2ad09ad86bd",
+            "version": "codex-stdout-stderr-v1"
+          },
+          "docker_cli": {
+            "path": "/fixture/bin/docker",
+            "resolved_path": "/fixture/bin/docker",
+            "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "version": "29.0.0"
+          },
+          "docker_engine": {
+            "capacity": {
+              "cpus": 24,
+              "memory_bytes": 25198305280
+            },
+            "endpoint": "unix:///var/run/docker.sock",
+            "id": "fixture-engine-at-preparation",
+            "platform": "linux/x86_64",
+            "version": "29.0.0"
+          },
+          "docker_plugins": {
+            "buildx": {
+              "path": "/fixture/bin/docker-buildx",
+              "resolved_path": "/fixture/bin/docker-buildx",
+              "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+              "version": "29.0.0"
+            },
+            "compose": {
+              "path": "/fixture/bin/docker-compose",
+              "resolved_path": "/fixture/bin/docker-compose",
+              "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+              "version": "29.0.0"
+            }
+          },
+          "harbor_version": "0.24.0",
+          "implementation_sha256": "066f9a3641d85ae8d109357b545e82973d4eb8a7bb7c5fbed4eed29c96df62b8",
+          "protocol": "harbor-docker-v1",
+          "resources": {
+            "cpu_enforcement": "limit",
+            "cpus": 1,
+            "memory_enforcement": "limit",
+            "memory_mb": 2048
+          },
+          "submission_receipt_version": 2
+        },
+        "original_task_assets_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "preparation_key": "6666666666666666666666666666666666666666666666666666666666666666",
+        "preparation_policy": "native-task-and-clean-guidance-source-v1",
+        "resources": {
+          "cpus": 1,
+          "memory_mb": 2048
+        },
+        "source_digest": "sha256:6dc78bb33b9e134d53a63475e593779b85f688fd2c56bdea2f8e3be878029960",
+        "source_policy": "reviewed-native-patch-source-v2",
+        "source_qualification": {
+          "base_tree_sha256": "fb3edd35801dec68226b01d0401b1a8ca27495ad3150bce592ddbb99ca04fac2",
+          "cleanup_status": "complete",
+          "coding_image_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "contract": {
+            "base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "collection": [],
+            "grader_sha256": "offline fixture",
+            "patch_artifact": "logs/artifacts/model.patch",
+            "tests_sha256": "a4fa5d65aaf67ab6ad8d3f65e8057e57df7630e883ec6ca6d8130c0ef79eed7e",
+            "verifier_payload": {
+              "test.patch": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "test.sh": "306c6ca7407560340797866e077e053627ad409277d1b9da58106fce4cf717cb"
+            }
+          },
+          "fixture_digest": "sha256:6dc78bb33b9e134d53a63475e593779b85f688fd2c56bdea2f8e3be878029960",
+          "fixture_metadata_digest": "754f32346f89b87c9443ba8f5da3577a12570cc09fd12b87e1366eb5b97ef45e",
+          "grader_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "grader_image_id": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "grader_startup": {
+            "entrypoint": [],
+            "environment": {},
+            "image_id": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "policy": "reviewed-native-grader-startup-v1",
+            "workdir": "/app"
+          },
+          "grader_tests_sha256": "a5c14196a2ebc19594ed55641c8ea1a01f5d8cff6729a0008b9ae4d3cfe717b2",
+          "source_policy": "reviewed-native-patch-source-v2",
+          "status": "complete"
+        },
+        "task_assets_sha256": "c6be52dec7f662de8df19398b01f14f443986206be0185e0026a63d3f90cbeb7",
+        "toolchain_identity": {
+          "base_image_identity": {
+            "image": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "image_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "platform": "linux/arm64",
+            "workdir": "/app"
+          },
+          "harness": "codex",
+          "harness_version": "0.143.0",
+          "image_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "install_policy": "harbor-native-install-only-v1",
+          "platform": "linux/arm64"
+        },
+        "transport_policy": {
+          "name": "native-cli-provider-hosts-v1",
+          "provider_hosts": [
+            "api.openai.com",
+            "chatgpt.com",
+            "auth.openai.com"
+          ]
+        },
+        "trusted_tests_sha256": "a4fa5d65aaf67ab6ad8d3f65e8057e57df7630e883ec6ca6d8130c0ef79eed7e",
+        "verifier_test_delivery": "native-image",
+        "workdir": "/app"
+      },
+      "timeout_seconds": 1800
+    },
+    "fixture_digest": "sha256:6dc78bb33b9e134d53a63475e593779b85f688fd2c56bdea2f8e3be878029960",
+    "prompt": "Set the answer to one for answer.",
+    "protocol": "native-harbor-baseline-cohort-v4",
+    "repeats": [
+      1,
+      2
+    ],
+    "source_policy": "reviewed-native-patch-source-v2",
+    "task_digest": "sha256:2807b89ab9699a44b3a0683ddf757aec55d32349d025cfa88972590b708d12b3",
+    "task_id": "answer"
+  },
+  "inventory": {
+    "attempts": {
+      "mode": 493,
+      "sha256": null
+    },
+    "attempts/baseline-1": {
+      "mode": 493,
+      "sha256": null
+    },
+    "attempts/baseline-1/handoff": {
+      "mode": 493,
+      "sha256": null
+    },
+    "attempts/baseline-1/handoff/artifacts": {
+      "mode": 493,
+      "sha256": null
+    },
+    "attempts/baseline-1/handoff/artifacts/before-source.json": {
+      "mode": 420,
+      "sha256": "76511856f013e17df1398f1174dd246db254055e94065653f629f28c922e2e1d"
+    },
+    "attempts/baseline-1/handoff/artifacts/docker-client.json": {
+      "mode": 420,
+      "sha256": "7bb189f4a0d778638ac6f6dc5310277f09d7696db7528c6f401c85c2655c1784"
+    },
+    "attempts/baseline-1/handoff/artifacts/harbor": {
+      "mode": 493,
+      "sha256": null
+    },
+    "attempts/baseline-1/handoff/artifacts/harbor/trial": {
+      "mode": 493,
+      "sha256": null
+    },
+    "attempts/baseline-1/handoff/artifacts/harbor/trial/artifacts": {
+      "mode": 493,
+      "sha256": null
+    },
+    "attempts/baseline-1/handoff/artifacts/harbor/trial/artifacts/logs": {
+      "mode": 493,
+      "sha256": null
+    },
+    "attempts/baseline-1/handoff/artifacts/harbor/trial/artifacts/logs/artifacts": {
+      "mode": 493,
+      "sha256": null
+    },
+    "attempts/baseline-1/handoff/artifacts/harbor/trial/artifacts/logs/artifacts/model.patch": {
+      "mode": 420,
+      "sha256": "fb235e234e83ecb578fc28b9764b0d6c2733a1f6449d06717297b027d935af60"
+    },
+    "attempts/baseline-1/handoff/artifacts/invocation.json": {
+      "mode": 420,
+      "sha256": "d6bb9fbb219698ecac3c9be9925db28864a7251013f9a4b9a770dcd7442a1df8"
+    },
+    "attempts/baseline-1/handoff/artifacts/native-treatment.json": {
+      "mode": 420,
+      "sha256": "233f10cb2886f3df03cd156cbe3c0d14339066f9a6b83f2905ce85b7716c4835"
+    },
+    "attempts/baseline-1/handoff/artifacts/prompt.txt": {
+      "mode": 420,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "attempts/baseline-1/handoff/artifacts/runtime-isolation.json": {
+      "mode": 420,
+      "sha256": "e45f2095f7591699b335bd037fc1ba0bc474c02feb12e7730047ea9565fcdf1f"
+    },
+    "attempts/baseline-1/handoff/artifacts/submission-source.json": {
+      "mode": 420,
+      "sha256": "2e95a3e9bc4f6a55b95ea5c7f633b97f658ba8b44838f89be67590693dda156c"
+    },
+    "attempts/baseline-1/handoff/diagnostic-source": {
+      "mode": 493,
+      "sha256": null
+    },
+    "attempts/baseline-1/handoff/diagnostic-source/answer.py": {
+      "mode": 420,
+      "sha256": "31055738067e8e385812d6332aa83e4a4bba83a4cd24e7c4a32f350c82a68a82"
+    },
+    "attempts/baseline-1/handoff/diagnostic-source/dist": {
+      "mode": 493,
+      "sha256": null
+    },
+    "attempts/baseline-1/handoff/diagnostic-source/dist/temporary.js": {
+      "mode": 420,
+      "sha256": "a21af92fede4525eb6c755066762044ee9261f4eeccdd12e3987b944c7e44fd3"
+    },
+    "attempts/baseline-1/handoff/execution.json": {
+      "mode": 420,
+      "sha256": "17393059fc4342814448fb7e811c83e3d3e433d2311cba4f5cdf9e22f8f1ca8f"
+    },
+    "attempts/baseline-1/handoff/snapshot": {
+      "mode": 493,
+      "sha256": null
+    },
+    "attempts/baseline-1/handoff/snapshot/answer.py": {
+      "mode": 420,
+      "sha256": "31055738067e8e385812d6332aa83e4a4bba83a4cd24e7c4a32f350c82a68a82"
+    },
+    "native-starts": {
+      "mode": 493,
+      "sha256": null
+    },
+    "native-starts/baseline-1.json": {
+      "mode": 420,
+      "sha256": "849b6cbdfb7a2efb89b222d5db33e0a505329aa4dc1a7c942a32ad5769b87b43"
+    }
+  },
+  "origin_status": "complete",
+  "records": [
+    {
+      "arm": "baseline",
+      "attempt": 1,
+      "before": null,
+      "before_evidence": null,
+      "id": "baseline-1",
+      "model": null,
+      "runtime": {
+        "harness": "codex-cli",
+        "reasoning_effort": null
+      },
+      "stages": [
+        {
+          "correctness": null,
+          "evidence": null,
+          "id": "handoff",
+          "snapshot": {
+            "path": "attempts/baseline-1/handoff/snapshot",
+            "sha256": "sha256:6f3a94ecd1b4f9d267130b9e1dc4c237295b9c02b5685951c2c53ddb7337cd4d"
+          },
+          "work": {
+            "elapsed_seconds": 7.0,
+            "tokens": null
+          }
+        }
+      ],
+      "task_id": "answer"
+    }
+  ],
+  "task_digest": "sha256:2807b89ab9699a44b3a0683ddf757aec55d32349d025cfa88972590b708d12b3"
+}

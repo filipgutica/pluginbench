@@ -1,0 +1,17 @@
+{
+  "preparation_key": "919a1427044efe7879a10951e6178482fc053cfe59362a9574df78b5678b64f7",
+  "images": {
+    "image_identity": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "grader_image_identity": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "rows": {
+    "oracle": {
+      "state": "ready",
+      "reason": null
+    },
+    "nop": {
+      "state": "ready",
+      "reason": null
+    }
+  }
+}

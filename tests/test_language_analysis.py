@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from legacy_support import legacy_json
 from pluginbench.language_analysis import (
     VERSION,
     AnalysisUnavailable,
@@ -369,8 +370,13 @@ def test_analysis_settings_and_implementation_drift_are_fatal(tmp_path: Path) ->
     source = tmp_path / "source"
     source.mkdir()
     config = prepare_analysis_config("rust", ["*"], ["*"], {})
+    config["observer_version"] = 2
+    with pytest.raises(ValueError, match="observer version 2 froze this profile"):
+        collect_language_analysis(source, config, tmp_path / "evidence")
+    config = prepare_analysis_config("rust", ["*"], ["*"], {})
+    del config["observer_version"]
     config["implementation_sha256"] = "tampered"
-    with pytest.raises(ValueError, match="implementation changed"):
+    with pytest.raises(ValueError, match="language_analysis.py has sha256 tampered"):
         collect_language_analysis(source, config, tmp_path / "evidence")
     config = prepare_analysis_config("rust", ["*"], ["*"], {})
     config["settings"] = {"vulture_min_confidence": 100}
@@ -385,10 +391,10 @@ def test_a_profile_frozen_before_the_dep_info_fix_still_loads(
     source = tmp_path / "source"
     source.mkdir()
     config = prepare_analysis_config("rust", ["*"], ["*"], {})
-    # sha256 of language_analysis.py at 942f12c, as that commit froze it into every profile.
-    config["implementation_sha256"] = (
-        "bc09200c57bf78d403d9f5b473d16af5ea653059dc06559ae3c86ba4652b9744"
-    )
+    # As 942f12c froze every profile: the observer's source hash, and no version.
+    del config["observer_version"]
+    observers = legacy_json("observer-identities.json")
+    config["implementation_sha256"] = observers["analysis_implementation_sha256"]
 
     analysis, _ = collect_language_analysis(source, config, tmp_path / "evidence")
 

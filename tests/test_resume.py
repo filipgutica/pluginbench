@@ -6,6 +6,7 @@ or finally block runs, as when the interrupted pilot was killed.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shutil
@@ -19,7 +20,9 @@ from typing import Any
 import pytest
 
 import pluginbench
+import native_support
 import resume_support
+from legacy_support import current_runtime, legacy_json
 from native_support import execution as native_execution
 from pluginbench import harbor_backend, parallel, study
 from pluginbench.ledger import Ledger
@@ -459,6 +462,60 @@ def test_moving_the_run_during_preflight_never_writes_to_the_old_path(
     assert calls == []
 
 
+@pytest.mark.parametrize("obstacle", ["undeclared-launcher", "busy-lock"])
+def test_a_run_with_nothing_left_to_code_finishes_without_its_vanilla_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, obstacle: str
+) -> None:
+    # Every attempt finished; caching a finished vanilla repeat must not decide completion.
+    cache = tmp_path / "cache"
+    root = _killed_run(tmp_path, boundary="after-ledger", at=12, cache=cache)
+    identity = resume_support.vanilla_identity(study._frozen_study(root))
+    held = []
+    if obstacle == "undeclared-launcher":
+        identity["launcher_sha256"] = {"codex.py": "f" * 64}
+    else:
+        for path in sorted((cache / ".locks").glob("*.lock")):
+            handle = path.open("a")
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held.append(handle)
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+    messages: list[str] = []
+    try:
+        study.resume_study(
+            root, progress=messages.append, baseline_cache=cache, baseline_identity=identity
+        )
+    finally:
+        for handle in held:
+            handle.close()
+    assert _json(root / "run.json")["status"] == "complete"
+    assert calls == []
+    kind = "UnknownSourceError" if obstacle == "undeclared-launcher" else "ValueError"
+    prefix = f"Some finished vanilla repeats were not cached in {cache}: {kind}: "
+    assert any(line.startswith(prefix) for line in messages)
+
+
+def test_resume_that_fails_before_coding_starts_closes_its_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _killed_run(tmp_path, boundary="after-ledger", at=12, cache=tmp_path / "cache")
+    closed: list[Ledger] = []
+    close = Ledger.close
+
+    def recording(ledger: Ledger) -> None:
+        closed.append(ledger)
+        close(ledger)
+
+    monkeypatch.setattr(Ledger, "close", recording)
+
+    def failing(message: str) -> None:
+        raise RuntimeError("the progress sink is gone")
+
+    with pytest.raises(RuntimeError, match="progress sink"):
+        study.resume_study(root, progress=failing)
+    assert len(closed) == 1
+
+
 def test_vanilla_attempt_killed_before_it_was_cached_is_cached_on_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -508,3 +565,30 @@ def test_vanilla_attempt_killed_before_it_was_cached_is_cached_on_resume(
 
     assert calls == []
     assert len(list(cache.glob("*/*/manifest.json"))) == 6
+
+
+def test_a_942f12c_vanilla_run_resumes_after_docker_memory_moved_by_28_kib(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The incident: a resume with vanilla reuse was refused because Docker reported 28 KiB
+    # less memory than at preparation. Only the saved runtime checks are real here.
+    cache = tmp_path / "cache"
+    saved = legacy_json("runtime.json")
+    # The tasks were prepared on the same 942f12c runtime, on the engine the child runs on.
+    prepared = legacy_json("runtime.json")
+    prepared["docker_engine"]["id"] = "daemon-one"
+    with monkeypatch.context() as tasks:
+        tasks.setattr(native_support, "runtime_identity", lambda: prepared)
+        root = _killed_run(tmp_path, boundary="during-call", at=7, cache=cache)
+    calls: list[str] = []
+    check = harbor_backend.assert_runtime
+    resume_support.install(monkeypatch, calls)
+    monkeypatch.setattr(harbor_backend, "assert_runtime", check)
+    current = current_runtime(saved)
+    current["docker_engine"]["id"] = "daemon-one"
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: current)
+    resolved = study._frozen_study(root)
+    identity = {**resume_support.vanilla_identity(resolved), "isolation": saved}
+    study.resume_study(root, baseline_cache=cache, baseline_identity=identity)
+    assert _json(root / "run.json")["status"] == "complete"
+    assert len(calls) == 6
