@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import os
 import shutil
@@ -128,7 +129,7 @@ def test_common_capability_limits_survive_real_harbor_option_parsing(
 ) -> None:
     from pluginbench import harbor_backend
 
-    sdk = pytest.importorskip("harbor.agents.installed.codex")
+    sdk = importlib.import_module("harbor.agents.installed.codex")
     policy = NativeCapabilities(subagents=subagents, max_threads=3, max_depth=1)
     configurations: list[dict[str, Any]] = []
     guidance = tmp_path / "guide.md"
