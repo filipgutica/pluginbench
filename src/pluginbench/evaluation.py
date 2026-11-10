@@ -853,7 +853,9 @@ def _code(
     # Runs prepared before vanilla identities were saved resume without the vanilla cache.
     identity = _object(json.loads(identity_path.read_text())) if identity_path.is_file() else None
     resuming = (evidence / "run.json").is_file()
-    if resuming and _coding_left(root, selection):
+
+    def same_coder() -> None:
+        # Checked only once reconciliation has found a slot left to code.
         version = _harness_version(config.runner.harness)
         if version != recipe["harness_version"]:
             raise ValueError(
@@ -862,6 +864,7 @@ def _code(
             )
         # One comparison must not hold attempts coded by two launchers.
         _assert_launcher(selection, identity, config.runner.harness)
+
     if resuming:
         resume_study(
             evidence,
@@ -869,6 +872,7 @@ def _code(
             baseline_cache=_caches(root).vanilla if identity else None,
             baseline_identity=identity,
             guard=guard,
+            before_coding=same_coder,
         )
     else:
         run_study(

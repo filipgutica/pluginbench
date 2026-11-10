@@ -6,6 +6,7 @@ or finally block runs, as when the interrupted pilot was killed.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shutil
@@ -459,6 +460,37 @@ def test_moving_the_run_during_preflight_never_writes_to_the_old_path(
             )
     assert not owned.exists()
     assert calls == []
+
+
+@pytest.mark.parametrize("obstacle", ["undeclared-launcher", "busy-lock"])
+def test_a_run_with_nothing_left_to_code_finishes_without_its_vanilla_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, obstacle: str
+) -> None:
+    # Every attempt finished; caching a finished vanilla repeat must not decide completion.
+    cache = tmp_path / "cache"
+    root = _killed_run(tmp_path, boundary="after-ledger", at=12, cache=cache)
+    identity = resume_support.vanilla_identity(study._frozen_study(root))
+    held = []
+    if obstacle == "undeclared-launcher":
+        identity["launcher_sha256"] = {"codex.py": "f" * 64}
+    else:
+        for path in sorted((cache / ".locks").glob("*.lock")):
+            handle = path.open("a")
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held.append(handle)
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+    messages: list[str] = []
+    try:
+        study.resume_study(
+            root, progress=messages.append, baseline_cache=cache, baseline_identity=identity
+        )
+    finally:
+        for handle in held:
+            handle.close()
+    assert _json(root / "run.json")["status"] == "complete"
+    assert calls == []
+    assert any(line.startswith("Finished vanilla repeats were not cached: ") for line in messages)
 
 
 def test_vanilla_attempt_killed_before_it_was_cached_is_cached_on_resume(

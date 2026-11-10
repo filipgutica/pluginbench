@@ -30,6 +30,7 @@ from pluginbench import (
     submissions,
 )
 from pluginbench.harbor_backend import assert_runtime as checked_runtime
+from pluginbench.ledger import Ledger
 from pluginbench.remeasure import propose_remeasurement
 from pluginbench.study_review import recover_review_citations
 from native_support import (
@@ -1953,6 +1954,68 @@ def test_resume_without_a_vanilla_identity_refuses_a_changed_task_runtime(
     assert len(calls) == coded
 
 
+@pytest.mark.parametrize("boundary", ["after-record", "after-ledger"])
+def test_a_run_killed_after_its_last_attempt_finished_resumes_with_a_newer_launcher(
+    config: evaluation.Evaluation,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    # Killed once the final attempt's record receipt (and then its ledger row) is durable,
+    # before run.json says so: run.json still shows coding left, but reconciliation does not.
+    config = _measured_and_reviewed(config, tmp_path, monkeypatch)
+    calls: list[str] = []
+    reviews: list[str] = []
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=config.timeout_seconds, interrupt_at=None
+    )
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    evidence = tmp_path / "run/evidence"
+    killed = False
+
+    def all_recorded() -> bool:
+        entries = json.loads((evidence / "plan.json").read_text())["entries"]
+        return all((evidence / "records" / f"{entry['id']}.json").is_file() for entry in entries)
+
+    def kill() -> None:
+        nonlocal killed
+        killed = True
+        raise KeyboardInterrupt("killed")
+
+    write, complete, checkpoint = study._write, Ledger.complete, study._checkpoint
+
+    def writing(path: Path, value: object) -> None:
+        write(path, value)
+        if boundary == "after-record" and path.parent.name == "records" and all_recorded():
+            kill()
+
+    def completing(self: Ledger, *args: Any, **kwargs: Any) -> None:
+        complete(self, *args, **kwargs)
+        if boundary == "after-ledger" and all_recorded():
+            kill()
+
+    def checkpointing(*args: Any, **kwargs: Any) -> None:
+        if not killed:  # A killed process writes nothing more.
+            checkpoint(*args, **kwargs)
+
+    with monkeypatch.context() as stopped:
+        stopped.setattr(study, "_write", writing)
+        stopped.setattr(Ledger, "complete", completing)
+        stopped.setattr(study, "_checkpoint", checkpointing)
+        with pytest.raises(KeyboardInterrupt):
+            evaluation.run_evaluation(config, tmp_path / "run")
+    states = json.loads((evidence / "run.json").read_text())["attempt_states"]
+    assert sum(state != "complete" for state in states.values()) == 1
+    coded = len(calls)
+    monkeypatch.setattr(harbor_backend, "assert_runtime", checked_runtime)
+    monkeypatch.setitem(components.VERSIONS, "launcher", components.VERSIONS["launcher"] + 1)
+    result = CliRunner().invoke(cli.app, ["run", str(tmp_path / "run"), "--yes", "--foreground"])
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert len(calls) == coded
+    assert json.loads((evidence / "run.json").read_text())["status"] == "complete"
+
+
 def test_a_run_stopped_after_its_last_attempt_finishes_with_a_newer_launcher(
     config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1995,8 +2058,8 @@ def _tree(root: Path) -> dict[str, str]:
     }
 
 
-# Runs 942f12c's own resume against a run directory. Docker and coding are stubbed out, so
-# reaching coding prints a line instead of starting an agent.
+# Runs 942f12c's own `run <run-dir>` command. Docker and coding are stubbed out, so reaching
+# coding ends the process with a line instead of starting an agent.
 _OLD_RESUME = """
 import json, sys
 from pathlib import Path
@@ -2015,10 +2078,11 @@ submissions.reviewed_contract = native_support.synthetic_contract
 version = json.loads((root / "inputs/study.json").read_text())["harness_version"]
 evaluation._harness_version = lambda harness: version
 evaluation._assert_resumable = lambda root, selection: None
-try:
-    evaluation.resume_evaluation(root)
-except ValueError as error:
-    print("refused:", error)
+from typer.testing import CliRunner
+from pluginbench import cli
+result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+print("exit:", result.exit_code, repr(result.exception))
+print(result.stderr)
 """
 
 
@@ -2064,5 +2128,10 @@ def test_942f12c_refuses_a_run_this_build_saved(
         timeout=300,
     )
     assert result.returncode == 0, result.stderr + result.stdout
-    assert "refused:" in result.stdout and "schema_version" in result.stdout, result.stdout
-    assert _tree(root) == before
+    assert "exit: 2" in result.stdout and "schema_version" in result.stdout, result.stdout
+    assert "started coding" not in result.stdout
+    after = _tree(root)
+    # Its CLI takes the run lock and records the attempt in events.jsonl before it reads the
+    # study; it writes nothing else, and starts no coding.
+    changed = {name for name in before.keys() | after.keys() if before.get(name) != after.get(name)}
+    assert changed <= {"run.lock", "events.jsonl"}, changed

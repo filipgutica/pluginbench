@@ -1028,8 +1028,13 @@ def resume_study(
     baseline_cache: Path | None = None,
     baseline_identity: dict[str, object] | None = None,
     guard: Callable[[], None] | None = None,
+    before_coding: Callable[[], None] | None = None,
 ) -> Path:
-    """Code every slot that has no complete attempt; keep complete attempts as they are."""
+    """Code every slot that has no complete attempt; keep complete attempts as they are.
+
+    `before_coding` runs once reconciliation has found a slot left to code, and may refuse.
+    A run.json older than the ledger and the record receipts cannot tell that.
+    """
     root = output.resolve()
     if baseline_cache is not None and not baseline_identity:
         raise ValueError("baseline reuse requires a fixed coding identity")
@@ -1046,7 +1051,13 @@ def resume_study(
     ledger = Ledger.open(path) if path.exists() else Ledger.create(
         path, _bound_document(root, run["plan"])["entries"], run["attempt_states"]
     )
-    plan, manifest, states = _reconcile(root, run, ledger)
+    try:
+        plan, manifest, states = _reconcile(root, run, ledger)
+        if before_coding is not None and any(state != "complete" for state in states.values()):
+            before_coding()
+    except BaseException:
+        ledger.close()
+        raise
     if progress:
         kept = sum(state == "complete" for state in states.values())
         discarded = len(list((root / "discarded").glob("*.json")))
@@ -1103,13 +1114,18 @@ def _run_attempts(
     # the coding runtime, which may have changed since, and caches finished vanilla repeats
     # under the runtime they were coded with.
     coding = any(state != "complete" for state in states.values())
+
+    def skipped(error: Exception) -> None:
+        if progress:
+            progress(f"Finished vanilla repeats were not cached: {error}")
+
     try:
         expected_runtime: dict[str, object] = {}
-        if baseline_identity is not None:
-            requested_runtime = baseline_identity.get("isolation")
-            if not isinstance(requested_runtime, dict):
-                raise ValueError("baseline reuse requires a fixed filesystem isolation identity")
+        requested_runtime = baseline_identity.get("isolation") if baseline_identity else None
+        if isinstance(requested_runtime, dict):
             expected_runtime = requested_runtime
+        elif baseline_identity is not None and coding:
+            raise ValueError("baseline reuse requires a fixed filesystem isolation identity")
         if coding:
             expected_runtime = (
                 harbor_backend.assert_runtime(expected_runtime, jobs=frozen.recipe.jobs)
@@ -1122,30 +1138,39 @@ def _run_attempts(
             _assert_task_runtimes(frozen, expected_runtime)
         if baseline_cache is not None:
             assert baseline_identity is not None
-            cache = BaselineCache(
-                path=baseline_cache,
-                root=root,
-                tasks=frozen.tasks,
-                entries=plan["entries"],
-                identity={
-                    **baseline_identity,
-                    # New entries record the runtime they run with; saved ones still match.
-                    "isolation": expected_runtime,
-                    "delivery": DELIVERY_POLICY,
-                    "capabilities": frozen.recipe.capabilities.model_dump(mode="json"),
-                    "study": {
-                        key: getattr(frozen.recipe, key)
-                        for key in (
-                            "harness",
-                            "model",
-                            "reasoning",
-                            "jobs",
-                            "timeout_seconds",
-                            "seed",
-                        )
+            try:
+                if not expected_runtime:
+                    raise ValueError("baseline reuse requires a fixed filesystem isolation identity")
+                cache = BaselineCache(
+                    path=baseline_cache,
+                    root=root,
+                    tasks=frozen.tasks,
+                    entries=plan["entries"],
+                    identity={
+                        **baseline_identity,
+                        # New entries record the runtime they run with; saved ones still match.
+                        "isolation": expected_runtime,
+                        "delivery": DELIVERY_POLICY,
+                        "capabilities": frozen.recipe.capabilities.model_dump(mode="json"),
+                        "study": {
+                            key: getattr(frozen.recipe, key)
+                            for key in (
+                                "harness",
+                                "model",
+                                "reasoning",
+                                "jobs",
+                                "timeout_seconds",
+                                "seed",
+                            )
+                        },
                     },
-                },
-            ).reserve()
+                ).reserve()
+            except Exception as error:
+                # With nothing left to code, caching finished repeats is best effort.
+                if coding:
+                    raise
+                skipped(error)
+        if cache is not None:
             # Decisions for complete attempts record what happened when they ran.
             decisions = plan.get("baseline_cache", {})
             decisions.update(
@@ -1159,9 +1184,16 @@ def _run_attempts(
             _write(root / "plan.json", plan)
             _checkpoint(root, frozen, manifest, states, status="preflight")
             # A kill between completion and publication leaves a finished repeat uncached.
-            for record in records:
-                if states[record["id"]] == "complete":
-                    cache.publish(record)
+            try:
+                for record in records:
+                    if states[record["id"]] == "complete":
+                        cache.publish(record)
+            except Exception as error:
+                if coding:
+                    raise
+                cache.close()
+                cache = None
+                skipped(error)
         if coding:
             preflight = harbor_backend.preflight(
                 jobs=frozen.recipe.jobs,

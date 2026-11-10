@@ -96,11 +96,6 @@ def install(
             return counts[name]
 
     def assert_runtime(expected: dict[str, object], **kwargs: object) -> dict[str, object]:
-        # study calls this just before it writes each invocation receipt, from `started`;
-        # its session-start checks of the saved task runtimes are not receipts.
-        receipt = sys._getframe(1).f_code.co_name == "started"
-        if boundary == "before-receipt" and receipt and counted("receipt") == at:
-            _kill()
         return expected
 
     def invoke(**kwargs: Any) -> dict[str, Any]:
@@ -136,6 +131,10 @@ def install(
     write = study._write
 
     def write_file(path: Path, value: object) -> None:
+        # An invocation receipt is `invocations/<attempt>/<stage>.json`.
+        receipt = path.parent.parent.name == "invocations"
+        if boundary == "before-receipt" and receipt and counted("receipt") == at:
+            _kill()
         write(path, value)
         if boundary == "after-plan-write" and path.name == "plan.json":
             _kill()
@@ -166,7 +165,7 @@ def install(
             _kill()
         publish(self, record)
 
-    if boundary == "after-plan-write":
+    if boundary in {"after-plan-write", "before-receipt"}:
         monkeypatch.setattr(study, "_write", write_file)
     if boundary == "ledger-insert":
         killing = types.SimpleNamespace(
