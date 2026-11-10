@@ -20,7 +20,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         1,
         {
             "codex.py": "6b1d892b37ea5e33337a469923762fe71130e22c840859771367cf34fa66b21f",
-            "harbor_backend.py": "53b0e6cb6488e1d9adda935ad71b19aead7da71b2e87063fd6e69dc3646860cb",
+            "harbor_backend.py": "8a61080de111649d4b7493171a96d762198af715cba991dc209699f1ac2643a4",
             "processes.py": "0170e0a4902fc610d19b50ed5656c601474adad97b9b8d6fb5b08c6ab6ad00d1",
             "native_treatments.py": "dcb11553bc9bd2ea7a15ff3293d3ec74617565f89c3c2d156f714acade8b73a8",
             "native_treatment_runtime.js": (

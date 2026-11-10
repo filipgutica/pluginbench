@@ -192,6 +192,18 @@ def test_a_prepared_entry_without_image_proof_does_not_hide_a_later_usable_one(
     assert reused["preparation_key"] == PREPARED_KEY
 
 
+def test_a_prepared_entry_whose_lock_cannot_be_opened_does_not_hide_a_later_usable_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preparation = _Preparation(tmp_path, monkeypatch)
+    blocked = preparation.cache / ("0" * 64)
+    shutil.copytree(preparation.cache / PREPARED_KEY, blocked)
+    (preparation.cache / (blocked.name + ".lock")).mkdir()
+    reused = preparation.run()
+    assert preparation.preparations == []
+    assert reused["preparation_key"] == PREPARED_KEY
+
+
 def test_a_prepared_entry_whose_images_the_engine_lost_names_the_entry_and_both_engines(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -437,6 +449,22 @@ def test_a_saved_directory_that_cannot_be_listed_does_not_stop_cache_lookups(
         unlistable.chmod(0o755)
     assert [(row["status"], row["cache_key"]) for row in preview] == [("hit", VANILLA_KEY)] * 2
     assert [row["status"] for row in decisions.values()] == ["hit", "hit"]
+
+
+def test_a_saved_cohort_whose_lock_cannot_be_opened_is_not_read(tmp_path: Path) -> None:
+    # Two saved cohorts hold both repeats; the lock of the one that sorts first is a directory.
+    vanilla = _Vanilla(tmp_path)
+    blocked = vanilla.cache / ("0" * 64)
+    shutil.copytree(vanilla.cache / VANILLA_KEY, blocked)
+    (vanilla.cache / ".locks" / (blocked.name + ".lock")).mkdir(parents=True)
+    cache = vanilla.reserve()
+    try:
+        decisions = cache.decisions()
+    finally:
+        cache.close()
+    assert [(row["status"], row["cache_key"]) for row in decisions.values()] == [
+        ("hit", VANILLA_KEY)
+    ] * 2
 
 
 def test_a_saved_repeat_with_malformed_evidence_is_skipped_for_the_next_one(

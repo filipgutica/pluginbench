@@ -567,10 +567,15 @@ class BaselineCache:
         # saved cohorts, which this build only reads.
         complete = all(found.values())
         own = self._lock(key, fcntl.LOCK_SH if complete else fcntl.LOCK_EX)
+        readable = [cohorts[0]]
         for cohort in cohorts[1:]:
-            self._lock(cohort.name, fcntl.LOCK_SH)
+            try:
+                self._lock(cohort.name, fcntl.LOCK_SH)
+            except OSError:
+                continue  # A saved cohort whose lock cannot be opened is not read.
+            readable.append(cohort)
         for repeat in repeats:
-            for cohort in cohorts:
+            for cohort in readable:
                 entry = cohort / str(repeat)
                 if not entry.exists():
                     continue

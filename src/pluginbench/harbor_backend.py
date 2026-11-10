@@ -1849,7 +1849,10 @@ def _saved_preparation(
             or lock_path.is_symlink()
         ):
             continue
-        lock = lock_path.open("a")
+        try:
+            lock = lock_path.open("a")
+        except OSError:
+            continue
         kept = False
         try:
             try:
