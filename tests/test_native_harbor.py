@@ -842,7 +842,10 @@ def test_native_preparation_cache_reuses_exact_image_source_and_portable_identit
         "platform": "linux/arm64",
         "workdir": "/app",
     }
-    expected: dict[str, object] = {"resources": {"cpus": 1, "memory_mb": 256}}
+    expected: dict[str, object] = {
+        "resources": {"cpus": 1, "memory_mb": 256},
+        "launcher_version": 1,
+    }
     monkeypatch.setattr(harbor, "runtime_identity", lambda **kwargs: expected)
     monkeypatch.setattr(harbor, "_native_image", lambda **kwargs: image)
     monkeypatch.setattr(harbor, "_inspect_image", lambda reference, **kwargs: {"Id": reference})
@@ -1095,7 +1098,7 @@ def test_failed_preparation_preserves_evidence_without_publishing_cache(
         "platform": "linux/arm64",
         "workdir": "/app",
     }
-    monkeypatch.setattr(harbor, "runtime_identity", lambda **kwargs: {})
+    monkeypatch.setattr(harbor, "runtime_identity", lambda **kwargs: {"launcher_version": 1})
     monkeypatch.setattr(harbor, "_native_image", lambda **kwargs: image)
 
     def fail(**kwargs: object) -> dict[str, object]:

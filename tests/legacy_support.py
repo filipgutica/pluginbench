@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -25,3 +26,16 @@ def current_runtime(saved: dict[str, Any]) -> dict[str, Any]:
     current["implementation_sha256"] = components.source_sha256("harbor_backend.py")
     current["docker_engine"]["capacity"]["memory_bytes"] -= 28 * 1024
     return current
+
+
+def copy_legacy(name: str, destination: Path) -> Path:
+    """Copy a fixture directory, restoring the file modes a vanilla manifest recorded.
+
+    Git keeps only the executable bit, and a vanilla cache inventory binds every mode bit.
+    """
+    shutil.copytree(LEGACY / name, destination)
+    for manifest in destination.glob("*/*/manifest.json"):
+        entry = manifest.parent
+        for relative, metadata in json.loads(manifest.read_text())["inventory"].items():
+            (entry / relative).chmod(metadata["mode"])
+    return destination

@@ -1106,6 +1106,8 @@ def _run_attempts(
                 entries=plan["entries"],
                 identity={
                     **baseline_identity,
+                    # New entries record the runtime they run with; saved ones still match.
+                    "isolation": expected_runtime,
                     "delivery": DELIVERY_POLICY,
                     "capabilities": frozen.recipe.capabilities.model_dump(mode="json"),
                     "study": {

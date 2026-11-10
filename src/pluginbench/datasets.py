@@ -117,16 +117,50 @@ def _task_digest(entry: TaskEntry, fixture: Path, native_task: Path) -> str:
         raise ValueError("prepared native source changed")
     if asset_digest != identity.get("task_assets_sha256"):
         raise ValueError("prepared native task assets changed")
-    provenance = {
-        key: value for key, value in entry.provenance.items() if key != "native_task_identity"
-    }
+    return _contract_digest(
+        task_id=entry.id,
+        prompt=entry.prompt,
+        provenance=entry.provenance,
+        fixture=fixture,
+        source_digest=source_digest,
+        native=portable_native_identity(identity),
+    )
+
+
+def task_digest(task: TaskSpec, native: dict[str, object]) -> str:
+    """The task's digest as it would be with `native` as its portable native identity.
+
+    A saved vanilla cohort's digest covers its own native identity, so it is checked against
+    the cohort's saved identity, not this run's.
+    """
+    return _contract_digest(
+        task_id=task.task_id,
+        prompt=task.prompt,
+        provenance=task.provenance,
+        fixture=task.fixture,
+        source_digest=inspect_snapshot(task.fixture)["digest"],
+        native=native,
+    )
+
+
+def _contract_digest(
+    *,
+    task_id: str,
+    prompt: str,
+    provenance: dict[str, str],
+    fixture: Path,
+    source_digest: object,
+    native: dict[str, object],
+) -> str:
     contract = {
-        "id": entry.id,
-        "prompt": entry.prompt,
-        "provenance": provenance,
+        "id": task_id,
+        "prompt": prompt,
+        "provenance": {
+            key: value for key, value in provenance.items() if key != "native_task_identity"
+        },
         "source_digest": source_digest,
         "source_metadata": source_metadata(fixture),
-        "native_task_identity": portable_native_identity(identity),
+        "native_task_identity": native,
     }
     encoded = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
     return "sha256:" + hashlib.sha256(encoded).hexdigest()

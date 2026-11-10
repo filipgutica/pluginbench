@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -1680,7 +1681,9 @@ def prepare_native_task(
             "provider_hosts": NATIVE_PROVIDER_HOSTS[harness],
         },
     }
-    key = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+    # Keyed by the runtime contract, so recorded and fit runtime fields never miss the cache.
+    contract = _preparation_contract(inputs)
+    key = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
     if cache.is_symlink():
         raise ValueError("Native preparation cache must not follow symlinks")
     cache.mkdir(parents=True, exist_ok=True)
@@ -1688,79 +1691,63 @@ def prepare_native_task(
     cached = cache / key
     if lock_path.is_symlink() or cached.is_symlink():
         raise ValueError("Native preparation cache entries must not follow symlinks")
-    with lock_path.open("a") as lock:
+    with lock_path.open("a") as lock, ExitStack() as held:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise ValueError(
                 "Native preparation inputs are in use by another evaluation"
             ) from error
-        if not cached.exists():
-            with tempfile.TemporaryDirectory(prefix=".native-prepare-", dir=cache) as temporary:
-                prepared = Path(temporary) / "prepared"
-                try:
-                    _prepare_native_task(
-                        task_dir=task_dir,
-                        destination=prepared,
-                        harness=harness,
-                        version=version,
-                        limits=limits,
-                        resolved=_NativePreparation(admission, expected, base, grader),
-                    )
-                except BaseException as error:
+        saved = None if cached.exists() else _saved_preparation(cache, contract, expected, held)
+        if saved is None:
+            if not cached.exists():
+                with tempfile.TemporaryDirectory(prefix=".native-prepare-", dir=cache) as temporary:
+                    prepared = Path(temporary) / "prepared"
                     try:
-                        destination.mkdir(parents=True, exist_ok=False)
-                        if (prepared / "artifacts").exists():
-                            shutil.copytree(
-                                prepared / "artifacts", destination / "artifacts", symlinks=True
+                        _prepare_native_task(
+                            task_dir=task_dir,
+                            destination=prepared,
+                            harness=harness,
+                            version=version,
+                            limits=limits,
+                            resolved=_NativePreparation(admission, expected, base, grader),
+                        )
+                    except BaseException as error:
+                        try:
+                            destination.mkdir(parents=True, exist_ok=False)
+                            if (prepared / "artifacts").exists():
+                                shutil.copytree(
+                                    prepared / "artifacts", destination / "artifacts", symlinks=True
+                                )
+                            codex.write_json(
+                                destination / "artifacts/preparation-failure.json",
+                                {
+                                    "status": "failed",
+                                    "error": str(error),
+                                    "preparation_key": key,
+                                    "inputs": inputs,
+                                },
                             )
-                        codex.write_json(
-                            destination / "artifacts/preparation-failure.json",
-                            {
-                                "status": "failed",
-                                "error": str(error),
-                                "preparation_key": key,
-                                "inputs": inputs,
-                            },
-                        )
-                    except (OSError, ValueError) as evidence_error:
-                        error.add_note(
-                            "Could not preserve native preparation failure evidence: "
-                            + str(evidence_error)
-                        )
-                    raise
-                manifest = _native_asset_inventory(prepared)
-                codex.write_json(prepared / "cache.json", {"inputs": inputs, "files": manifest})
-                prepared.rename(cached)
-        actual = _native_asset_inventory(cached, exclude="cache.json")
-        packet = _native_object(
-            json.loads((cached / "cache.json").read_text()), "native cache packet"
-        )
-        if packet["inputs"] != inputs:
-            raise ValueError("Native preparation cache inputs changed")
-        files = _native_object(packet["files"], "native cache files")
-        if actual != files:
-            raise ValueError("Native preparation cache evidence changed")
-        receipt = _native_object(
-            json.loads((cached / "artifacts/native-preparation.json").read_text()),
-            "cached native preparation",
-        )
-        if (
-            receipt["status"] != "complete"
-            or _native_object(receipt["cleanup"], "cached cleanup")["status"] != "complete"
-            or receipt["isolation"] != expected
-            or inspect_snapshot(cached / "fixture")["digest"] != receipt["source_digest"]
-            or native_task_assets(cached / "task") != receipt["task_assets_sha256"]
-        ):
-            raise ValueError("Native preparation cache has incomplete or invalid proof")
-        for name in ("image_identity", "grader_image_identity"):
-            image = _native_object(receipt[name], "cached native image")
-            _assert_native_image(image, expected)
+                        except (OSError, ValueError) as evidence_error:
+                            error.add_note(
+                                "Could not preserve native preparation failure evidence: "
+                                + str(evidence_error)
+                            )
+                        raise
+                    manifest = _native_asset_inventory(prepared)
+                    codex.write_json(prepared / "cache.json", {"inputs": inputs, "files": manifest})
+                    prepared.rename(cached)
+            saved = cached, _cached_preparation(cached, contract, expected)
+        cached, receipt = saved
+        assert_prepared_images(receipt, expected, label=f"Prepared cache entry {cached}")
         shutil.copytree(cached, destination)
+        # Docker work for this run uses the runtime it runs on; the entry's is provenance.
         receipt.update(
             task_dir=str((destination / "task").resolve()),
             fixture_dir=str((destination / "fixture").resolve()),
-            preparation_key=key,
+            preparation_key=cached.name,
+            isolation=expected,
+            preparation_isolation=receipt["isolation"],
         )
         receipt["preparation_identity"] = {
             name: value
@@ -1769,6 +1756,67 @@ def prepare_native_task(
         }
         codex.write_json(destination / "artifacts/native-preparation.json", receipt)
         return receipt
+
+
+def _preparation_contract(inputs: dict[str, Any]) -> dict[str, Any]:
+    return {**inputs, "runtime": runtime_contract(_native_object(inputs["runtime"], "runtime"))}
+
+
+def _cached_preparation(
+    cached: Path, contract: dict[str, Any], expected: dict[str, object]
+) -> dict[str, Any]:
+    """The receipt of a complete cache entry prepared from equivalent inputs; raise if not."""
+    packet = _native_object(json.loads((cached / "cache.json").read_text()), "native cache packet")
+    if _preparation_contract(_native_object(packet["inputs"], "native cache inputs")) != contract:
+        raise ValueError("Native preparation cache inputs changed")
+    files = _native_object(packet["files"], "native cache files")
+    if _native_asset_inventory(cached, exclude="cache.json") != files:
+        raise ValueError("Native preparation cache evidence changed")
+    receipt = _native_object(
+        json.loads((cached / "artifacts/native-preparation.json").read_text()),
+        "cached native preparation",
+    )
+    if (
+        receipt["status"] != "complete"
+        or _native_object(receipt["cleanup"], "cached cleanup")["status"] != "complete"
+        or runtime_contract(_native_object(receipt["isolation"], "cached runtime"))
+        != runtime_contract(expected)
+        or inspect_snapshot(cached / "fixture")["digest"] != receipt["source_digest"]
+        or native_task_assets(cached / "task") != receipt["task_assets_sha256"]
+    ):
+        raise ValueError("Native preparation cache has incomplete or invalid proof")
+    return receipt
+
+
+def _saved_preparation(
+    cache: Path, contract: dict[str, Any], expected: dict[str, object], held: ExitStack
+) -> tuple[Path, dict[str, Any]] | None:
+    """An entry saved under another key, as by 942f12c, whose inputs are equivalent.
+
+    Candidates are tried in name order. One that is in use, invalid, or names source this
+    build does not know is skipped: it is not this preparation. The chosen entry stays
+    share-locked until `held` closes.
+    """
+    for candidate in sorted(cache.iterdir()):
+        lock_path = cache / (candidate.name + ".lock")
+        if (
+            candidate.name.startswith(".")
+            or candidate.suffix == ".lock"
+            or candidate.is_symlink()
+            or not candidate.is_dir()
+            or lock_path.is_symlink()
+        ):
+            continue
+        lock = lock_path.open("a")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            receipt = _cached_preparation(candidate, contract, expected)
+        except (OSError, ValueError, KeyError, TypeError):
+            lock.close()
+            continue
+        held.enter_context(lock)
+        return candidate, receipt
+    return None
 
 
 def probe_coding_environment(identity: dict[str, object]) -> dict[str, object]:
@@ -2203,6 +2251,8 @@ def invoke_native(
             **launch,
             "task_assets_sha256": identity["task_assets_sha256"],
             "native_task_identity": identity,
+            # What this attempt ran with: vanilla cache admission checks its Docker client.
+            "runtime": expected,
             "timeout_seconds": timeout,
             "delivery": native_treatments.DELIVERY_POLICY,
             "capabilities": capabilities.model_dump(mode="json"),
