@@ -535,7 +535,6 @@ def test_image_inspection_error_does_not_trigger_a_pull(monkeypatch: pytest.Monk
 def test_codex_transport_delegates_to_sdk_pipefail_and_preserves_separate_stderr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
-    pytest.importorskip("harbor")
     sdk_codex = importlib.import_module("harbor.agents.installed.codex").Codex
     sdk_result = importlib.import_module("harbor.environments.base").ExecResult
     agent_directory = tmp_path / "artifacts/harbor/trial/agent"

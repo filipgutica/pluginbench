@@ -81,7 +81,7 @@ def github_task(url: str) -> tuple[str, str]:
 def dataset_catalog(
     dataset: str, version: str | None = None
 ) -> tuple[str, str, list[dict[str, str]]]:
-    # Harbor is optional: importing the CLI and rebuilding reports must work without it.
+    # Imported here, not at the top: importing the CLI and rebuilding reports must not load Harbor.
     client = importlib.import_module("harbor.registry.client.package").PackageDatasetClient()
 
     if version and "@" in dataset:

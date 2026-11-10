@@ -11,7 +11,7 @@ Select tokens in/out, lines added/removed, complexity, dead code, coverage, and 
 Requires Python 3.12+, Git, Docker with Linux containers, Compose, Buildx, and a logged-in Codex CLI. Local collectors and reviews require macOS `sandbox-exec` or Linux Bubblewrap. JavaScript/TypeScript analysis requires Node, Corepack, and Fallow 3.18.0.
 
 ```sh
-pip install -e '.[harbor]'
+pip install -e .
 pluginbench init                                    # write evaluation.yaml to edit
 pluginbench check evaluation.yaml                   # every check that needs no model
 pluginbench run evaluation.yaml                     # check, then run in the background

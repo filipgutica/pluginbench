@@ -39,7 +39,7 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Install the package
-        run: python -m pip install -e '.[dev,harbor]'
+        run: python -m pip install -e '.[dev]'
 
       - name: Lint
         run: ruff check src tests
@@ -52,3 +52,19 @@ jobs:
 
       - name: Build the package
         run: python -m build
+
+      - name: Check the built package
+        run: python scripts/check_dist.py
+
+      - name: Run the installed wheel
+        # From outside the checkout, so `pluginbench` can only be the installed wheel.
+        run: |
+          python -m venv "$RUNNER_TEMP/wheel"
+          "$RUNNER_TEMP/wheel/bin/pip" install dist/*.whl
+          cd "$RUNNER_TEMP"
+          wheel/bin/pluginbench --version
+          wheel/bin/pluginbench init evaluation.yaml
+          wheel/bin/pluginbench compare \
+            "$GITHUB_WORKSPACE/tests/fixtures/compare/pilot-coverage" \
+            "$GITHUB_WORKSPACE/tests/fixtures/compare/pilot-no-coverage" \
+            --gates "$GITHUB_WORKSPACE/tests/fixtures/compare/card-gates.yaml"
