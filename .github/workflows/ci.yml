@@ -4,6 +4,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  # A release pull request is opened with the workflow token, which starts no workflow.
+  # Run this by hand on its branch: gh workflow run CI --ref release-please--branches--main
+  workflow_dispatch:
 
 permissions:
   contents: read
