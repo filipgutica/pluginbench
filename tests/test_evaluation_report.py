@@ -704,7 +704,7 @@ def test_trusted_test_overlap_with_every_test_passing_is_an_overlap_pass(
         stage = attempt["stages"][0]  # type: ignore[index]
         stage["correctness"] = {"status": status}
         stage["task_result"] = grading
-        stage["execution_provenance"].update(  # type: ignore[union-attr]
+        stage["execution_provenance"].update(
             successful_native_completion=True, timed_out=False, exit_code=0
         )
         attempts.append(attempt)
@@ -1122,11 +1122,12 @@ def test_completeness_matrix_shows_each_task_measure_and_arm(tmp_path: Path) -> 
 
     data = json.loads(write_evaluation_report(report, config, tmp_path).read_text())
 
-    cells = {
-        (row["task"], row["metric"], arm): cell
-        for row in _rows(data, "completeness_matrix")
-        for arm, cell in row["cells"].items()
-    }
+    cells = {}
+    for matrix_row in _rows(data, "completeness_matrix"):
+        row_cells = matrix_row["cells"]
+        assert isinstance(row_cells, dict)
+        for arm, cell in row_cells.items():
+            cells[matrix_row["task"], matrix_row["metric"], arm] = cell
     assert cells["fixture-task", "Output tokens", "baseline"]["text"] == "measured"
     missing = cells["fixture-task", "Output tokens", "workflow"]
     assert missing["state"] == "unknown" and (missing["measured"], missing["assigned"]) == (2, 3)

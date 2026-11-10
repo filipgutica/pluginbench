@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -223,7 +224,7 @@ def test_watch_redraws_until_the_run_stops(tmp_path: Path, monkeypatch: pytest.M
         None,
     ]
     monkeypatch.setattr(run_lock, "owner", lambda path: owners.pop(0))
-    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
 
     result = CliRunner().invoke(cli.app, ["status", str(root), "--watch"])
 
@@ -326,7 +327,7 @@ def test_watch_skips_a_redraw_when_a_file_is_mid_write(
     root = _run(tmp_path / "run", states=STATES, ledger=True)
     owners: list[dict[str, Any] | None] = [{"pid": 1, "pgid": 1, "started_at": "t"}, None]
     monkeypatch.setattr(run_lock, "owner", lambda path: owners.pop(0))
-    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
     real = run_status.run_status
     calls = 0
 

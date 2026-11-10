@@ -183,9 +183,11 @@ def per_test_lines(project: Path, report: Path) -> dict[str, set[int]]:
         test_scope=["test/**"],
         workdir=str(project),
     )
+    per_test = parsed["per_test_numbits"]
+    assert isinstance(per_test, dict)
     return {
         name: {line for bits in files.values() for line in numbits_to_lines(bits)}
-        for name, files in parsed["per_test_numbits"].items()
+        for name, files in per_test.items()
     }
 
 
@@ -221,7 +223,8 @@ def test_a_same_title_test_joins_the_existing_test(
         (tmp_path / name / "lib").mkdir(parents=True)
         (tmp_path / name / "lib/subject.js").write_text(source)
     change = assessment_metrics.compare_snapshots(tmp_path / "old", tmp_path / "new")
-    changed = assessment_metrics._changed_line_coverage(*measured, change)
+    before, after = measured
+    changed = assessment_metrics._changed_line_coverage(before, after, change)
     assert changed["added_tests"] == 0
     assert changed["redundant_added_tests"] == 0
 

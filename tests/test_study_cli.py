@@ -674,7 +674,7 @@ def test_integrated_evaluation_and_report_regeneration(
     monkeypatch.setattr(codex, "invoke", invoke)
     monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
     root = tmp_path / "results"
-    reward_decoder = study._binary_native_reward
+    reward_decoder = harbor_backend.binary_native_reward
     if separate_coverage_scope:
         monkeypatch.setattr(study, "_binary_native_reward", lambda value: None)
 
@@ -1381,7 +1381,9 @@ def test_new_output_folder_keeps_comparison_identity_and_cache_decisions(
     for row in rows:
         (second.caches.vanilla / row["cache_key"] / str(row["repeat"])).mkdir(parents=True)
     third = evaluation.check_evaluation(config, tmp_path / "c/run")
-    assert [row["status"] for row in third["vanilla_cache"]] == ["hit"] * config.repeats
+    third_rows = third["vanilla_cache"]
+    assert isinstance(third_rows, list)
+    assert [row["status"] for row in third_rows] == ["hit"] * config.repeats
     assert len(built) == 1 and len(qualified) == 1
 
 
@@ -1428,13 +1430,15 @@ def test_jobs_above_docker_capacity_fail_instead_of_being_lowered(
     with pytest.raises(ValueError, match="jobs=3 does not fit.*set jobs: 2 or fewer"):
         evaluation.plan_evaluation(config.model_copy(update={"jobs": 3}))
     plan = evaluation.plan_evaluation(config.model_copy(update={"jobs": 2}))
-    assert plan["jobs"] == plan["comparison_identity"]["jobs"] == 2
+    comparison_identity = plan["comparison_identity"]
+    assert isinstance(comparison_identity, dict)
+    assert plan["jobs"] == comparison_identity["jobs"] == 2
 
 
 def test_reference_agents_reuse_only_a_pass_for_the_same_preparation_and_images(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    broken = {
+    broken: dict[str, object] = {
         "oracle": reference_agent(reward=0.0, patch_bytes=0),
         "nop": reference_agent(reward=0.0, patch_bytes=0),
     }
@@ -1675,9 +1679,11 @@ def test_review_adds_a_selected_revision_with_the_frozen_reviewer(
     assert again.exit_code == 2 and "choose a new --revision name" in again.stderr
     assert len(reviews) == reviewed + 9
     saved = evaluation._load_selection(root)
+    measurements = saved["measurements"]
+    assert isinstance(measurements, list)
     for change, message in (
         (
-            {"reviewer": None, "measurements": [m for m in saved["measurements"] if m != "review"]},
+            {"reviewer": None, "measurements": [m for m in measurements if m != "review"]},
             "has no reviewer",
         ),
         ({"review_revision": None}, "has not finished its first review"),
