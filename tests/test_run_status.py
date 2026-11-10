@@ -277,8 +277,51 @@ def test_a_stopped_run_reads_as_stopped_not_failed(
     status = run_status.run_status(root)
     assert status["phase"] == "stopped" and status["error"] is None
     assert status["last_event"]["event"] == "stopped"
+    assert status["resume_command"] == f"pluginbench run {root}"
     # Nothing owns the run, so its recorded `running` attempt is shown as interrupted.
     assert "  task-a  vanilla   pass interrupted" in run_status.format_status(status)
+
+
+def _killed(root: Path, **started: str) -> None:
+    """A worker that began and never recorded how it ended, as after SIGKILL or power loss."""
+    (root / "events.jsonl").write_text(
+        json.dumps({"event": "started", **started})
+        + "\n"
+        + json.dumps({"event": "progress", "message": "Coding 3/4: task-a"})
+        + "\n"
+    )
+
+
+def test_a_killed_run_reads_as_interrupted_and_says_how_to_resume(tmp_path: Path) -> None:
+    root = _run(tmp_path / "run", states=STATES, ledger=True)
+    _killed(root)
+
+    status = run_status.run_status(root)
+    shown = run_status.format_status(status)
+
+    assert status["phase"] == "interrupted" and status["error"] is None
+    assert status["resume_command"] == f"pluginbench run {root}"
+    assert "Phase: interrupted (no exit record)" in shown
+    assert f"Resume: pluginbench run {root}" in shown
+    # The summary agrees with the table: no process is running the recorded `running` attempt.
+    assert "Attempts: 4 slots: 2 complete, 1 interrupted, 1 pending" in shown
+    with run_lock.hold(root):
+        owned = run_status.run_status(root)
+        assert owned["phase"] == "coding" and owned["resume_command"] is None
+        assert "1 running" in run_status.format_status(owned)
+
+
+def test_a_killed_review_of_a_finished_run_offers_no_resume(tmp_path: Path) -> None:
+    root = _run(tmp_path / "run", states=dict.fromkeys(STATES, "complete"), ledger=True)
+    run = json.loads((root / "evidence/run.json").read_text())
+    _write(root / "evidence/run.json", {**run, "status": "complete"})
+    _write(root / "report/report.html", "")
+    _killed(root, command="review")
+
+    status = run_status.run_status(root)
+
+    assert status["phase"] == "interrupted" and status["resume_command"] is None
+    assert "Resume:" not in run_status.format_status(status)
 
 
 def test_review_refuses_an_active_run_before_planning(tmp_path: Path) -> None:

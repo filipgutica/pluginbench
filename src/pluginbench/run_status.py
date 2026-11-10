@@ -197,10 +197,24 @@ def _heartbeat(root: Path, evidence: Path, now: datetime) -> dict[str, Any] | No
     return {"at": at.isoformat(), "age_seconds": round((now - at).total_seconds())}
 
 
+def _pending(root: Path, selection: dict[str, Any], run: dict[str, Any] | None) -> str | None:
+    """The first phase the run has not finished, or None when nothing is left."""
+    if run is None:
+        return "starting"
+    if run.get("status") != "complete":
+        return "coding"
+    if selection.get("measurement_required") and selection.get("measurement_revision") is None:
+        return "measuring"
+    if selection.get("reviewer") and selection.get("review_revision") is None:
+        return "reviewing"
+    if not (root / "report/report.html").is_file():
+        return "reporting"
+    return None
+
+
 def _phase(
     *,
-    root: Path,
-    selection: dict[str, Any],
+    pending: str | None,
     run: dict[str, Any] | None,
     active: bool,
     events: list[dict[str, Any]],
@@ -208,22 +222,15 @@ def _phase(
     started = [event for event in events if event.get("event") == "started"]
     if active and started and started[-1].get("command") == "review":
         return "reviewing"
-    pending: str | None = None
-    if run is None:
-        pending = "starting"
-    elif run.get("status") != "complete":
-        pending = "coding"
-    elif selection.get("measurement_required") and selection.get("measurement_revision") is None:
-        pending = "measuring"
-    elif selection.get("reviewer") and selection.get("review_revision") is None:
-        pending = "reviewing"
-    elif not (root / "report/report.html").is_file():
-        pending = "reporting"
     if active and pending:
         return pending
     # The latest operation, such as a re-review of a finished run, may have stopped or failed.
     if events and events[-1].get("event") in ("stopped", "failed"):
         return str(events[-1]["event"])
+    # A worker records how it ended before it releases the run. One that was killed, or lost
+    # with its host, leaves `started` or `progress` as the last event.
+    if events and events[-1].get("event") in ("started", "progress"):
+        return "interrupted"
     if pending is None:
         return "complete"
     return "not_started" if run is None else "stopped"
@@ -247,6 +254,7 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
         owner = {}  # Held, but its record is unreadable mid-write.
     active = owner is not None
     events = _events(root)
+    pending = _pending(root, selection, run)
     slots, source = _slots(evidence, run)
     plan = _read(evidence / "plan.json") or {}
     decisions = plan.get("baseline_cache") or {}
@@ -320,7 +328,9 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "run": str(root),
         "name": selection.get("name"),
-        "phase": _phase(root=root, selection=selection, run=run, active=active, events=events),
+        "phase": _phase(pending=pending, run=run, active=active, events=events),
+        # Null while a process owns the run, and when the run has nothing left to do.
+        "resume_command": f"pluginbench run {root}" if pending and not active else None,
         "active": active,
         "owner": {key: owner.get(key) for key in ("pid", "pgid", "started_at")} if owner else None,
         "heartbeat": _heartbeat(root, evidence, now),
@@ -380,17 +390,22 @@ def _age(seconds: int) -> str:
 _RESULTS = ("pass", "overlap_pass", "fail", "unknown", "empty", "running", "interrupted", "pending")
 
 
+def _shown_state(state: str, active: bool) -> str:
+    """A `running` attempt of a run no one owns is stale, so it is shown as interrupted."""
+    return "interrupted" if state == "running" and not active else state
+
+
 def _result(row: dict[str, Any], active: bool) -> str:
-    """An attempt's outcome, or its state; a `running` attempt of a run no one owns is stale."""
-    if row["outcome"]:
-        return str(row["outcome"])
-    return "interrupted" if row["state"] == "running" and not active else str(row["state"])
+    """An attempt's outcome, or the state shown for it."""
+    return str(row["outcome"] or _shown_state(row["state"], active))
 
 
 def format_status(status: dict[str, Any]) -> str:
     """The terminal view of run_status()."""
     lines = [f"Run: {status['run']}" + (f"  ({status['name']})" if status["name"] else "")]
     phase = f"Phase: {status['phase']}"
+    if status["phase"] == "interrupted":
+        phase += " (no exit record)"
     if status["owner"]:
         phase += f"   process {status['owner']['pid']} since {status['owner']['started_at']}"
     if status["heartbeat"]:
@@ -398,7 +413,11 @@ def format_status(status: dict[str, Any]) -> str:
     lines.append(phase)
     if status["error"]:
         lines.append(f"Error: {status['error']}")
-    states = status["states"]
+    if status["resume_command"]:
+        lines.append(f"Resume: {status['resume_command']}")
+    states: Counter[str] = Counter()
+    for state, count in status["states"].items():
+        states[_shown_state(state, status["active"])] += count
     summary = ", ".join(f"{count} {state}" for state, count in sorted(states.items()))
     lines.append(
         f"Attempts: {status['attempts_total']} slots" + (f": {summary}" if summary else "")

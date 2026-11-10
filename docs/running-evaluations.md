@@ -224,7 +224,7 @@ Resume reads attempt states from the run's single-writer SQLite ledger, `evidenc
 
 Resume then completes pending measurements or starts a review phase that has not begun. Started review phases require a fresh evaluation. A run prepared before measurement profiles were saved, with measurement not yet started, is refused before any coding call. The same applies to a reviewer whose CLI, credentials, or sandbox host fail their check. Offline citation recovery can fix formatting only when the exact source supports it.
 
-`--notify` sends a desktop notification (macOS `osascript`, Linux `notify-send`) when preparation and readiness checks pass and coding starts, and when the run finishes, stops, or fails. A readiness failure therefore arrives before any model call. Notifications are best effort and never change the run's outcome.
+`--notify` sends a desktop notification (macOS `osascript`, Linux `notify-send`) when preparation and readiness checks pass and coding starts, and when the run finishes, stops, or fails. A readiness failure therefore arrives before any model call. Notifications are best effort and never change the run's outcome. When the notifier is not on `PATH`, `run` prints a warning before it starts. A run that is killed, or whose host goes down, cannot send a notification; `status` then shows `interrupted`.
 
 ## Watch a run
 
@@ -236,7 +236,8 @@ Resume then completes pending measurements or starts a review phase that has not
 | --- | --- |
 | `schema_version` | `1` |
 | `run`, `name` | Absolute run directory and evaluation name |
-| `phase` | `starting`, `coding`, `measuring`, `reviewing`, `reporting`, `complete`, `stopped` (unfinished with no live owner, or the latest operation, such as a re-review, was stopped), `failed` (the last event is a failure), or `not_started`. `stop` and Ctrl-C record a `stopped` event, not a failure |
+| `phase` | `starting`, `coding`, `measuring`, `reviewing`, `reporting`, `complete`, `stopped` (the latest operation was stopped, or an unfinished run from before events were recorded has no live owner), `interrupted` (no live owner, and the last event is `started` or `progress`: the worker was killed or its host went down before it could record an exit), `failed` (the last event is a failure), or `not_started`. `stop` and Ctrl-C record a `stopped` event, not a failure |
+| `resume_command` | `pluginbench run <run>` when the run has work left and no process owns it, otherwise null |
 | `active`, `owner` | Whether a live process holds `run.lock`, and its `pid`, `pgid`, and `started_at` |
 | `heartbeat` | `at` and `age_seconds` of the newest write to `events.jsonl`, `run.log`, the ledger, or `run.json` |
 | `last_event`, `error` | The last line of `events.jsonl` (`started`, `progress`, `stopped`, `failed`, or `finished`), and the failure message if the run failed |
@@ -250,7 +251,7 @@ Resume then completes pending measurements or starts a review phase that has not
 | `report`, `log` | Paths to `report/report.html` and `run.log`, or null |
 | `attempts` | One row per live slot: `id`, `slot`, `task`, `arm`, `repeat`, `state`, `outcome`, `outcome_reason`, `reused`, `tokens`, `tokens_status`, `minutes`, and `measures` (metric → `status`, `value`, `unit`, `reason`, from `report/results.json` once it exists) |
 
-States are `pending`, `running`, `complete`, and `interrupted`. Outcomes are `pass`, `overlap_pass`, `fail`, `empty` (the graded patch is empty), and `unknown`, with the verifier's reason in `outcome_reason`. A withheld result is classified as the report classifies it: `overlap_pass` or `fail` from the verifier's rewards, otherwise `unknown`. `tokens_status` is `exact`, `lower_bound` (usage saved by an unfinished attempt, or only an observed floor), `unknown` (no usage saved yet), or `not_started`. A receipt without `total_tokens` gets input plus output, as Codex counts it; when either is missing the attempt is `lower_bound`. A total's `lower_bound` is true when any attempt it counts is `lower_bound` or `unknown`. The vanilla arm is `vanilla`, including in runs that recorded it as `baseline`. The table shows a `running` attempt of a run that no process owns as `interrupted`; the JSON keeps the recorded state.
+States are `pending`, `running`, `complete`, and `interrupted`. Outcomes are `pass`, `overlap_pass`, `fail`, `empty` (the graded patch is empty), and `unknown`, with the verifier's reason in `outcome_reason`. A withheld result is classified as the report classifies it: `overlap_pass` or `fail` from the verifier's rewards, otherwise `unknown`. `tokens_status` is `exact`, `lower_bound` (usage saved by an unfinished attempt, or only an observed floor), `unknown` (no usage saved yet), or `not_started`. A receipt without `total_tokens` gets input plus output, as Codex counts it; when either is missing the attempt is `lower_bound`. A total's `lower_bound` is true when any attempt it counts is `lower_bound` or `unknown`. The vanilla arm is `vanilla`, including in runs that recorded it as `baseline`. The terminal view shows a `running` attempt of a run that no process owns as `interrupted`, in the summary line and in the table; the JSON keeps the recorded state.
 
 ## Review again
 

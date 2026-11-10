@@ -145,13 +145,17 @@ def _plan_summary(plan: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _notifier() -> str:
+    return "osascript" if sys.platform == "darwin" else "notify-send"
+
+
 def _notify(message: str) -> None:
     """Best-effort desktop notification; a failed notice never fails the run."""
     if sys.platform == "darwin":
         text = json.dumps(message, ensure_ascii=False)
-        command = ["osascript", "-e", f'display notification {text} with title "PluginBench"']
+        command = [_notifier(), "-e", f'display notification {text} with title "PluginBench"']
     else:
-        command = ["notify-send", "PluginBench", message]
+        command = [_notifier(), "PluginBench", message]
     try:
         subprocess.run(command, capture_output=True, check=False, timeout=10)
     except (OSError, subprocess.SubprocessError):
@@ -380,6 +384,12 @@ def run(
             typer.echo(json.dumps(plan, indent=2) if as_json else _plan_summary(plan))
             return
         typer.echo(_plan_summary(plan))
+        if notify and shutil.which(_notifier()) is None:
+            typer.echo(
+                f"Warning: --notify needs {_notifier()}, which is not on PATH; "
+                "no notification will be sent.",
+                err=True,
+            )
         if not yes and not typer.confirm("Start evaluation?"):
             raise typer.Exit()
         progress = _notifying_progress(plan["coding_calls"]) if notify else typer.echo
