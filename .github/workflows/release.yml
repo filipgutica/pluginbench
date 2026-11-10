@@ -4,8 +4,8 @@ on:
   push:
     branches: [main]
 
-# The jobs that write or publish pin their actions to a commit, so an upstream change cannot
-# reach them without a change to this file.
+# The jobs that write or publish pin their actions to a commit, so moving a tag upstream does
+# not change the revision they run. The PyPI action still pulls a container image by tag.
 permissions: {}
 
 concurrency:

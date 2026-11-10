@@ -6,7 +6,7 @@ Releases are cut by the `Release` workflow (`.github/workflows/release.yml`) wit
 
 1. Every push to `main` updates one open pull request, titled `chore(main): release <version>`. It holds the version bump in `pyproject.toml`, `src/pluginbench/__init__.py`, and `.release-please-manifest.json`, and the new `CHANGELOG.md` section, written from the commit subjects since the last release.
 2. The version follows the commits: before 1.0.0, a `feat` or a breaking change raises the minor version, and a `fix` or another change that appears in the changelog raises the patch version. Commits that the changelog hides, such as `ci`, `test`, and `chore`, open no release on their own. To choose a version by hand, add a commit whose message body has the line `Release-As: <version>`.
-3. Run CI on that pull request: close it and reopen it. It is opened with the workflow token, which starts no workflow, and a reopen by a person does. Repeat this after the workflow updates the pull request, so the checks belong to its last commit.
+3. Start CI on that pull request. It is opened and updated with the workflow token, so GitHub creates its CI runs in an approval-required state and shows a banner in the merge box: select **Approve workflows to run** (this needs write access). Do this again after each update, so the checks belong to the last commit. If no banner appears, close and reopen the pull request.
 4. Merging the pull request is the decision to release. The workflow then tags `v<version>`, creates the GitHub release, builds the package from that tag, checks it with `scripts/check_dist.py`, and uploads it to PyPI from the `pypi` environment.
 
 Commit subjects become the changelog, so write them for a user: `fix: …`, `feat: …`, `docs: …`.
