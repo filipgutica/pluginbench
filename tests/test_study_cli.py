@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import inspect
 import json
+import hashlib
 import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -26,6 +29,7 @@ from pluginbench import (
     study,
     submissions,
 )
+from pluginbench.harbor_backend import assert_runtime as checked_runtime
 from pluginbench.remeasure import propose_remeasurement
 from pluginbench.study_review import recover_review_citations
 from native_support import (
@@ -1891,3 +1895,143 @@ def test_resume_refuses_to_code_with_a_different_launcher(
     assert result.exit_code == 2
     assert message in result.stderr and "start a new run" in result.stderr
     assert len(calls) == coded
+
+
+def test_resume_without_a_vanilla_identity_refuses_a_changed_task_runtime(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Runs prepared before vanilla identities were saved still bind the runtime each task
+    # was prepared on: new attempts must not join the comparison across an exact change.
+    root, calls, _ = _stopped_after_two_attempts(config, tmp_path, monkeypatch)
+    coded = len(calls)
+    (root / "inputs/vanilla-identity.json").unlink()
+    monkeypatch.setattr(harbor_backend, "assert_runtime", checked_runtime)
+    moved = harbor_backend.runtime_identity
+
+    def other_platform(**kwargs: Any) -> dict[str, Any]:
+        runtime = json.loads(json.dumps(moved(**kwargs)))
+        runtime["docker_engine"]["platform"] = "linux/riscv64"
+        return dict(runtime)
+
+    monkeypatch.setattr(harbor_backend, "runtime_identity", other_platform)
+    result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+    # A refusal, not a traceback: the message and exit code 2, like other refusals.
+    assert result.exit_code == 2, result.stderr + result.stdout
+    assert 'docker_engine.platform was "linux/arm64", is now "linux/riscv64"' in result.stderr
+    assert "Restore that runtime, or start a new run" in result.stderr
+    assert len(calls) == coded
+
+
+def test_a_run_stopped_after_its_last_attempt_finishes_with_a_newer_launcher(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Nothing is left to code, so a launcher change must not strand the finished paid work.
+    config = _measured_and_reviewed(config, tmp_path, monkeypatch)
+    calls: list[str] = []
+    reviews: list[str] = []
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=config.timeout_seconds, interrupt_at=None
+    )
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    checkpoint = study._checkpoint
+
+    def killed_at_completion(*args: Any, status: str, **kwargs: Any) -> None:
+        if status == "complete":
+            raise KeyboardInterrupt("stopped before the completion checkpoint")
+        checkpoint(*args, status=status, **kwargs)
+
+    with monkeypatch.context() as stopped:
+        stopped.setattr(study, "_checkpoint", killed_at_completion)
+        with pytest.raises(KeyboardInterrupt):
+            evaluation.run_evaluation(config, tmp_path / "run")
+    root = tmp_path / "run"
+    assert json.loads((root / "evidence/run.json").read_text())["status"] == "interrupted"
+    coded = len(calls)
+    monkeypatch.setattr(harbor_backend, "assert_runtime", checked_runtime)
+    monkeypatch.setitem(components.VERSIONS, "launcher", components.VERSIONS["launcher"] + 1)
+    result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert len(calls) == coded
+    assert json.loads((root / "evidence/run.json").read_text())["status"] == "complete"
+
+
+def _tree(root: Path) -> dict[str, str]:
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+# Runs 942f12c's own resume against a run directory. Docker and coding are stubbed out, so
+# reaching coding prints a line instead of starting an agent.
+_OLD_RESUME = """
+import json, sys
+from pathlib import Path
+export, root = Path(sys.argv[1]), Path(sys.argv[2])
+sys.path[:0] = [str(export / "src"), str(export / "tests")]
+import native_support, pluginbench
+from pluginbench import evaluation, harbor_backend, study, submissions
+assert Path(pluginbench.__file__).is_relative_to(export), pluginbench.__file__
+def refuse_docker(*args, **kwargs):
+    raise SystemExit("942f12c ran a Docker command")
+def coding(*args, **kwargs):
+    raise SystemExit("942f12c started coding")
+harbor_backend._docker = refuse_docker
+study._run_attempts = coding
+submissions.reviewed_contract = native_support.synthetic_contract
+version = json.loads((root / "inputs/study.json").read_text())["harness_version"]
+evaluation._harness_version = lambda harness: version
+evaluation._assert_resumable = lambda root, selection: None
+try:
+    evaluation.resume_evaluation(root)
+except ValueError as error:
+    print("refused:", error)
+"""
+
+
+@pytest.mark.parametrize("started", [True, False])
+def test_942f12c_refuses_a_run_this_build_saved(
+    config: evaluation.Evaluation,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    started: bool,
+) -> None:
+    # The owner runs 942f12c beside newer builds. It cannot read launcher versions, so it must
+    # refuse this build's runs instead of coding them with another launcher.
+    repository = Path(__file__).resolve().parents[1]
+    present = subprocess.run(
+        ["git", "-C", str(repository), "cat-file", "-e", "942f12c^{commit}"],
+        capture_output=True,
+    )
+    if present.returncode:
+        pytest.skip("942f12c is not in this clone's history")
+    export = tmp_path / "942f12c"
+    export.mkdir()
+    archive = subprocess.run(
+        ["git", "-C", str(repository), "archive", "942f12c", "src", "tests"],
+        capture_output=True,
+        check=True,
+    )
+    subprocess.run(["tar", "-x", "-C", str(export)], input=archive.stdout, check=True)
+    if started:
+        root, _, _ = _stopped_after_two_attempts(config, tmp_path, monkeypatch)
+    else:
+        prepared = _measured_and_reviewed(config, tmp_path, monkeypatch)
+        root = evaluation.prepare_evaluation(prepared, tmp_path / "prepared")
+    before = _tree(root)
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", _OLD_RESUME, str(export), str(root)],
+        env={
+            "PATH": os.environ["PATH"],
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "XDG_CACHE_HOME": str(tmp_path / "xdg"),
+        },
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert "refused:" in result.stdout and "schema_version" in result.stdout, result.stdout
+    assert _tree(root) == before

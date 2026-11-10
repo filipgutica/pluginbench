@@ -14,7 +14,7 @@ from pluginbench.datasets import native_identity
 from native_support import (
     task_entry,
     execution as native_execution,
-    offline_runtime,
+    runtime_identity,
     synthetic_contract,
 )
 
@@ -43,7 +43,7 @@ def _recipe(tmp_path: Path) -> Path:
 def _offline_harbor(monkeypatch: pytest.MonkeyPatch) -> None:
     # Native preparation/admission is tested separately; retain real reconstruction here.
     monkeypatch.setattr(submissions, "reviewed_contract", synthetic_contract)
-    identity = offline_runtime()
+    identity = runtime_identity()
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: identity)
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
 
@@ -196,7 +196,7 @@ def test_runtime_drift_stops_new_calls_and_preserves_completed_submission(
     calls = _fake_runtime(monkeypatch)
     native = harbor_backend.invoke_native
     runtime = harbor_backend
-    identity = offline_runtime()
+    identity = runtime_identity()
     monkeypatch.setattr(runtime, "runtime_identity", lambda **kwargs: identity)
 
     def changed_runtime(**kwargs: Any) -> dict[str, Any]:
@@ -960,7 +960,7 @@ def test_a_replaced_docker_engine_without_the_prepared_images_stops_before_any_c
     # Engine ID is recorded, not compared, so a reset engine is found by its missing images.
     recipe = study.load_study(_recipe(tmp_path))
     calls = _fake_runtime(monkeypatch)
-    replaced = offline_runtime()
+    replaced = runtime_identity()
     engine = replaced["docker_engine"]
     assert isinstance(engine, dict)
     engine["id"] = "replacement-engine"

@@ -417,7 +417,9 @@ def assert_runtime(
     changes = runtime_changes(saved, runtime_contract(actual, launcher=launcher))
     if changes:
         raise isolation.RuntimeDriftError(
-            "Harbor or Docker runtime changed since this run was prepared: " + "; ".join(changes)
+            "Harbor or Docker runtime changed since this run was prepared: "
+            + "; ".join(changes)
+            + ". Restore that runtime, or start a new run"
         )
     current = _object(_object(actual["docker_engine"], "Docker engine")["capacity"], "capacity")
     if _fitting_jobs(current, cpus=cpus, memory_mb=memory) < jobs:
@@ -426,7 +428,8 @@ def assert_runtime(
         raise isolation.RuntimeDriftError(
             f"Docker capacity no longer fits this run: {jobs} jobs of {cpus} CPUs and "
             f"{memory} MB need {jobs * cpus} CPUs and {jobs * memory} MB within 80% of "
-            f"memory; docker_engine.capacity was {_shown(before)}, is now {_shown(current)}"
+            f"memory; docker_engine.capacity was {_shown(before)}, is now {_shown(current)}. "
+            "Give Docker that capacity again, or start a new run"
         )
     return actual
 

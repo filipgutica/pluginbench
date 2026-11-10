@@ -754,7 +754,7 @@ def prepare_evaluation(
         ):
             raise ValueError("fixed review criteria changed during preparation")
     recipe = {
-        "schema_version": 2,
+        "schema_version": 3,
         "backend": "harbor",
         "harness_version": harness_versions[config.runner.harness],
         "container_cpus": config.container_cpus,

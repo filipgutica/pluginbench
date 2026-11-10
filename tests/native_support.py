@@ -103,16 +103,6 @@ def runtime_identity() -> dict[str, object]:
     }
 
 
-def offline_runtime() -> dict[str, object]:
-    """The least a runtime identity holds for its saved-runtime checks to pass offline."""
-    return {
-        "resources": {"cpus": 1, "memory_mb": 2048},
-        "offline": True,
-        "launcher_version": components.VERSIONS["launcher"],
-        "docker_engine": {"capacity": {"cpus": 8, "memory_bytes": 32 * 1024**3}},
-    }
-
-
 def task_entry(
     root: Path, name: str, *, answer_path: str = "src/answer.py", version: str = "1.2.3"
 ) -> dict[str, object]:

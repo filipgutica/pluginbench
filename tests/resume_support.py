@@ -19,7 +19,6 @@ import pytest
 import yaml
 
 from native_support import (
-    offline_runtime,
     execution as native_execution,
     runtime_identity,
     synthetic_contract,
@@ -84,7 +83,7 @@ def install(
 ) -> None:
     """Fake every Harbor entry point a study reaches; record each native call's attempt ID."""
     monkeypatch.setattr(submissions, "reviewed_contract", synthetic_contract)
-    identity = offline_runtime()
+    identity = runtime_identity()
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: identity)
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
     lock = threading.Lock()
@@ -97,8 +96,10 @@ def install(
             return counts[name]
 
     def assert_runtime(expected: dict[str, object], **kwargs: object) -> dict[str, object]:
-        # study calls this just before it writes each invocation receipt.
-        if boundary == "before-receipt" and counted("receipt") == at:
+        # study calls this just before it writes each invocation receipt, from `started`;
+        # its session-start checks of the saved task runtimes are not receipts.
+        receipt = sys._getframe(1).f_code.co_name == "started"
+        if boundary == "before-receipt" and receipt and counted("receipt") == at:
             _kill()
         return expected
 
