@@ -285,6 +285,10 @@ def _scoped_lines(
             except UnicodeDecodeError as error:
                 if kind == "test" and Path(path).suffix.lower() not in _SOURCE_SUFFIXES:
                     continue
+                # A file the change leaves byte-identical adds and removes no lines,
+                # whatever its encoding.
+                if inventories[0].get(path) == inventories[1].get(path):
+                    continue
                 raise ValueError(f"scoped source must be UTF-8 text: {path}") from error
         populations.append(lines)
     added = removed = 0
