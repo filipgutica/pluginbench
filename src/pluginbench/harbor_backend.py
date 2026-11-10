@@ -1429,10 +1429,16 @@ def _qualify_native_source(
             command,
             expected_runtime=expected,
         ).strip()
-        _docker("start", "--attach", container_id, timeout=60, expected_runtime=expected)
-        if _docker("wait", container_id, expected_runtime=expected).strip() != "0":
-            raise ValueError("native grader base inventory command failed")
+        # Not `start --attach`: that exits with the container's status, and a failed inventory
+        # would then surface as "docker start failed" without the reason in the logs.
+        _docker("start", container_id, expected_runtime=expected)
+        exit_code = _docker("wait", container_id, timeout=60, expected_runtime=expected).strip()
         output = _docker("logs", container_id, expected_runtime=expected)
+        if exit_code != "0":
+            raise ValueError(
+                f"native grader base inventory command failed (exit {exit_code}): "
+                + output.strip()
+            )
         (destination / "base-tree.raw").write_text(output)
         head, separator, inventory = output.partition("\n")
         if not separator or head != base:

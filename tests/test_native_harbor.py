@@ -416,7 +416,17 @@ def test_native_preparation_freezes_both_images_and_source_without_models(
 
 @pytest.mark.parametrize(
     "failure",
-    [None, "head", "source", "payload", "cleanup", "environment", "entrypoint", "workdir"],
+    [
+        None,
+        "head",
+        "inventory",
+        "source",
+        "payload",
+        "cleanup",
+        "environment",
+        "entrypoint",
+        "workdir",
+    ],
 )
 def test_source_qualification_binds_grader_base_payload_and_coding_fixture(
     tmp_path: Path,
@@ -456,10 +466,15 @@ def test_source_qualification_binds_grader_base_payload_and_coding_fixture(
 
     def docker(*arguments: str, **kwargs: object) -> str:
         calls.append(arguments)
+        if arguments[:2] == ("start", "--attach") and failure == "inventory":
+            # As Docker does: an attached start exits with the container's own status.
+            raise ValueError("docker start failed: ")
         if arguments[0] == "create":
             return "container"
         if arguments[0] == "wait":
-            return "0"
+            return "128" if failure == "inventory" else "0"
+        if arguments[0] == "logs" and failure == "inventory":
+            return "fatal: not a tree object: " + base + "\n"
         if arguments[0] == "logs":
             return (
                 ("b" * 40 if failure == "head" else base)
@@ -517,6 +532,12 @@ def test_source_qualification_binds_grader_base_payload_and_coding_fixture(
     assert create[create.index("--cpus") + 1] == "1"
     assert create[create.index("--memory") + 1] == "256m"
     assert "ls-tree -r -z --full-tree " + base in create[-1]
+    assert [call[0] for call in calls[:4]] == ["create", "start", "wait", "logs"]
+    if failure == "inventory":
+        assert proof["reason"] == (
+            "native grader base inventory command failed (exit 128): "
+            "fatal: not a tree object: " + base
+        )
     if failure is None:
         assert proof["base_tree"] == {
             "code.py": {"mode": "100644", "type": "blob", "blob": "c" * 40}
