@@ -1055,17 +1055,18 @@ def resume_study(
         plan, manifest, states = _reconcile(root, run, ledger)
         if before_coding is not None and any(state != "complete" for state in states.values()):
             before_coding()
+        if progress:
+            kept = sum(state == "complete" for state in states.values())
+            discarded = len(list((root / "discarded").glob("*.json")))
+            progress(
+                f"Resuming: {kept} complete attempts kept, {len(states) - kept} to code, "
+                f"{discarded} interrupted attempts discarded"
+            )
+        _checkpoint(root, frozen, manifest, states, status="running")
     except BaseException:
+        # `_run_attempts` closes the ledger once it owns the run.
         ledger.close()
         raise
-    if progress:
-        kept = sum(state == "complete" for state in states.values())
-        discarded = len(list((root / "discarded").glob("*.json")))
-        progress(
-            f"Resuming: {kept} complete attempts kept, {len(states) - kept} to code, "
-            f"{discarded} interrupted attempts discarded"
-        )
-    _checkpoint(root, frozen, manifest, states, status="running")
     return _run_attempts(
         _Run(root, frozen, plan, manifest, states, ledger),
         progress=progress,
@@ -1117,7 +1118,10 @@ def _run_attempts(
 
     def skipped(error: Exception) -> None:
         if progress:
-            progress(f"Finished vanilla repeats were not cached: {error}")
+            progress(
+                f"Some finished vanilla repeats were not cached in {baseline_cache}: "
+                f"{type(error).__name__}: {error}"
+            )
 
     try:
         expected_runtime: dict[str, object] = {}
@@ -1166,7 +1170,8 @@ def _run_attempts(
                     },
                 ).reserve()
             except Exception as error:
-                # With nothing left to code, caching finished repeats is best effort.
+                # With nothing left to code, caching finished repeats is best effort: no
+                # failure of the cache, whatever its type, may decide that the run finishes.
                 if coding:
                     raise
                 skipped(error)

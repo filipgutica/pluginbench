@@ -490,7 +490,30 @@ def test_a_run_with_nothing_left_to_code_finishes_without_its_vanilla_cache(
             handle.close()
     assert _json(root / "run.json")["status"] == "complete"
     assert calls == []
-    assert any(line.startswith("Finished vanilla repeats were not cached: ") for line in messages)
+    kind = "UnknownSourceError" if obstacle == "undeclared-launcher" else "ValueError"
+    prefix = f"Some finished vanilla repeats were not cached in {cache}: {kind}: "
+    assert any(line.startswith(prefix) for line in messages)
+
+
+def test_resume_that_fails_before_coding_starts_closes_its_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _killed_run(tmp_path, boundary="after-ledger", at=12, cache=tmp_path / "cache")
+    closed: list[Ledger] = []
+    close = Ledger.close
+
+    def recording(ledger: Ledger) -> None:
+        closed.append(ledger)
+        close(ledger)
+
+    monkeypatch.setattr(Ledger, "close", recording)
+
+    def failing(message: str) -> None:
+        raise RuntimeError("the progress sink is gone")
+
+    with pytest.raises(RuntimeError, match="progress sink"):
+        study.resume_study(root, progress=failing)
+    assert len(closed) == 1
 
 
 def test_vanilla_attempt_killed_before_it_was_cached_is_cached_on_resume(
