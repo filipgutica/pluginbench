@@ -349,14 +349,12 @@ def _caches(output: Path) -> _Caches:
 
 
 def _launcher_sha256(harness: str) -> dict[str, str]:
-    return {
-        name: components.source_sha256(name)
-        for name in components.FILES["launcher"]
-        if name != "claude.py" or harness == "claude"
-    }
+    return {name: components.source_sha256(name) for name in components.launcher_files(harness)}
 
 
-def _assert_launcher(selection: dict[str, object], identity: dict[str, object] | None) -> None:
+def _assert_launcher(
+    selection: dict[str, object], identity: dict[str, object] | None, harness: str
+) -> None:
     """Coding resumes only with the launcher version that coded the run's earlier attempts."""
     current = components.VERSIONS["launcher"]
     try:
@@ -366,7 +364,7 @@ def _assert_launcher(selection: dict[str, object], identity: dict[str, object] |
         elif "launcher_version" in identity:
             saved = identity["launcher_version"]
         else:
-            saved = components.saved_version("launcher", _object(identity["launcher_sha256"]))
+            saved = components.saved_launcher_version(harness, identity.get("launcher_sha256"))
     except components.UnknownSourceError as error:
         raise ValueError(
             f"{error}. This build's launcher is version {current}: resume this run with the "
@@ -863,7 +861,7 @@ def _code(
                 f"{recipe['harness_version']}; install that version to resume it"
             )
         # One comparison must not hold attempts coded by two launchers.
-        _assert_launcher(selection, identity)
+        _assert_launcher(selection, identity, config.runner.harness)
     if resuming:
         resume_study(
             evidence,

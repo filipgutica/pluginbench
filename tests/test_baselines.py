@@ -175,15 +175,18 @@ def test_native_cache_reuses_failed_attempts_and_unknown_usage_without_observers
         "grader_image",
         "source",
         "task_assets",
-        "runtime",
+        "engine-id",
+        "platform",
         "toolchain",
         "trusted_tests",
         "source_policy",
         "delivery",
         "capabilities",
+        "unchanged",
     ],
 )
 def test_changed_native_coding_identity_misses(tmp_path: Path, field: str) -> None:
+    # Lookups scan saved contexts, so a different key alone does not prove a miss: reserve.
     path = tmp_path / "cache"
     first, tasks, records = _cohort(tmp_path / "first", path)
     _publish(first, records)
@@ -191,7 +194,9 @@ def test_changed_native_coding_identity_misses(tmp_path: Path, field: str) -> No
     context = json.loads(json.dumps(other.contexts["answer"]))
     coding = context["coding"]
     native = coding["native_task_identity"]
-    if field == "source_policy":
+    if field == "unchanged":
+        pass
+    elif field == "source_policy":
         context["source_policy"] = "old working tree source policy"
     elif field in {"model", "reasoning", "jobs"}:
         coding["study"][field] = "different"
@@ -199,8 +204,11 @@ def test_changed_native_coding_identity_misses(tmp_path: Path, field: str) -> No
         coding[field] = "different"
     elif field == "grader_image":
         native["grader_image_identity"]["image_id"] = "sha256:" + "9" * 64
-    elif field == "runtime":
+    elif field == "engine-id":
+        # Recorded, not compared: the engine was restarted or replaced.
         coding["isolation"]["docker_engine"]["id"] = "new daemon"
+    elif field == "platform":
+        coding["isolation"]["docker_engine"]["platform"] = "linux/riscv64"
     elif field == "toolchain":
         native["toolchain_identity"]["image_id"] = "sha256:" + "9" * 64
     else:
@@ -211,7 +219,15 @@ def test_changed_native_coding_identity_misses(tmp_path: Path, field: str) -> No
                 "trusted_tests": "trusted_tests_sha256",
             }[field]
         ] = "9" * 64
-    assert baselines._hash(context) != first.keys["answer"]
+    other.contexts["answer"] = context
+    other.contracts["answer"] = baselines._cohort_contract(context)
+    other.keys["answer"] = baselines._cohort_key(context, other.tasks["answer"])
+    other.reserve()
+    try:
+        statuses = [row["status"] for row in other.decisions().values()]
+    finally:
+        other.close()
+    assert statuses == ["hit" if field in {"unchanged", "engine-id"} else "miss"] * 2
 
 
 @pytest.mark.parametrize(

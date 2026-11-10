@@ -392,7 +392,10 @@ def _cohort_contract(context: dict[str, Any]) -> dict[str, Any]:
             coding[key]["isolation"] = harbor_backend.runtime_contract(coding[key]["isolation"])
     hashes = coding.pop("launcher_sha256", None)
     if hashes is not None and "launcher_version" not in coding:
-        coding["launcher_version"] = components.saved_version("launcher", hashes)
+        study = coding.get("study")
+        coding["launcher_version"] = components.saved_launcher_version(
+            study.get("harness") if isinstance(study, dict) else None, hashes
+        )
     return contract
 
 
@@ -419,30 +422,41 @@ def _same_cohort(saved: object, contract: dict[str, Any], task: TaskSpec) -> boo
         return False
 
 
+def _saved_match(entry: Path, contract: dict[str, Any], task: TaskSpec) -> bool:
+    """A saved `<key>/<repeat>` entry whose manifest is readable and whose context matches."""
+    try:
+        context = json.loads((entry / "manifest.json").read_text())["context"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return _same_cohort(context, contract, task)
+
+
 def _cohorts(path: Path, key: str, contract: dict[str, Any], task: TaskSpec) -> list[Path]:
     """Directories that may hold this task's repeats: its own key, then saved cohorts.
 
-    A saved cohort, such as one 942f12c keyed by its full runtime, qualifies when its context
-    matches; its name then is that older key.
+    A saved cohort, such as one an older PluginBench keyed by its full runtime, qualifies
+    when any of its repeats matches; its name then is that older key.
     """
-    saved = []
-    for cohort in sorted(path.iterdir()) if path.is_dir() else []:
-        if cohort.name == key or cohort.name.startswith(".") or cohort.is_symlink():
-            continue
-        manifests = sorted(cohort.glob("*/manifest.json"))
-        try:
-            context = json.loads(manifests[0].read_text())["context"]
-        except (IndexError, OSError, ValueError, KeyError, TypeError):
-            continue
-        if _same_cohort(context, contract, task):
-            saved.append(cohort)
+    saved = [
+        cohort
+        for cohort in (sorted(path.iterdir()) if path.is_dir() else [])
+        if cohort.name != key
+        and not cohort.name.startswith(".")
+        and not cohort.is_symlink()
+        and cohort.is_dir()
+        and any(_saved_match(entry, contract, task) for entry in sorted(cohort.iterdir()))
+    ]
     return [path / key, *saved]
 
 
-def _resolve(cohorts: list[Path], repeat: int) -> Path | None:
-    return next(
-        (cohort / str(repeat) for cohort in cohorts if (cohort / str(repeat)).exists()), None
-    )
+def _resolve(
+    cohorts: list[Path], repeat: int, contract: dict[str, Any], task: TaskSpec
+) -> Path | None:
+    """Where a repeat is found: the run's own key, else the first saved cohort that matches."""
+    own, *saved = (cohort / str(repeat) for cohort in cohorts)
+    if own.exists():
+        return own
+    return next((entry for entry in saved if _saved_match(entry, contract, task)), None)
 
 
 def preview(
@@ -455,18 +469,18 @@ def preview(
         for repeat in range(1, repeats + 1)
     ]
     contexts = cohort_contexts(tasks=tasks, entries=entries, identity=identity)
+    contracts = {task.task_id: _cohort_contract(contexts[task.task_id]) for task in tasks}
     cohorts = {
         task.task_id: _cohorts(
-            path,
-            _cohort_key(contexts[task.task_id], task),
-            _cohort_contract(contexts[task.task_id]),
-            task,
+            path, _cohort_key(contexts[task.task_id], task), contracts[task.task_id], task
         )
         for task in tasks
     }
+    by_id = {task.task_id: task for task in tasks}
     rows = []
     for entry in entries:
-        found = _resolve(cohorts[entry["task_id"]], entry["attempt"])
+        task_id = entry["task_id"]
+        found = _resolve(cohorts[task_id], entry["attempt"], contracts[task_id], by_id[task_id])
         rows.append(
             {
                 "task_id": entry["task_id"],
@@ -535,7 +549,8 @@ class BaselineCache:
         if any(path.is_symlink() for path in cohorts):
             raise ValueError("baseline cache cohort must not follow symlinks")
         repeats = self.contexts[task_id]["repeats"]
-        found = {repeat: _resolve(cohorts, repeat) for repeat in repeats}
+        task, contract = self.tasks[task_id], self.contracts[task_id]
+        found = {repeat: _resolve(cohorts, repeat, contract, task) for repeat in repeats}
         if any(path is not None and path.is_symlink() for path in found.values()):
             raise ValueError("baseline cache entry must not follow symlinks")
         # Exclusive on this run's key while it may still publish a missing repeat; shared on

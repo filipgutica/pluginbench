@@ -146,6 +146,33 @@ def test_the_first_valid_of_several_equivalent_prepared_entries_is_reused(
     assert receipt["preparation_key"] == PREPARED_KEY
 
 
+def test_a_prepared_entry_whose_images_were_pruned_does_not_hide_a_later_usable_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preparation = _Preparation(tmp_path, monkeypatch)
+    # Both entries are intact and equivalent; the engine pruned the images of the first.
+    pruned = preparation.cache / ("0" * 64)
+    shutil.copytree(preparation.cache / PREPARED_KEY, pruned)
+    receipt_path = pruned / "artifacts/native-preparation.json"
+    receipt = json.loads(receipt_path.read_text())
+    gone = {**IMAGE, "image": "sha256:" + "b" * 64, "image_id": "sha256:" + "b" * 64}
+    receipt.update(image_identity=gone, grader_image_identity=gone)
+    receipt_path.write_text(json.dumps(receipt))
+    packet = json.loads((pruned / "cache.json").read_text())
+    packet["files"] = harbor_backend._native_asset_inventory(pruned, exclude="cache.json")
+    (pruned / "cache.json").write_text(json.dumps(packet))
+
+    def inspect(reference: str, **kwargs: Any) -> dict[str, object]:
+        if reference == gone["image_id"]:
+            raise ValueError("No such image: " + reference)
+        return {"Id": reference}
+
+    monkeypatch.setattr(harbor_backend, "_inspect_image", inspect)
+    reused = preparation.run()
+    assert preparation.preparations == []
+    assert reused["preparation_key"] == PREPARED_KEY
+
+
 def test_a_prepared_entry_whose_images_the_engine_lost_names_the_entry_and_both_engines(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -251,10 +278,17 @@ def _changed(vanilla: _Vanilla, change: str) -> None:
         vanilla.identity["isolation"]["resources"]["memory_mb"] = 4096
     elif change == "jobs":
         vanilla.identity["jobs"] = 3
-    elif change == "unknown-launcher-hash":
+    elif change in {"unknown-launcher-hash", "partial-launcher-hashes"}:
         for manifest in vanilla.cache.glob("*/*/manifest.json"):
             saved = json.loads(manifest.read_text())
-            saved["context"]["coding"]["launcher_sha256"]["codex.py"] = "f" * 64
+            hashes = saved["context"]["coding"]["launcher_sha256"]
+            if change == "unknown-launcher-hash":
+                hashes["codex.py"] = "f" * 64
+            else:
+                # Every hash but one dropped: not a declaration of the launcher that coded it.
+                saved["context"]["coding"]["launcher_sha256"] = {
+                    "harbor_backend.py": hashes["harbor_backend.py"]
+                }
             manifest.write_text(json.dumps(saved))
 
 
@@ -269,6 +303,7 @@ def _changed(vanilla: _Vanilla, change: str) -> None:
         "limits",
         "jobs",
         "unknown-launcher-hash",
+        "partial-launcher-hashes",
     ],
 )
 def test_a_942f12c_vanilla_cohort_for_a_different_run_is_a_miss_not_an_error(
@@ -315,3 +350,49 @@ def test_a_cohort_split_across_directories_is_resolved_per_repeat(
         path=vanilla.cache, tasks=vanilla.tasks(), repeats=2, identity=vanilla.identity
     )
     assert [row["cache_key"] for row in preview] == [VANILLA_KEY, other]
+
+
+@pytest.mark.parametrize("malformed", ["isolation-null", "launcher-hashes-string"])
+def test_a_malformed_unrelated_cohort_does_not_stop_cache_lookups(
+    tmp_path: Path, malformed: str
+) -> None:
+    vanilla = _Vanilla(tmp_path)
+    manifest = json.loads((vanilla.cache / VANILLA_KEY / "1/manifest.json").read_text())
+    coding = manifest["context"]["coding"]
+    if malformed == "isolation-null":
+        coding["isolation"] = None
+    else:
+        coding["launcher_sha256"] = "broken"
+    broken = vanilla.cache / ("0" * 64) / "1"
+    broken.mkdir(parents=True)
+    (broken / "manifest.json").write_text(json.dumps(manifest))
+    preview = baselines.preview(
+        path=vanilla.cache, tasks=vanilla.tasks(), repeats=2, identity=vanilla.identity
+    )
+    assert [(row["status"], row["cache_key"]) for row in preview] == [("hit", VANILLA_KEY)] * 2
+    cache = vanilla.reserve()
+    try:
+        assert [row["status"] for row in cache.decisions().values()] == ["hit", "hit"]
+    finally:
+        cache.close()
+
+
+def test_an_unreadable_saved_repeat_does_not_hide_the_valid_repeats_after_it(
+    tmp_path: Path,
+) -> None:
+    vanilla = _Vanilla(tmp_path)
+    (vanilla.cache / VANILLA_KEY / "1/manifest.json").write_text("{")
+    preview = baselines.preview(
+        path=vanilla.cache, tasks=vanilla.tasks(), repeats=2, identity=vanilla.identity
+    )
+    assert [row["status"] for row in preview] == ["miss", "hit"]
+    cache = vanilla.reserve()
+    try:
+        decisions = cache.decisions()
+    finally:
+        cache.close()
+    assert [(row["status"], row["cache_key"]) for row in decisions.values()][1] == (
+        "hit",
+        VANILLA_KEY,
+    )
+    assert [row["status"] for row in decisions.values()][0] == "miss"

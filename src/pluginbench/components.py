@@ -76,9 +76,29 @@ def source_sha256(name: str) -> str:
     return hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
 
 
-def saved_version(component: str, hashes: Mapping[str, object]) -> int:
+def launcher_files(harness: str) -> tuple[str, ...]:
+    """The launcher files a coding run hashes: claude.py only when Claude is the harness."""
+    return tuple(name for name in FILES["launcher"] if name != "claude.py" or harness == "claude")
+
+
+def saved_launcher_version(harness: object, hashes: object) -> int:
+    """The version of a saved launcher hash set, which must name every file of its harness."""
+    expected = launcher_files(harness) if harness in ("codex", "claude") else ()
+    saved = sorted(hashes) if isinstance(hashes, Mapping) else []
+    if not expected or saved != sorted(expected):
+        raise UnknownSourceError(
+            f"the saved PluginBench launcher hashes {', '.join(saved) or 'no file'}, not the "
+            f"files of a {harness} launcher"
+        )
+    assert isinstance(hashes, Mapping)
+    return saved_version("launcher", hashes)
+
+
+def saved_version(component: str, hashes: object) -> int:
     """The version a run saved before versions existed used, read from its source hashes."""
     label = component.replace("_", " ")
+    if not isinstance(hashes, Mapping):
+        raise UnknownSourceError(f"the saved PluginBench {label} source hashes are not a mapping")
     if not hashes:
         raise UnknownSourceError(f"the saved PluginBench {label} records no source hash")
     versions = set()

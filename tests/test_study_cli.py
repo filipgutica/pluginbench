@@ -1869,11 +1869,27 @@ def test_stopped_run_copied_to_a_new_path_resumes_there(
     assert not root.exists()
 
 
+# The launcher hashes a Codex run saved at 942f12c.
+_SAVED_CODEX_LAUNCHER = {
+    name: next(iter(components._SAVED_HASHES[name]))
+    for name in components.FILES["launcher"]
+    if name != "claude.py"
+}
+
+
 @pytest.mark.parametrize(
     ("saved", "message"),
     [
         ({"launcher_version": 2}, "launcher version 2, and this build's launcher is version 1"),
-        ({"launcher_sha256": {"codex.py": "f" * 64}}, "codex.py has sha256 ffffffffffff"),
+        (
+            {"launcher_sha256": {**_SAVED_CODEX_LAUNCHER, "codex.py": "f" * 64}},
+            "codex.py has sha256 ffffffffffff",
+        ),
+        # A partial set is not a declaration of the launcher that coded the run.
+        (
+            {"launcher_sha256": {"harbor_backend.py": _SAVED_CODEX_LAUNCHER["harbor_backend.py"]}},
+            "hashes harbor_backend.py, not the files of a codex launcher",
+        ),
     ],
 )
 def test_resume_refuses_to_code_with_a_different_launcher(

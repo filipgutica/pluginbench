@@ -348,6 +348,8 @@ def runtime_contract(identity: dict[str, object], *, launcher: bool = True) -> d
     and an unknown hash raises. `launcher=False` leaves the launcher version out, for work
     that starts no coding agent.
     """
+    if not isinstance(identity, dict):
+        raise ValueError("a saved runtime identity is not an object")
     contract = copy.deepcopy(identity)
     version = contract.get("launcher_version")
     if version is None:
@@ -1767,8 +1769,8 @@ def prepare_native_task(
                     codex.write_json(prepared / "cache.json", {"inputs": inputs, "files": manifest})
                     prepared.rename(cached)
             saved = cached, _cached_preparation(cached, contract, expected)
+            assert_prepared_images(saved[1], expected, label=f"Prepared cache entry {cached}")
         cached, receipt = saved
-        assert_prepared_images(receipt, expected, label=f"Prepared cache entry {cached}")
         shutil.copytree(cached, destination)
         # Docker work for this run uses the runtime it runs on; the entry's is provenance.
         receipt.update(
@@ -1823,9 +1825,11 @@ def _saved_preparation(
     """An entry saved under another key, as by 942f12c, whose inputs are equivalent.
 
     Candidates are tried in name order. One that is in use, invalid, or names source this
-    build does not know is skipped: it is not this preparation. The chosen entry stays
-    share-locked until `held` closes.
+    build does not know is skipped: it is not this preparation. So is one whose images the
+    current Docker engine no longer holds; if no candidate is usable for that reason, the
+    first such error is raised. The chosen entry stays share-locked until `held` closes.
     """
+    unavailable: ValueError | None = None
     for candidate in sorted(cache.iterdir()):
         lock_path = cache / (candidate.name + ".lock")
         if (
@@ -1843,8 +1847,16 @@ def _saved_preparation(
         except (OSError, ValueError, KeyError, TypeError):
             lock.close()
             continue
+        try:
+            assert_prepared_images(receipt, expected, label=f"Prepared cache entry {candidate}")
+        except ValueError as error:
+            lock.close()
+            unavailable = unavailable or error
+            continue
         held.enter_context(lock)
         return candidate, receipt
+    if unavailable is not None:
+        raise unavailable
     return None
 
 
