@@ -816,6 +816,27 @@ def test_capacity_that_no_longer_fits_is_refused_with_both_values(
     assert harbor.assert_runtime(saved, jobs=5)
 
 
+@pytest.mark.parametrize(("jobs", "fits"), [(1, True), (2, False)])
+def test_measurement_capacity_counts_the_largest_limits_run_at_once(
+    monkeypatch: pytest.MonkeyPatch, jobs: int, fits: bool
+) -> None:
+    small = legacy_json("runtime.json")  # 2 CPUs and 8192 MB
+    large = {**small, "resources": {**small["resources"], "memory_mb": 12288}}
+    current = current_runtime(small)
+    # The 80% budget of 20 GiB is 16384 MB: room for the larger container, not for both.
+    current["docker_engine"]["capacity"]["memory_bytes"] = 20 * 1024**3
+
+    def reported(*, cpus: int, memory_mb: int) -> dict[str, Any]:
+        return {**current, "resources": {**current["resources"], "memory_mb": memory_mb}}
+
+    monkeypatch.setattr(harbor, "runtime_identity", reported)
+    if fits:
+        harbor.assert_capacity([small, large, small], jobs=jobs)
+        return
+    with pytest.raises(isolation.RuntimeDriftError, match="need 4 CPUs and 20480 MB"):
+        harbor.assert_capacity([small, large, small], jobs=jobs)
+
+
 def test_recorded_runtime_fields_may_all_differ_and_docker_then_uses_the_current_ones(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

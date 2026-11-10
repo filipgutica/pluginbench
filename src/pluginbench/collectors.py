@@ -180,6 +180,23 @@ def observer_identity() -> dict[str, str]:
     return {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()}
 
 
+def container_runtime(collector: Collector) -> dict[str, object] | None:
+    """The saved runtime of the Docker container this collector starts, if it starts one.
+
+    Native coverage starts one, and so does Rust analysis for its unused diagnostics.
+    """
+    if collector.kind == "fallow" or (
+        collector.kind == "coverage" and collector.report_format is None
+    ):
+        return None
+    config = json.loads(collector.config.read_text())
+    if collector.kind == "analysis" and config.get("language") != "rust":
+        return None
+    identity = config.get("native_task_identity")
+    runtime = identity.get("isolation") if isinstance(identity, dict) else None
+    return runtime if isinstance(runtime, dict) else None
+
+
 def _assert_observer(collector: Collector) -> None:
     assert collector.report_format is not None
     config = json.loads(collector.config.read_text())

@@ -434,6 +434,32 @@ def assert_runtime(
     return actual
 
 
+def assert_capacity(runtimes: list[dict[str, object]], *, jobs: int) -> None:
+    """Check that Docker holds the containers that run at once: `jobs` of `runtimes`.
+
+    The largest CPU and memory limits are summed separately, so tasks with different limits
+    are never under-counted. Measurement uses this; it starts no coding agent.
+    """
+    limits = []
+    for runtime in runtimes:
+        resources = _object(runtime.get("resources"), "container resources")
+        cpus, memory = resources.get("cpus"), resources.get("memory_mb")
+        if not isinstance(cpus, int) or not isinstance(memory, int):
+            raise ValueError("Frozen container resource limits are missing")
+        limits.append((cpus, memory))
+    count = min(jobs, len(limits))
+    cpus = sum(sorted((limit[0] for limit in limits), reverse=True)[:count])
+    memory = sum(sorted((limit[1] for limit in limits), reverse=True)[:count])
+    actual = assert_runtime(runtimes[0], launcher=False)
+    current = _object(_object(actual["docker_engine"], "Docker engine")["capacity"], "capacity")
+    if cpus > int(current["cpus"]) or memory * 1024**2 > int(current["memory_bytes"]) * 0.8:
+        raise isolation.RuntimeDriftError(
+            f"Docker capacity no longer fits this run's measurement: {count} containers at once "
+            f"need {cpus} CPUs and {memory} MB within 80% of memory; docker_engine.capacity is "
+            f"now {_shown(current)}. Give Docker that capacity again, then resume the run"
+        )
+
+
 def capacity_jobs(*, cpus: int = 1, memory_mb: int = 2048) -> int:
     """Bound coding concurrency by the actual Docker allocation, leaving headroom."""
     if cpus < 1 or memory_mb < 128:
