@@ -291,6 +291,20 @@ def test_scoped_code_size_refuses_non_text_source_instead_of_counting_zero(
         measure(before=before, after=after, scope=["*"], change=change)
 
 
+def test_scoped_code_size_skips_unchanged_non_text_source(tmp_path: Path) -> None:
+    before, after = tmp_path / "before", tmp_path / "after"
+    for root in (before, after):
+        _write(root / "src/latin1.py", "temporary\n")
+        (root / "src/latin1.py").write_bytes(b"# caf\xe9\n")
+    _write(before / "src/index.py", "old()\n")
+    _write(after / "src/index.py", "new()\nextra()\n")
+    result = assessment_metrics.scoped_code_size(
+        before=before, after=after, scope=["src/**"], change=compare_snapshots(before, after)
+    )
+    assert result["source_lines_added"] == 2
+    assert result["source_lines_removed"] == 1
+
+
 def test_scoped_code_size_rejects_mutation_after_reading(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
