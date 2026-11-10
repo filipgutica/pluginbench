@@ -855,6 +855,8 @@ def test_integrated_evaluation_and_report_regeneration(
         model_calls = len(calls), len(judge_calls)
         monkeypatch.setattr(study, "_binary_native_reward", reward_decoder)
         evaluation.regenerate_report(root)
+        # A saved run opens through any spelling of its path, as a new one does.
+        evaluation.regenerate_report(root / ".." / root.name)
         assert (len(calls), len(judge_calls)) == model_calls
         assert all(path.read_bytes() == data for path, data in original_receipts.items())
     data = json.loads((root / "report/results.json").read_text())
@@ -1421,6 +1423,32 @@ def test_cache_location_is_resolved_and_checked_before_preparation(
     with pytest.raises(ValueError, match=expected):
         evaluation.check_evaluation(config, output)
     assert not output.exists()
+
+
+@pytest.mark.parametrize("spelling", ["parent", "symlink"])
+def test_output_reached_through_a_parent_or_a_symlink_is_prepared(
+    spelling: str,
+    config: evaluation.Evaluation,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_cache: Path,
+) -> None:
+    # Prepared task paths are resolved, so an unresolved output root was never their parent.
+    _build_with_fresh_image_ids(monkeypatch, tmp_path / "scratch")
+    monkeypatch.setattr(harbor_backend, "run_reference_agents", passing_reference_agents)
+    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.167.0"})
+    monkeypatch.setattr(codex, "runtime_environment", lambda *args, **kwargs: ({}, ()))
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "real", target_is_directory=True)
+    output = {
+        "parent": tmp_path / "real/sub/../run",
+        "symlink": tmp_path / "link/run",
+    }[spelling]
+
+    checked = evaluation._check(config, output, None)
+
+    assert checked.root == tmp_path / "real/run"
+    assert (checked.root / "inputs").is_dir()
 
 
 def test_jobs_above_docker_capacity_fail_instead_of_being_lowered(

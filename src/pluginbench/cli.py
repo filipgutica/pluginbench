@@ -384,7 +384,7 @@ def run(
             raise typer.Exit()
         progress = _notifying_progress(plan["coding_calls"]) if notify else typer.echo
         if evaluation is None:
-            root = target.expanduser().absolute()
+            root = target.expanduser().resolve()
         else:
             destination = output or _new_run_directory()
             try:
