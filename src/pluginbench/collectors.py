@@ -200,14 +200,16 @@ def container_runtime(collector: Collector) -> dict[str, object] | None:
 def _assert_observer(collector: Collector) -> None:
     assert collector.report_format is not None
     config = json.loads(collector.config.read_text())
+    if not isinstance(config, dict):
+        raise components.ObserverError(f"it is not a JSON object: {components.OBSERVER_NEXT_STEP}")
     version = config.get("observer_version")
     if version is None:
         version = components.saved_version("coverage_observer", config.get("implementation") or {})
     current = components.VERSIONS["coverage_observer"]
     if version != current:
-        raise ValueError(
-            f"Coverage observer version {version} froze this profile; this PluginBench "
-            f"measures with version {current}"
+        raise components.ObserverError(
+            f"coverage observer version {version} froze this profile, and this PluginBench "
+            f"measures with version {current}: {components.OBSERVER_NEXT_STEP}"
         )
 
 
@@ -423,6 +425,20 @@ def _native_coverage(
 def _run_collector(
     root: Path, collector: Collector, destination: Path, baseline: Path | None
 ) -> tuple[dict[str, object], str, str]:
+    """Collect one measure; a profile this build's observer cannot measure is named."""
+    try:
+        return _observed(root, collector, destination, baseline)
+    except components.UnknownSourceError as error:
+        raise ValueError(
+            f"Measurement profile {collector.config}: {error}; {components.OBSERVER_NEXT_STEP}"
+        ) from error
+    except components.ObserverError as error:
+        raise ValueError(f"Measurement profile {collector.config}: {error}") from error
+
+
+def _observed(
+    root: Path, collector: Collector, destination: Path, baseline: Path | None
+) -> tuple[dict[str, object], str, str]:
     if collector.report_format is None:
         return _collect(root, collector, destination, baseline)
     _assert_observer(collector)
@@ -433,7 +449,10 @@ def _run_collector(
         # The profile binds a version, not bytes: an edit during collection must not mix
         # two implementations in one result.
         if observer_identity() != implementation:
-            raise ValueError("Coverage observer bytes changed during execution")
+            raise components.ObserverError(
+                "the coverage observer's bytes changed during execution: measure again with "
+                "an unchanged PluginBench"
+            )
 
 
 def _collect(

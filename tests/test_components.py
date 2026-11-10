@@ -34,7 +34,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         1,
         {
             "language_analysis.py": (
-                "fa7497799b97f8fb0a1cba54b22293fbd56d1fb40d23b14429a3f71f1445e898"
+                "df4f76cff23df1e011e5a75bc79c3754d9e8893eb207512cd25f05a664eb8545"
             ),
         },
     ),
@@ -56,6 +56,8 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
 @pytest.mark.parametrize("component", sorted(components.VERSIONS))
 def test_each_hashed_file_is_pinned_to_its_component_version(component: str) -> None:
     version, hashes = PINNED[component]
+    # A file dropped from the declared list would stop being hashed without anyone deciding.
+    assert sorted(components.FILES[component]) == sorted(hashes)
     actual = {name: components.source_sha256(name) for name in components.FILES[component]}
     changed = sorted(name for name in actual if actual[name] != hashes.get(name))
     assert not changed, (

@@ -135,7 +135,12 @@ def vanilla() -> None:
         assert all(row["status"] == "hit" for row in second.decisions().values())
     finally:
         second.close()
-    shutil.copytree(WORK / "published/config", OUTPUT / "vanilla-task")
+    # 942f12c's study loader needs the recipe and guidance to publish; admission reads neither.
+    shutil.copytree(
+        WORK / "published/config",
+        OUTPUT / "vanilla-task",
+        ignore=shutil.ignore_patterns("recipe.yaml", "guidance.md"),
+    )
     shutil.copytree(cache_path, OUTPUT / "vanilla", ignore=shutil.ignore_patterns(".locks"))
     write(OUTPUT / "vanilla-identity.json", coding(tasks))
 

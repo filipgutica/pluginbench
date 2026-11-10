@@ -788,6 +788,7 @@ def test_a_changed_exact_runtime_field_is_refused_and_named(
     with pytest.raises(isolation.RuntimeDriftError) as raised:
         harbor.assert_runtime(saved)
     assert expected in str(raised.value)
+    assert str(raised.value).endswith("Restore that runtime, or start a new run")
 
 
 def test_memory_jitter_in_a_942f12c_runtime_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -811,6 +812,7 @@ def test_capacity_that_no_longer_fits_is_refused_with_both_values(
         'docker_engine.capacity was {"cpus": 24, "memory_bytes": 25198305280}, is now '
         '{"cpus": 24, "memory_bytes": 8589934592}'
     ) in str(raised.value)
+    assert str(raised.value).endswith("Give Docker that capacity again, or start a new run")
     # Concurrency the evaluation itself allows is checked without capacity_jobs' cap of 4.
     current["docker_engine"]["capacity"]["memory_bytes"] = 25198305280 * 4
     assert harbor.assert_runtime(saved, jobs=5)

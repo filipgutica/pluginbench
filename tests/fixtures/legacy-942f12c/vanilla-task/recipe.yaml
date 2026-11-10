@@ -1,9 +1,0 @@
-guidance:
-  candidate:
-  - guidance.md
-harness_version: 0.143.0
-name: candidate
-repeats: 2
-schema_version: 1
-tasks: tasks.yaml
-timeout_seconds: 1800

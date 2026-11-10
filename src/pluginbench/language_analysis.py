@@ -868,9 +868,9 @@ def _analysis_tools(language: str, config: dict[str, object]) -> dict[str, dict[
         )
     current = components.VERSIONS["analysis_observer"]
     if version is not None and version != current:
-        raise ValueError(
-            f"Analysis observer version {version} froze this profile; this PluginBench "
-            f"measures with version {current}"
+        raise components.ObserverError(
+            f"analysis observer version {version} froze this profile, and this PluginBench "
+            f"measures with version {current}: {components.OBSERVER_NEXT_STEP}"
         )
     if config.get("settings", ANALYSIS_SETTINGS) != ANALYSIS_SETTINGS:
         raise ValueError("Analysis settings differ from the qualified observer")
@@ -907,6 +907,9 @@ def collect_language_analysis(
             _analysis_tools(language, config) != tools
             or hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != implementation
         ):
-            raise ValueError("Analysis observer bytes changed during execution")
+            raise components.ObserverError(
+                "the analysis observer's bytes changed during execution: measure again with "
+                "an unchanged PluginBench"
+            )
         if inspect_snapshot(root)["digest"] != before:
             raise ValueError("Analysis modified measured source")

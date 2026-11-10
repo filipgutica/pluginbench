@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from legacy_support import legacy_json
 from pluginbench.assessment_metrics import evaluate_evidence, inspect_snapshot
 from pluginbench import isolation
 from pluginbench.collectors import (
@@ -847,6 +848,73 @@ def test_native_observer_drift_is_rejected_before_command(
     with pytest.raises(ValueError, match="coverage_report.py has sha256 old"):
         collect_measurements(snapshot, tmp_path / "evidence", [collector])
     assert inspect_snapshot(snapshot)["source_lines"] == 1
+
+
+@pytest.mark.parametrize(
+    ("saved", "message"),
+    [
+        # A profile 942f12c froze records the observer's source hash, and is measured.
+        ("942f12c", None),
+        ({"observer_version": 2}, "coverage observer version 2 froze this profile"),
+        ({"implementation": "broken"}, "source hashes are not a mapping"),
+        ([], "it is not a JSON object"),
+    ],
+)
+def test_a_saved_coverage_profile_is_measured_or_named_with_the_next_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, saved: object, message: str | None
+) -> None:
+    from pluginbench import collectors
+
+    if saved == "942f12c":
+        saved = {
+            "implementation": legacy_json("observer-identities.json")["coverage_implementation"]
+        }
+    profile = config(tmp_path, saved)
+    collector = Collector(
+        kind="coverage",
+        config=profile,
+        command=["pytest"],
+        report_format="lcov",
+        report_path="coverage/lcov.info",
+        tool_version="1",
+    )
+
+    def collected(*args: object) -> object:
+        raise LookupError("the observer accepted the profile")
+
+    monkeypatch.setattr(collectors, "_collect", collected)
+    if message is None:
+        with pytest.raises(LookupError):
+            collect_measurements(source(tmp_path), tmp_path / "evidence", [collector])
+        return
+    with pytest.raises(ValueError) as raised:
+        collect_measurements(source(tmp_path), tmp_path / "evidence", [collector])
+    assert f"Measurement profile {profile}: " in str(raised.value)
+    assert message in str(raised.value)
+    assert "prepare a new measurement revision" in str(raised.value)
+
+
+def test_a_coverage_observer_changed_during_collection_names_the_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pluginbench import collectors, components
+
+    profile = config(tmp_path, {"observer_version": components.VERSIONS["coverage_observer"]})
+    collector = Collector(
+        kind="coverage",
+        config=profile,
+        command=["pytest"],
+        report_format="lcov",
+        report_path="coverage/lcov.info",
+        tool_version="1",
+    )
+    identities = iter([{"coverage_report.py": "before"}, {"coverage_report.py": "after"}])
+    monkeypatch.setattr(collectors, "observer_identity", lambda: next(identities))
+    monkeypatch.setattr(collectors, "_collect", lambda *args: ({}, "1", "lcov"))
+    with pytest.raises(ValueError) as raised:
+        collect_measurements(source(tmp_path), tmp_path / "evidence", [collector])
+    assert f"Measurement profile {profile}: " in str(raised.value)
+    assert "measure again with an unchanged PluginBench" in str(raised.value)
 
 
 @pytest.mark.parametrize("mutate_before", [False, True])

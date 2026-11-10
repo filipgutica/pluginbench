@@ -72,6 +72,16 @@ class UnknownSourceError(ValueError):
     """A saved run records source bytes that no PluginBench version declares."""
 
 
+class ObserverError(ValueError):
+    """A measurement profile cannot be measured by the observer this build runs."""
+
+
+# What to do with a measurement profile that another observer version froze.
+OBSERVER_NEXT_STEP = (
+    "measure it with the PluginBench build that froze it, or prepare a new measurement revision"
+)
+
+
 def source_sha256(name: str) -> str:
     return hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
 
