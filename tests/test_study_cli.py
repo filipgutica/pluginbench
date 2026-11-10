@@ -2136,3 +2136,19 @@ def test_942f12c_refuses_a_run_this_build_saved(
     # study; it writes nothing else, and starts no coding.
     changed = {name for name in before.keys() | after.keys() if before.get(name) != after.get(name)}
     assert changed <= {"run.lock", "events.jsonl"}, changed
+
+
+def test_report_on_a_run_stopped_during_coding_covers_the_finished_attempts_and_says_so(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stopped, _, _ = _stopped_after_two_attempts(config, tmp_path, monkeypatch)
+    root = stopped.rename(tmp_path / "my run")  # The printed command must survive a space.
+    result = CliRunner().invoke(cli.app, ["report", str(root)])
+    assert result.exit_code == 0, result.stderr
+    assert "This run is not finished: 2 of 9 attempts are complete" in result.stderr
+    assert f"Finish it with: pluginbench run '{root}'" in result.stderr
+    data = json.loads((root / "report/results.json").read_text())
+    assert data["unfinished_run"] == {"complete": 2, "assigned": 9}
+    assert data["limitations"][0].startswith("This run is not finished: 2 of 9 attempts")
+    graded = [row for row in data["attempts"] if row["correctness"] != "unknown"]
+    assert len(data["attempts"]) == 9 and len(graded) == 2
