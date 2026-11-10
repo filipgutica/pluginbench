@@ -1153,6 +1153,21 @@ def test_required_measure_that_is_not_configured_blocks_the_check(
     assert not checkable["calls"]
 
 
+def test_check_reports_a_runtime_refusal_like_other_refusals(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # check reaches the saved-runtime checks through its native measurement probes.
+    def refused(*args: object, **kwargs: object) -> object:
+        raise isolation.RuntimeDriftError("Docker capacity no longer fits this run's measurement")
+
+    monkeypatch.setattr(cli, "check_evaluation", refused)
+    result = CliRunner().invoke(
+        cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"])]
+    )
+    assert result.exit_code == 2
+    assert "Error: Docker capacity no longer fits" in result.stderr
+
+
 def test_check_fails_when_a_run_could_not_load_the_saved_profiles(
     checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
