@@ -520,7 +520,7 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
         }
     )
     comparison = _object(plan["comparison_identity"])
-    root = output.expanduser().absolute()
+    root = output.expanduser().resolve()
     if root.exists():
         raise ValueError(f"output must be a new directory: {root}")
     caches = _caches(root)
@@ -1108,7 +1108,7 @@ def _coding_left(root: Path, selection: dict[str, object]) -> int:
 
 
 def plan_resume(root: Path) -> dict[str, object]:
-    root = root.expanduser().absolute()
+    root = root.expanduser().resolve()
     selection = _load_selection(root)
     if not _coding_done(root):
         if _measurement_unstarted(root, selection):
@@ -1141,7 +1141,7 @@ def resume_evaluation(
     guard: Callable[[], None] | None = None,
 ) -> Path:
     """Run whatever a prepared evaluation has left: coding, then measurement and reviews."""
-    root = root.expanduser().absolute()
+    root = root.expanduser().resolve()
     selection = _load_selection(root)
     if not _coding_done(root):
         _assert_resumable(root, selection)
@@ -1158,7 +1158,7 @@ def resume_evaluation(
 
 def plan_review(root: Path, revision: str) -> dict[str, object]:
     """Check that a finished run can be reviewed again as `revision`, and count its calls."""
-    root = root.expanduser().absolute()
+    root = root.expanduser().resolve()
     selection = _load_selection(root)
     config = _saved_evaluation(selection)
     if config.reviewer is None:
@@ -1186,7 +1186,7 @@ def review_evaluation(
     Earlier revisions stay in evidence. Returns the selected revision: `<revision>-citations`
     when offline citation recovery repaired its formatting.
     """
-    root = root.expanduser().absolute()
+    root = root.expanduser().resolve()
     plan_review(root, revision)
     selection = _load_selection(root)
     config = _saved_evaluation(selection)
@@ -1279,7 +1279,7 @@ def _measurement_collection(root: Path, selection: dict[str, object]) -> dict[st
 
 
 def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path:
-    root = root.expanduser().absolute()
+    root = root.expanduser().resolve()
     config = _load_selection(root)
     comparison = _object(config["comparison_identity"])
     config["comparison_identity"] = comparison
