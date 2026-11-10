@@ -54,7 +54,7 @@ New native treatment runs currently require Codex. Legacy file-only `guidance` m
 
 ## Execution and isolation
 
-Install with `pip install -e '.[harbor]'`. Docker must run Linux containers through a local Unix endpoint, with Compose and Buildx available. The current runner accepts single-step Linux CPU tasks with separate verifiers and Dockerfiles or prebuilt images. Shared verifiers, task-authored Compose, multistep tasks, GPUs, and TPUs are rejected before model calls.
+Install with `pip install -e .`, which also installs Harbor 0.24.0. Docker must run Linux containers through a local Unix endpoint, with Compose and Buildx available. The current runner accepts single-step Linux CPU tasks with separate verifiers and Dockerfiles or prebuilt images. Shared verifiers, task-authored Compose, multistep tasks, GPUs, and TPUs are rejected before model calls.
 
 Harbor owns the task instructions, environment, artifact collection, and correctness checks. PluginBench freezes both task images, installs the exact selected agent CLI, and removes inherited personal guidance. It exports the initial repository and records the prepared image before looking up a reusable vanilla baseline. Preparation does not run a task-specific PluginBench dependency recipe or calibrate the task's tests.
 
@@ -363,7 +363,7 @@ pluginbench judge tally judging/r3
 ## Development
 
 ```sh
-pip install -e '.[dev,harbor]'
+pip install -e '.[dev]'
 pytest
 ruff check src tests
 mypy src tests

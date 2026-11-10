@@ -1,7 +1,6 @@
 {
   "name": "pluginbench-charts",
   "private": true,
-  "version": "0.4.0",
   "description": "Build the vendored ECharts report bundle",
   "engines": {
     "node": ">=22.20.0"
