@@ -52,7 +52,7 @@ def _gates_file(tmp_path: Path, **changes: object) -> Path:
 def test_pilot_climb_measures_match_the_study_analysis() -> None:
     # analyze.py's numbers for the pilot's climb split, from the same saved reports.
     evidence = load_evidence(PILOT)
-    expected = {
+    expected: dict[str, dict[str, float]] = {
         "tokens": {"vanilla": 1.67e6, "superpowers": 3.96e6, "workflow-main": 4.59e6},
         "cognitive ratio to reference": {
             "vanilla": 0.15,

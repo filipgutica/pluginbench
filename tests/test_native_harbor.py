@@ -1488,12 +1488,13 @@ def test_git_probe_commits_in_the_coding_image_with_only_the_task_environment(
         }.get(arguments[0], "")
 
     cleaned: list[str] = []
+
+    def cleanup(**kwargs: object) -> dict[str, object]:
+        cleaned.append(str(kwargs["project"]))
+        return {"status": "complete"}
+
     monkeypatch.setattr(harbor, "_docker", docker)
-    monkeypatch.setattr(
-        harbor,
-        "cleanup",
-        lambda **kwargs: cleaned.append(str(kwargs["project"])) or {"status": "complete"},
-    )
+    monkeypatch.setattr(harbor, "cleanup", cleanup)
     receipt = harbor.probe_coding_environment(_prepared_identity(task))
     create = calls[0]
     assert create[0] == "create" and "sha256:" + "c" * 64 in create

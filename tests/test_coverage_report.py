@@ -235,7 +235,9 @@ def test_inspector_fixture_feeds_existing_redundancy_measure(
         },
         change=change,
     )
-    changed = compared["coverage"]["changed_lines"]
+    coverage = compared["coverage"]
+    assert isinstance(coverage, dict)
+    changed = coverage["changed_lines"]
     if with_per_test:
         assert changed["added_tests"] == 2
         assert changed["redundant_added_test_names"] == [

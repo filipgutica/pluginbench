@@ -558,7 +558,7 @@ def test_missing_collector_is_not_configured_but_a_failing_tool_is_broken(
 
 @pytest.mark.parametrize("require_ready", [False, True])
 def test_only_broken_rows_block_unless_every_measure_is_required(require_ready: bool) -> None:
-    matrix = {
+    matrix: dict[str, dict[str, dict[str, object]]] = {
         "covered": {"coverage": {"state": "ready", "reason": None}},
         "uncovered": {"coverage": {"state": "not_configured", "reason": "no coverage tool"}},
     }
