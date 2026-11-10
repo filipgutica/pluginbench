@@ -16,7 +16,7 @@ Local collectors and reviews use an OS filesystem boundary: macOS Seatbelt or Li
 
 The OS wrapper enforces Codex reviewers' read-only access. Codex's inner sandbox is disabled inside that wrapper because nested Seatbelt prevents command startup. Packet writes and reads outside the allowed roots remain blocked.
 
-Native coding, grading, and configured coverage commands use Docker resource limits. Local static analysis and reviews share host resources. On macOS, local processes share the host network and process IDs; system/runtime paths remain readable. Linux Bubblewrap has stronger descendant isolation but has not been validated on this macOS development machine. Use a trusted machine; this is not a shared-hosting boundary.
+Native coding, grading, and configured coverage commands use Docker resource limits. Local static analysis and reviews share host resources. On macOS, local processes share the host network and process IDs; system/runtime paths remain readable. On Linux, Bubblewrap also isolates descendants in their own process namespace, and `/tmp` is read-only, so a collector must write temporary files under `TMPDIR`. Use a trusted machine; this is not a shared-hosting boundary.
 
 Native coding permits the selected provider's fixed host allowlist while retaining task network restrictions. Custom provider endpoints are unsupported. Native graders retain the task's network policy. PluginBench supplies only the selected credential through a temporary private runtime. It uses empty personal CLI settings, removes that runtime after bounded invocations, and scrubs known secrets from saved artifacts. Raw traces can still contain private task data; inspect them before sharing.
 

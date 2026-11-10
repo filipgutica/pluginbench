@@ -262,6 +262,9 @@ def command(
             mounted.append(root)
         for root in writes:
             wrapped.extend(["--bind", str(root), str(root)])
+        # Bubblewrap's own root and /tmp are writable scratch by default, so a write outside
+        # every granted root would succeed there and vanish. Deny it, as the macOS profile does.
+        wrapped.extend(["--remount-ro", "/tmp", "--remount-ro", "/"])
         wrapped.extend(["--", *argv])
     return wrapped, {
         **identity,
