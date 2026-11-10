@@ -1048,8 +1048,15 @@ def export_native_source(
     image_id: str | None = None,
     resume: bool = False,
     fresh_source: bool = False,
+    agent_workspace: bool = False,
 ) -> dict[str, object]:
-    """Freeze actual stopped source before handing it to another phase."""
+    """Freeze actual stopped source before handing it to another phase.
+
+    A symlink is refused, except in an `agent_workspace`: there it is left out and listed in
+    `excluded_runtime_paths`. What an agent leaves beside its work, such as a virtual
+    environment's `bin/python`, decides nothing, because the graded submission is rebuilt from
+    the task's fixture and the committed patch.
+    """
     if (
         re.fullmatch(r"/(?:[A-Za-z0-9_.-]+/?)+", workdir) is None
         or workdir in {"/root", "/home", "/tmp", "/usr", "/etc", "/var", "/logs"}
@@ -1081,7 +1088,12 @@ def export_native_source(
                 if path.name in EXCLUDED_NAMES:
                     continue
                 if path.is_symlink():
-                    raise ValueError(f"Native source contains a symlink: {path.relative_to(raw)}")
+                    if not agent_workspace:
+                        raise ValueError(
+                            f"Native source contains a symlink: {path.relative_to(raw)}"
+                        )
+                    excluded_runtime_paths.append(path.relative_to(raw).as_posix())
+                    continue
                 if fresh_source and path.name == ".pytest_cache" and path.is_dir():
                     excluded_runtime_paths.append(path.relative_to(raw).as_posix())
                     continue
@@ -1163,6 +1175,7 @@ def install_native_hooks(trial: object, boundary: dict[str, object]) -> None:
             expected=expected,
             image_id=str(image["image_id"]),
             fresh_source=True,
+            agent_workspace=True,
         )
         codex.write_json(area / "artifacts/submission-source.json", receipt)
 
@@ -2123,6 +2136,7 @@ def _native_submission(
             expected=expected,
             image_id=str(image["image_id"]),
             fresh_source=True,
+            agent_workspace=True,
         )
     if inspect_snapshot(area / "workspace")["digest"] != receipt["snapshot_digest"]:
         raise ValueError("Frozen native submission changed before measurement")
