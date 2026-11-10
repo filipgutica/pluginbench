@@ -277,8 +277,94 @@ def test_a_stopped_run_reads_as_stopped_not_failed(
     status = run_status.run_status(root)
     assert status["phase"] == "stopped" and status["error"] is None
     assert status["last_event"]["event"] == "stopped"
+    assert status["resume_command"] == f"pluginbench run {root}"
     # Nothing owns the run, so its recorded `running` attempt is shown as interrupted.
     assert "  task-a  vanilla   pass interrupted" in run_status.format_status(status)
+
+
+def _killed(root: Path, **started: str) -> None:
+    """A worker that began and never recorded how it ended, as after SIGKILL or power loss."""
+    (root / "events.jsonl").write_text(
+        json.dumps({"event": "started", **started})
+        + "\n"
+        + json.dumps({"event": "progress", "message": "Coding 3/4: task-a"})
+        + "\n"
+    )
+
+
+def test_a_killed_run_reads_as_interrupted_and_says_how_to_resume(tmp_path: Path) -> None:
+    # The space checks that the printed command can be pasted into a shell.
+    root = _run(tmp_path / "my run", states=STATES, ledger=True)
+    _killed(root)
+
+    status = run_status.run_status(root)
+    shown = run_status.format_status(status)
+
+    assert status["phase"] == "interrupted" and status["error"] is None
+    assert status["resume_command"] == f"pluginbench run '{root}'"
+    assert "Phase: interrupted (no exit record)" in shown
+    assert f"Resume: pluginbench run '{root}'" in shown
+    # The summary agrees with the table: no process is running the recorded `running` attempt.
+    assert "Attempts: 4 slots: 2 complete, 1 interrupted, 1 pending" in shown
+    with run_lock.hold(root):
+        owned = run_status.run_status(root)
+        assert owned["phase"] == "coding" and owned["resume_command"] is None
+        assert "1 running" in run_status.format_status(owned)
+
+
+def test_a_killed_review_of_a_finished_run_offers_no_resume(tmp_path: Path) -> None:
+    root = _run(tmp_path / "run", states=dict.fromkeys(STATES, "complete"), ledger=True)
+    run = json.loads((root / "evidence/run.json").read_text())
+    _write(root / "evidence/run.json", {**run, "status": "complete"})
+    _write(root / "report/report.html", "")
+    _killed(root, command="review")
+
+    status = run_status.run_status(root)
+
+    assert status["phase"] == "interrupted" and status["resume_command"] is None
+    assert "Resume:" not in run_status.format_status(status)
+    # While a process owns a finished run, the same events are not a sign that it died.
+    with run_lock.hold(root):
+        assert run_status.run_status(root)["phase"] == "reviewing"
+    _killed(root)
+    with run_lock.hold(root):
+        assert run_status.run_status(root)["phase"] == "complete"
+
+
+@pytest.mark.parametrize(
+    "phase,revision,shown",
+    [
+        ("measuring", "observer-revisions/measurements/revision.json", "Measurement: measurements"),
+        ("reviewing", "review-revisions/review/review-state.json", "Review: review"),
+    ],
+)
+def test_a_run_killed_after_coding_shows_its_revision_as_interrupted(
+    tmp_path: Path, phase: str, revision: str, shown: str
+) -> None:
+    root = _run(tmp_path / "run", states=dict.fromkeys(STATES, "complete"), ledger=True)
+    run = json.loads((root / "evidence/run.json").read_text())
+    _write(root / "evidence/run.json", {**run, "status": "complete"})
+    selection = json.loads((root / "evaluation.json").read_text())
+    started: dict[str, dict[str, object]] = {
+        "measuring": {"measurement_required": True},
+        "reviewing": {"reviewer": {"harness": "codex"}},
+    }
+    _write(root / "evaluation.json", {**selection, **started[phase]})
+    in_progress = {"measuring": "collecting", "reviewing": "running"}[phase]
+    _write(root / "evidence" / revision, {"status": in_progress})
+    _killed(root)
+
+    status = run_status.run_status(root)
+    text = run_status.format_status(status)
+
+    assert status["phase"] == "interrupted"
+    # `run` decides whether this state can continue; status only names the command.
+    assert f"Resume: {status['resume_command']}" in text
+    assert f"{shown} interrupted" in text
+    with run_lock.hold(root):
+        owned = run_status.run_status(root)
+        assert owned["phase"] == phase and owned["resume_command"] is None
+        assert f"{shown} {in_progress}" in run_status.format_status(owned)
 
 
 def test_review_refuses_an_active_run_before_planning(tmp_path: Path) -> None:

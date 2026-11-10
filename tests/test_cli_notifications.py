@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable
@@ -84,6 +85,32 @@ def test_runs_without_the_flag_send_no_notices(
     monkeypatch.setattr(cli, "resume_evaluation", run)
     assert _run(tmp_path).exit_code == 0
     assert notices == []
+
+
+@pytest.mark.parametrize("installed", [False, True])
+def test_notify_without_a_notifier_warns_before_the_run_starts(
+    installed: bool, notices: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Preparation fails, so a warning in the output was printed before it.
+    def prepare(config: object, output: Path, *, progress: Callable[[str], None]) -> Path:
+        raise ValueError("measurements are not ready")
+
+    which = shutil.which
+    monkeypatch.setattr(cli, "prepare_evaluation", prepare)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: (
+            (installed and "/usr/bin/notify-send") or None if name == "notify-send" else which(name)
+        ),
+    )
+
+    result = _run(tmp_path, "--notify")
+
+    assert result.exit_code == 2
+    warning = "Warning: --notify needs notify-send, which is not on PATH"
+    assert result.stderr.count(warning) == (0 if installed else 1)
 
 
 @pytest.mark.parametrize(
