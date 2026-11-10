@@ -27,7 +27,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
                 "229d01b78fd893b8e502139507b74d18f0147079c58f15f90b0548b5520e67c5"
             ),
             "treatments.py": "e807503ac1809dd1030a6805702fe23da0d4cd07eb2d9f52d12069ae85f1926f",
-            "claude.py": "87951a73f68414d49253815480c683695e586b0c205adb6cbdb61101e887abd7",
+            "claude.py": "d769c7343dc7bd00a06baffb5282e67feca5580d7627b61d7648f23edb4cf4e9",
         },
     ),
     "analysis_observer": (
