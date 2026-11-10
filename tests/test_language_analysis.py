@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from pathlib import Path
@@ -343,6 +344,27 @@ def test_native_rust_diagnostics_require_complete_compiled_source_population(
         _rust_report(payload, tmp_path, ["unused.rs", "feature_excluded.rs"], "/app")
 
 
+def test_rust_dep_info_from_c_build_scripts_closes_the_source_population(
+    tmp_path: Path,
+) -> None:
+    """Build scripts leave C dep-info beside rustc's, with rules continued across lines."""
+    from pluginbench.language_analysis import _rust_report
+
+    report = (
+        "rustc 1.92.0 (ded5c06cf 2025-12-08)\ncargo 1.92.0 (344c4567c 2025-10-21)\n"
+        + json.dumps({"reason": "build-finished", "success": True})
+        + "\n__PLUGINBENCH_DEPINFO__\n"
+    )
+    c_rule = "/tmp/target/build/shim.o: shim.c \\\n  /usr/include/stdio.h\n"
+    rust_rule = "/tmp/target/debug/sample.d: /app/src/with\\ space.rs /app/unused.rs\n"
+
+    paths = ["src/with space.rs", "unused.rs"]
+    assert _rust_report(report + c_rule + rust_rule, tmp_path, paths, "/app") == []
+    # Dep-info that still cannot be split leaves this one measure unavailable, not the run dead.
+    with pytest.raises(AnalysisUnavailable, match="dep-info could not be read"):
+        _rust_report(report + "shim.o: /usr/include/it's.h\n", tmp_path, paths, "/app")
+
+
 def test_analysis_settings_and_implementation_drift_are_fatal(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -354,6 +376,40 @@ def test_analysis_settings_and_implementation_drift_are_fatal(tmp_path: Path) ->
     config["settings"] = {"vulture_min_confidence": 100}
     with pytest.raises(ValueError, match="settings differ"):
         collect_language_analysis(source, config, tmp_path / "evidence")
+
+
+def test_a_profile_frozen_before_the_dep_info_fix_still_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runs prepared on 942f12c keep their analysis measurements, and the observer's guard."""
+    source = tmp_path / "source"
+    source.mkdir()
+    config = prepare_analysis_config("rust", ["*"], ["*"], {})
+    # sha256 of language_analysis.py at 942f12c, as that commit froze it into every profile.
+    config["implementation_sha256"] = (
+        "bc09200c57bf78d403d9f5b473d16af5ea653059dc06559ae3c86ba4652b9744"
+    )
+
+    analysis, _ = collect_language_analysis(source, config, tmp_path / "evidence")
+
+    assert analysis["analyzed_paths"] == []
+
+    observer = Path(inspect.getfile(collect_language_analysis))
+    read_bytes = Path.read_bytes
+
+    def rewrite_observer(*_: object, **__: object) -> tuple[dict[str, object], str]:
+        monkeypatch.setattr(
+            Path,
+            "read_bytes",
+            lambda path: b"rewritten" if path == observer else read_bytes(path),
+        )
+        return {}, "unused"
+
+    monkeypatch.setattr(
+        "pluginbench.language_analysis._collect_language_analysis", rewrite_observer
+    )
+    with pytest.raises(ValueError, match="bytes changed during execution"):
+        collect_language_analysis(source, config, tmp_path / "evidence-2")
 
 
 def test_vulture_distribution_bytes_are_frozen_and_required(tmp_path: Path) -> None:

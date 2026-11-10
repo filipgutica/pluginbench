@@ -687,7 +687,14 @@ def _rust_report(raw: str, root: Path, paths: list[str], workdir: str) -> list[d
     for line in depinfo.splitlines():
         if ": " not in line:
             continue
-        for filename in shlex.split(line.split(": ", 1)[1]):
+        # C build scripts leave Make dep-info beside rustc's and end a continued rule with a
+        # backslash. rustc writes each rule on one line, so only that marker is dropped.
+        prerequisites = re.sub(r"(?<!\\)\\$", "", line.split(": ", 1)[1])
+        try:
+            filenames = shlex.split(prerequisites)
+        except ValueError as exc:
+            raise AnalysisUnavailable(f"Rust dep-info could not be read: {exc}") from exc
+        for filename in filenames:
             relative = filename.removeprefix(workdir + "/")
             if relative in paths:
                 compiled.add(relative)
@@ -851,10 +858,21 @@ def _collect_language_analysis(
     }, VERSION
 
 
+# Earlier versions of this file whose analysis this one reproduces, so the profiles they froze
+# still load. Each returns the same result wherever it returned one.
+_EQUIVALENT_IMPLEMENTATIONS = frozenset(
+    {
+        # 942f12c: Rust dep-info that shlex could not split raised ValueError and ended the run.
+        "bc09200c57bf78d403d9f5b473d16af5ea653059dc06559ae3c86ba4652b9744",
+    }
+)
+
+
 def _analysis_tools(language: str, config: dict[str, object]) -> dict[str, dict[str, object]]:
     implementation = config.get("implementation_sha256")
     if (
         implementation is not None
+        and implementation not in _EQUIVALENT_IMPLEMENTATIONS
         and implementation != hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     ):
         raise ValueError("Analysis observer implementation changed after freezing")
@@ -882,11 +900,17 @@ def collect_language_analysis(
 ) -> tuple[dict[str, object], str]:
     language = _string(config["language"])
     tools = _analysis_tools(language, config)
+    # A profile frozen by an equivalent earlier version does not pin this file's bytes, so they
+    # are compared here as well.
+    implementation = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     before = inspect_snapshot(root)["digest"]
     try:
         return _collect_language_analysis(root, config, destination, tools, timeout=timeout)
     finally:
-        if _analysis_tools(language, config) != tools:
+        if (
+            _analysis_tools(language, config) != tools
+            or hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != implementation
+        ):
             raise ValueError("Analysis observer bytes changed during execution")
         if inspect_snapshot(root)["digest"] != before:
             raise ValueError("Analysis modified measured source")
