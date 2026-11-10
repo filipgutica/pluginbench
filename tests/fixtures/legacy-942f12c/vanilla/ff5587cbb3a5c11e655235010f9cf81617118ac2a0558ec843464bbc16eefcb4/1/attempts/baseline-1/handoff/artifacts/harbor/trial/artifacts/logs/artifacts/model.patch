@@ -1,0 +1,7 @@
+diff --git a/answer.py b/answer.py
+index 3439c4a..3ee5ee9 100644
+--- a/answer.py
++++ b/answer.py
+@@ -1 +1 @@
+-answer = 0
++answer = 1

@@ -17,7 +17,7 @@ from collections.abc import Callable
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
-from pluginbench import baselines, claude, codex, harbor_backend, isolation, submissions
+from pluginbench import baselines, claude, codex, components, harbor_backend, isolation, submissions
 from pluginbench.treatments import Treatment, resolve_treatment, treatment_inventory
 from pluginbench.native_treatments import NativeCapabilities, DELIVERY_POLICY, admit
 from pluginbench.task_sources import Tasks, cache_root
@@ -348,24 +348,34 @@ def _caches(output: Path) -> _Caches:
     return caches
 
 
-# Modules that decide how a coding attempt is launched. Session parsing lives in
-# codex_events.py, outside this list, so a parser-only change keeps every vanilla cache key.
-_LAUNCHER_MODULES = (
-    "codex.py",
-    "harbor_backend.py",
-    "processes.py",
-    "native_treatments.py",
-    "native_treatment_runtime.js",
-    "treatments.py",
-)
-
-
 def _launcher_sha256(harness: str) -> dict[str, str]:
-    names = (*_LAUNCHER_MODULES, *(["claude.py"] if harness == "claude" else []))
-    return {
-        name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-        for name in names
-    }
+    return {name: components.source_sha256(name) for name in components.launcher_files(harness)}
+
+
+def _assert_launcher(
+    selection: dict[str, object], identity: dict[str, object] | None, harness: str
+) -> None:
+    """Coding resumes only with the launcher version that coded the run's earlier attempts."""
+    current = components.VERSIONS["launcher"]
+    try:
+        if identity is None:
+            isolation = _object(_object(selection["comparison_identity"])["isolation"])
+            saved = harbor_backend.runtime_contract(isolation)["launcher_version"]
+        elif "launcher_version" in identity:
+            saved = identity["launcher_version"]
+        else:
+            saved = components.saved_launcher_version(harness, identity.get("launcher_sha256"))
+    except components.UnknownSourceError as error:
+        raise ValueError(
+            f"{error}. This build's launcher is version {current}: resume this run with the "
+            "build that started it, or start a new run"
+        ) from error
+    if saved != current:
+        raise ValueError(
+            f"this run codes with PluginBench launcher version {saved}, and this build's "
+            f"launcher is version {current}: resume this run with the build that started it, "
+            "or start a new run"
+        )
 
 
 def _vanilla_identity(
@@ -386,6 +396,7 @@ def _vanilla_identity(
         "timeout_seconds": config.timeout_seconds,
         "jobs": config.jobs,
         "seed": config.seed,
+        "launcher_version": components.VERSIONS["launcher"],
         "launcher_sha256": _launcher_sha256(config.runner.harness),
         # run_study binds the same settings from its frozen recipe.
         "study": {
@@ -741,7 +752,7 @@ def prepare_evaluation(
         ):
             raise ValueError("fixed review criteria changed during preparation")
     recipe = {
-        "schema_version": 2,
+        "schema_version": 3,
         "backend": "harbor",
         "harness_version": harness_versions[config.runner.harness],
         "container_cpus": config.container_cpus,
@@ -842,23 +853,18 @@ def _code(
     # Runs prepared before vanilla identities were saved resume without the vanilla cache.
     identity = _object(json.loads(identity_path.read_text())) if identity_path.is_file() else None
     resuming = (evidence / "run.json").is_file()
-    if resuming and _coding_left(root, selection):
+
+    def same_coder() -> None:
+        # Checked only once reconciliation has found a slot left to code.
         version = _harness_version(config.runner.harness)
         if version != recipe["harness_version"]:
             raise ValueError(
                 f"{config.runner.harness} CLI is {version}, but this run codes with "
                 f"{recipe['harness_version']}; install that version to resume it"
             )
-    if (
-        resuming
-        and identity
-        and identity["launcher_sha256"] != _launcher_sha256(config.runner.harness)
-    ):
-        identity = None
-        if progress:
-            progress(
-                "Launcher code changed since this run started; new vanilla attempts are not cached"
-            )
+        # One comparison must not hold attempts coded by two launchers.
+        _assert_launcher(selection, identity, config.runner.harness)
+
     if resuming:
         resume_study(
             evidence,
@@ -866,6 +872,7 @@ def _code(
             baseline_cache=_caches(root).vanilla if identity else None,
             baseline_identity=identity,
             guard=guard,
+            before_coding=same_coder,
         )
     else:
         run_study(

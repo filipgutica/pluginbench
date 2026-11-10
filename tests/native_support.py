@@ -8,7 +8,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from pluginbench import harbor_backend, submissions
+from pluginbench import components, harbor_backend, submissions
 from pluginbench.assessment_metrics import inspect_snapshot
 
 
@@ -84,6 +84,7 @@ def runtime_identity() -> dict[str, object]:
     return {
         "protocol": harbor_backend.PROTOCOL,
         "harbor_version": "0.24.0",
+        "launcher_version": components.VERSIONS["launcher"],
         "implementation_sha256": "a" * 64,
         "submission_receipt_version": 2,
         "docker_cli": executable("docker", "1"),
@@ -96,6 +97,7 @@ def runtime_identity() -> dict[str, object]:
             "version": "29.5.3",
             "platform": "linux/arm64",
             "endpoint": "unix:///var/run/docker.sock",
+            "capacity": {"cpus": 8, "memory_bytes": 32 * 1024**3},
         },
         "resources": {"cpus": 1, "memory_mb": 2048},
     }

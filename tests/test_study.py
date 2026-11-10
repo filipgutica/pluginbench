@@ -11,7 +11,12 @@ import yaml
 from pluginbench import codex, study, isolation, harbor_backend, submissions
 from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.datasets import native_identity
-from native_support import task_entry, execution as native_execution, synthetic_contract
+from native_support import (
+    task_entry,
+    execution as native_execution,
+    runtime_identity,
+    synthetic_contract,
+)
 
 
 def _recipe(tmp_path: Path) -> Path:
@@ -38,7 +43,7 @@ def _recipe(tmp_path: Path) -> Path:
 def _offline_harbor(monkeypatch: pytest.MonkeyPatch) -> None:
     # Native preparation/admission is tested separately; retain real reconstruction here.
     monkeypatch.setattr(submissions, "reviewed_contract", synthetic_contract)
-    identity = {"resources": {"cpus": 1, "memory_mb": 2048}, "offline": True}
+    identity = runtime_identity()
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: identity)
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
 
@@ -128,7 +133,7 @@ def test_harbor_submissions_use_trusted_grading_and_keep_missing_values(
     path.write_text(yaml.safe_dump(document))
     runtime = {"protocol": "offline-harbor-fixture"}
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: runtime)
-    monkeypatch.setattr(harbor_backend, "assert_runtime", lambda expected: None)
+    monkeypatch.setattr(harbor_backend, "assert_runtime", lambda expected, **kwargs: expected)
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
     monkeypatch.setattr(
         harbor_backend, "invoke_native", lambda **kwargs: pytest.fail("coding must use Harbor")
@@ -191,7 +196,7 @@ def test_runtime_drift_stops_new_calls_and_preserves_completed_submission(
     calls = _fake_runtime(monkeypatch)
     native = harbor_backend.invoke_native
     runtime = harbor_backend
-    identity = {"resources": {"cpus": 1, "memory_mb": 2048}, "offline": True}
+    identity = runtime_identity()
     monkeypatch.setattr(runtime, "runtime_identity", lambda **kwargs: identity)
 
     def changed_runtime(**kwargs: Any) -> dict[str, Any]:
@@ -947,3 +952,25 @@ def test_parallel_interrupt_drains_active_cost_and_stops_queued_attempts(
     assert all(len(record["stages"]) == 1 for record in records)
     observed = [record for record in records if record["id"] in calls]
     assert all(record["stages"][0]["work"]["tokens"]["output_tokens"] == 5 for record in observed)
+
+
+def test_a_replaced_docker_engine_without_the_prepared_images_stops_before_any_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Engine ID is recorded, not compared, so a reset engine is found by its missing images.
+    recipe = study.load_study(_recipe(tmp_path))
+    calls = _fake_runtime(monkeypatch)
+    replaced = runtime_identity()
+    engine = replaced["docker_engine"]
+    assert isinstance(engine, dict)
+    engine["id"] = "replacement-engine"
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: replaced)
+
+    def missing(reference: str, **kwargs: Any) -> dict[str, object]:
+        raise ValueError("No such image: " + reference)
+
+    monkeypatch.setattr(harbor_backend, "_inspect_image", missing)
+    with pytest.raises(ValueError, match="prepared on Docker engine daemon-one") as raised:
+        study.run_study(recipe, tmp_path / "results")
+    assert "the current engine replacement-engine does not hold its image" in str(raised.value)
+    assert calls == []

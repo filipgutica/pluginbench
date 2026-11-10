@@ -15,12 +15,12 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
-from pluginbench import harbor_backend, submissions
+from pluginbench import components, harbor_backend, submissions
 from pluginbench.codex_events import failed_before_first_turn
 from pluginbench.native_treatments import DELIVERY_POLICY, NativeCapabilities
 from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.assessment_models import AttemptInput
-from pluginbench.datasets import TaskSpec, native_identity, portable_native_identity
+from pluginbench.datasets import TaskSpec, native_identity, portable_native_identity, task_digest
 
 
 def _hash(value: object) -> str:
@@ -127,7 +127,9 @@ def _eligible(*, attempt: Path, record: dict[str, Any], coding: object, task: Ta
         or toolchain.get("image_id") != image.get("image_id")
         or toolchain.get("harness") != settings.get("harness")
         or toolchain.get("harness_version") != coding.get("harness_version")
-        or identity.get("isolation") != expected
+        or not isinstance(identity.get("isolation"), dict)
+        or harbor_backend.runtime_contract(identity["isolation"])
+        != harbor_backend.runtime_contract(expected)
     ):
         return False
     runtime = record.get("runtime") or {}
@@ -200,9 +202,13 @@ def _matches_native_stage(
         coding["study"],
     )
     artifacts = target / "artifacts"
-    if not _matches_docker_client(artifacts, expected):
-        return False
     invocation = json.loads((artifacts / "invocation.json").read_text())
+    # Attempts record the runtime they ran with; entries from before that ran with the cohort's.
+    ran_with = invocation.get("runtime", expected)
+    if harbor_backend.runtime_contract(ran_with) != harbor_backend.runtime_contract(expected):
+        return False
+    if not _matches_docker_client(artifacts, ran_with):
+        return False
     observed_identity = invocation.get("native_task_identity")
     if (
         not isinstance(observed_identity, dict)
@@ -371,32 +377,129 @@ def cohort_contexts(
     return contexts
 
 
+def _cohort_contract(context: dict[str, Any]) -> dict[str, Any]:
+    """What a cached cohort must share with this run: its context with runtimes as contracts.
+
+    Runtime recorded and fit fields and launcher source hashes are left out, and saved
+    hashes become their launcher version. The task digest covers the full native identity,
+    runtime included, so it is left out too; `_same_cohort` checks it separately.
+    """
+    contract = copy.deepcopy({key: value for key, value in context.items() if key != "task_digest"})
+    coding = contract["coding"]
+    coding["isolation"] = harbor_backend.runtime_contract(coding["isolation"])
+    for key in ("native_task_identity", "task_environment"):
+        if isinstance(coding.get(key), dict) and "isolation" in coding[key]:
+            coding[key]["isolation"] = harbor_backend.runtime_contract(coding[key]["isolation"])
+    hashes = coding.pop("launcher_sha256", None)
+    if hashes is not None and "launcher_version" not in coding:
+        study = coding.get("study")
+        coding["launcher_version"] = components.saved_launcher_version(
+            study.get("harness") if isinstance(study, dict) else None, hashes
+        )
+    return contract
+
+
+def _cohort_key(context: dict[str, Any], task: TaskSpec) -> str:
+    contract = _cohort_contract(context)
+    contract["task_digest"] = task_digest(task, contract["coding"]["native_task_identity"])
+    return _hash(contract)
+
+
+def _same_cohort(saved: object, contract: dict[str, Any], task: TaskSpec) -> bool:
+    """A saved context matches when its contract is equal and its own task digest still holds.
+
+    Recomputing the digest from the saved native identity binds prompt, source, file modes and
+    provenance exactly. Anything unreadable, or saved by a build this one cannot vouch for,
+    does not match.
+    """
+    if not isinstance(saved, dict):
+        return False
+    try:
+        return bool(
+            _cohort_contract(saved) == contract
+            and task_digest(task, saved["coding"]["native_task_identity"]) == saved["task_digest"]
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _saved_match(entry: Path, contract: dict[str, Any], task: TaskSpec) -> bool:
+    """A saved `<key>/<repeat>` entry whose manifest is readable and whose context matches."""
+    try:
+        context = json.loads((entry / "manifest.json").read_text())["context"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return _same_cohort(context, contract, task)
+
+
+def _saved_cohort(cohort: Path, contract: dict[str, Any], task: TaskSpec) -> bool:
+    """A saved cohort directory with any matching repeat; one that cannot be listed has none."""
+    try:
+        entries = sorted(cohort.iterdir())
+    except OSError:
+        return False
+    return any(_saved_match(entry, contract, task) for entry in entries)
+
+
+def _cohorts(path: Path, key: str, contract: dict[str, Any], task: TaskSpec) -> list[Path]:
+    """Directories that may hold this task's repeats: its own key, then saved cohorts.
+
+    A saved cohort, such as one an older PluginBench keyed by its full runtime, qualifies
+    when any of its repeats matches; its name then is that older key.
+    """
+    saved = [
+        cohort
+        for cohort in (sorted(path.iterdir()) if path.is_dir() else [])
+        if cohort.name != key
+        and not cohort.name.startswith(".")
+        and not cohort.is_symlink()
+        and cohort.is_dir()
+        and _saved_cohort(cohort, contract, task)
+    ]
+    return [path / key, *saved]
+
+
+def _resolve(
+    cohorts: list[Path], repeat: int, contract: dict[str, Any], task: TaskSpec
+) -> Path | None:
+    """Where a repeat is found: the run's own key, else the first saved cohort that matches."""
+    own, *saved = (cohort / str(repeat) for cohort in cohorts)
+    if own.exists():
+        return own
+    return next((entry for entry in saved if _saved_match(entry, contract, task)), None)
+
+
 def preview(
     *, path: Path, tasks: tuple[TaskSpec, ...], repeats: int, identity: dict[str, object]
 ) -> list[dict[str, object]]:
-    """Hit or miss for every vanilla attempt from cache keys alone; `reserve` still validates."""
+    """Hit or miss for every vanilla attempt from saved entries alone; `reserve` validates."""
     entries: list[dict[str, Any]] = [
         {"task_id": task.task_id, "arm": "baseline", "attempt": repeat}
         for task in tasks
         for repeat in range(1, repeats + 1)
     ]
-    keys = {
-        task_id: _hash(context)
-        for task_id, context in cohort_contexts(
-            tasks=tasks, entries=entries, identity=identity
-        ).items()
+    contexts = cohort_contexts(tasks=tasks, entries=entries, identity=identity)
+    contracts = {task.task_id: _cohort_contract(contexts[task.task_id]) for task in tasks}
+    cohorts = {
+        task.task_id: _cohorts(
+            path, _cohort_key(contexts[task.task_id], task), contracts[task.task_id], task
+        )
+        for task in tasks
     }
-    return [
-        {
-            "task_id": entry["task_id"],
-            "repeat": entry["attempt"],
-            "status": "hit"
-            if (path / keys[entry["task_id"]] / str(entry["attempt"])).is_dir()
-            else "miss",
-            "cache_key": keys[entry["task_id"]],
-        }
-        for entry in entries
-    ]
+    by_id = {task.task_id: task for task in tasks}
+    rows = []
+    for entry in entries:
+        task_id = entry["task_id"]
+        found = _resolve(cohorts[task_id], entry["attempt"], contracts[task_id], by_id[task_id])
+        rows.append(
+            {
+                "task_id": entry["task_id"],
+                "repeat": entry["attempt"],
+                "status": "hit" if found else "miss",
+                "cache_key": (found.parent if found else cohorts[entry["task_id"]][0]).name,
+            }
+        )
+    return rows
 
 
 class BaselineCache:
@@ -420,8 +523,16 @@ class BaselineCache:
         self.tasks = {task.task_id: task for task in tasks}
         self.entries = [entry for entry in entries if entry["arm"] == "baseline"]
         self.contexts = cohort_contexts(tasks=tasks, entries=self.entries, identity=identity)
-        self.keys = {task_id: _hash(context) for task_id, context in self.contexts.items()}
+        self.contracts = {
+            task_id: _cohort_contract(context) for task_id, context in self.contexts.items()
+        }
+        self.keys = {
+            task_id: _cohort_key(context, self.tasks[task_id])
+            for task_id, context in self.contexts.items()
+        }
         self.hits: dict[tuple[str, int], dict[str, Any]] = {}
+        # Where each hit lives: this run's own key, or a saved cohort under an older key.
+        self.origins: dict[tuple[str, int], Path] = {}
         self._resources = ExitStack()
 
     def reserve(self) -> BaselineCache:
@@ -432,33 +543,73 @@ class BaselineCache:
             raise ValueError("baseline cache locks must not follow symlinks")
         try:
             for task_id, key in sorted(self.keys.items(), key=lambda item: item[1]):
-                lock_path = self.path / ".locks" / f"{key}.lock"
-                if lock_path.is_symlink():
-                    raise ValueError("baseline cache lock must not follow symlinks")
-                lock = self._resources.enter_context(lock_path.open("a"))
-                cohort = self.path / key
-                if cohort.is_symlink():
-                    raise ValueError("baseline cache cohort must not follow symlinks")
-                repeats = self.contexts[task_id]["repeats"]
-                cached = {repeat: cohort / str(repeat) for repeat in repeats}
-                if any(path.is_symlink() for path in cached.values()):
-                    raise ValueError("baseline cache entry must not follow symlinks")
-                try:
-                    # Exclusive while this run may still publish a missing repeat.
-                    complete = all(path.exists() for path in cached.values())
-                    mode = fcntl.LOCK_SH if complete else fcntl.LOCK_EX
-                    fcntl.flock(lock, mode | fcntl.LOCK_NB)
-                except BlockingIOError as exc:
-                    raise ValueError(
-                        f"baseline cache cohort is in use: {key}; wait for its owning run to finish"
-                    ) from exc
-                for repeat, path in cached.items():
-                    if path.exists():
-                        self.hits[(task_id, repeat)] = self._validate(task_id, path)
+                self._reserve(task_id, key)
         except BaseException:
             self.close()
             raise
         return self
+
+    def _reserve(self, task_id: str, key: str) -> None:
+        """Lock this task's cohorts and validate each repeat where it is first found.
+
+        Repeats resolve one by one, own key first, so a cohort that a 942f12c run started and
+        this build finished is read from both places.
+        """
+        cohorts = _cohorts(self.path, key, self.contracts[task_id], self.tasks[task_id])
+        if any(path.is_symlink() for path in cohorts):
+            raise ValueError("baseline cache cohort must not follow symlinks")
+        repeats = self.contexts[task_id]["repeats"]
+        task, contract = self.tasks[task_id], self.contracts[task_id]
+        found = {repeat: _resolve(cohorts, repeat, contract, task) for repeat in repeats}
+        if any(path is not None and path.is_symlink() for path in found.values()):
+            raise ValueError("baseline cache entry must not follow symlinks")
+        # Exclusive on this run's key while it may still publish a missing repeat; shared on
+        # saved cohorts, which this build only reads.
+        complete = all(found.values())
+        own = self._lock(key, fcntl.LOCK_SH if complete else fcntl.LOCK_EX)
+        readable = [cohorts[0]]
+        for cohort in cohorts[1:]:
+            try:
+                self._lock(cohort.name, fcntl.LOCK_SH)
+            except OSError:
+                continue  # A saved cohort whose lock cannot be opened is not read.
+            readable.append(cohort)
+        for repeat in repeats:
+            for cohort in readable:
+                entry = cohort / str(repeat)
+                if not entry.exists():
+                    continue
+                if cohort == cohorts[0]:
+                    manifest = self._validate(task_id, entry)
+                else:
+                    try:
+                        manifest = self._validate(task_id, entry)
+                    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                        # A saved entry that does not validate, malformed evidence included,
+                        # is not this repeat.
+                        continue
+                self.hits[(task_id, repeat)] = manifest
+                self.origins[(task_id, repeat)] = entry
+                break
+        if complete and not all((task_id, repeat) in self.hits for repeat in repeats):
+            self._flock(own, key, fcntl.LOCK_EX)
+
+    def _lock(self, key: str, mode: int) -> object:
+        lock_path = self.path / ".locks" / f"{key}.lock"
+        if lock_path.is_symlink():
+            raise ValueError("baseline cache lock must not follow symlinks")
+        lock = self._resources.enter_context(lock_path.open("a"))
+        self._flock(lock, key, mode)
+        return lock
+
+    @staticmethod
+    def _flock(lock: Any, key: str, mode: int) -> None:
+        try:
+            fcntl.flock(lock, mode | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError(
+                f"baseline cache cohort is in use: {key}; wait for its owning run to finish"
+            ) from exc
 
     def close(self) -> None:
         self._resources.close()
@@ -469,7 +620,7 @@ class BaselineCache:
             raise ValueError("baseline cache entry must be a directory")
         manifest: dict[str, Any] = json.loads((cached / "manifest.json").read_text())
         if (
-            manifest["context"] != self.contexts[task_id]
+            not _same_cohort(manifest["context"], self.contracts[task_id], self.tasks[task_id])
             or manifest["inventory"] != _inventory(cached)
             or manifest["origin_status"] != "complete"
         ):
@@ -485,10 +636,11 @@ class BaselineCache:
         if [record["attempt"] for record in records] != [int(cached.name)] or any(
             record["task_id"] != task_id
             or record["arm"] != "baseline"
+            # The evidence is checked against the identity it was cached under.
             or not _eligible(
                 attempt=cached / "attempts" / record["id"],
                 record=record,
-                coding=self.contexts[task_id]["coding"],
+                coding=manifest["context"]["coding"],
                 task=self.tasks[task_id],
             )
             for record in records
@@ -503,14 +655,14 @@ class BaselineCache:
         for entry in self.entries:
             task_id = entry["task_id"]
             hit = self.hits.get((task_id, entry["attempt"]))
+            origin = self.origins.get((task_id, entry["attempt"]))
+            key = origin.parent.name if origin else self.keys[task_id]
             # Relative to the cache root, so moving the cache or this run keeps it resolvable.
             # Historical decisions held an absolute `origin_run` path instead.
             decisions[entry["id"]] = {
                 "status": "hit" if hit else "miss",
-                "cache_key": self.keys[task_id],
-                "origin_cohort": f"{self.path.name}/{self.keys[task_id]}/{entry['attempt']}"
-                if hit
-                else None,
+                "cache_key": key,
+                "origin_cohort": f"{self.path.name}/{key}/{entry['attempt']}" if hit else None,
                 "origin_attempt": hit["records"][0]["id"] if hit else None,
             }
         return decisions
@@ -523,7 +675,7 @@ class BaselineCache:
             return None
         record: dict[str, Any] = copy.deepcopy(manifest["records"][0])
         old_id = record["id"]
-        cached = self.path / self.keys[entry["task_id"]] / str(entry["attempt"])
+        cached = self.origins[(entry["task_id"], entry["attempt"])]
         attempt = self.root / "attempts" / entry["id"]
         attempt.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(cached / "attempts" / old_id, attempt, symlinks=True)

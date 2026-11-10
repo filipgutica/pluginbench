@@ -30,6 +30,11 @@ REQUIRED_FLAGS = (
     "--json-schema",
 )
 AUTH_NAMES = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
+_NO_CREDENTIAL = (
+    "Claude authentication unavailable: neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY "
+    "is set in the environment of this process. A service, such as a systemd unit, does not "
+    "inherit a variable that a shell profile exports; set one in the service's environment"
+)
 READ_TOOLS = "Read,Glob,Grep"
 
 
@@ -119,13 +124,9 @@ def runtime_environment(
                     check=False,
                 )
             except OSError as error:
-                raise ValueError(
-                    "Claude authentication unavailable; export an OAuth token or API key"
-                ) from error
+                raise ValueError(_NO_CREDENTIAL) from error
             if credentials.returncode:
-                raise ValueError(
-                    "Claude authentication unavailable; export an OAuth token or API key"
-                )
+                raise ValueError(_NO_CREDENTIAL)
             try:
                 token = json.loads(credentials.stdout)["claudeAiOauth"]["accessToken"]
             except (KeyError, TypeError, ValueError) as error:
@@ -227,6 +228,20 @@ def observed_cli_version(startup: object) -> str | None:
     return versions[0] if len(set(versions)) == 1 else None
 
 
+def _builtin_plugin(plugin: object) -> bool:
+    """A plugin the CLI ships and loads by itself; no setting of the run selects it.
+
+    Its `path` is the word `builtin`, where an installed plugin has a directory. The set is
+    part of the CLI version, which the run records, and stays in the saved startup event.
+    """
+    return (
+        isinstance(plugin, dict)
+        and plugin.get("path") == "builtin"
+        and isinstance(plugin.get("name"), str)
+        and plugin.get("source") == f"{plugin['name']}@builtin"
+    )
+
+
 def parse_events(
     stdout: str, traces: list[str], host: str = "claude", *, requested_effort: str = "medium"
 ) -> dict[str, Any]:
@@ -255,9 +270,13 @@ def parse_events(
             startup.append(event)
             if isinstance(event.get("effort"), str) and event["effort"].strip():
                 efforts.add(event["effort"])
-            if any(
-                event.get(key)
-                for key in ("plugins", "mcp_servers", "plugin_errors", "mcp_server_errors")
+            plugins = event.get("plugins") or []
+            if (
+                not isinstance(plugins, list)
+                or not all(_builtin_plugin(plugin) for plugin in plugins)
+                or any(
+                    event.get(key) for key in ("mcp_servers", "plugin_errors", "mcp_server_errors")
+                )
             ):
                 errors.append("custom plugin or MCP configuration present in native startup")
         if event.get("type") == "system" and str(event.get("subtype", "")).startswith("hook_"):

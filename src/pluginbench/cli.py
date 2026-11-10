@@ -18,6 +18,7 @@ import typer
 import yaml
 
 from pluginbench import __version__, run_lock
+from pluginbench.isolation import RuntimeDriftError
 from pluginbench.evaluation import (
     CheckFailed,
     check_evaluation,
@@ -407,7 +408,13 @@ def run(
             _work(root, lock=lock, progress=progress, notify=notify)
         else:
             _detach(root, notify=notify)
-    except (OSError, ValueError, yaml.YAMLError, subprocess.SubprocessError) as exc:
+    except (
+        OSError,
+        ValueError,
+        yaml.YAMLError,
+        subprocess.SubprocessError,
+        RuntimeDriftError,
+    ) as exc:
         _error(exc)
     finally:
         owned.close()
@@ -429,7 +436,13 @@ def check(
         typer.echo("\n".join(_vanilla_cache_lines(report)))
         typer.echo(_readiness_table(report))
         typer.echo(f"Ready. Check: {destination / 'check.json'}")
-    except (OSError, ValueError, yaml.YAMLError, subprocess.SubprocessError) as exc:
+    except (
+        OSError,
+        ValueError,
+        yaml.YAMLError,
+        subprocess.SubprocessError,
+        RuntimeDriftError,
+    ) as exc:
         _error(exc)
 
 

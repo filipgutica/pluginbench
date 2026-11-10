@@ -1,0 +1,94 @@
+{
+  "inputs": {
+    "task_assets_sha256": "cad3bd7166b996096f94c4c6a011cfcb35a6e0f47c3ae2ea6d10e5214781f4b5",
+    "base_image": {
+      "image": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "image_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "platform": "linux/amd64",
+      "workdir": "/app"
+    },
+    "grader_base_image": {
+      "image": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "image_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "platform": "linux/amd64",
+      "workdir": "/app"
+    },
+    "harness": "codex",
+    "version": "0.208.0",
+    "resources": {
+      "cpus": 1,
+      "memory_mb": 256,
+      "setup_timeout": 600
+    },
+    "runtime": {
+      "protocol": "harbor-docker-v1",
+      "harbor_version": "0.24.0",
+      "submission_receipt_version": 2,
+      "codex_transport": {
+        "version": "codex-stdout-stderr-v1",
+        "harbor_run_sha256": "5b14fbcc889a398f80c7b5f7e2a621efc1337ba72e748fafefbab2ad09ad86bd"
+      },
+      "implementation_sha256": "066f9a3641d85ae8d109357b545e82973d4eb8a7bb7c5fbed4eed29c96df62b8",
+      "docker_cli": {
+        "path": "/fixture/bin/docker",
+        "resolved_path": "/fixture/bin/docker",
+        "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "version": "29.0.0"
+      },
+      "docker_plugins": {
+        "compose": {
+          "path": "/fixture/bin/docker-compose",
+          "resolved_path": "/fixture/bin/docker-compose",
+          "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+          "version": "29.0.0"
+        },
+        "buildx": {
+          "path": "/fixture/bin/docker-buildx",
+          "resolved_path": "/fixture/bin/docker-buildx",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "version": "29.0.0"
+        }
+      },
+      "docker_engine": {
+        "id": "fixture-engine-at-preparation",
+        "version": "29.0.0",
+        "platform": "linux/x86_64",
+        "endpoint": "unix:///var/run/docker.sock",
+        "capacity": {
+          "cpus": 24,
+          "memory_bytes": 25198305280
+        }
+      },
+      "resources": {
+        "cpus": 1,
+        "memory_mb": 256,
+        "cpu_enforcement": "limit",
+        "memory_enforcement": "limit"
+      }
+    },
+    "install_sha256": "c9bdeebd44029c20f3fd215bab8dfa0082b22b6620a74d71fe1bb245de603a1c",
+    "policy": "native-task-and-qualified-patch-source-v3",
+    "source_policy": "reviewed-native-patch-source-v2",
+    "transport_policy": {
+      "name": "native-cli-provider-hosts-v1",
+      "provider_hosts": [
+        "api.openai.com",
+        "chatgpt.com",
+        "auth.openai.com"
+      ]
+    }
+  },
+  "files": {
+    "artifacts/": "directory:493",
+    "artifacts/native-preparation.json": "0a912c32388c564a6268d13d43012dd64237d1e9094a48ffc67bd8f2f556cd0b",
+    "fixture/": "directory:493",
+    "fixture/code.py": "ebe7fad953e35be93af628916fcbb17582656e6a6a2342b8f8143b2a960e5623",
+    "task/": "directory:493",
+    "task/environment/": "directory:493",
+    "task/environment/Dockerfile": "6071a35d52ddbae023c165887c33628c816ea570292ff366246fff2899a81bae",
+    "task/instruction.md": "bba88f8f1701b9cdd1fc45799e4fdc5de463d5243bfe4278ea5bfea335237205",
+    "task/task.toml": "668d0859bc03b338cbef577164cb614360af1e5f404db57c598f39c348b8dc63",
+    "task/tests/": "directory:493",
+    "task/tests/test.sh": "afa99617fef26333ccf27d6383ea8d5684e9356921cc93476ac1fafbff0a7a77"
+  }
+}

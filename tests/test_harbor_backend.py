@@ -21,6 +21,7 @@ from pluginbench import harbor_backend as harbor
 from pluginbench import isolation, native_treatments
 from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.processes import run_command
+from legacy_support import current_runtime, legacy_json
 
 
 def base_image() -> dict[str, str]:
@@ -45,6 +46,7 @@ def runtime() -> dict[str, Any]:
         "protocol": harbor.PROTOCOL,
         "harbor_version": harbor.HARBOR_VERSION,
         "codex_transport": {"version": "codex-stdout-stderr-v1", "harbor_run_sha256": "e" * 64},
+        "launcher_version": 1,
         "implementation_sha256": "a" * 64,
         "docker_cli": {
             "path": "/frozen/docker",
@@ -57,6 +59,7 @@ def runtime() -> dict[str, Any]:
             "version": "29.5",
             "platform": "linux/arm64",
             "endpoint": "unix:///private/docker.sock",
+            "capacity": {"cpus": 4, "memory_bytes": 8 * 1024**3},
         },
         "resources": {
             "cpus": 1,
@@ -226,8 +229,8 @@ def test_runtime_freezes_selected_docker_cli_and_plugins(
     assert actual["docker_plugins"] == plugins
     Path(plugins["compose"]["path"]).write_text("#!/bin/sh\nexit 1\n")
     assert harbor.runtime_identity()["docker_plugins"] != actual["docker_plugins"]
-    with pytest.raises(isolation.RuntimeDriftError, match="changed"):
-        harbor.assert_runtime(actual)
+    # Recorded, not compared: later Docker commands run the plugin installed now.
+    assert harbor.assert_runtime(actual)["docker_plugins"] != actual["docker_plugins"]
 
 
 @pytest.mark.parametrize("component", ["docker", "compose", "buildx"])
@@ -734,3 +737,173 @@ print('loaded')
         [sys.executable, "-c", script], cwd=tmp_path, text=True, capture_output=True, check=True
     )
     assert result.stdout.strip() == "loaded"
+
+
+# Every field a runtime contract compares exactly, with a value that differs from the saved one.
+EXACT_RUNTIME_CHANGES: dict[str, object] = {
+    "protocol": "harbor-docker-v2",
+    "harbor_version": "0.25.0",
+    "submission_receipt_version": 3,
+    "codex_transport.version": "codex-stdout-stderr-v2",
+    "codex_transport.harbor_run_sha256": "0" * 64,
+    "docker_engine.platform": "linux/arm64",
+    "resources.cpus": 3,
+    "resources.memory_mb": 4096,
+    "resources.cpu_enforcement": "reservation",
+    "resources.memory_enforcement": "reservation",
+    "launcher_version": 2,
+}
+
+
+def _leaves(value: dict[str, Any], prefix: str = "") -> set[str]:
+    return {
+        path
+        for key, item in value.items()
+        for path in (
+            _leaves(item, prefix + key + ".") if isinstance(item, dict) else {prefix + key}
+        )
+    }
+
+
+def test_every_exact_runtime_field_has_a_drift_case() -> None:
+    saved = legacy_json("runtime.json")
+    assert _leaves(harbor.runtime_contract(saved)) == set(EXACT_RUNTIME_CHANGES)
+
+
+@pytest.mark.parametrize("path", sorted(EXACT_RUNTIME_CHANGES))
+def test_a_changed_exact_runtime_field_is_refused_and_named(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    saved = legacy_json("runtime.json")
+    current = current_runtime(saved)
+    *parents, field = path.split(".")
+    node, before = current, saved
+    for key in parents:
+        node, before = node[key], before[key]
+    # 942f12c saved no launcher version; its harbor_backend.py hash reads as version 1.
+    was = 1 if path == "launcher_version" else before[field]
+    node[field] = EXACT_RUNTIME_CHANGES[path]
+    monkeypatch.setattr(harbor, "runtime_identity", lambda **kwargs: current)
+    expected = f"{path} was {json.dumps(was)}, is now {json.dumps(EXACT_RUNTIME_CHANGES[path])}"
+    with pytest.raises(isolation.RuntimeDriftError) as raised:
+        harbor.assert_runtime(saved)
+    assert expected in str(raised.value)
+    assert str(raised.value).endswith("Restore that runtime, or start a new run")
+
+
+def test_memory_jitter_in_a_942f12c_runtime_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    saved = legacy_json("runtime.json")
+    current = current_runtime(saved)
+    monkeypatch.setattr(harbor, "runtime_identity", lambda **kwargs: current)
+    assert harbor.assert_runtime(saved) == current
+
+
+def test_capacity_that_no_longer_fits_is_refused_with_both_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved = legacy_json("runtime.json")
+    current = current_runtime(saved)
+    # One 8192 MB container needs more than 80% of 8 GiB.
+    current["docker_engine"]["capacity"]["memory_bytes"] = 8 * 1024**3
+    monkeypatch.setattr(harbor, "runtime_identity", lambda **kwargs: current)
+    with pytest.raises(isolation.RuntimeDriftError, match="no longer fits") as raised:
+        harbor.assert_runtime(saved)
+    assert (
+        'docker_engine.capacity was {"cpus": 24, "memory_bytes": 25198305280}, is now '
+        '{"cpus": 24, "memory_bytes": 8589934592}'
+    ) in str(raised.value)
+    assert str(raised.value).endswith("Give Docker that capacity again, or start a new run")
+    # Concurrency the evaluation itself allows is checked without capacity_jobs' cap of 4.
+    current["docker_engine"]["capacity"]["memory_bytes"] = 25198305280 * 4
+    assert harbor.assert_runtime(saved, jobs=5)
+
+
+@pytest.mark.parametrize(("jobs", "fits"), [(1, True), (2, False)])
+def test_measurement_capacity_counts_the_largest_limits_run_at_once(
+    monkeypatch: pytest.MonkeyPatch, jobs: int, fits: bool
+) -> None:
+    small = legacy_json("runtime.json")  # 2 CPUs and 8192 MB
+    large = {**small, "resources": {**small["resources"], "memory_mb": 12288}}
+    current = current_runtime(small)
+    # The 80% budget of 20 GiB is 16384 MB: room for the larger container, not for both.
+    current["docker_engine"]["capacity"]["memory_bytes"] = 20 * 1024**3
+
+    def reported(*, cpus: int, memory_mb: int) -> dict[str, Any]:
+        return {**current, "resources": {**current["resources"], "memory_mb": memory_mb}}
+
+    monkeypatch.setattr(harbor, "runtime_identity", reported)
+    if fits:
+        harbor.assert_capacity([[small], [large], [small]], jobs=jobs)
+        return
+    with pytest.raises(isolation.RuntimeDriftError, match="need 4 CPUs and 20480 MB"):
+        harbor.assert_capacity([[small], [large], [small]], jobs=jobs)
+
+
+def test_recorded_runtime_fields_may_all_differ_and_docker_then_uses_the_current_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    saved = legacy_json("runtime.json")
+    current = current_runtime(saved)
+    plugins = docker_plugins(tmp_path / "plugins")
+    plugins["compose"]["version"] = "9.9.9"
+    current.update(docker_cli=docker_cli(tmp_path / "plugins"), docker_plugins=plugins)
+    current["docker_engine"].update(
+        id="replacement-engine", version="30.0.0", endpoint="unix:///replacement/docker.sock"
+    )
+    monkeypatch.setattr(harbor, "runtime_identity", lambda **kwargs: current)
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+    monkeypatch.setattr(harbor, "run_command", run)
+    runtime = harbor.assert_runtime(saved)
+    harbor._docker("info", expected_runtime=runtime)
+    assert calls == [
+        [current["docker_cli"]["resolved_path"], "--host", "unix:///replacement/docker.sock", "info"]
+    ]
+
+
+def test_an_unknown_saved_launcher_hash_is_refused_and_names_the_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved = {**legacy_json("runtime.json"), "implementation_sha256": "f" * 64}
+    monkeypatch.setattr(harbor, "runtime_identity", lambda **kwargs: current_runtime(saved))
+    with pytest.raises(ValueError, match="harbor_backend.py has sha256 ffffffffffff"):
+        harbor.assert_runtime(saved)
+
+
+class _FirstDockerCall(Exception):
+    pass
+
+
+def test_measurement_ignores_the_launcher_version_and_runs_the_current_docker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Measurement starts no coding agent. Its saved runtime names a Docker CLI that no longer
+    # exists, so only the current identity can reach Docker.
+    saved = legacy_json("runtime.json")
+    current = {**current_runtime(saved), "launcher_version": 2}
+    current["docker_cli"] = docker_cli(tmp_path)
+    monkeypatch.setattr(harbor, "runtime_identity", lambda **kwargs: current)
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        raise _FirstDockerCall
+
+    monkeypatch.setattr(harbor, "run_command", run)
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "index.ts").write_text("original code\n")
+    with pytest.raises(_FirstDockerCall):
+        harbor.run_native_command(
+            snapshot=snapshot,
+            task_identity={"isolation": saved, "image_identity": base_image(), "workdir": "/app"},
+            destination=tmp_path / "measurement",
+            command=["coverage"],
+            report_path="coverage/lcov.info",
+            timeout=10,
+        )
+    assert calls[0][:3] == [current["docker_cli"]["resolved_path"], "--host", "unix:///var/run/docker.sock"]

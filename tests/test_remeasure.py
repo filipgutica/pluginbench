@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from pluginbench import remeasure, study
+from native_support import runtime_identity
+from pluginbench import components, harbor_backend, isolation, remeasure, study
 from pluginbench.assessment_metrics import evaluate_evidence
 from pluginbench.assessment_models import AssessmentInput
 from pluginbench.collectors import Collector, collect_measurements
@@ -1010,3 +1011,98 @@ def test_reference_comparison_reextracts_stored_raw_evidence(tmp_path: Path) -> 
     (after / "src/index.ts").write_text("changed\n")
     with pytest.raises(ValueError, match="reference snapshot changed"):
         remeasure.reference_comparison(root, reference)
+
+
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_measurement_checks_capacity_for_the_containers_it_runs_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, jobs: int
+) -> None:
+    # Two inputs, each measured in an 8 GiB container. Docker now has 16 GiB, whose 80%
+    # budget holds one such container, not two.
+    root = _native(tmp_path / "run")
+    saved = {**runtime_identity(), "resources": {"cpus": 2, "memory_mb": 8192}}
+    config = tmp_path / "native-coverage.json"
+    _write(
+        config,
+        {
+            "native_task_identity": {"isolation": saved},
+            "test_scope": ["tests/**"],
+            "observer_version": components.VERSIONS["coverage_observer"],
+        },
+    )
+    profiles = {
+        "task": [
+            Collector(
+                kind="coverage",
+                config=config,
+                scope=["value.js"],
+                command=["npm", "test"],
+                report_format="lcov",
+                report_path="coverage/lcov.info",
+                tool_version="coverage-tool 1",
+            )
+        ]
+    }
+    current = json.loads(json.dumps(runtime_identity()))
+    current["docker_engine"]["capacity"] = {"cpus": 8, "memory_bytes": 16 * 1024**3}
+    monkeypatch.setattr(
+        harbor_backend,
+        "runtime_identity",
+        lambda *, cpus, memory_mb: {**current, "resources": {"cpus": cpus, "memory_mb": memory_mb}},
+    )
+    started: list[Path] = []
+
+    def collecting(snapshot: Path, evidence_dir: Path, *args: object, **kwargs: object) -> None:
+        started.append(evidence_dir)
+        raise LookupError("collection reached")
+
+    monkeypatch.setattr(remeasure, "collect_measurements", collecting)
+    if jobs == 1:
+        with pytest.raises(LookupError, match="collection reached"):
+            remeasure.propose_remeasurement(root, profiles=profiles, revision="one", jobs=1)
+        assert started
+        return
+    with pytest.raises(isolation.RuntimeDriftError, match="2 containers at once need 4 CPUs"):
+        remeasure.propose_remeasurement(root, profiles=profiles, revision="two", jobs=2)
+    assert started == []
+
+
+def test_measurement_capacity_counts_each_inputs_largest_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # One task's Rust analysis runs in 2 GiB and its coverage in 12 GiB, one after another.
+    # Two inputs at once need room for two 12 GiB containers, which 16 GiB does not hold.
+    root = _native(tmp_path / "run")
+    analysis, coverage = tmp_path / "analysis.json", tmp_path / "coverage.json"
+    small = {**runtime_identity(), "resources": {"cpus": 1, "memory_mb": 2048}}
+    large = {**runtime_identity(), "resources": {"cpus": 1, "memory_mb": 12288}}
+    _write(analysis, {"language": "rust", "native_task_identity": {"isolation": small}})
+    _write(coverage, {"native_task_identity": {"isolation": large}})
+    profiles = {
+        "task": [
+            Collector(kind="analysis", config=analysis, scope=["src/**"]),
+            Collector(
+                kind="coverage",
+                config=coverage,
+                scope=["value.js"],
+                command=["npm", "test"],
+                report_format="lcov",
+                report_path="coverage/lcov.info",
+                tool_version="coverage-tool 1",
+            ),
+        ]
+    }
+    current = json.loads(json.dumps(runtime_identity()))
+    current["docker_engine"]["capacity"] = {"cpus": 8, "memory_bytes": 16 * 1024**3}
+    monkeypatch.setattr(
+        harbor_backend,
+        "runtime_identity",
+        lambda *, cpus, memory_mb: {**current, "resources": {"cpus": cpus, "memory_mb": memory_mb}},
+    )
+    monkeypatch.setattr(
+        remeasure,
+        "collect_measurements",
+        lambda *args, **kwargs: pytest.fail("no container may start"),
+    )
+    with pytest.raises(isolation.RuntimeDriftError, match="need 2 CPUs and 24576 MB"):
+        remeasure.propose_remeasurement(root, profiles=profiles, revision="mixed", jobs=2)

@@ -1,0 +1,73 @@
+{
+  "cleanup": {
+    "project": "fixture",
+    "status": "complete"
+  },
+  "fixture_dir": "/prepared/fixture",
+  "grader_image_identity": {
+    "image": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "image_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": "linux/amd64",
+    "workdir": "/app"
+  },
+  "image_identity": {
+    "image": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "image_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": "linux/amd64",
+    "workdir": "/app"
+  },
+  "isolation": {
+    "codex_transport": {
+      "harbor_run_sha256": "5b14fbcc889a398f80c7b5f7e2a621efc1337ba72e748fafefbab2ad09ad86bd",
+      "version": "codex-stdout-stderr-v1"
+    },
+    "docker_cli": {
+      "path": "/fixture/bin/docker",
+      "resolved_path": "/fixture/bin/docker",
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "version": "29.0.0"
+    },
+    "docker_engine": {
+      "capacity": {
+        "cpus": 24,
+        "memory_bytes": 25198305280
+      },
+      "endpoint": "unix:///var/run/docker.sock",
+      "id": "fixture-engine-at-preparation",
+      "platform": "linux/x86_64",
+      "version": "29.0.0"
+    },
+    "docker_plugins": {
+      "buildx": {
+        "path": "/fixture/bin/docker-buildx",
+        "resolved_path": "/fixture/bin/docker-buildx",
+        "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "version": "29.0.0"
+      },
+      "compose": {
+        "path": "/fixture/bin/docker-compose",
+        "resolved_path": "/fixture/bin/docker-compose",
+        "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "version": "29.0.0"
+      }
+    },
+    "harbor_version": "0.24.0",
+    "implementation_sha256": "066f9a3641d85ae8d109357b545e82973d4eb8a7bb7c5fbed4eed29c96df62b8",
+    "protocol": "harbor-docker-v1",
+    "resources": {
+      "cpu_enforcement": "limit",
+      "cpus": 1,
+      "memory_enforcement": "limit",
+      "memory_mb": 256
+    },
+    "submission_receipt_version": 2
+  },
+  "source_digest": "sha256:580b4522fca9a5c42e0ccb18359fdd35815a13904db2366898c99cc57caa6045",
+  "status": "complete",
+  "task_assets_sha256": "cad3bd7166b996096f94c4c6a011cfcb35a6e0f47c3ae2ea6d10e5214781f4b5",
+  "task_dir": "/prepared/task",
+  "toolchain_identity": {
+    "harness": "codex",
+    "image_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  }
+}

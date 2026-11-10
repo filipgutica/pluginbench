@@ -175,15 +175,18 @@ def test_native_cache_reuses_failed_attempts_and_unknown_usage_without_observers
         "grader_image",
         "source",
         "task_assets",
-        "runtime",
+        "engine-id",
+        "platform",
         "toolchain",
         "trusted_tests",
         "source_policy",
         "delivery",
         "capabilities",
+        "unchanged",
     ],
 )
 def test_changed_native_coding_identity_misses(tmp_path: Path, field: str) -> None:
+    # Lookups scan saved contexts, so a different key alone does not prove a miss: reserve.
     path = tmp_path / "cache"
     first, tasks, records = _cohort(tmp_path / "first", path)
     _publish(first, records)
@@ -191,7 +194,9 @@ def test_changed_native_coding_identity_misses(tmp_path: Path, field: str) -> No
     context = json.loads(json.dumps(other.contexts["answer"]))
     coding = context["coding"]
     native = coding["native_task_identity"]
-    if field == "source_policy":
+    if field == "unchanged":
+        pass
+    elif field == "source_policy":
         context["source_policy"] = "old working tree source policy"
     elif field in {"model", "reasoning", "jobs"}:
         coding["study"][field] = "different"
@@ -199,8 +204,11 @@ def test_changed_native_coding_identity_misses(tmp_path: Path, field: str) -> No
         coding[field] = "different"
     elif field == "grader_image":
         native["grader_image_identity"]["image_id"] = "sha256:" + "9" * 64
-    elif field == "runtime":
+    elif field == "engine-id":
+        # Recorded, not compared: the engine was restarted or replaced.
         coding["isolation"]["docker_engine"]["id"] = "new daemon"
+    elif field == "platform":
+        coding["isolation"]["docker_engine"]["platform"] = "linux/riscv64"
     elif field == "toolchain":
         native["toolchain_identity"]["image_id"] = "sha256:" + "9" * 64
     else:
@@ -211,7 +219,15 @@ def test_changed_native_coding_identity_misses(tmp_path: Path, field: str) -> No
                 "trusted_tests": "trusted_tests_sha256",
             }[field]
         ] = "9" * 64
-    assert baselines._hash(context) != first.keys["answer"]
+    other.contexts["answer"] = context
+    other.contracts["answer"] = baselines._cohort_contract(context)
+    other.keys["answer"] = baselines._cohort_key(context, other.tasks["answer"])
+    other.reserve()
+    try:
+        statuses = [row["status"] for row in other.decisions().values()]
+    finally:
+        other.close()
+    assert statuses == ["hit" if field in {"unchanged", "engine-id"} else "miss"] * 2
 
 
 @pytest.mark.parametrize(
@@ -581,3 +597,53 @@ def test_moved_cache_and_run_keep_their_cache_decisions_readable(tmp_path: Path)
         origin = json.loads((moved / "baseline-evidence" / identifier / "origin.json").read_text())
         assert {key: origin[key] for key in decision} == decision
         assert all((moved / row["path"]).is_file() for row in origin["historical_evidence"])
+
+
+def _hits(cache: baselines.BaselineCache) -> list[str]:
+    try:
+        cache.reserve()
+        return [row["status"] for row in cache.decisions().values()]
+    finally:
+        cache.close()
+
+
+def test_runtime_captures_that_differ_by_memory_jitter_still_publish_and_admit(
+    tmp_path: Path,
+) -> None:
+    # `check` captures the runtime at planning and again at preparation; Docker can report a
+    # few KiB less memory between them. Every cohort that run published was never admitted.
+    path = tmp_path / "cache"
+    first, tasks, records = _cohort(tmp_path / "first", path)
+    planned = runtime_identity()
+    engine = planned["docker_engine"]
+    assert isinstance(engine, dict)
+    engine["capacity"] = {"cpus": 8, "memory_bytes": 32 * 1024**3 - 28 * 1024}
+    jittered = baselines.BaselineCache(
+        path=path,
+        root=first.root,
+        tasks=tasks,
+        entries=records,
+        identity={**_coding(tasks), "isolation": planned},
+    )
+    _publish(jittered, records)
+    assert len(list(path.glob("*/*/manifest.json"))) == 2
+    second, _, _ = _cohort(tmp_path / "second", path)
+    assert _hits(second) == ["hit", "hit"]
+
+
+def test_an_attempt_that_ran_with_an_updated_docker_cli_is_still_cached(tmp_path: Path) -> None:
+    # Each attempt uses the Docker CLI installed when it starts and records that runtime.
+    path = tmp_path / "cache"
+    first, tasks, records = _cohort(tmp_path / "first", path)
+    updated = runtime_identity()
+    updated["docker_cli"] = {**updated["docker_cli"], "sha256": "9" * 64}  # type: ignore[dict-item]
+    for record in records:
+        artifacts = first.root / "attempts" / record["id"] / "handoff/artifacts"
+        client = json.loads((artifacts / "docker-client.json").read_text())
+        client["docker_cli"] = updated["docker_cli"]
+        (artifacts / "docker-client.json").write_text(json.dumps(client))
+        invocation = json.loads((artifacts / "invocation.json").read_text())
+        (artifacts / "invocation.json").write_text(json.dumps({**invocation, "runtime": updated}))
+    _publish(first, records)
+    second, _, _ = _cohort(tmp_path / "second", path)
+    assert _hits(second) == ["hit", "hit"]

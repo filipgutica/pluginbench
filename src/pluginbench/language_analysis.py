@@ -18,7 +18,7 @@ from collections.abc import Callable
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from pluginbench import isolation
+from pluginbench import components, isolation
 from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.code_diff import _is_test_path
 
@@ -145,6 +145,7 @@ def prepare_analysis_config(
         "tool_identities": identities,
         "supported_suffixes": [SUFFIXES[language]],
         "settings": deepcopy(ANALYSIS_SETTINGS),
+        "observer_version": components.VERSIONS["analysis_observer"],
         "implementation_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
     }
 
@@ -858,24 +859,19 @@ def _collect_language_analysis(
     }, VERSION
 
 
-# Earlier versions of this file whose analysis this one reproduces, so the profiles they froze
-# still load. Each returns the same result wherever it returned one.
-_EQUIVALENT_IMPLEMENTATIONS = frozenset(
-    {
-        # 942f12c: Rust dep-info that shlex could not split raised ValueError and ended the run.
-        "bc09200c57bf78d403d9f5b473d16af5ea653059dc06559ae3c86ba4652b9744",
-    }
-)
-
-
 def _analysis_tools(language: str, config: dict[str, object]) -> dict[str, dict[str, object]]:
+    version = config.get("observer_version")
     implementation = config.get("implementation_sha256")
-    if (
-        implementation is not None
-        and implementation not in _EQUIVALENT_IMPLEMENTATIONS
-        and implementation != hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    ):
-        raise ValueError("Analysis observer implementation changed after freezing")
+    if version is None and implementation is not None:
+        version = components.saved_version(
+            "analysis_observer", {"language_analysis.py": implementation}
+        )
+    current = components.VERSIONS["analysis_observer"]
+    if version is not None and version != current:
+        raise components.ObserverError(
+            f"analysis observer version {version} froze this profile, and this PluginBench "
+            f"measures with version {current}: {components.OBSERVER_NEXT_STEP}"
+        )
     if config.get("settings", ANALYSIS_SETTINGS) != ANALYSIS_SETTINGS:
         raise ValueError("Analysis settings differ from the qualified observer")
     if config.get("supported_suffixes", [SUFFIXES[language]]) != [SUFFIXES[language]]:
@@ -900,8 +896,8 @@ def collect_language_analysis(
 ) -> tuple[dict[str, object], str]:
     language = _string(config["language"])
     tools = _analysis_tools(language, config)
-    # A profile frozen by an equivalent earlier version does not pin this file's bytes, so they
-    # are compared here as well.
+    # A profile binds this file by version, not bytes, so the bytes are compared here: an
+    # edit during collection must not mix two implementations in one result.
     implementation = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     before = inspect_snapshot(root)["digest"]
     try:
@@ -911,6 +907,9 @@ def collect_language_analysis(
             _analysis_tools(language, config) != tools
             or hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != implementation
         ):
-            raise ValueError("Analysis observer bytes changed during execution")
+            raise components.ObserverError(
+                "the analysis observer's bytes changed during execution: measure again with "
+                "an unchanged PluginBench"
+            )
         if inspect_snapshot(root)["digest"] != before:
             raise ValueError("Analysis modified measured source")
