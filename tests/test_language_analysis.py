@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from pathlib import Path
@@ -377,8 +378,10 @@ def test_analysis_settings_and_implementation_drift_are_fatal(tmp_path: Path) ->
         collect_language_analysis(source, config, tmp_path / "evidence")
 
 
-def test_a_profile_frozen_before_the_dep_info_fix_still_loads(tmp_path: Path) -> None:
-    """Runs prepared on 942f12c keep their analysis measurements after an upgrade."""
+def test_a_profile_frozen_before_the_dep_info_fix_still_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runs prepared on 942f12c keep their analysis measurements, and the observer's guard."""
     source = tmp_path / "source"
     source.mkdir()
     config = prepare_analysis_config("rust", ["*"], ["*"], {})
@@ -390,6 +393,23 @@ def test_a_profile_frozen_before_the_dep_info_fix_still_loads(tmp_path: Path) ->
     analysis, _ = collect_language_analysis(source, config, tmp_path / "evidence")
 
     assert analysis["analyzed_paths"] == []
+
+    observer = Path(inspect.getfile(collect_language_analysis))
+    read_bytes = Path.read_bytes
+
+    def rewrite_observer(*_: object, **__: object) -> tuple[dict[str, object], str]:
+        monkeypatch.setattr(
+            Path,
+            "read_bytes",
+            lambda path: b"rewritten" if path == observer else read_bytes(path),
+        )
+        return {}, "unused"
+
+    monkeypatch.setattr(
+        "pluginbench.language_analysis._collect_language_analysis", rewrite_observer
+    )
+    with pytest.raises(ValueError, match="bytes changed during execution"):
+        collect_language_analysis(source, config, tmp_path / "evidence-2")
 
 
 def test_vulture_distribution_bytes_are_frozen_and_required(tmp_path: Path) -> None:

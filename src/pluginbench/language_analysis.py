@@ -900,11 +900,17 @@ def collect_language_analysis(
 ) -> tuple[dict[str, object], str]:
     language = _string(config["language"])
     tools = _analysis_tools(language, config)
+    # A profile frozen by an equivalent earlier version does not pin this file's bytes, so they
+    # are compared here as well.
+    implementation = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     before = inspect_snapshot(root)["digest"]
     try:
         return _collect_language_analysis(root, config, destination, tools, timeout=timeout)
     finally:
-        if _analysis_tools(language, config) != tools:
+        if (
+            _analysis_tools(language, config) != tools
+            or hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != implementation
+        ):
             raise ValueError("Analysis observer bytes changed during execution")
         if inspect_snapshot(root)["digest"] != before:
             raise ValueError("Analysis modified measured source")
