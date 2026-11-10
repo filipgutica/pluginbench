@@ -7,6 +7,7 @@ writes anything. Runs from before the ledger fall back to evidence/run.json.
 from __future__ import annotations
 
 import json
+import shlex
 import sqlite3
 from collections import Counter
 from datetime import UTC, datetime
@@ -229,11 +230,24 @@ def _phase(
         return str(events[-1]["event"])
     # A worker records how it ended before it releases the run. One that was killed, or lost
     # with its host, leaves `started` or `progress` as the last event.
-    if events and events[-1].get("event") in ("started", "progress"):
+    if not active and events and events[-1].get("event") in ("started", "progress"):
         return "interrupted"
     if pending is None:
         return "complete"
     return "not_started" if run is None else "stopped"
+
+
+def _resume_blocked(
+    pending: str | None, evidence: Path, measurement_revisions: list[dict[str, Any]]
+) -> str | None:
+    """Why `run` refuses to continue, for the two phases whose started work it cannot replay."""
+    if pending == "measuring" and any(
+        row["status"] == "collecting" for row in measurement_revisions
+    ):
+        return "measurement was interrupted while it was collecting and cannot be replayed"
+    if pending == "reviewing" and (evidence / "review-revisions/review").exists():
+        return "the first review had started, and its model calls cannot be replayed"
+    return None
 
 
 def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
@@ -324,13 +338,21 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
             "tokens": _tokens(rows),
         }
     log = root / "run.log"
+    measurement_revisions = _revisions(
+        evidence / "observer-revisions", "revision.json", selection.get("measurement_revision")
+    )
+    blocked = _resume_blocked(pending, evidence, measurement_revisions)
+    unfinished = bool(pending) and not active
     return {
         "schema_version": SCHEMA_VERSION,
         "run": str(root),
         "name": selection.get("name"),
         "phase": _phase(pending=pending, run=run, active=active, events=events),
-        # Null while a process owns the run, and when the run has nothing left to do.
-        "resume_command": f"pluginbench run {root}" if pending and not active else None,
+        # Both are null while a process owns the run, and when the run has nothing left to do.
+        "resume_command": shlex.join(["pluginbench", "run", str(root)])
+        if unfinished and not blocked
+        else None,
+        "resume_blocked": blocked if unfinished else None,
         "active": active,
         "owner": {key: owner.get(key) for key in ("pid", "pgid", "started_at")} if owner else None,
         "heartbeat": _heartbeat(root, evidence, now),
@@ -352,11 +374,7 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
         "arms": arms,
         "measures": {
             "selected": selection.get("measurements", []),
-            "measurement_revisions": _revisions(
-                evidence / "observer-revisions",
-                "revision.json",
-                selection.get("measurement_revision"),
-            ),
+            "measurement_revisions": measurement_revisions,
             "review_revisions": _revisions(
                 evidence / "review-revisions",
                 "review-state.json",
@@ -391,8 +409,8 @@ _RESULTS = ("pass", "overlap_pass", "fail", "unknown", "empty", "running", "inte
 
 
 def _shown_state(state: str, active: bool) -> str:
-    """A `running` attempt of a run no one owns is stale, so it is shown as interrupted."""
-    return "interrupted" if state == "running" and not active else state
+    """Work recorded as in progress in a run no one owns is stale, so it shows as interrupted."""
+    return "interrupted" if state in ("running", "collecting") and not active else state
 
 
 def _result(row: dict[str, Any], active: bool) -> str:
@@ -415,6 +433,8 @@ def format_status(status: dict[str, Any]) -> str:
         lines.append(f"Error: {status['error']}")
     if status["resume_command"]:
         lines.append(f"Resume: {status['resume_command']}")
+    if status["resume_blocked"]:
+        lines.append(f"Resume: not possible; {status['resume_blocked']}")
     states: Counter[str] = Counter()
     for state, count in status["states"].items():
         states[_shown_state(state, status["active"])] += count
@@ -469,7 +489,8 @@ def format_status(status: dict[str, Any]) -> str:
         for row in measures[key]:
             progress = f" {row['reviewed']}/{row['assigned']}" if "assigned" in row else ""
             selected = " (selected)" if row["selected"] else ""
-            lines.append(f"{label}: {row['revision']} {row['status']}{progress}{selected}")
+            shown = _shown_state(row["status"], status["active"])
+            lines.append(f"{label}: {row['revision']} {shown}{progress}{selected}")
     if status["report"]:
         lines.append(f"Report: {status['report']}")
     if status["log"]:
