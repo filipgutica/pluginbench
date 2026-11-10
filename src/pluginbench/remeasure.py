@@ -484,12 +484,9 @@ def _collect_references(
     return references
 
 
-def _container_runtime(collectors: list[Collector]) -> dict[str, object] | None:
-    """The runtime of the containers one task's collectors start; they share the task's."""
-    return next(
-        (runtime for item in collectors if (runtime := container_runtime(item)) is not None),
-        None,
-    )
+def _container_runtimes(collectors: list[Collector]) -> list[dict[str, object]]:
+    """The runtimes of the containers one task's collectors start, one after another."""
+    return [runtime for item in collectors if (runtime := container_runtime(item)) is not None]
 
 
 def propose_remeasurement(
@@ -670,13 +667,11 @@ def propose_remeasurement(
                 raise
 
         # Inputs run `jobs` at a time, and each runs its task's containers one after another.
-        runtimes = [
-            runtime
-            for item in inputs
-            if (runtime := _container_runtime(frozen[item.key[0]])) is not None
+        containers = [
+            runtimes for item in inputs if (runtimes := _container_runtimes(frozen[item.key[0]]))
         ]
-        if runtimes:
-            harbor_backend.assert_capacity(runtimes, jobs=jobs)
+        if containers:
+            harbor_backend.assert_capacity(containers, jobs=jobs)
         run_jobs(inputs, jobs=jobs, operation=collect_input)
         bindings = []
         proposed_records = {record.id: record for record in revised.records}

@@ -894,6 +894,21 @@ def test_a_saved_coverage_profile_is_measured_or_named_with_the_next_step(
     assert "prepare a new measurement revision" in str(raised.value)
 
 
+def test_a_profile_that_is_not_an_object_starts_no_counted_container(tmp_path: Path) -> None:
+    from pluginbench.collectors import container_runtime
+
+    # Measuring it refuses the profile by name; the capacity count must not fail first.
+    collector = Collector(
+        kind="coverage",
+        config=config(tmp_path, []),
+        command=["pytest"],
+        report_format="lcov",
+        report_path="coverage/lcov.info",
+        tool_version="1",
+    )
+    assert container_runtime(collector) is None
+
+
 def test_a_coverage_observer_changed_during_collection_names_the_profile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

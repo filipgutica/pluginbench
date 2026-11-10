@@ -173,6 +173,25 @@ def test_a_prepared_entry_whose_images_were_pruned_does_not_hide_a_later_usable_
     assert reused["preparation_key"] == PREPARED_KEY
 
 
+def test_a_prepared_entry_without_image_proof_does_not_hide_a_later_usable_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preparation = _Preparation(tmp_path, monkeypatch)
+    # Its files match its inventory, but its receipt names no prepared image.
+    broken = preparation.cache / ("0" * 64)
+    shutil.copytree(preparation.cache / PREPARED_KEY, broken)
+    receipt_path = broken / "artifacts/native-preparation.json"
+    receipt = json.loads(receipt_path.read_text())
+    del receipt["image_identity"]
+    receipt_path.write_text(json.dumps(receipt))
+    packet = json.loads((broken / "cache.json").read_text())
+    packet["files"] = harbor_backend._native_asset_inventory(broken, exclude="cache.json")
+    (broken / "cache.json").write_text(json.dumps(packet))
+    reused = preparation.run()
+    assert preparation.preparations == []
+    assert reused["preparation_key"] == PREPARED_KEY
+
+
 def test_a_prepared_entry_whose_images_the_engine_lost_names_the_entry_and_both_engines(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -396,3 +415,46 @@ def test_an_unreadable_saved_repeat_does_not_hide_the_valid_repeats_after_it(
         VANILLA_KEY,
     )
     assert [row["status"] for row in decisions.values()][0] == "miss"
+
+
+def test_a_saved_directory_that_cannot_be_listed_does_not_stop_cache_lookups(
+    tmp_path: Path,
+) -> None:
+    vanilla = _Vanilla(tmp_path)
+    unlistable = vanilla.cache / ("0" * 64)
+    (unlistable / "1").mkdir(parents=True)
+    unlistable.chmod(0)
+    try:
+        preview = baselines.preview(
+            path=vanilla.cache, tasks=vanilla.tasks(), repeats=2, identity=vanilla.identity
+        )
+        cache = vanilla.reserve()
+        try:
+            decisions = cache.decisions()
+        finally:
+            cache.close()
+    finally:
+        unlistable.chmod(0o755)
+    assert [(row["status"], row["cache_key"]) for row in preview] == [("hit", VANILLA_KEY)] * 2
+    assert [row["status"] for row in decisions.values()] == ["hit", "hit"]
+
+
+def test_a_saved_repeat_with_malformed_evidence_is_skipped_for_the_next_one(
+    tmp_path: Path,
+) -> None:
+    # An earlier saved cohort holds repeat 1 too, but its invocation receipt is not an object.
+    vanilla = _Vanilla(tmp_path)
+    malformed = vanilla.cache / ("0" * 64) / "1"
+    shutil.copytree(vanilla.cache / VANILLA_KEY / "1", malformed)
+    next(malformed.glob("attempts/*/*/artifacts/invocation.json")).write_text("[]")
+    manifest = json.loads((malformed / "manifest.json").read_text())
+    manifest["inventory"] = baselines._inventory(malformed)
+    (malformed / "manifest.json").write_text(json.dumps(manifest))
+    cache = vanilla.reserve()
+    try:
+        decisions = cache.decisions()
+    finally:
+        cache.close()
+    assert [(row["status"], row["cache_key"]) for row in decisions.values()] == [
+        ("hit", VANILLA_KEY)
+    ] * 2

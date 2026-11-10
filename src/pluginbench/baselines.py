@@ -412,13 +412,14 @@ def _same_cohort(saved: object, contract: dict[str, Any], task: TaskSpec) -> boo
     provenance exactly. Anything unreadable, or saved by a build this one cannot vouch for,
     does not match.
     """
+    if not isinstance(saved, dict):
+        return False
     try:
-        assert isinstance(saved, dict)
         return bool(
             _cohort_contract(saved) == contract
             and task_digest(task, saved["coding"]["native_task_identity"]) == saved["task_digest"]
         )
-    except (AssertionError, KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError):
         return False
 
 
@@ -429,6 +430,15 @@ def _saved_match(entry: Path, contract: dict[str, Any], task: TaskSpec) -> bool:
     except (OSError, ValueError, KeyError, TypeError):
         return False
     return _same_cohort(context, contract, task)
+
+
+def _saved_cohort(cohort: Path, contract: dict[str, Any], task: TaskSpec) -> bool:
+    """A saved cohort directory with any matching repeat; one that cannot be listed has none."""
+    try:
+        entries = sorted(cohort.iterdir())
+    except OSError:
+        return False
+    return any(_saved_match(entry, contract, task) for entry in entries)
 
 
 def _cohorts(path: Path, key: str, contract: dict[str, Any], task: TaskSpec) -> list[Path]:
@@ -444,7 +454,7 @@ def _cohorts(path: Path, key: str, contract: dict[str, Any], task: TaskSpec) -> 
         and not cohort.name.startswith(".")
         and not cohort.is_symlink()
         and cohort.is_dir()
-        and any(_saved_match(entry, contract, task) for entry in sorted(cohort.iterdir()))
+        and _saved_cohort(cohort, contract, task)
     ]
     return [path / key, *saved]
 
@@ -569,8 +579,10 @@ class BaselineCache:
                 else:
                     try:
                         manifest = self._validate(task_id, entry)
-                    except (OSError, ValueError, KeyError, TypeError):
-                        continue  # A saved entry that does not validate is not this repeat.
+                    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                        # A saved entry that does not validate, malformed evidence included,
+                        # is not this repeat.
+                        continue
                 self.hits[(task_id, repeat)] = manifest
                 self.origins[(task_id, repeat)] = entry
                 break

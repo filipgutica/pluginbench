@@ -833,10 +833,10 @@ def test_measurement_capacity_counts_the_largest_limits_run_at_once(
 
     monkeypatch.setattr(harbor, "runtime_identity", reported)
     if fits:
-        harbor.assert_capacity([small, large, small], jobs=jobs)
+        harbor.assert_capacity([[small], [large], [small]], jobs=jobs)
         return
     with pytest.raises(isolation.RuntimeDriftError, match="need 4 CPUs and 20480 MB"):
-        harbor.assert_capacity([small, large, small], jobs=jobs)
+        harbor.assert_capacity([[small], [large], [small]], jobs=jobs)
 
 
 def test_recorded_runtime_fields_may_all_differ_and_docker_then_uses_the_current_ones(

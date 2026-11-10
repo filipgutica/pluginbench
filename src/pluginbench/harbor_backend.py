@@ -436,23 +436,28 @@ def assert_runtime(
     return actual
 
 
-def assert_capacity(runtimes: list[dict[str, object]], *, jobs: int) -> None:
-    """Check that Docker holds the containers that run at once: `jobs` of `runtimes`.
+def assert_capacity(inputs: list[list[dict[str, object]]], *, jobs: int) -> None:
+    """Check that Docker holds the containers that run at once: `jobs` of `inputs`.
 
-    The largest CPU and memory limits are summed separately, so tasks with different limits
-    are never under-counted. Measurement uses this; it starts no coding agent.
+    Each input runs its containers one after another, so it needs its largest CPU and its
+    largest memory limit. The largest needs of the inputs that run at once are summed for
+    each resource separately, so different limits are never under-counted. Measurement uses
+    this; it starts no coding agent.
     """
-    limits = []
-    for runtime in runtimes:
-        resources = _object(runtime.get("resources"), "container resources")
-        cpus, memory = resources.get("cpus"), resources.get("memory_mb")
-        if not isinstance(cpus, int) or not isinstance(memory, int):
-            raise ValueError("Frozen container resource limits are missing")
-        limits.append((cpus, memory))
-    count = min(jobs, len(limits))
-    cpus = sum(sorted((limit[0] for limit in limits), reverse=True)[:count])
-    memory = sum(sorted((limit[1] for limit in limits), reverse=True)[:count])
-    actual = assert_runtime(runtimes[0], launcher=False)
+    needs = []
+    for runtimes in inputs:
+        limits = []
+        for runtime in runtimes:
+            resources = _object(runtime.get("resources"), "container resources")
+            cpus, memory = resources.get("cpus"), resources.get("memory_mb")
+            if not isinstance(cpus, int) or not isinstance(memory, int):
+                raise ValueError("Frozen container resource limits are missing")
+            limits.append((cpus, memory))
+        needs.append((max(limit[0] for limit in limits), max(limit[1] for limit in limits)))
+    count = min(jobs, len(needs))
+    cpus = sum(sorted((need[0] for need in needs), reverse=True)[:count])
+    memory = sum(sorted((need[1] for need in needs), reverse=True)[:count])
+    actual = assert_runtime(inputs[0][0], launcher=False)
     current = _object(_object(actual["docker_engine"], "Docker engine")["capacity"], "capacity")
     if cpus > int(current["cpus"]) or memory * 1024**2 > int(current["memory_bytes"]) * 0.8:
         raise isolation.RuntimeDriftError(
@@ -1807,6 +1812,10 @@ def _cached_preparation(
         json.loads((cached / "artifacts/native-preparation.json").read_text()),
         "cached native preparation",
     )
+    for name in ("image_identity", "grader_image_identity"):
+        image = _native_object(receipt.get(name), "cached native image")
+        if not all(isinstance(image.get(key), str) for key in ("image", "image_id")):
+            raise ValueError("Native preparation cache has incomplete or invalid proof")
     if (
         receipt["status"] != "complete"
         or _native_object(receipt["cleanup"], "cached cleanup")["status"] != "complete"
@@ -1841,20 +1850,26 @@ def _saved_preparation(
         ):
             continue
         lock = lock_path.open("a")
+        kept = False
         try:
-            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
-            receipt = _cached_preparation(candidate, contract, expected)
-        except (OSError, ValueError, KeyError, TypeError):
-            lock.close()
-            continue
-        try:
-            assert_prepared_images(receipt, expected, label=f"Prepared cache entry {candidate}")
-        except ValueError as error:
-            lock.close()
-            unavailable = unavailable or error
-            continue
-        held.enter_context(lock)
-        return candidate, receipt
+            try:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                receipt = _cached_preparation(candidate, contract, expected)
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            try:
+                assert_prepared_images(
+                    receipt, expected, label=f"Prepared cache entry {candidate}"
+                )
+            except ValueError as error:
+                unavailable = unavailable or error
+                continue
+            held.enter_context(lock)
+            kept = True  # `held` closes it from now on.
+            return candidate, receipt
+        finally:
+            if not kept:
+                lock.close()
     if unavailable is not None:
         raise unavailable
     return None

@@ -190,6 +190,8 @@ def container_runtime(collector: Collector) -> dict[str, object] | None:
     ):
         return None
     config = json.loads(collector.config.read_text())
+    if not isinstance(config, dict):
+        return None  # Measuring it refuses the profile by name.
     if collector.kind == "analysis" and config.get("language") != "rust":
         return None
     identity = config.get("native_task_identity")
