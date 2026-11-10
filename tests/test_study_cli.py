@@ -2128,8 +2128,8 @@ def _tree(root: Path) -> dict[str, str]:
     }
 
 
-# Runs 942f12c's own `run <run-dir>` command. Docker and coding are stubbed out, so reaching
-# coding ends the process with a line instead of starting an agent.
+# Runs an earlier build's own `run <run-dir>` command. Docker and coding are stubbed out, so
+# reaching coding ends the process with a line instead of starting an agent.
 _OLD_RESUME = """
 import json, sys
 from pathlib import Path
@@ -2139,9 +2139,9 @@ import native_support, pluginbench
 from pluginbench import evaluation, harbor_backend, study, submissions
 assert Path(pluginbench.__file__).is_relative_to(export), pluginbench.__file__
 def refuse_docker(*args, **kwargs):
-    raise SystemExit("942f12c ran a Docker command")
+    raise SystemExit("the earlier build ran a Docker command")
 def coding(*args, **kwargs):
-    raise SystemExit("942f12c started coding")
+    raise SystemExit("the earlier build started coding")
 harbor_backend._docker = refuse_docker
 study._run_attempts = coding
 submissions.reviewed_contract = native_support.synthetic_contract
@@ -2156,35 +2156,51 @@ print(result.stderr)
 """
 
 
+# 942f12c cannot read launcher versions. febdf03 can, but cannot supply a git identity.
+@pytest.mark.parametrize("build", ["942f12c", "febdf03"])
 @pytest.mark.parametrize("started", [True, False])
-def test_942f12c_refuses_a_run_this_build_saved(
+def test_an_earlier_build_refuses_a_run_it_would_code_differently(
     config: evaluation.Evaluation,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     started: bool,
+    build: str,
 ) -> None:
-    # The owner runs 942f12c beside newer builds. It cannot read launcher versions, so it must
-    # refuse this build's runs instead of coding them with another launcher.
+    # The owner runs earlier builds beside this one. Each must refuse a run it would code in
+    # another way, instead of spending paid attempts on it.
     repository = Path(__file__).resolve().parents[1]
     present = subprocess.run(
-        ["git", "-C", str(repository), "cat-file", "-e", "942f12c^{commit}"],
+        ["git", "-C", str(repository), "cat-file", "-e", build + "^{commit}"],
         capture_output=True,
     )
     if present.returncode:
-        pytest.skip("942f12c is not in this clone's history")
-    export = tmp_path / "942f12c"
+        pytest.skip(build + " is not in this clone's history")
+    export = tmp_path / build
     export.mkdir()
     archive = subprocess.run(
-        ["git", "-C", str(repository), "archive", "942f12c", "src", "tests"],
+        ["git", "-C", str(repository), "archive", build, "src", "tests"],
         capture_output=True,
         check=True,
     )
     subprocess.run(["tar", "-x", "-C", str(export)], input=archive.stdout, check=True)
+    if build == "febdf03":
+        # One task has no git identity of its own, so this build supplies one.
+        monkeypatch.setattr(
+            harbor_backend,
+            "probe_coding_environment",
+            lambda identity: {
+                **passing_git_probe(identity),
+                "supplied_git_identity": dict(harbor_backend.SUPPLIED_GIT_IDENTITY),
+            },
+        )
     if started:
         root, _, _ = _stopped_after_two_attempts(config, tmp_path, monkeypatch)
     else:
         prepared = _measured_and_reviewed(config, tmp_path, monkeypatch)
         root = evaluation.prepare_evaluation(prepared, tmp_path / "prepared")
+    # Only a run that needs the supplied identity gets the newer schema.
+    saved = json.loads((root / "inputs/study.json").read_text())["schema_version"]
+    assert saved == (4 if build == "febdf03" else 3)
     before = _tree(root)
     result = subprocess.run(
         [sys.executable, "-I", "-c", _OLD_RESUME, str(export), str(root)],

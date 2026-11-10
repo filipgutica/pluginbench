@@ -772,8 +772,10 @@ def prepare_evaluation(
             != comparison["review_criteria_sha256"]
         ):
             raise ValueError("fixed review criteria changed during preparation")
+    supplied = any("supplied_git_identity" in _object(row) for row in task_environment.values())
     recipe = {
-        "schema_version": 3,
+        # 4 makes builds that cannot supply a git identity refuse the run before coding.
+        "schema_version": 4 if supplied else 3,
         "backend": "harbor",
         "harness_version": harness_versions[config.runner.harness],
         "container_cpus": config.container_cpus,
