@@ -237,19 +237,6 @@ def _phase(
     return "not_started" if run is None else "stopped"
 
 
-def _resume_blocked(
-    pending: str | None, evidence: Path, measurement_revisions: list[dict[str, Any]]
-) -> str | None:
-    """Why `run` refuses to continue, for the two phases whose started work it cannot replay."""
-    if pending == "measuring" and any(
-        row["status"] == "collecting" for row in measurement_revisions
-    ):
-        return "measurement was interrupted while it was collecting and cannot be replayed"
-    if pending == "reviewing" and (evidence / "review-revisions/review").exists():
-        return "the first review had started, and its model calls cannot be replayed"
-    return None
-
-
 def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
     """Everything `status` shows, as the documented JSON object; reads only."""
     root = root.expanduser().absolute()
@@ -338,21 +325,16 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
             "tokens": _tokens(rows),
         }
     log = root / "run.log"
-    measurement_revisions = _revisions(
-        evidence / "observer-revisions", "revision.json", selection.get("measurement_revision")
-    )
-    blocked = _resume_blocked(pending, evidence, measurement_revisions)
-    unfinished = bool(pending) and not active
     return {
         "schema_version": SCHEMA_VERSION,
         "run": str(root),
         "name": selection.get("name"),
         "phase": _phase(pending=pending, run=run, active=active, events=events),
-        # Both are null while a process owns the run, and when the run has nothing left to do.
+        # Whether the saved state can continue is `run`'s decision: it checks first and refuses
+        # before any model call. Status only names the command for an unfinished, unowned run.
         "resume_command": shlex.join(["pluginbench", "run", str(root)])
-        if unfinished and not blocked
+        if pending and not active
         else None,
-        "resume_blocked": blocked if unfinished else None,
         "active": active,
         "owner": {key: owner.get(key) for key in ("pid", "pgid", "started_at")} if owner else None,
         "heartbeat": _heartbeat(root, evidence, now),
@@ -374,7 +356,11 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
         "arms": arms,
         "measures": {
             "selected": selection.get("measurements", []),
-            "measurement_revisions": measurement_revisions,
+            "measurement_revisions": _revisions(
+                evidence / "observer-revisions",
+                "revision.json",
+                selection.get("measurement_revision"),
+            ),
             "review_revisions": _revisions(
                 evidence / "review-revisions",
                 "review-state.json",
@@ -433,8 +419,6 @@ def format_status(status: dict[str, Any]) -> str:
         lines.append(f"Error: {status['error']}")
     if status["resume_command"]:
         lines.append(f"Resume: {status['resume_command']}")
-    if status["resume_blocked"]:
-        lines.append(f"Resume: not possible; {status['resume_blocked']}")
     states: Counter[str] = Counter()
     for state, count in status["states"].items():
         states[_shown_state(state, status["active"])] += count

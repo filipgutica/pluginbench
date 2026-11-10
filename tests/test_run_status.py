@@ -278,7 +278,6 @@ def test_a_stopped_run_reads_as_stopped_not_failed(
     assert status["phase"] == "stopped" and status["error"] is None
     assert status["last_event"]["event"] == "stopped"
     assert status["resume_command"] == f"pluginbench run {root}"
-    assert status["resume_blocked"] is None
     # Nothing owns the run, so its recorded `running` attempt is shown as interrupted.
     assert "  task-a  vanilla   pass interrupted" in run_status.format_status(status)
 
@@ -303,7 +302,6 @@ def test_a_killed_run_reads_as_interrupted_and_says_how_to_resume(tmp_path: Path
 
     assert status["phase"] == "interrupted" and status["error"] is None
     assert status["resume_command"] == f"pluginbench run '{root}'"
-    assert status["resume_blocked"] is None
     assert "Phase: interrupted (no exit record)" in shown
     assert f"Resume: pluginbench run '{root}'" in shown
     # The summary agrees with the table: no process is running the recorded `running` attempt.
@@ -340,10 +338,9 @@ def test_a_killed_review_of_a_finished_run_offers_no_resume(tmp_path: Path) -> N
         ("reviewing", "review-revisions/review/review-state.json", "Review: review"),
     ],
 )
-def test_a_run_killed_in_work_that_cannot_be_replayed_offers_no_resume(
+def test_a_run_killed_after_coding_shows_its_revision_as_interrupted(
     tmp_path: Path, phase: str, revision: str, shown: str
 ) -> None:
-    # `run` refuses both states, so the hint would lead straight to that refusal.
     root = _run(tmp_path / "run", states=dict.fromkeys(STATES, "complete"), ledger=True)
     run = json.loads((root / "evidence/run.json").read_text())
     _write(root / "evidence/run.json", {**run, "status": "complete"})
@@ -360,13 +357,13 @@ def test_a_run_killed_in_work_that_cannot_be_replayed_offers_no_resume(
     status = run_status.run_status(root)
     text = run_status.format_status(status)
 
-    assert status["phase"] == "interrupted" and status["resume_command"] is None
-    assert "cannot be replayed" in status["resume_blocked"]
-    assert f"Resume: not possible; {status['resume_blocked']}" in text
+    assert status["phase"] == "interrupted"
+    # `run` decides whether this state can continue; status only names the command.
+    assert f"Resume: {status['resume_command']}" in text
     assert f"{shown} interrupted" in text
     with run_lock.hold(root):
         owned = run_status.run_status(root)
-        assert owned["phase"] == phase and owned["resume_blocked"] is None
+        assert owned["phase"] == phase and owned["resume_command"] is None
         assert f"{shown} {in_progress}" in run_status.format_status(owned)
 
 
