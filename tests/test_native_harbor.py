@@ -159,11 +159,57 @@ def test_public_hooks_freeze_before_model_and_before_native_verification(
     if not changed:
         assert exports[1]["destination"] == tmp_path / "workspace"
         assert exports[1]["fresh_source"] is True
+        # Only the agent's workspace may hold links; the starting source may not.
+        assert exports[1]["agent_workspace"] is True
+        assert "agent_workspace" not in exports[0]
         assert "resume" not in exports[1]
         assert (
             json.loads((tmp_path / "artifacts/submission-source.json").read_text())["stopped"]
             is True
         )
+
+
+def test_native_export_of_an_agent_workspace_leaves_out_symlinks_and_lists_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = {"Running": False, "Status": "exited", "OOMKilled": False, "ExitCode": 0, "Error": ""}
+    state.update(StartedAt="start", FinishedAt="finish")
+
+    def docker(*arguments: str, **kwargs: object) -> str:
+        if arguments[0] == "cp":
+            raw = Path(arguments[2])
+            (raw / "code.py").write_text("print('source')\n")
+            # What `python -m venv .venv` leaves: a linked interpreter and a linked directory.
+            (raw / ".venv/bin").mkdir(parents=True)
+            (raw / ".venv/bin/python").symlink_to("/usr/bin/python3")
+            (raw / ".venv/bin/activate").write_text("# activate\n")
+            (raw / ".venv/lib64").symlink_to("lib", target_is_directory=True)
+        return ""
+
+    monkeypatch.setattr(
+        harbor, "_native_container", lambda **kwargs: {"Id": "id", "Image": "image", "State": state}
+    )
+    monkeypatch.setattr(harbor, "_docker", docker)
+
+    def export(name: str, *, agent_workspace: bool) -> dict[str, object]:
+        return harbor.export_native_source(
+            destination=tmp_path / name,
+            project="owned",
+            trial_dir=tmp_path,
+            workdir="/app",
+            expected={},
+            agent_workspace=agent_workspace,
+        )
+
+    receipt = export("workspace", agent_workspace=True)
+    workspace = tmp_path / "workspace"
+    assert receipt["excluded_runtime_paths"] == [".venv/bin/python", ".venv/lib64"]
+    assert receipt["snapshot_digest"] == inspect_snapshot(workspace)["digest"]
+    assert (workspace / "code.py").is_file() and (workspace / ".venv/bin/activate").is_file()
+    assert not any(path.is_symlink() for path in workspace.rglob("*"))
+    # Any other source, such as a task's starting source, still refuses a link.
+    with pytest.raises(ValueError, match="Native source contains a symlink: .venv/bin/python"):
+        export("before", agent_workspace=False)
 
 
 @pytest.mark.parametrize("fresh_source", [False, True])
