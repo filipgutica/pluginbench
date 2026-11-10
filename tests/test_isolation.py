@@ -90,7 +90,11 @@ def test_runtime_identity_tracks_replacement_of_selected_executable(
 ) -> None:
     executable = tmp_path / "codex"
     executable.write_text("first binary")
-    monkeypatch.setattr(shutil, "which", lambda name: str(executable) if name == "codex" else None)
+    which = shutil.which
+    # Only codex is replaced: on Linux the sandbox backend itself is found through `which`.
+    monkeypatch.setattr(
+        shutil, "which", lambda name: str(executable) if name == "codex" else which(name)
+    )
     before = isolation.runtime_identity()
     replacement = tmp_path / "replacement"
     replacement.write_text("other binary")
