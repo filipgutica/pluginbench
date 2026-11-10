@@ -4,7 +4,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import IO, Literal, TypedDict, Unpack
+from typing import IO, Any, Literal, TypedDict, Unpack
 
 import pytest
 
@@ -227,6 +227,53 @@ def test_structured_final_and_usage_include_cached_input_without_invented_effort
     assert "unverified" in parsed["effort_evidence_source"]
 
 
+def _answered(startup: dict[str, object]) -> dict[str, Any]:
+    return claude.parse_events(
+        stream(
+            startup,
+            {"type": "assistant", "message": {"model": "actual-model", "content": []}},
+            result(),
+        ),
+        [],
+    )
+
+
+def _builtin(name: str) -> dict[str, str]:
+    # The shape Claude Code 2.1.322 reports for the plugins it ships and loads by itself.
+    return {"name": name, "path": "builtin", "source": f"{name}@builtin"}
+
+
+def test_plugins_built_into_the_cli_are_not_custom_configuration() -> None:
+    plugins = [_builtin("cc-plugin-agents-md"), _builtin("cc-plugin-privacy")]
+    parsed = _answered(init(plugins=plugins))
+    assert parsed["stream_errors"] == []
+    assert parsed["successful_native_completion"]
+    assert parsed["startup"][0]["plugins"] == plugins
+
+
+@pytest.mark.parametrize(
+    "startup",
+    [
+        {"plugins": [{"name": "mine", "path": "/plugins/mine", "source": "mine@market"}]},
+        {"plugins": [{"name": "mine", "path": "/plugins/mine", "source": "mine@builtin"}]},
+        {"plugins": [{"name": "mine", "path": "builtin", "source": "mine@market"}]},
+        {"plugins": [_builtin("cc-plugin-privacy"), "mine"]},
+        {"plugins": {"cc-plugin-privacy": "builtin"}},
+        {"mcp_servers": [{"name": "files", "status": "connected"}]},
+        {"plugins": [_builtin("cc-plugin-privacy")], "plugin_errors": ["failed to load"]},
+        {"plugins": [_builtin("cc-plugin-privacy")], "mcp_server_errors": ["failed to start"]},
+    ],
+)
+def test_any_other_plugin_or_mcp_server_at_startup_fails_the_call(
+    startup: dict[str, object],
+) -> None:
+    parsed = _answered(init(**startup))
+    assert parsed["stream_errors"] == [
+        "custom plugin or MCP configuration present in native startup"
+    ]
+    assert not parsed["successful_native_completion"]
+
+
 def test_latest_model_usage_covers_auxiliary_calls_without_summing_cumulative_results() -> None:
     first = result(
         modelUsage={
@@ -348,8 +395,11 @@ def test_keychain_unavailable_does_not_create_private_runtime(
         raise FileNotFoundError("security unavailable")
 
     monkeypatch.setattr(subprocess, "run", missing)
-    with pytest.raises(ValueError, match="export an OAuth token or API key"):
+    with pytest.raises(ValueError) as refused:
         claude.runtime_environment(tmp_path / "private")
+    # The message names both variables and the case that hides them: a service's environment.
+    assert all(name in str(refused.value) for name in claude.AUTH_NAMES)
+    assert "systemd unit" in str(refused.value)
     assert not (tmp_path / "private").exists()
 
 
