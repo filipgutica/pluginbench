@@ -852,6 +852,14 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         "Each guidance set is compared with the same vanilla cohort. Compare separate evaluations through compatible baseline deltas.",
         "Deltas are differences in observed medians, not a winner or composite quality score. A negative delta is not automatically better.",
     ]
+    unfinished = _map(config.get("unfinished_run"))
+    if unfinished:
+        limitations.insert(
+            0,
+            f"This run is not finished: {unfinished['complete']} of {unfinished['assigned']} "
+            "attempts are complete. This report is partial: results that are missing stay "
+            "unknown.",
+        )
     if origins:
         limitations.append(
             f"{len(origins)} vanilla attempts were reused from earlier evaluations. Their tokens and time are original observations, not fresh independent samples. Grading, measurements, and reviews run again."
@@ -905,6 +913,8 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         "diagnostic_panels": sorted(DIAGNOSTIC_PANELS),
         "limitations": limitations,
     }
+    if unfinished:
+        data["unfinished_run"] = unfinished
     data["comparisons"] = _comparison_rows(data)
     data["aggregates"] = _aggregate_rows(data)
     data["passing_medians"], data["passing_aggregates"] = _passing_summaries(data)
