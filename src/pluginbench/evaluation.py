@@ -25,6 +25,7 @@ from pluginbench.measurement_profiles import (
     REMOVED_TEST_OVERLAP,
     MeasurementSettings,
     blocking_findings,
+    not_measured,
     capability_plan,
     prepare_profiles,
     probe_measurements,
@@ -703,6 +704,17 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
         identity=vanilla_identity,
     )
     findings = blocking_findings(matrix, require_ready=config.measurement_settings.require_ready)
+    # Decided once here and saved with the run: status and the report read this list. Under
+    # require_ready a broken measure blocks instead, so nothing is skipped.
+    skipped = [] if config.measurement_settings.require_ready else not_measured(matrix)
+    for row in skipped:
+        warning = (
+            f"{row['task']}: {row['measure']} is broken, so it is not measured for this task: "
+            f"{row['reason']}"
+        )
+        if progress:
+            progress("Warning: " + warning)
+        warnings.append(warning)
     report: dict[str, object] = {
         "status": "blocked" if findings else "ready",
         "model_calls": 0,
@@ -711,6 +723,7 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
         "coding_images": coding_images,
         "warnings": warnings,
         "findings": findings,
+        "not_measured": skipped,
         "matrix": matrix,
         "vanilla_cache": vanilla_cache,
     }
@@ -806,6 +819,7 @@ def prepare_evaluation(
         "task_scopes": scopes,
         "measurement_capabilities": capabilities,
         "measurement_readiness": capabilities,
+        "not_measured": checked.report["not_measured"],
         "artifact_base": "evidence",
         "measurement_required": any(profiles.values()),
         "measurement_revision": None,
@@ -956,6 +970,7 @@ def _finish_evaluation(
             revision=revision,
             progress=progress,
             jobs=config.jobs,
+            masks_listed_pairs=bool(selection.get("not_measured")),
         )
         _adopt_measurement_revision(root, selection, revision)
         _save_selection(root, selection)

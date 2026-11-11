@@ -169,7 +169,11 @@ COMPLETENESS_COUNTS = {
 
 
 def _selected_completeness(
-    *, data: dict[str, object], projection: dict[str, object], selected: list[object]
+    *,
+    data: dict[str, object],
+    projection: dict[str, object],
+    selected: list[object],
+    skipped: dict[tuple[str, str], object],
 ) -> list[dict[str, object]]:
     source = {
         row["attempt_id"]: row
@@ -218,6 +222,10 @@ def _selected_completeness(
             counts["Review input/output tokens"] = captured(
                 ("Judge input tokens", "Judge output tokens")
             )
+        # A pair the check marked as not measured is incomplete, whatever its collector counted.
+        for measure in map(str, selected):
+            if (str(attempt["task"]), measure) in skipped and measure in COMPLETENESS_COUNTS:
+                counts[COMPLETENESS_COUNTS[measure]] = False
         results.append(
             {
                 **record,
@@ -762,6 +770,12 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         )
         for attempt_id, stage in handoffs.items()
     }
+    # Pairs the check recorded as not measured. One collector serves several measures, so a
+    # marked pair's collector can still run; its values are hidden, not reported.
+    skipped = {
+        (str(row["task"]), str(row["measure"])): row.get("reason")
+        for row in _rows(config.get("not_measured", []))
+    }
     observations = []
     for source in _rows(projection["observations"]):
         if source.get("metric") not in families:
@@ -783,7 +797,22 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
             for key, value in _map(source.get("provenance")).items()
             if key in PROVENANCE_FIELDS
         }
+        if (str(row.get("task")), families[metric]) in skipped:
+            # A masked row keeps no measurement result: no value, counts, or population.
+            row.update(
+                value=None,
+                status="unavailable",
+                reason=skipped[str(row.get("task")), families[metric]],
+                compatibility=None,
+                per_test_count=None,
+                provenance={},
+            )
         observations.append(row)
+
+    def shown(median: dict[str, object]) -> bool:
+        metric = median.get("metric")
+        return metric in families and (str(median.get("task")), families[metric]) not in skipped
+
     attempts = []
     origins = _map(report.get("baseline_origin"))
     for attempt in _rows(report.get("attempts")):
@@ -908,10 +937,8 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         "attempts": attempts,
         "observations": observations,
         "observation_fields": list(OBSERVATION_FIELDS),
-        "medians": [row for row in _rows(projection["medians"]) if row.get("metric") in families],
-        "raw_medians": [
-            row for row in _rows(projection["raw_medians"]) if row.get("metric") in families
-        ],
+        "medians": [row for row in _rows(projection["medians"]) if shown(row)],
+        "raw_medians": [row for row in _rows(projection["raw_medians"]) if shown(row)],
         "metric_guide": {metric: guide[metric] for metric in families},
         "independent_review": projection.get("independent_review")
         if "review" in selected
@@ -926,14 +953,21 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
     data["comparisons"] = _comparison_rows(data)
     data["aggregates"] = _aggregate_rows(data)
     data["passing_medians"], data["passing_aggregates"] = _passing_summaries(data)
-    data["reference_values"] = _reference_values(report)
+    owners = {metric: name for name, metrics in MEASUREMENT_METRICS.items() for metric in metrics}
+    data["reference_values"] = [
+        # A listed pair's reference is masked like its observations, with the same reason.
+        {**row, "value": None, "status": "unavailable", "reason": skipped[key]}
+        if (key := (str(row["task"]), owners.get(str(row["metric"]), ""))) in skipped
+        else row
+        for row in _reference_values(report)
+    ]
     data["reference_comparisons"] = _reference_comparisons(data)
     data["reference_aggregates"] = _reference_aggregates(_rows(data["reference_comparisons"]))
     prices = _map(config.get("prices"))
     data["prices"] = prices or None
     data["cost"] = _cost_rows(observations, prices) if "tokens" in selected else []
     data["measurement_completeness"] = _selected_completeness(
-        data=data, projection=projection, selected=selected
+        data=data, projection=projection, selected=selected, skipped=skipped
     )
     data["completeness_matrix"] = _completeness_matrix(
         observations, _map(config.get("measurement_capabilities"))
