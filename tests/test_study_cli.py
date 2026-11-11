@@ -2211,27 +2211,32 @@ def _killed_while_measuring(
 
 
 @contextmanager
-def _held_by_another_process(root: Path) -> Iterator[None]:
-    """Hold run.lock as a process that has not written its owner record yet."""
+def _held_by_another_process(root: Path, record: dict[str, object]) -> Iterator[None]:
+    """Hold run.lock as another process that has not replaced the owner record yet."""
     fd = os.open(root / run_lock.LOCK_NAME, os.O_RDWR)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        record = os.pread(fd, 1 << 16, 0)
+        saved = os.pread(fd, 1 << 16, 0)
         os.ftruncate(fd, 0)
+        os.pwrite(fd, json.dumps(record).encode(), 0)
         try:
             yield
         finally:
-            os.pwrite(fd, record, 0)
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, saved, 0)
     finally:
         os.close(fd)
 
 
 def _assert_only_a_free_run_is_recovered(root: Path) -> None:
-    with _held_by_another_process(root):
-        with pytest.raises(ValueError, match="another process may own this run"):
-            evaluation.plan_resume(root)
-        with pytest.raises(ValueError, match="run is already active"):
-            evaluation.resume_evaluation(root)
+    # No record yet, or one that still names this process, which held the lock before.
+    records: tuple[dict[str, object], ...] = ({}, {"pid": os.getpid()})
+    for record in records:
+        with _held_by_another_process(root, record):
+            with pytest.raises(ValueError, match="another process may own this run"):
+                evaluation.plan_resume(root)
+            with pytest.raises(ValueError, match="run is already active"):
+                evaluation.resume_evaluation(root)
     assert evaluation.plan_resume(root)["collect_measurements"] is True
 
 

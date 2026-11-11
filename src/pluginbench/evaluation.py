@@ -1067,10 +1067,6 @@ def _next_measurement_revision(evidence: Path) -> str:
     return revision
 
 
-def _owns(root: Path) -> bool:
-    return (run_lock.owner(root) or {}).get("pid") == os.getpid()
-
-
 def _sole_owner(root: Path) -> bool:
     """Whether this process may treat a measurement left active as dead.
 
@@ -1079,7 +1075,7 @@ def _sole_owner(root: Path) -> bool:
     that ended. A plan may assume the same while no live process holds the lock. A held lock with
     no owner record yet counts as another owner.
     """
-    return run_lock.owner(root) is None or _owns(root)
+    return run_lock.held_here(root) or run_lock.owner(root) is None
 
 
 def _measurement_to_recover(
@@ -1270,7 +1266,7 @@ def resume_evaluation(
     never has two processes working on it. Must then run in the main thread.
     """
     root = root.expanduser().resolve()
-    with nullcontext() if _owns(root) else run_lock.hold(root):
+    with nullcontext() if run_lock.held_here(root) else run_lock.hold(root):
         return _resume(root, progress=progress, guard=guard)
 
 

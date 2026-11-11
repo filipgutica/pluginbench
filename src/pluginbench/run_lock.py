@@ -62,6 +62,16 @@ class RunLock:
             raise RunMoved(f"run directory moved away from {self.root}; no further work starts")
 
 
+# Roots whose lock this process holds now. The owner record can lag a handover, so it cannot
+# say whether this process still holds a lock.
+_held: set[Path] = set()
+
+
+def held_here(root: Path) -> bool:
+    """Whether this process holds root/run.lock right now."""
+    return root.resolve() in _held
+
+
 def _owner(fd: int) -> dict[str, object] | None:
     text = os.pread(fd, 1 << 16, 0).decode()
     if not text.strip():
@@ -160,9 +170,11 @@ def hold(root: Path) -> Iterator[RunLock]:
         os.pwrite(fd, (json.dumps(owner, indent=2) + "\n").encode(), 0)
         os.fsync(fd)
         previous_handler = signal.signal(signal.SIGTERM, _interrupt)
+        _held.add(root)
         try:
             yield RunLock(root, fd)
         finally:
+            _held.discard(root)
             signal.signal(signal.SIGTERM, previous_handler)
     finally:
         os.close(fd)
