@@ -281,7 +281,8 @@ def _validate_fixed_bindings(root: Path, protocol_ref: object) -> None:
         raise ValueError("review criteria differs from frozen guidance or rubric")
 
 
-def _copy_source(snapshot: Snapshot, destination: Path) -> None:
+def copy_source(snapshot: Snapshot, destination: Path) -> None:
+    """Copy a snapshot's files to `destination`, after checking them against its digest."""
     inspected = inspect_snapshot(snapshot.root)
     if inspected["digest"] != snapshot.digest:
         raise ValueError("review source differs from its bound snapshot")
@@ -327,8 +328,8 @@ def _packet(
 ) -> None:
     assert record.before is not None and selected.snapshot is not None
     target.mkdir(parents=True)
-    _copy_source(record.before, target / "before")
-    _copy_source(selected.snapshot, target / "after")
+    copy_source(record.before, target / "before")
+    copy_source(selected.snapshot, target / "after")
     (target / "task.txt").write_text(task.prompt)
     study._write(target / "packet.json", {"packet_id": packet_id, "stage": "submission"})
     study._write(
@@ -336,6 +337,11 @@ def _packet(
         {"checks": selected.correctness.checks if selected.correctness else None},
     )
     study._write(target / "response-schema.json", JudgeResponse.model_json_schema())
+    write_source_diff(target)
+
+
+def write_source_diff(target: Path) -> None:
+    """Write `target/source.diff`: `target/before` against `target/after`, with no names."""
     result = subprocess.run(
         [
             "git",

@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import importlib
 import json
+import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -416,7 +418,17 @@ def test_native_preparation_freezes_both_images_and_source_without_models(
 
 @pytest.mark.parametrize(
     "failure",
-    [None, "head", "source", "payload", "cleanup", "environment", "entrypoint", "workdir"],
+    [
+        None,
+        "head",
+        "inventory",
+        "source",
+        "payload",
+        "cleanup",
+        "environment",
+        "entrypoint",
+        "workdir",
+    ],
 )
 def test_source_qualification_binds_grader_base_payload_and_coding_fixture(
     tmp_path: Path,
@@ -456,10 +468,15 @@ def test_source_qualification_binds_grader_base_payload_and_coding_fixture(
 
     def docker(*arguments: str, **kwargs: object) -> str:
         calls.append(arguments)
+        if arguments[:2] == ("start", "--attach") and failure == "inventory":
+            # As Docker does: an attached start exits with the container's own status.
+            raise ValueError("docker start failed: ")
         if arguments[0] == "create":
             return "container"
         if arguments[0] == "wait":
-            return "0"
+            return "128" if failure == "inventory" else "0"
+        if arguments[0] == "logs" and failure == "inventory":
+            return "fatal: not a tree object: " + base + "\n"
         if arguments[0] == "logs":
             return (
                 ("b" * 40 if failure == "head" else base)
@@ -517,6 +534,12 @@ def test_source_qualification_binds_grader_base_payload_and_coding_fixture(
     assert create[create.index("--cpus") + 1] == "1"
     assert create[create.index("--memory") + 1] == "256m"
     assert "ls-tree -r -z --full-tree " + base in create[-1]
+    assert [call[0] for call in calls[:4]] == ["create", "start", "wait", "logs"]
+    if failure == "inventory":
+        assert proof["reason"] == (
+            "native grader base inventory command failed (exit 128): "
+            "fatal: not a tree object: " + base
+        )
     if failure is None:
         assert proof["base_tree"] == {
             "code.py": {"mode": "100644", "type": "blob", "blob": "c" * 40}
@@ -1530,6 +1553,9 @@ def test_git_probe_commits_in_the_coding_image_with_only_the_task_environment(
 
     def docker(*arguments: str, **kwargs: object) -> str:
         calls.append(arguments)
+        if arguments[:2] == ("start", "--attach") and not committed:
+            # As Docker does: an attached start exits with the container's own status.
+            raise ValueError("docker start failed: ")
         return {
             "create": "probe-container\n",
             "wait": "0\n" if committed else "128\n",
@@ -1562,6 +1588,206 @@ def test_git_probe_commits_in_the_coding_image_with_only_the_task_environment(
     else:
         assert receipt["status"] == "failed"
         assert "Author identity unknown" in str(receipt["reason"])
+
+
+SUPPLIED_ENV = "GIT_CONFIG_PARAMETERS='user.name=PluginBench Agent' 'user.email=agent@pluginbench.invalid'"
+
+
+@pytest.mark.parametrize("second_exit", ["0", "128"])
+def test_git_probe_supplies_the_neutral_identity_only_when_git_has_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, second_exit: str
+) -> None:
+    task = native_task(tmp_path)
+    creates: list[tuple[str, ...]] = []
+
+    def docker(*arguments: str, **kwargs: object) -> str:
+        if arguments[0] == "create":
+            creates.append(arguments)
+        supplied = SUPPLIED_ENV in creates[-1]
+        return {
+            "create": "probe-container\n",
+            # Exit 3 is the probe's own report that `git var` found no identity.
+            "wait": (second_exit if supplied else "3") + "\n",
+            "logs": "PluginBench Agent <agent@pluginbench.invalid> 1 +0000\n"
+            if supplied and second_exit == "0"
+            else ("fatal: unable to write new index file\n" if supplied else "Author identity unknown\n"),
+        }.get(arguments[0], "")
+
+    monkeypatch.setattr(harbor, "_docker", docker)
+    monkeypatch.setattr(harbor, "cleanup", lambda **kwargs: {"status": "complete"})
+    receipt = harbor.probe_coding_environment(_prepared_identity(task))
+    # The first probe has only the task's environment; the second adds exactly the launch env.
+    assert len(creates) == 2
+    assert not any(argument.startswith("GIT_CONFIG_PARAMETERS=") for argument in creates[0])
+    supplied = {"name": "PluginBench Agent", "email": "agent@pluginbench.invalid"}
+    assert receipt["supplied_git_identity"] == supplied
+    launch = harbor.supplied_git_env({"supplied_git_identity": supplied})
+    assert [f"{key}={value}" for key, value in launch.items()] == [SUPPLIED_ENV]
+    first = receipt["task_identity_probe"]
+    assert isinstance(first, dict) and first["status"] == "failed"
+    assert "no author or committer identity" in str(first["reason"])
+    if second_exit == "0":
+        assert receipt["status"] == "passed"
+        assert receipt["author"] == "PluginBench Agent <agent@pluginbench.invalid> 1 +0000"
+    else:
+        assert receipt["status"] == "failed"
+        assert receipt["reason"] == (
+            "with the git identity PluginBench supplied, git commit failed in the coding image "
+            "(exit 128): fatal: unable to write new index file"
+        )
+
+
+def _scratch_repository(path: Path) -> tuple[str, dict[str, str]]:
+    """A one-commit repository, its HEAD, and an environment in which git finds no identity."""
+    path.mkdir()
+    # `user.useConfigOnly` stops git from guessing an identity from the host name.
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(path),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "user.useConfigOnly",
+        "GIT_CONFIG_VALUE_0": "true",
+    }
+    (path / "code.py").write_text("value = 1\n")
+    for command in (
+        ["git", "init", "-q"],
+        ["git", "add", "code.py"],
+        ["git", "-c", "user.name=Setup", "-c", "user.email=setup@example.invalid", "commit", "-qm", "base"],
+    ):
+        subprocess.run(command, cwd=path, env=env, check=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=path, env=env, check=True, capture_output=True, text=True
+    )
+    return head.stdout.strip(), env
+
+
+@pytest.mark.parametrize("own_parameters", [None, "'commit.gpgsign=false'"])
+def test_git_probe_never_replaces_git_parameters_the_task_sets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, own_parameters: str | None
+) -> None:
+    task = native_task(tmp_path)
+    repository = tmp_path / "repository"
+    _, env = _scratch_repository(repository)
+    if own_parameters is not None:
+        env["GIT_CONFIG_PARAMETERS"] = own_parameters
+    scripts: list[str] = []
+
+    def docker(*arguments: str, **kwargs: object) -> str:
+        # Each probe script runs here under real bash and git, in place of the container.
+        if arguments[0] == "create":
+            scripts.append(arguments[-1])
+            supplied = [a for a in arguments if a.startswith("GIT_CONFIG_PARAMETERS=")]
+            launch = {**env, **dict(a.split("=", 1) for a in supplied)}
+            ran.append(
+                subprocess.run(["bash", "-c", scripts[-1]], env=launch, capture_output=True, text=True)
+            )
+            return "probe-container\n"
+        return {"wait": f"{ran[-1].returncode}\n", "logs": ran[-1].stdout}.get(arguments[0], "")
+
+    ran: list[subprocess.CompletedProcess[str]] = []
+    monkeypatch.setattr(harbor, "_docker", docker)
+    monkeypatch.setattr(harbor, "cleanup", lambda **kwargs: {"status": "complete"})
+    receipt = harbor.probe_coding_environment(
+        {**_prepared_identity(task), "workdir": str(repository)}
+    )
+    if own_parameters is None:
+        assert [run.returncode for run in ran] == [3, 0]
+        assert receipt["status"] == "passed"
+        assert str(receipt["author"]).startswith("PluginBench Agent <agent@pluginbench.invalid> ")
+    else:
+        # One probe only: supplying the identity would drop the task's own setting.
+        assert [run.returncode for run in ran] == [4]
+        assert receipt["status"] == "failed" and "supplied_git_identity" not in receipt
+        assert "the task sets GIT_CONFIG_PARAMETERS" in str(receipt["reason"])
+
+
+def test_base_inventory_command_prints_the_git_error_only_when_it_fails(tmp_path: Path) -> None:
+    head, env = _scratch_repository(tmp_path / "repository")
+
+    def inventory(base: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "-c", harbor._base_inventory_command(base)],
+            cwd=tmp_path / "repository",
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    found = inventory(head)
+    assert found.returncode == 0 and found.stderr == ""
+    assert found.stdout.startswith(head + "\n100644 blob ") and found.stdout.endswith("\tcode.py\0")
+    # Only standard output reaches `docker logs`, so the error must be there.
+    missing = inventory("a" * 40)
+    assert missing.returncode == 128 and missing.stderr == ""
+    assert missing.stdout == head + "\nfatal: not a tree object\n"
+
+
+@pytest.mark.parametrize("supplied", [True, False])
+def test_coding_and_reference_agents_get_the_supplied_identity_and_nothing_otherwise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supplied: bool
+) -> None:
+    monkeypatch.setattr(submissions, "reviewed_contract", synthetic_contract)
+    identity = _reference_identity(tmp_path / "reference", solution=True)
+    if supplied:
+        identity["supplied_git_identity"] = dict(harbor.SUPPLIED_GIT_IDENTITY)
+    agents: list[dict[str, object]] = []
+
+    def process(**kwargs: object) -> dict[str, object]:
+        config = kwargs["config"]
+        assert isinstance(config, dict)
+        agents.append(config["agent"])
+        assert "env" not in config["environment"]
+        raise ValueError("stop after launch")
+
+    monkeypatch.setattr(harbor, "_native_process", process)
+    monkeypatch.setattr(harbor, "assert_runtime", lambda expected, **kwargs: expected)
+    monkeypatch.setattr(harbor, "_assert_native_image", lambda image, expected: None)
+    monkeypatch.setattr(
+        harbor,
+        "_native_submission",
+        lambda **kwargs: {"status": "complete", "snapshot_digest": "frozen-submission"},
+    )
+    monkeypatch.setattr(harbor, "_native_cleanup_projects", lambda **kwargs: {"status": "complete"})
+    monkeypatch.setattr(harbor, "cleanup", lambda **kwargs: {"status": "complete"})
+    harbor.run_reference_agents(identity, tmp_path / "check")
+    # A paid attempt, on a task with the separate verifier native execution requires.
+    task_dir = native_task(tmp_path)
+    coding = {
+        **{
+            key: identity[key]
+            for key in ("transport_policy", "toolchain_identity", "workdir", "source_digest")
+        },
+        **({"supplied_git_identity": identity["supplied_git_identity"]} if supplied else {}),
+        "task_assets_sha256": harbor.native_task_assets(task_dir),
+        "image_identity": {"image": "coding", "image_id": "coding"},
+        "grader_image_identity": {"image": "grader", "image_id": "grader"},
+    }
+    area = tmp_path / "attempt"
+    area.mkdir()
+    with pytest.raises(ValueError, match="stop after launch"):
+        harbor.invoke_native(
+            area=area,
+            task_dir=task_dir,
+            entry={"host": "codex"},
+            protocol={
+                "native_task_identity": coding,
+                "isolation": identity["isolation"],
+                "harness_version": "1.2.3",
+                "reasoning": "low",
+                "models": {"codex": "fake-model"},
+            },
+            prompt="",
+            timeout=600,
+        )
+    assert [agent["name"] for agent in agents] == ["oracle", "nop", "codex"]
+    for agent in agents:
+        if supplied:
+            env = agent["env"]
+            assert isinstance(env, dict)
+            assert [f"{key}={value}" for key, value in env.items()] == [SUPPLIED_ENV]
+        else:
+            assert "env" not in agent
 
 
 ORACLE_PATCH = """diff --git a/src/answer.py b/src/answer.py

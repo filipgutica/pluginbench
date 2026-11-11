@@ -70,7 +70,9 @@ class StudyRecipe(BaseModel):
 
     # 3: runtimes record declared component versions. Builds before it refuse these runs,
     # so a run is never coded by two launchers that cannot tell each other apart.
-    schema_version: Literal[1, 2, 3]
+    # 4: a task needs the git identity PluginBench supplies. Builds before it would code that
+    # task without one, and every commit there would fail. Other runs stay at 3.
+    schema_version: Literal[1, 2, 3, 4]
     name: str = Field(min_length=1)
     backend: Literal["harbor"] = "harbor"
     harness: Literal["codex", "claude"] = "codex"
@@ -178,7 +180,8 @@ def load_study(path: Path) -> ResolvedStudy:
     recipe.tasks = _resolve(base, recipe.tasks)
     recipe.auth_file = _resolve(base, recipe.auth_file)
     tasks = _load_tasks(recipe)
-    recipe.schema_version = 3
+    if recipe.schema_version < 4:
+        recipe.schema_version = 3
     recipe.treatments = {
         name: resolve_treatment(item, base, recipe.harness)
         for name, item in recipe.treatments.items()

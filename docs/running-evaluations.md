@@ -175,10 +175,10 @@ The checks:
 - A Codex reviewer needs `codex-code-mode-host` beside the launched `codex`, inside the review sandbox.
 - Selected collectors run twice on the starting source. Selected unused-code measurements also require unambiguous declaration matching in the starting population.
 - The submission source must qualify when the task has a reviewed patch-grading contract.
-- `git commit` must work in the coding image with only the task's environment. Graded patches are `git diff BASE HEAD`, so a failing commit makes every patch empty. A prebuilt `docker_image` is used as published; `check` warns when a Dockerfile beside it is never built.
+- `git commit` must work in the coding image. Graded patches are `git diff BASE HEAD`, so a failing commit makes every patch empty. The first probe uses only the task's environment. If git has no author or committer identity there, PluginBench supplies `PluginBench Agent <agent@pluginbench.invalid>` to that task's agents and probes again. `check` and `check.json` say when this happens, and the identity becomes part of the task's cache key. A task that sets its own identity gets nothing added. A prebuilt `docker_image` is used as published; `check` warns when a Dockerfile beside it is never built.
 - Harbor's oracle agent must produce a nonempty patch with reward 1, and its nop agent must get reward 0, through the same commit, patch and verifier path.
 
-Oracle and nop results are cached by preparation key and image IDs. A prepared entry reused from an older key keeps that key, so its oracle and nop results are reused too. Only passing results are cached, so a failure is retried on the next check.
+Oracle and nop results are cached by preparation key, image IDs and any supplied git identity. A prepared entry reused from an older key keeps that key, so its oracle and nop results are reused too. Only passing results are cached, so a failure is retried on the next check.
 
 `check` also prints hit or miss for every vanilla attempt, computed from saved entries and their contexts without validating their evidence. `run` validates each hit again before it reuses it.
 
@@ -339,9 +339,9 @@ pluginbench judge run judging/r3 --judge codex:gpt-6-astra:high \
 pluginbench judge tally judging/r3
 ```
 
-`prepare` takes two `RUN_DIR=ARM` specs. They can name one run or two runs, and `vanilla` matches the arm older runs call `baseline`. It reads each run's `report/results.json` and review packets and nothing else.
+`prepare` takes two `RUN_DIR=ARM` specs. They can name one run or two runs, and `vanilla` matches the arm older runs call `baseline`. It reads each run's `report/results.json` and review packets. For a submission with no review packet, it reads the attempt's saved snapshots and the frozen task instruction instead.
 - It refuses any task that `--exclude` lists. Put holdout tasks there.
-- Each submission's diff comes from its review packet. A run needs a finished review, and the packet must be bound to the attempt's submission and starting source.
+- Each submission's diff comes from its review packet, which must be bound to the attempt's submission and starting source. A run without a reviewer, or one that stopped before review, has no packets: its diffs are built from the saved snapshots, checked against the digests in the report, and written under numbered folders in `submissions/` in the output directory. An attempt with no saved submission, such as one that was not coded, cannot be judged. It is left out with its pair, and `prepare` names it on stderr and under `omitted` in the key.
 - Both sides of a pair must start from the same source. They must also have the same instruction.
 - Diff headers become `a/` and `b/` with no `index` lines, so neither side's tooling identifies it.
 - The seed randomizes A and B for each pair.
