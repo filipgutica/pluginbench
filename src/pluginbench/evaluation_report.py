@@ -147,11 +147,14 @@ def correctness_state(status: object, grading: object) -> str:
     may fail to build before any test runs. Any other withheld result stays unknown.
     """
     grading = _map(grading)
-    # A saved report already holds this function's earlier verdict, so classify it again.
     if status not in {"unknown", "fail"} or grading.get("reason") != TRUSTED_TEST_OVERLAP:
         return str(status)
     rewards = _map(_map(grading.get("native_verifier_result")).get("rewards"))
+    if status == "fail" and rewards.get("reward") != 0:
+        # A fail the receipt recorded itself, such as a run that did not complete.
+        return "fail"
     if rewards.get("reward") == 0:
+        # Also a saved report's earlier verdict, which compare and judge read back.
         p2p_total = rewards.get("p2p_total")
         no_existing_test_ran = (
             isinstance(p2p_total, int) and p2p_total > 0 and rewards.get("p2p_passed") == 0

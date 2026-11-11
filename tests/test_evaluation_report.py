@@ -826,6 +826,10 @@ def test_a_saved_overlap_fail_is_classified_again_when_read() -> None:
     assert correctness_state("fail", unbuilt) == "unknown"
     assert correctness_state("fail", _overlap_grading(0, f2p_passed=3)) == "fail"
     assert correctness_state("fail", {"reason": "native reward is unavailable"}) == "fail"
+    # A fail the receipt recorded for another reason stays a fail, whatever the rewards say.
+    assert correctness_state("fail", _overlap_grading(1)) == "fail"
+    missing = {"reason": "trusted verifier tests overwrite authored patch paths"}
+    assert correctness_state("fail", missing) == "fail"
 
 
 @pytest.mark.parametrize("execution_state", ["provider", "timeout", "complete", "missing"])
