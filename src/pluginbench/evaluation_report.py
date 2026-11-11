@@ -147,7 +147,8 @@ def correctness_state(status: object, grading: object) -> str:
     may fail to build before any test runs. Any other withheld result stays unknown.
     """
     grading = _map(grading)
-    if status != "unknown" or grading.get("reason") != TRUSTED_TEST_OVERLAP:
+    # A saved report already holds this function's earlier verdict, so classify it again.
+    if status not in {"unknown", "fail"} or grading.get("reason") != TRUSTED_TEST_OVERLAP:
         return str(status)
     rewards = _map(_map(grading.get("native_verifier_result")).get("rewards"))
     if rewards.get("reward") == 0:

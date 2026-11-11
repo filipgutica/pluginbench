@@ -16,6 +16,7 @@ from pluginbench.evaluation_report import (
     _reference_aggregates,
     _reference_comparisons,
     _reference_values,
+    correctness_state,
     evaluation_data,
     write_evaluation_report,
 )
@@ -817,6 +818,14 @@ def test_trusted_test_overlap_with_every_test_passing_is_an_overlap_pass(
     visible = _outcome_text(data, tmp_path, package=True)
     assert "1/5 attempts passed" in visible
     assert "1 failed task check · 1 overlap pass · 0 execution failures · 2 unknown" in visible
+
+
+def test_a_saved_overlap_fail_is_classified_again_when_read() -> None:
+    # compare and judge pass the correctness a report saved earlier, before this rule existed.
+    unbuilt = _overlap_grading(0, p2p_passed=0)
+    assert correctness_state("fail", unbuilt) == "unknown"
+    assert correctness_state("fail", _overlap_grading(0, f2p_passed=3)) == "fail"
+    assert correctness_state("fail", {"reason": "native reward is unavailable"}) == "fail"
 
 
 @pytest.mark.parametrize("execution_state", ["provider", "timeout", "complete", "missing"])
