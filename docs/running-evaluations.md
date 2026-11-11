@@ -290,7 +290,7 @@ gates:
     factor: 1.1
 ```
 
-Statistics are taken per task first, then averaged. A missing value is never 0: tasks without a value, and tasks measured on only some attempts, are listed under "Missing values" with their reasons. A `total` with any unmeasured attempt is `undetermined`. Each gate compares both sides over the tasks both have and says how many, and names tasks whose measured repeat counts differ.
+Statistics are taken per task first, then averaged. A missing value is never 0: tasks without a value, and tasks measured on only some attempts, are listed under "Missing values" with their reasons. A metric gate is `undetermined` when either package has an assigned attempt without a value for its metrics. This applies to `total` and to both mean statistics. The detail names the metrics and the measured and assigned attempts on each side. Assigned attempts are the attempts the run kept. An interrupted attempt that a resume discarded, and its token use, are not in the report or in token gates. A task that never has a value, such as a task where the measure is not configured or not measured, therefore also makes the gate `undetermined`. To decide the gate, define a named split without that task. The `all` section still includes it, so that gate stays `undetermined` there. A ratio gate leaves out a task without a usable reference: missing, zero, or below `reference_floor`. That task's missing values do not make the gate `undetermined`, and the gate says how many tasks it compared. Each gate compares both sides over the tasks both have and says how many, and names tasks whose measured repeat counts differ.
 
 Each split also has a paired section for every package against each comparator named in the gates file. It matches tasks across runs, including inputs selected with `DIR=ARM,ARM`. For each task, it reports:
 
@@ -322,7 +322,7 @@ gates:
     factor: 1.3                   # upper geometric-mean token ratio must be <= 1.3
 ```
 
-Bound gates omit `statistic`: they always average repeats within task. They cannot use `per_task`, `tolerance`, or `reference_floor`. Correctness bounds require `bound: lower`, `direction: higher`, and `margin`. Token bounds require both token metrics, `bound: upper`, `direction: lower`, and `factor`. A bound gate is `undetermined` with fewer than six usable pairs or any excluded task in its split. Otherwise, `pass` means its endpoint meets the declared limit; `fail` means the bound does not establish that requirement. Gates without `bound` keep their existing behavior.
+Bound gates omit `statistic`: they always average repeats within task. They cannot use `per_task`, `tolerance`, or `reference_floor`. Correctness bounds require `bound: lower`, `direction: higher`, and `margin`. Token bounds require both token metrics, `bound: upper`, `direction: lower`, and `factor`. A bound gate is `undetermined` with fewer than six usable pairs or any excluded task in its split. Otherwise, `pass` means its endpoint meets the declared limit; `fail` means the bound does not establish that requirement. Gates without `bound` work as described above.
 
 ## Judging
 

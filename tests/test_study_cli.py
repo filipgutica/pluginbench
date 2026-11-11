@@ -29,6 +29,7 @@ from pluginbench import (
     study,
     submissions,
 )
+from pluginbench.compare import Gate, Gates, check_gate, load_evidence
 from pluginbench.harbor_backend import assert_runtime as checked_runtime
 from pluginbench.ledger import Ledger
 from pluginbench.remeasure import propose_remeasurement
@@ -1398,6 +1399,34 @@ def test_run_reports_a_measure_broken_on_one_task_as_not_measured(
         if (row["task"], row["metric"]) == ("arbitrary-native-task", "Line coverage %")
     } == {"measured"}
     assert "Warning:" not in CliRunner().invoke(cli.app, ["status", str(root)]).stdout
+
+
+def test_a_gate_on_a_listed_pair_reads_the_report_as_undetermined(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _coverage_broken_on_one_task(checkable, monkeypatch)
+    root, result, _, _ = _run_checkable(checkable, monkeypatch)
+    assert result.exit_code == 0, result.stderr
+    evidence = load_evidence([str(root)])
+    candidate = sorted({row.arm for row in evidence.attempts} - {"vanilla"})[0]
+    gate = Gate(
+        name="coverage",
+        metrics=["Line coverage %"],
+        statistic="mean_of_task_medians",
+        against="vanilla",
+        direction="higher",
+        tolerance=10,
+    )
+    gates = Gates(count_overlap_passes=True, gates=[gate])
+
+    split = check_gate(
+        evidence, gates, gate, candidate, ["arbitrary-native-task", "covered-native-task"]
+    )
+    covered = check_gate(evidence, gates, gate, candidate, ["covered-native-task"])
+
+    assert split.result == "undetermined" and split.detail.startswith("missing Line coverage %")
+    # A split without the listed task decides.
+    assert covered.result in {"pass", "fail"} and covered.detail == "1 of 1 tasks"
 
 
 @pytest.mark.parametrize("failure", ["unavailable", "integrity"])
