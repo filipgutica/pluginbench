@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import inspect
 import json
 import hashlib
@@ -9,6 +10,8 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -27,6 +30,7 @@ from pluginbench import (
     harbor_backend,
     isolation,
     remeasure,
+    run_lock,
     study,
     submissions,
 )
@@ -2205,6 +2209,31 @@ def _killed_while_measuring(
     return root, calls, reviews
 
 
+@contextmanager
+def _held_by_another_process(root: Path) -> Iterator[None]:
+    """Hold run.lock as a process that has not written its owner record yet."""
+    fd = os.open(root / run_lock.LOCK_NAME, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        record = os.pread(fd, 1 << 16, 0)
+        os.ftruncate(fd, 0)
+        try:
+            yield
+        finally:
+            os.pwrite(fd, record, 0)
+    finally:
+        os.close(fd)
+
+
+def _assert_only_a_free_run_is_recovered(root: Path) -> None:
+    with _held_by_another_process(root):
+        with pytest.raises(ValueError, match="another process may own this run"):
+            evaluation.plan_resume(root)
+        with pytest.raises(ValueError, match="run is already active"):
+            evaluation.resume_evaluation(root)
+    assert evaluation.plan_resume(root)["collect_measurements"] is True
+
+
 @pytest.mark.parametrize("torn", [False, True], ids=["before-a-write", "during-a-write"])
 def test_run_resumes_a_measurement_that_a_kill_left_collecting(
     config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, torn: bool
@@ -2214,10 +2243,8 @@ def test_run_resumes_a_measurement_that_a_kill_left_collecting(
     )
     killed = root / "evidence/observer-revisions/measurements/revision.json"
     assert json.loads(killed.read_text())["status"] == "collecting"
-    # Only the run.lock holder may decide the collection is dead.
-    with pytest.raises(ValueError, match="still marked active"):
-        evaluation.resume_evaluation(root)
-    assert evaluation.plan_resume(root)["collect_measurements"] is True
+    _assert_only_a_free_run_is_recovered(root)
+    assert json.loads(killed.read_text())["status"] == "collecting"
     coded = len(calls)
 
     result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
@@ -2269,10 +2296,7 @@ def test_run_measures_again_when_measurement_ended_before_saving_its_profiles(
         state = json.loads((abandoned / "revision.json").read_text())
         assert state["status"] == "failed" and "frozen_profiles" not in state
     kept = study._inventory(abandoned)
-    # Only the run.lock holder may decide the start was abandoned.
-    with pytest.raises(ValueError, match="no saved frozen profiles"):
-        evaluation.resume_evaluation(root)
-    assert evaluation.plan_resume(root)["collect_measurements"] is True
+    _assert_only_a_free_run_is_recovered(root)
     coded = len(calls)
 
     result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
@@ -2344,6 +2368,10 @@ def test_stopped_run_copied_to_a_new_path_resumes_there(
     shutil.copytree(root, moved, symlinks=True)
     shutil.rmtree(root)
     coded = len(calls)
+    # The copied run.lock still names the old path; deleting it is the documented way on.
+    refused = CliRunner().invoke(cli.app, ["run", str(moved), "--yes", "--foreground"])
+    assert refused.exit_code == 2 and "delete" in refused.stderr
+    (moved / "run.lock").unlink()
     result = CliRunner().invoke(cli.app, ["run", str(moved), "--yes", "--foreground"])
     assert result.exit_code == 0, result.stderr + result.stdout
     assert len(calls) == coded + 7 and len(reviews) == 9

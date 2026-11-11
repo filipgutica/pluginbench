@@ -203,6 +203,16 @@ def test_an_ignored_ctrl_c_never_hides_a_later_stop(stop_handlers: None) -> None
     assert signal.getsignal(signal.SIGTERM) is _stopped
 
 
+def test_a_ctrl_c_handler_that_returns_never_hides_a_later_stop(stop_handlers: None) -> None:
+    seen = []
+    signal.signal(signal.SIGINT, lambda item, frame: seen.append(item))
+    with pytest.raises(KeyboardInterrupt, match="SIGTERM"):
+        with run_lock.deferred_stop():
+            signal.raise_signal(signal.SIGINT)
+            signal.raise_signal(signal.SIGTERM)
+    assert seen == [signal.SIGINT]
+
+
 def test_a_stop_while_handlers_are_restored_still_restores_ctrl_c(
     stop_handlers: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:

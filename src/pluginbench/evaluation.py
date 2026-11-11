@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import tempfile
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -1066,18 +1067,19 @@ def _next_measurement_revision(evidence: Path) -> str:
     return revision
 
 
-def _sole_owner(root: Path, *, resuming: bool) -> bool:
-    """Whether this process may treat measurement or review state left active as dead.
+def _owns(root: Path) -> bool:
+    return (run_lock.owner(root) or {}).get("pid") == os.getpid()
 
-    Only the holder of run.lock collects or reviews, and its flock ends with its process, even
-    on SIGKILL. So state the holder finds still active was left by a process that ended. A plan
-    may assume the same while no live process holds the lock; a resume acts on it only as the
-    holder. A held lock with no owner record yet counts as another owner.
+
+def _sole_owner(root: Path) -> bool:
+    """Whether this process may treat a measurement left active as dead.
+
+    `resume_evaluation` measures only while it holds run.lock, and the flock ends with its
+    process, even on SIGKILL. So a measurement the holder finds still active was left by a process
+    that ended. A plan may assume the same while no live process holds the lock. A held lock with
+    no owner record yet counts as another owner.
     """
-    current = run_lock.owner(root)
-    if current is None:
-        return not resuming
-    return current.get("pid") == os.getpid()
+    return run_lock.owner(root) is None or _owns(root)
 
 
 def _measurement_to_recover(
@@ -1139,7 +1141,7 @@ def _resume_inputs(
             # Each named revision ended before it saved frozen profiles: a kill left its
             # directory with no state file, or a stop recorded it as failed first. Its directory
             # stays as it is; measurement starts again under a new name with the prepared profiles.
-            if not _sole_owner(root, resuming=resuming):
+            if not _sole_owner(root):
                 raise ValueError(
                     "observer recovery has no saved frozen profiles and another process may own "
                     "this run; cannot replay it"
@@ -1155,7 +1157,7 @@ def _resume_inputs(
             revision, state = found
             directory = evidence / "observer-revisions" / revision
             selection["pending_measurement_revision"] = revision
-            if state["status"] == "collecting" and _sole_owner(root, resuming=resuming):
+            if state["status"] == "collecting" and _sole_owner(root):
                 # Its process ended without recording why; record it as failed, keep its files.
                 state.update(
                     status="failed",
@@ -1174,9 +1176,7 @@ def _resume_inputs(
                     or _preserved_inventory(evidence, manifest, original.parent)
                     != state["preserved"]
                 ):
-                    raise ValueError(
-                        "saved native inputs changed after failed observer collection"
-                    )
+                    raise ValueError("saved native inputs changed after failed observer collection")
                 if study._inventory(directory / "profiles") != state["profile_inventory"]:
                     raise ValueError("frozen observer profiles changed")
                 profiles = load_profiles(study._bound_path(evidence, state["frozen_profiles"]))
@@ -1264,8 +1264,19 @@ def resume_evaluation(
     progress: Callable[[str], None] | None = None,
     guard: Callable[[], None] | None = None,
 ) -> Path:
-    """Run whatever a prepared evaluation has left: coding, then measurement and reviews."""
+    """Run whatever a prepared evaluation has left: coding, then measurement and reviews.
+
+    Holds run.lock for the whole call, taking it unless this process already has it, so a run
+    never has two processes working on it. Must then run in the main thread.
+    """
     root = root.expanduser().resolve()
+    with nullcontext() if _owns(root) else run_lock.hold(root):
+        return _resume(root, progress=progress, guard=guard)
+
+
+def _resume(
+    root: Path, *, progress: Callable[[str], None] | None, guard: Callable[[], None] | None
+) -> Path:
     selection = _load_selection(root)
     if not _coding_done(root):
         _assert_resumable(root, selection)

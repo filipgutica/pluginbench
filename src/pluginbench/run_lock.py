@@ -79,7 +79,7 @@ def _interrupt(signum: int, frame: FrameType | None) -> None:
 
 @contextmanager
 def deferred_stop() -> Iterator[None]:
-    """Hold SIGTERM and SIGINT until the block ends, then deliver the first that arrived.
+    """Hold SIGTERM and SIGINT until the block ends, then deliver them in arrival order.
 
     For writes that must land together: `stop` and Ctrl-C otherwise interrupt between any two
     bytecodes. Keep the block to those writes. Only the main thread runs signal handlers, so
@@ -105,19 +105,20 @@ def deferred_stop() -> Iterator[None]:
         yield
     finally:
         failure: BaseException | None = None
-        for item, handler in previous.items():
-            while True:
-                try:
+        while True:
+            try:
+                for item, handler in previous.items():
                     signal.signal(item, handler)
-                    break
-                except BaseException as exc:
-                    # A signal that arrives now runs a handler already restored, which may raise.
-                    # Keep the first error and finish restoring before raising it.
-                    failure = failure or exc
+                break
+            except BaseException as exc:
+                # A signal that arrives now runs a handler already restored, which may raise
+                # anywhere in the loop. Keep the first error and restore every handler again.
+                failure = failure or exc
         if failure is not None:
             raise failure
-        if pending:
-            signal.raise_signal(pending[0])
+        # In arrival order: a handler that returns must not swallow a later stop.
+        for signum in pending:
+            signal.raise_signal(signum)
 
 
 @contextmanager
