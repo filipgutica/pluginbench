@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from pluginbench import cli, run_lock, run_status
+from pluginbench import cli, harbor_backend, run_lock, run_status
 from pluginbench.ledger import LEDGER_NAME, Ledger
 
 USAGE = {
@@ -332,6 +332,77 @@ def test_a_killed_run_reads_as_interrupted_and_says_how_to_resume(tmp_path: Path
         owned = run_status.run_status(root)
         assert owned["phase"] == "coding" and owned["resume_command"] is None
         assert "1 running" in run_status.format_status(owned)
+
+
+def test_a_killed_run_names_the_containers_it_left_running_until_a_resume_owns_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _run(tmp_path / "run", states=STATES, ledger=True)
+    _killed(root)
+    task = root / "evidence/frozen/suite/0/task"
+    task.mkdir(parents=True)
+    project = "pluginbench-" + "a" * 32 + "__env"
+    rows = [
+        [cid, f"{project}-{service}-1", project, str(task.resolve() / "environment")]
+        for cid, service in (("c1", "main"), ("c2", "sidecar"))
+    ]
+    # Another run's trial: never named.
+    rows.append(["c3", "x", "pluginbench-" + "b" * 32 + "__env", str(tmp_path / "other/task")])
+    queries: list[tuple[str, ...]] = []
+
+    def docker(*arguments: str, **kwargs: object) -> str:
+        queries.append(arguments)
+        return "".join(json.dumps(row) + "\n" for row in rows)
+
+    monkeypatch.setattr(harbor_backend, "_docker", docker)
+
+    status = run_status.run_status(root)
+    shown = run_status.format_status(status)
+    as_json = CliRunner().invoke(cli.app, ["status", str(root), "--json"])
+
+    assert status["left_running"] == {
+        "checked": True,
+        "error": None,
+        "containers": [
+            {"id": "c1", "name": f"{project}-main-1", "project": project},
+            {"id": "c2", "name": f"{project}-sidecar-1", "project": project},
+        ],
+        "stop_command": "docker stop c1 c2",
+    }
+    assert json.loads(as_json.stdout)["left_running"] == status["left_running"]
+    assert f"Containers left running with no live owner: {project}" in shown
+    assert "Stop them: docker stop c1 c2" in shown
+    # Only `docker ps`: status reports and never stops anything.
+    assert {query[0] for query in queries} == {"ps"}
+    queries.clear()
+    with run_lock.hold(root):
+        assert run_status.run_status(root)["left_running"] is None
+    assert not queries
+
+
+def test_status_says_it_could_not_check_for_containers_when_docker_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _run(tmp_path / "run", states=STATES, ledger=True)
+    _killed(root)
+    (root / "evidence/frozen/suite/0/task").mkdir(parents=True)
+
+    def docker(*arguments: str, **kwargs: object) -> str:
+        raise ValueError("docker ps failed: Cannot connect to the Docker daemon")
+
+    monkeypatch.setattr(harbor_backend, "_docker", docker)
+
+    status = run_status.run_status(root)
+    table = CliRunner().invoke(cli.app, ["status", str(root)])
+
+    assert status["left_running"] == {
+        "checked": False,
+        "error": "docker ps failed: Cannot connect to the Docker daemon",
+        "containers": [],
+        "stop_command": None,
+    }
+    assert table.exit_code == 0, table.output
+    assert "Containers: could not check for ones left running: docker ps failed" in table.output
 
 
 def test_a_killed_review_of_a_finished_run_offers_no_resume(tmp_path: Path) -> None:
