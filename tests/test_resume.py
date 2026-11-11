@@ -24,7 +24,7 @@ import native_support
 import resume_support
 from legacy_support import current_runtime, legacy_json
 from native_support import execution as native_execution
-from pluginbench import harbor_backend, parallel, study
+from pluginbench import harbor_backend, ledger, parallel, run_status, study
 from pluginbench.ledger import Ledger
 
 _PATH = os.pathsep.join([str(Path(pluginbench.__file__).parents[1]), str(Path(__file__).parent)])
@@ -227,10 +227,8 @@ def test_work_finished_while_a_stop_drains_is_kept_with_interrupted_usage(
     assert Counter(run["attempt_states"].values()) == {"complete": 4}
 
 
-def test_backend_failure_before_the_first_turn_stops_the_run_unscored_and_uncached(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # A seed whose first attempt is vanilla, so a scored failure would be cached.
+def _vanilla_first(tmp_path: Path) -> study.ResolvedStudy:
+    """12 attempts whose first is vanilla, so a scored failure of it would be cached."""
     seed = next(
         seed
         for seed in range(100)
@@ -243,10 +241,17 @@ def test_backend_failure_before_the_first_turn_stops_the_run_unscored_and_uncach
         )["entries"][0]["arm"]
         == "baseline"
     )
-    recipe = resume_support.recipe(
-        tmp_path / "config", tasks=2, treatments=1, repeats=3, jobs=1, seed=seed
+    return study.load_study(
+        resume_support.recipe(
+            tmp_path / "config", tasks=2, treatments=1, repeats=3, jobs=1, seed=seed
+        )
     )
-    resolved = study.load_study(recipe)
+
+
+def test_backend_failure_before_the_first_turn_stops_the_run_unscored_and_uncached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resolved = _vanilla_first(tmp_path)
     cache, root = tmp_path / "cache", tmp_path / "run"
     calls: list[str] = []
     resume_support.install(monkeypatch, calls)
@@ -592,3 +597,182 @@ def test_a_942f12c_vanilla_run_resumes_after_docker_memory_moved_by_28_kib(
     study.resume_study(root, baseline_cache=cache, baseline_identity=identity)
     assert _json(root / "run.json")["status"] == "complete"
     assert len(calls) == 6
+
+
+# The command a timed-out Harbor worker ran; its paths must not reach the saved error.
+_WORKER = ["python", "-m", "pluginbench.harbor_backend", "/private/trial.json", "/a/worker.json"]
+_USAGE = {"input_tokens": 10, "output_tokens": 5}
+
+
+# Set by a test whose workers hang after Harbor collected the patch, as in a hung verifier.
+_COLLECTED = {"patch": False}
+
+
+def _overrun(kwargs: dict[str, Any]) -> None:
+    """A worker that overran its budget after the agent used tokens, as Harbor records it."""
+    artifacts = kwargs["area"] / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "execution.json").write_text(
+        json.dumps({"usage": _USAGE, "timed_out": True, "submission_collected": _COLLECTED["patch"]})
+    )
+    raise subprocess.TimeoutExpired(_WORKER, 5400)
+
+
+# A patch that Harbor collected before the worker hung has no verifier result. It must stay
+# ungraded and unknown: graded without one, the attempt would be scored as a fail.
+@pytest.mark.parametrize("collected", [False, True])
+def test_a_worker_that_overruns_its_budget_is_kept_ungraded_and_the_run_goes_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, collected: bool
+) -> None:
+    monkeypatch.setitem(_COLLECTED, "patch", collected)
+    resolved = _vanilla_first(tmp_path)
+    failed = study.plan_study(resolved)["entries"][0]["id"]
+    cache, run = tmp_path / "cache", tmp_path / "run"
+    root = run / "evidence"
+    run.mkdir()
+    (run / "evaluation.json").write_text(json.dumps({"name": "fixture"}))
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+    invoke = harbor_backend.invoke_native
+
+    def first_overruns(**kwargs: Any) -> dict[str, Any]:
+        if kwargs["entry"]["id"] != failed:
+            return invoke(**kwargs)
+        calls.append(failed)
+        _overrun(kwargs)
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", first_overruns)
+    identity = resume_support.vanilla_identity(resolved)
+    study.run_study(resolved, root, baseline_cache=cache, baseline_identity=identity)
+
+    saved = _json(root / "run.json")
+    assert saved["status"] == "complete" and len(calls) == 12  # The other attempts were coded.
+    assert Counter(saved["attempt_states"].values()) == {"complete": 12}
+    reason = "the Harbor worker exceeded its budget of 5400 seconds"
+    assert _json(root / "attempts" / failed / "handoff/execution.json")["error"] == reason
+    report = _json(root / "report/assessment-report.json")
+    stage = next(row for row in report["attempts"] if row["id"] == failed)["stages"][0]
+    assert stage["snapshot_digest"] is None and stage["correctness"]["status"] == "unknown"
+    assert stage["work"]["tokens"] == _USAGE
+    assert stage["execution_provenance"]["timed_out"] is True
+    assert stage["execution_provenance"]["error"] == reason
+    assert len(list(cache.glob("*/*/manifest.json"))) == 5  # Not a vanilla baseline.
+    row = next(row for row in run_status.run_status(run)["attempts"] if row["id"] == failed)
+    assert (row["outcome"], row["outcome_reason"]) == ("unknown", reason)
+
+    calls.clear()
+    resume_support.install(monkeypatch, calls)
+    study.resume_study(root, baseline_cache=cache, baseline_identity=identity)
+    assert calls == []
+
+
+def _failing_calls(monkeypatch: pytest.MonkeyPatch, calls: list[str], failing: set[int]) -> None:
+    """The calls with these ordinals overrun their budget; the others pass."""
+    resume_support.install(monkeypatch, calls)
+    invoke = harbor_backend.invoke_native
+
+    def invoke_or_overrun(**kwargs: Any) -> dict[str, Any]:
+        if len(calls) + 1 not in failing:
+            return invoke(**kwargs)
+        calls.append(kwargs["entry"]["id"])
+        _overrun(kwargs)
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke_or_overrun)
+
+
+@pytest.mark.parametrize("collected", [False, True])
+def test_three_failed_calls_in_a_row_stop_new_attempts_and_resume_codes_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, collected: bool
+) -> None:
+    monkeypatch.setitem(_COLLECTED, "patch", collected)
+    recipe = resume_support.recipe(tmp_path / "config", tasks=2, treatments=1, repeats=3, jobs=1)
+    root = tmp_path / "run"
+    calls: list[str] = []
+    _failing_calls(monkeypatch, calls, {1, 2, 3})
+    with pytest.raises(ValueError, match="the last 3 attempts to finish each failed") as stop:
+        study.run_study(study.load_study(recipe), root)
+    assert len(calls) == 3
+    assert str(stop.value).count("the Harbor worker exceeded its budget of 5400 seconds") == 3
+    assert "`pluginbench run <run-dir>` codes the pending slots" in str(stop.value)
+    saved = _json(root / "run.json")
+    assert saved["status"] == "interrupted"
+    assert Counter(saved["attempt_states"].values()) == {"complete": 3, "pending": 9}
+
+    coded = list(calls)
+    calls.clear()
+    resume_support.install(monkeypatch, calls)
+    study.resume_study(root)
+    assert len(calls) == 9 and not set(calls) & set(coded)  # The three stay as recorded.
+    assert _json(root / "run.json")["status"] == "complete"
+
+
+def test_a_finished_attempt_without_a_failed_call_resets_the_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recipe = resume_support.recipe(tmp_path / "config", tasks=2, treatments=1, repeats=3, jobs=1)
+    root = tmp_path / "run"
+    calls: list[str] = []
+    _failing_calls(monkeypatch, calls, {1, 2, 4, 5})
+    study.run_study(study.load_study(recipe), root)
+    assert len(calls) == 12
+    assert _json(root / "run.json")["status"] == "complete"
+
+
+def test_with_two_jobs_the_count_follows_the_order_attempts_finish_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Call 1 fails but finishes after call 2 passes, so calls 1, 3 and 4 fail in a row.
+
+    In the order they started, call 2's pass would sit between them and no stop would follow.
+    """
+    from threading import Event, Lock
+
+    recipe = resume_support.recipe(tmp_path / "config", tasks=2, treatments=1, repeats=3, jobs=2)
+    root = tmp_path / "run"
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+    invoke = harbor_backend.invoke_native
+    lock = Lock()
+    ordinals: dict[str, int] = {}
+    committed = {ordinal: Event() for ordinal in range(1, 13)}
+    complete = ledger.Ledger.complete
+
+    def completing(self: ledger.Ledger, attempt_id: str, *args: Any, **kwargs: Any) -> None:
+        complete(self, attempt_id, *args, **kwargs)
+        committed[ordinals[attempt_id]].set()
+
+    # Each held call waits until the named call has been recorded complete. Call 4 also waits
+    # for call 5, admitted when call 3 finished, to be in flight when the run stops.
+    after = {1: 2, 3: 1, 4: 3}
+    fifth = Event()
+
+    def ordered(**kwargs: Any) -> dict[str, Any]:
+        with lock:
+            ordinal = len(ordinals) + 1
+            ordinals[kwargs["entry"]["id"]] = ordinal
+        if ordinal in after:
+            assert committed[after[ordinal]].wait(timeout=10)
+        if ordinal == 4:
+            assert fifth.wait(timeout=10)
+        if ordinal == 5:
+            fifth.set()
+            # Call 5 must finish after call 4, or its pass would reset the count.
+            assert committed[4].wait(timeout=10)
+        if ordinal == 2 or ordinal > 4:
+            return invoke(**kwargs)
+        calls.append(kwargs["entry"]["id"])
+        _overrun(kwargs)
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(ledger.Ledger, "complete", completing)
+    monkeypatch.setattr(harbor_backend, "invoke_native", ordered)
+    with pytest.raises(ValueError, match="the last 3 attempts to finish each failed"):
+        study.run_study(study.load_study(recipe), root)
+    by_ordinal = {ordinal: attempt for attempt, ordinal in ordinals.items()}
+    # Call 5 was in flight when the run stopped; it finished, and no call 6 started.
+    assert len(ordinals) == 5
+    states = _json(root / "run.json")["attempt_states"]
+    assert all(states[by_ordinal[ordinal]] == "complete" for ordinal in range(1, 6))
+    assert Counter(states.values()) == {"complete": 5, "pending": 7}

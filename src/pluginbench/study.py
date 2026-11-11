@@ -9,6 +9,7 @@ import json
 import os
 import random
 import shutil
+import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from functools import partial
@@ -426,6 +427,32 @@ class BackendUnavailable(ValueError):
     """A coding session failed before its first model turn; the run stops instead of scoring it."""
 
 
+def _call_error(error: BaseException) -> str:
+    """The saved error of a failed coding call. A timeout's own text holds its command line."""
+    if not isinstance(error, subprocess.TimeoutExpired):
+        return f"{type(error).__name__}: {error}"
+    command = error.cmd if isinstance(error.cmd, list) else []
+    process = "the Harbor worker" if "pluginbench.harbor_backend" in command else "a Docker command"
+    return f"{process} exceeded its budget of {error.timeout:g} seconds"
+
+
+# Attempts that may finish in a row with a failed call and no submission before the run stops.
+CONSECUTIVE_FAILURE_LIMIT = 3
+
+
+def _failed_call(root: Path, record: dict[str, Any]) -> str | None:
+    """`task · arm · repeat: error` for an attempt whose call failed with no submission."""
+    for stage in record["stages"]:
+        path = root / "attempts" / record["id"] / stage["id"] / "execution.json"
+        execution = json.loads(path.read_text()) if path.is_file() else {}
+        error = execution.get("error")
+        if error and execution.get("submission_collected") is not True:
+            if isinstance(error, dict):  # Harbor's exception_info for the agent.
+                error = f"{error.get('exception_type')}: {error.get('exception_message')}"
+            return f"{record['task_id']} · {record['arm']} · repeat {record['attempt']}: {error}"
+    return None
+
+
 def _execute_stage(
     *,
     root: Path,
@@ -474,7 +501,8 @@ def _execute_stage(
             prompt=prompt,
             timeout=study.recipe.timeout_seconds,
         )
-    except (OSError, ValueError, KeyboardInterrupt) as exc:
+    # A worker process that overruns its budget is a failed call like any other.
+    except (OSError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
         artifacts = area / "artifacts"
         execution = codex.parse_events(
             "",
@@ -499,7 +527,11 @@ def _execute_stage(
             runtime_receipt = artifacts / "execution.json"
             if runtime_receipt.is_file():
                 execution.update(json.loads(runtime_receipt.read_text()))
-        execution.update(successful_native_completion=False, error=f"{type(exc).__name__}: {exc}")
+        execution.update(successful_native_completion=False, error=_call_error(exc))
+        if isinstance(exc, subprocess.TimeoutExpired):
+            # The worker never returned a verifier result, so a patch it collected cannot be
+            # graded. Left as collected, the attempt would be scored as a fail.
+            execution["submission_collected"] = False
         if isinstance(exc, KeyboardInterrupt):
             interrupted = exc
     guard()
@@ -1218,6 +1250,11 @@ def _run_attempts(
             status="running",
         )
 
+        # Attempts that made a call in this invocation, and the latest of them, in the order
+        # they finished, that each ended with an error and no submission.
+        called: set[str] = set()
+        failed_in_a_row: list[str] = []
+
         def commit(index: int, record: dict[str, Any], status: str) -> None:
             if guard:
                 guard()
@@ -1238,11 +1275,27 @@ def _run_attempts(
             if cache is not None and status == "complete":
                 # Cached as it finishes, so a run that stops later still keeps it for reuse.
                 cache.publish(record)
+            if status == "complete" and record["id"] in called:
+                error = _failed_call(root, record)
+                if error is None:
+                    failed_in_a_row.clear()
+                else:
+                    failed_in_a_row.append(error)
+                if len(failed_in_a_row) == CONSECUTIVE_FAILURE_LIMIT:
+                    # A setup that fails every call must not spend the whole budget.
+                    raise ValueError(
+                        f"the last {CONSECUTIVE_FAILURE_LIMIT} attempts to finish each failed "
+                        "without a submission, so no new attempt starts: "
+                        + "; ".join(failed_in_a_row)
+                        + ". They stay recorded. `pluginbench run <run-dir>` codes the pending "
+                        "slots"
+                    )
 
         def invoked(index: int, record: dict[str, Any], stage_id: str) -> None:
             if guard:
                 guard()
             records[index] = record
+            called.add(record["id"])
             receipt = root / "invocations" / record["id"] / f"{stage_id}.json"
             ledger.stage_started(record["id"], stage_id, _reference(root, receipt))
             _checkpoint(root, frozen, manifest, states, status="running")

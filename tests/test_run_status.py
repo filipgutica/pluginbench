@@ -42,6 +42,28 @@ def _finished(evidence: Path, attempt: str, *, behavior: bool | None, usage: obj
     _write(handoff / "verifier-result.json", {"patch_sha256": "ab" * 32, "reason": "overlap"})
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        "the Harbor worker exceeded its budget of 5400 seconds",
+        # Harbor's own record of an agent exception.
+        {"exception_type": "AgentTimeoutError", "exception_message": "agent timed out"},
+    ],
+)
+def test_an_attempt_without_a_submission_gives_its_failed_call_as_the_reason(
+    tmp_path: Path, error: object
+) -> None:
+    root = _run(tmp_path / "run", states={**STATES, "a3": "complete"}, ledger=True)
+    handoff = root / "evidence/attempts/a3/handoff"
+    _write(handoff / "execution.json", {"usage": None, "elapsed_seconds": 600})
+    _write(handoff / "unsupported-submission.json", {"error": error})
+
+    row = next(row for row in run_status.run_status(root)["attempts"] if row["id"] == "a3")
+
+    expected = error if isinstance(error, str) else "AgentTimeoutError: agent timed out"
+    assert (row["outcome"], row["outcome_reason"]) == ("unknown", expected)
+
+
 def _run(root: Path, *, states: dict[str, str], ledger: bool) -> Path:
     """A run directory as Phase 3 writes it: a1 reused and passing, a2 failing, a3 running."""
     evidence = root / "evidence"

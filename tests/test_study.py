@@ -243,13 +243,17 @@ def test_artifact_links_are_retained_without_reading_external_files(
         return execution
 
     monkeypatch.setattr(harbor_backend, "invoke_native", linked_artifacts)
-    root = study.run_study(study.load_study(path), tmp_path / "results")
-    assert len(calls) == 4
+    root = tmp_path / "results"
+    # Each attempt ends with an artifact error and no submission, so the third in a row stops
+    # new attempts.
+    with pytest.raises(ValueError, match="unsupported native artifact"):
+        study.run_study(study.load_study(path), root)
+    assert len(calls) == 3
     for file in root.rglob("*"):
         if file.is_file() and not file.is_symlink():
             assert secret.read_bytes() not in file.read_bytes()
     archives = list(root.glob("attempts/*/handoff/artifacts/unsupported-artifacts.tar"))
-    assert len(archives) == 4
+    assert len(archives) == 3
     with tarfile.open(archives[0]) as archive:
         link = archive.getmember("artifacts/harbor/trial/agent/not-native-log")
         assert link.issym()
