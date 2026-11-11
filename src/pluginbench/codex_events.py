@@ -6,8 +6,9 @@ launched. A parser-only change re-reads saved traces; it does not change how a m
 
 from __future__ import annotations
 
-import hashlib
 import json
+import warnings
+from functools import cache
 from typing import Any
 
 
@@ -49,13 +50,11 @@ def parse_events(
         raise ValueError(f"unsupported native host: {host}")
     commands: list[dict[str, Any]] = []
     models = set()
-    usage = None
     startup = []
     errors: list[Any] = []
     tools = []
     final = []
     successful_completion = False
-    turn_usage: list[dict[str, int]] = []
     stdout_events: list[dict[str, Any]] = []
     for line in stdout.splitlines():
         try:
@@ -66,10 +65,16 @@ def parse_events(
         if not isinstance(event, dict):
             errors.append("stdout JSONL event is not an object")
             continue
+        if not isinstance(event.get("type"), str):
+            errors.append("invalid stdout event type")
+            continue
         stdout_events.append(event)
         item = event.get("item", {})
         if not isinstance(item, dict):
             errors.append("stdout item is not an object")
+            continue
+        if item.get("type") is not None and not isinstance(item["type"], str):
+            errors.append("invalid stdout item type")
             continue
         if event.get("type") == "item.completed" and item.get("type") == "command_execution":
             commands.append(item)
@@ -81,12 +86,11 @@ def parse_events(
                 errors.append("invalid agent message text")
         if event.get("type") == "turn.completed":
             reported = event.get("usage")
-            if isinstance(reported, dict) and all(
-                isinstance(value, int) and not isinstance(value, bool) and value >= 0
-                for value in reported.values()
+            if (
+                not isinstance(reported, dict)
+                or _token_usage(reported) is None
+                or not {"input_tokens", "output_tokens"}.issubset(reported)
             ):
-                turn_usage.append(reported)
-            else:
                 errors.append("invalid turn usage")
             successful_completion = True
         if event.get("type") in {"error", "turn.failed"}:
@@ -94,10 +98,8 @@ def parse_events(
         if item.get("type") not in {None, "command_execution", "agent_message", "reasoning"}:
             tools.append(item)
     effort = set()
-    partial_usage = []
     trace_events: list[list[dict[str, Any]]] = []
     for trace in traces:
-        last_observed_usage = None
         decoded_trace = []
         for line in trace.splitlines():
             try:
@@ -108,21 +110,10 @@ def parse_events(
             if not isinstance(event, dict):
                 errors.append("trace JSONL event is not an object")
                 continue
+            if not isinstance(event.get("type"), str):
+                errors.append("invalid trace event type")
+                continue
             decoded_trace.append(event)
-            if event.get("type") == "event_msg":
-                payload = event.get("payload", {})
-                info = payload.get("info") if isinstance(payload, dict) else None
-                observed = info.get("total_token_usage") if isinstance(info, dict) else None
-                if (
-                    isinstance(payload, dict)
-                    and payload.get("type") == "token_count"
-                    and isinstance(observed, dict)
-                ):
-                    if observed and all(
-                        isinstance(value, int) and not isinstance(value, bool) and value >= 0
-                        for value in observed.values()
-                    ):
-                        last_observed_usage = observed
             if event.get("type") in {"session_meta", "turn_context"}:
                 payload = event.get("payload", {})
                 startup.append({"type": event["type"], "payload": payload})
@@ -139,23 +130,27 @@ def parse_events(
                     elif payload.get("effort") is not None:
                         errors.append("invalid trace effort")
         trace_events.append(decoded_trace)
-        if last_observed_usage is not None:
-            partial_usage.append(
-                {
-                    "trace_sha256": "sha256:" + hashlib.sha256(trace.encode()).hexdigest(),
-                    "tokens": last_observed_usage,
-                    "status": "last observed session total; incomplete usage lower bound",
-                }
-            )
-    if turn_usage:
-        # Missing usage fields stay unknown instead of being silently undercounted.
-        common_keys = set.intersection(*(set(turn) for turn in turn_usage))
-        usage = {key: sum(turn[key] for turn in turn_usage) for key in sorted(common_keys)}
+    # Validate trace identity and cumulative usage even when subagents are disabled.
+    accounting = _descendant_usage(stdout_events, trace_events, errors)
     result = {
         "command_items": commands,
         "actual_primary_models": sorted(models),
-        "usage": usage,
-        "partial_usage": partial_usage if usage is None else [],
+        "usage": accounting["usage"],
+        "partial_usage": accounting["partial_usage"],
+        "usage_accounting": accounting["usage_accounting"],
+        # Evidence that a model turn occurred survives an unavailable token measure.
+        "observed_token_usage": any(
+            event.get("type") == "turn.completed" and _token_usage(event.get("usage")) is not None
+            for event in stdout_events
+        ) or any(
+            event.get("type") == "event_msg"
+            and isinstance(payload := event.get("payload"), dict)
+            and payload.get("type") == "token_count"
+            and isinstance(info := payload.get("info"), dict)
+            and _token_usage(info.get("total_token_usage")) is not None
+            for events in trace_events
+            for event in events
+        ),
         "native_dollars": None,
         "dollars_status": "unknown",
         "requested_effort": requested_effort,
@@ -169,7 +164,6 @@ def parse_events(
         "successful_native_completion": successful_completion and not errors,
     }
     if include_descendants:
-        accounting = _descendant_usage(stdout_events, trace_events, errors)
         result.update(accounting)
     return result
 
@@ -184,6 +178,7 @@ def failed_before_first_turn(execution: dict[str, Any]) -> str | None:
     if (
         execution.get("timed_out") is True
         or execution.get("usage") is not None
+        or execution.get("observed_token_usage") is True
         or any(execution.get(key) for key in ("partial_usage", "command_items", "agent_messages"))
     ):
         return None
@@ -215,17 +210,20 @@ def _token_usage(value: object) -> dict[str, int] | None:
     return value
 
 
-# Codex versions whose forked-child rollout layout has been checked against real traces.
-_INHERITED_HISTORY_VERSIONS = frozenset({"0.162.1", "0.167.0"})
+# Codex versions checked against real traces or equivalent upstream rollout source.
+# rust-v0.167.1 keeps rust-v0.167.0's protocol, rollout writer, and fork/history code.
+_VERIFIED_TRACE_VERSIONS = frozenset({"0.162.1", "0.167.0", "0.167.1"})
 
 
+@cache
 def admit_version(version: str) -> None:
-    """Refuse a Codex CLI whose session traces the usage parser has not been checked against."""
-    if version not in _INHERITED_HISTORY_VERSIONS:
-        raise ValueError(
-            f"Codex CLI {version} is not supported: token usage is parsed only for "
-            + ", ".join(sorted(_INHERITED_HISTORY_VERSIONS))
-            + ". Install a supported version, or check this version's rollouts and add it."
+    """Accept every version; warn once per unverified version in this process."""
+    if version not in _VERIFIED_TRACE_VERSIONS:
+        warnings.warn(
+            f"Codex CLI {version} has not been checked against PluginBench's trace parser; "
+            "token usage is verified per attempt and reported as unavailable if a trace "
+            "does not match. Verified versions: " + ", ".join(sorted(_VERIFIED_TRACE_VERSIONS)),
+            stacklevel=2,
         )
 
 
@@ -240,15 +238,20 @@ def _session_history(
         or first.get("subagent_history_start_ordinal") is not None
     )
     if not inherited:
-        if len(metadata) != 1 or not isinstance(metadata[0], dict):
+        if len(metadata) != 1 or not isinstance(first, dict):
             reasons.add("trace lacks one unambiguous session identity")
             return None
-        return metadata[0], events, False
+        return first, events, False
 
     # 0.162.1 protocol.rs defines this ordinal as the first own-history record.
     # Earlier records are inherited model context, including other session headers.
-    # 0.167.0 child rollouts keep the same header fields, boundary, and ordinals.
+    # 0.167.0 and 0.167.1 keep the same header fields, boundary, and ordinals.
     assert isinstance(first, dict)
+    version = first.get("cli_version")
+    if not isinstance(version, str) or version not in _VERIFIED_TRACE_VERSIONS:
+        label = version if isinstance(version, str) else "unknown"
+        reasons.add(f"inherited-history layout of Codex {label} is unverified")
+        return None
     boundary = first.get("subagent_history_start_ordinal")
     source = first.get("source")
     subagent = source.get("subagent") if isinstance(source, dict) else None
@@ -256,8 +259,7 @@ def _session_history(
     parent = first.get("parent_thread_id")
     path = first.get("agent_path")
     valid = (
-        first.get("cli_version") in _INHERITED_HISTORY_VERSIONS
-        and first.get("history_mode") == "paginated"
+        first.get("history_mode") == "paginated"
         and first.get("history_base") is None
         and isinstance(parent, str)
         and bool(parent)
@@ -385,8 +387,12 @@ def _descendant_usage(
         for event in session["events"]:
             payload = event.get("payload")
             if not isinstance(payload, dict):
+                reasons.add(f"invalid trace payload for session {identity}")
                 continue
             kind = payload.get("type") if event.get("type") == "event_msg" else None
+            if event.get("type") == "event_msg" and not isinstance(kind, str):
+                reasons.add(f"invalid event message type for session {identity}")
+                continue
             if event.get("type") == "response_item":
                 call_id = payload.get("call_id")
                 if (
@@ -456,6 +462,8 @@ def _descendant_usage(
                     _token_usage(info.get("total_token_usage")) if isinstance(info, dict) else None
                 )
                 if observed is not None:
+                    if not {"input_tokens", "output_tokens"}.issubset(observed):
+                        reasons.add(f"invalid cumulative usage for session {identity}")
                     if session["inherited"] and own_turn is None:
                         reasons.add(f"unverified own turn for session {identity}")
                         identity_safe = False
@@ -476,7 +484,7 @@ def _descendant_usage(
                     ):
                         reasons.add(f"nonmonotonic cumulative usage for session {identity}")
                     total = observed
-                elif isinstance(info, dict):
+                elif info is not None:
                     reasons.add(f"invalid cumulative usage for session {identity}")
             if kind == "collab_agent_spawn_begin":
                 call_id = payload.get("call_id")

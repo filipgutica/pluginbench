@@ -94,7 +94,7 @@ test('every internal link and heading anchor resolves; document links stay on th
   }
   const documentLinks = [
     { from: '/pluginbench/running-evaluations/', name: 'Configuration reference', href: '/pluginbench/config-reference/', heading: 'Configuration reference' },
-    { from: '/pluginbench/reproduce/', name: 'supported coding CLI', href: '/pluginbench/running-evaluations/#supported-coding-clis', heading: 'Evaluation details' },
+    { from: '/pluginbench/reproduce/', name: 'coding CLI', href: '/pluginbench/running-evaluations/#verified-coding-clis', heading: 'Evaluation details' },
     { from: '/pluginbench/metrics/', name: 'running evaluations', href: '/pluginbench/running-evaluations/#compare-runs', heading: 'Evaluation details' },
   ];
   for (const { from, name, href, heading } of documentLinks) {

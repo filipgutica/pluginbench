@@ -23,7 +23,9 @@ def test_codex_final_message_excludes_earlier_progress_for_structured_review() -
             {"type": "turn.completed", "usage": {"input_tokens": 20, "output_tokens": 10}},
         )
     )
-    parsed = codex.parse_events(stdout, [], "codex")
+    parsed = codex.parse_events(
+        stdout, [native_session("root", [{"input_tokens": 20, "output_tokens": 10}])], "codex"
+    )
     assert json.loads(parsed["final"]) == {"issues": []}
     assert parsed["agent_messages"] == ["I will inspect the source.", '{"issues": []}']
     assert parsed["usage"] == {"input_tokens": 20, "output_tokens": 10}
@@ -90,19 +92,19 @@ def test_cli_version_without_native_session_metadata_is_unknown(startup: object)
     assert codex.parse_events("", [], "codex")["observed_cli_version"] is None
 
 
-def test_turn_usage_is_summed_and_missing_fields_stay_unknown() -> None:
+def test_turn_usage_is_checked_against_trace_totals_and_missing_fields_stay_unknown() -> None:
     parsed = codex.parse_events(
         stream(
             {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 3}},
             {"type": "turn.completed", "usage": {"input_tokens": 4, "output_tokens": 2}},
         ),
-        [],
+        [native_session("root", [{"input_tokens": 14, "output_tokens": 5}])],
         "codex",
         requested_effort="high",
     )
     assert parsed["usage"] == {"input_tokens": 14, "output_tokens": 5}
-    assert parsed["actual_primary_models"] == []
-    assert parsed["runtime_effort_evidence"] == []
+    assert parsed["actual_primary_models"] == ["primary"]
+    assert parsed["runtime_effort_evidence"] == ["high"]
     assert parsed["requested_effort"] == "high"
     missing = codex.parse_events(
         stream(
@@ -112,7 +114,8 @@ def test_turn_usage_is_summed_and_missing_fields_stay_unknown() -> None:
         [],
         "codex",
     )
-    assert missing["usage"] == {"input_tokens": 14}
+    assert missing["usage"] is None
+    assert missing["usage_accounting"]["reasons"]
 
 
 @pytest.mark.parametrize(
@@ -201,14 +204,15 @@ def test_invoke_uses_explicit_auth_and_effort_and_removes_private_data(
     token = "fake-token-which-must-never-remain-in-evidence"
     auth = tmp_path / "selected-auth.json"
     auth.write_text(json.dumps({"token": token}))
+    trace = native_session("root", [{"input_tokens": 10, "output_tokens": 3}])
+    trace = trace.replace('"0.162.1"', '"0.134.0"').replace('"primary"', '"observed-model"')
+    trace = trace.replace('"high"', '"low"')
     script = (
         "import json,os,pathlib,sys; "
         "home=pathlib.Path(os.environ['CODEX_HOME']); "
         "token=json.loads((home/'auth.json').read_text())['token']; "
         "(home/'sessions').mkdir(); "
-        "(home/'sessions/test.jsonl').write_text(json.dumps({'type':'session_meta',"
-        "'payload':{'cli_version':'0.134.0'}})+'\\n'+json.dumps({'type':'turn_context',"
-        "'payload':{'model':'observed-model','effort':'low'}})); "
+        f"(home/'sessions/test.jsonl').write_text({trace!r}); "
         "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':token}})); "
         "print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'output_tokens':3}})); "
         f"sys.exit({exit_code})"
@@ -442,7 +446,7 @@ def test_invocation_cannot_overwrite_existing_execution_evidence(tmp_path: Path)
     assert existing.read_text() == '{"exit_code":0}'
 
 
-def test_truncated_trace_reports_usage_lower_bound_without_completed_usage() -> None:
+def test_truncated_trace_without_session_identity_cannot_supply_usage_or_lower_bound() -> None:
     trace = (
         stream(
             {
@@ -465,8 +469,10 @@ def test_truncated_trace_reports_usage_lower_bound_without_completed_usage() -> 
     parsed = codex.parse_events("", [trace], "codex")
     assert parsed["usage"] is None
     assert not parsed["successful_native_completion"]
-    assert parsed["partial_usage"][0]["tokens"] == {"input_tokens": 15, "output_tokens": 5}
-    assert parsed["partial_usage"][0]["trace_sha256"].startswith("sha256:")
+    assert parsed["partial_usage"] == []
+    assert "trace lacks one unambiguous session identity" in (
+        parsed["usage_accounting"]["reasons"]
+    )
 
 
 def native_session(
@@ -780,7 +786,7 @@ def named_native_spawn() -> list[dict[str, object]]:
     ]
 
 
-@pytest.mark.parametrize("version", ["0.162.1", "0.167.0"])
+@pytest.mark.parametrize("version", ["0.162.1", "0.167.0", "0.167.1"])
 def test_native_inherited_child_counts_only_own_history_and_deduplicates_copies(
     version: str,
 ) -> None:
@@ -918,18 +924,92 @@ def test_native_named_spawn_rejects_two_session_identities_for_one_child_path() 
     )
 
 
-@pytest.mark.parametrize("version", ["0.162.1", "0.167.0"])
+@pytest.mark.parametrize("version", ["0.162.1", "0.167.0", "0.167.1"])
 def test_version_admission_accepts_versions_the_usage_parser_was_checked_against(
     version: str,
 ) -> None:
     codex.admit_version(version)
 
 
-@pytest.mark.parametrize("version", ["0.168.0", "0.162.0", "0.167.1"])
-def test_version_admission_rejects_versions_whose_usage_would_be_lost(version: str) -> None:
-    # 0.167.0 forked rollouts were silently recorded with no usage under a 0.162.1-only parser.
-    with pytest.raises(ValueError, match=f"Codex CLI {version} is not supported"):
-        codex.admit_version(version)
+@pytest.mark.parametrize("include_descendants", [False, True])
+def test_unverified_plain_session_is_measured_when_its_structure_matches(
+    include_descendants: bool,
+) -> None:
+    trace = native_session("root", [{"input_tokens": 20, "output_tokens": 5}])
+    trace = trace.replace('"0.162.1"', '"0.168.0"')
+    parsed = codex.parse_events("", [trace], "codex", include_descendants=include_descendants)
+    assert parsed["usage"] == {"input_tokens": 20, "output_tokens": 5}
+    assert parsed["usage_accounting"]["status"] == "complete"
+
+
+@pytest.mark.parametrize("include_descendants", [False, True])
+def test_unverified_inherited_history_makes_tokens_unavailable(
+    include_descendants: bool,
+) -> None:
+    root = native_session(
+        "root", [{"input_tokens": 20, "output_tokens": 5}], extra=named_native_spawn()
+    )
+    child = stream(*inherited_native_child()).replace('"0.162.1"', '"0.168.0"')
+    parsed = codex.parse_events(
+        stream({"type": "turn.completed", "usage": {"input_tokens": 20, "output_tokens": 5}}),
+        [root, child], "codex", include_descendants=include_descendants,
+    )
+    assert parsed["usage"] is None
+    assert parsed["partial_usage"] == []
+    assert "inherited-history layout of Codex 0.168.0 is unverified" in (
+        parsed["usage_accounting"]["reasons"]
+    )
+
+
+@pytest.mark.parametrize("include_descendants", [False, True])
+@pytest.mark.parametrize(
+    "bad_event",
+    [
+        {"type": [], "payload": {}},
+        {"type": "event_msg", "payload": {"type": []}},
+        {"type": "event_msg", "payload": False},
+        {"type": "event_msg", "payload": {"type": "token_count", "info": []}},
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"input_tokens": 15}},
+            },
+        },
+    ],
+)
+def test_malformed_session_makes_tokens_unavailable_without_crashing(
+    bad_event: dict[str, object], include_descendants: bool,
+) -> None:
+    trace = native_session("root", [{"input_tokens": 20, "output_tokens": 5}])
+    lines = trace.splitlines()
+    lines.insert(2, json.dumps(bad_event))
+    parsed = codex.parse_events(
+        stream({"type": "turn.completed", "usage": {"input_tokens": 20, "output_tokens": 5}}),
+        ["\n".join(lines)], "codex", include_descendants=include_descendants,
+    )
+    assert parsed["usage"] is None
+    assert parsed["usage_accounting"]["status"] == "incomplete"
+    assert parsed["usage_accounting"]["reasons"]
+
+
+@pytest.mark.parametrize("include_descendants", [False, True])
+@pytest.mark.parametrize("header", ["missing", "late"])
+def test_session_without_a_leading_identity_cannot_supply_tokens(
+    header: str, include_descendants: bool,
+) -> None:
+    lines = native_session("root", [{"input_tokens": 20, "output_tokens": 5}]).splitlines()
+    metadata = lines.pop(0)
+    if header == "late":
+        lines.insert(1, metadata)
+    parsed = codex.parse_events(
+        stream({"type": "turn.completed", "usage": {"input_tokens": 20, "output_tokens": 5}}),
+        ["\n".join(lines)], "codex", include_descendants=include_descendants,
+    )
+    assert parsed["usage"] is None
+    assert "trace lacks one unambiguous session identity" in (
+        parsed["usage_accounting"]["reasons"]
+    )
 
 
 # Minimized from a real attempt during a network outage: Codex retried, then failed the turn.
@@ -965,6 +1045,12 @@ def test_session_that_failed_before_its_first_model_turn_is_a_backend_failure() 
         # Reconnected and finished the turn.
         (
             [*_OUTAGE[:4], {"type": "turn.completed", "usage": {"input_tokens": 9}}],
+            [],
+            False,
+        ),
+        # A completed turn proves a call even when no trace could validate its token measure.
+        (
+            [*_OUTAGE, {"type": "turn.completed", "usage": {"input_tokens": 9}}],
             [],
             False,
         ),

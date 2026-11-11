@@ -408,6 +408,7 @@ def test_interrupted_judge_binds_reportable_usage_and_pending_assignments(
             "\n".join(
                 json.dumps(event)
                 for event in (
+                    {"type": "session_meta", "payload": {"id": "judge", "cli_version": "0.162.1"}},
                     {
                         "type": "turn_context",
                         "payload": {"model": "gpt-6-astra", "effort": "high"},
@@ -419,6 +420,8 @@ def test_interrupted_judge_binds_reportable_usage_and_pending_assignments(
                             "info": {"total_token_usage": usage},
                         },
                     },
+                    *([{"type": "event_msg", "payload": {"type": "task_complete"}}]
+                      if final_usage else []),
                 )
             )
             + "\n"

@@ -34,7 +34,7 @@ PluginBench runs on Linux or macOS. Every run needs:
 | Python | 3.12 or later | Runs PluginBench |
 | Git | Any recent | Task sources and patches |
 | Docker | Linux containers on a local Unix socket, with Compose and Buildx | Each attempt and its verifier run in containers |
-| Codex CLI | Exactly 0.162.1 or 0.167.0, logged in | Coding agent. PluginBench checks the `codex` on your `PATH` and copies its login from `~/.codex/auth.json`. Other versions fail `check`. |
+| Codex CLI | Logged in; verified trace versions: 0.162.1, 0.167.0, 0.167.1 | Coding agent. PluginBench checks the `codex` on your `PATH` and copies its login from `~/.codex/auth.json`. Unverified versions warn and continue; incompatible traces or unverified inherited history leave tokens unavailable. |
 
 Some measures and commands need more:
 
