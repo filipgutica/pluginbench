@@ -1,0 +1,29 @@
+---
+import InstallCommands from '../components/InstallCommands.vue';
+import DocsLayout from '../layouts/DocsLayout.astro';
+import { home } from '../lib/pages';
+---
+<DocsLayout {...home} headings={[]}>
+  <section class="fg-site-hero" aria-labelledby="title">
+    <h1 id="title">Compare the guidance you give coding agents.</h1>
+    <div class="fg-site-hero__lede">
+      <p class="lede">
+        PluginBench runs the same coding tasks with and without your instructions, skills, or plugins, keeping the harness, model, and reasoning effort fixed.
+        Compare correctness, resource use, and the code each attempt adds to decide which guidance is worth using.
+      </p>
+    </div>
+    <div class="fg-site-hero__aside">
+      <div class="install">
+        <p class="fg-site-meta">Install from a clone</p>
+        <InstallCommands client:load />
+      </div>
+      <dl class="fg-site-facts">
+        <div><dt>Runs on</dt><dd>Linux or macOS</dd></div>
+        <div><dt>Needs</dt><dd>Python 3.12+, Git, Docker with Compose and Buildx</dd></div>
+        <div><dt>Agent</dt><dd>Codex CLI 0.162.1 or 0.167.0</dd></div>
+        <div><dt>Source</dt><dd><a href="https://github.com/filipgutica/pluginbench">filipgutica/pluginbench</a></dd></div>
+      </dl>
+    </div>
+  </section>
+  <p><a href="https://github.com/filipgutica/pluginbench#readme">Full reference</a></p>
+</DocsLayout>

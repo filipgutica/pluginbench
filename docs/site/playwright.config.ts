@@ -16,7 +16,7 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      testMatch: 'site.spec.ts',
+      testMatch: ['site.spec.ts', 'document-html.spec.ts'],
       use: { browserName: 'chromium' },
     },
     {

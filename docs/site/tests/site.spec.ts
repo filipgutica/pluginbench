@@ -1,4 +1,5 @@
 import { expect, test as base } from '@playwright/test';
+import { documents } from '../src/lib/pages';
 import { expectNoOverflow, routes } from './pages';
 
 const test = base.extend<{ cleanPage: void }>({
@@ -23,8 +24,9 @@ for (const width of [320, 390, 720, 801, 1280]) {
     for (const route of routes) {
       await expect(page.locator('.fg-site-rail')).toHaveAttribute('data-enhanced', 'true');
       if (width <= 800) await page.locator('.fg-site-rail__toggle').click();
-      const nav = page.getByRole('navigation', { name: 'On this page', exact: true });
-      await expect(nav.getByRole('group', { name: 'Documentation', exact: true }).getByRole('link')).toHaveText(routes.map(({ label }) => label));
+      const nav = page.getByRole('navigation', { name: 'Documentation', exact: true });
+      await expect(nav.locator('.fg-site-rail__group').first().getByRole('link')).toHaveText(routes.map(({ label }) => label));
+      await expect(nav.getByRole('group', { name: 'On this page', exact: true })).toHaveCount(await page.locator('main h2').count() ? 1 : 0);
       await nav.getByRole('link', { name: route.label, exact: true }).click();
       await expect(page).toHaveURL(route.path);
       await expect(page).toHaveTitle(`${route.label} · PluginBench`);
@@ -47,16 +49,16 @@ for (const width of [320, 390, 720, 801, 1280]) {
     }
     await expect(page.locator('.fg-site-rail')).toHaveAttribute('data-enhanced', 'true');
     if (width <= 800) await page.locator('.fg-site-rail__toggle').click();
-    const nav = page.getByRole('navigation', { name: 'On this page', exact: true });
+    const nav = page.getByRole('navigation', { name: 'Documentation', exact: true });
     await expect(nav.locator('[aria-current="page"]')).toHaveText('Measurement specification');
-    await nav.getByRole('link', { name: 'Requirements', exact: true }).click();
+    await nav.getByRole('group', { name: 'On this page', exact: true }).getByRole('link', { name: 'Requirements', exact: true }).click();
     await expect(page).toHaveURL(/#requirements$/);
     await expect(page.locator('#requirements')).toBeInViewport();
     if (width <= 800) await expect(page.getByRole('dialog')).toHaveCount(0);
   });
 }
 
-test('every internal link and heading anchor resolves; repository links stay on GitHub', async ({ page }) => {
+test('every internal link and heading anchor resolves; document links stay on the site; repository links stay on GitHub', async ({ page }) => {
   const targets = new Map<string, Set<string>>();
   const links: string[] = [];
   for (const route of routes) {
@@ -70,6 +72,28 @@ test('every internal link and heading anchor resolves; repository links stay on 
     if (url.origin !== new URL(page.url()).origin) continue;
     expect(targets.has(url.pathname), href).toBe(true);
     if (url.hash) expect(targets.get(url.pathname)?.has(decodeURIComponent(url.hash.slice(1))), href).toBe(true);
+  }
+  // A published document must never be linked as its GitHub source file.
+  const publishedSources = documents.map(({ source }) => `https://github.com/filipgutica/pluginbench/blob/main/${source}`);
+  for (const route of routes) {
+    await page.goto(route.path);
+    const bodyLinks = await page.getByRole('main').locator('a[href]').evaluateAll((elements) => elements.map((element) => (element as HTMLAnchorElement).href));
+    for (const href of bodyLinks) expect(publishedSources.some((source) => href.split('#')[0] === source), href).toBe(false);
+  }
+  const documentLinks = [
+    { from: '/pluginbench/running-evaluations/', name: 'Configuration reference', href: '/pluginbench/config-reference/', heading: 'Configuration reference' },
+    { from: '/pluginbench/reproduce/', name: 'supported coding CLI', href: '/pluginbench/running-evaluations/#supported-coding-clis', heading: 'Evaluation details' },
+    { from: '/pluginbench/metrics/', name: 'running evaluations', href: '/pluginbench/running-evaluations/#compare-runs', heading: 'Evaluation details' },
+  ];
+  for (const { from, name, href, heading } of documentLinks) {
+    await page.goto(from);
+    const link = page.getByRole('main').getByRole('link', { name, exact: true });
+    await expect(link).toHaveAttribute('href', href);
+    await link.click();
+    await expect(page).toHaveURL(new URL(href, page.url()).href);
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText(heading);
+    const fragment = new URL(href, page.url()).hash.slice(1);
+    if (fragment) await expect(page.locator(`[id="${fragment}"]`)).toBeInViewport();
   }
   await page.goto('/pluginbench/running-evaluations/');
   await expect(page.getByRole('link', { name: 'the starter config', exact: true })).toHaveAttribute('href', 'https://github.com/filipgutica/pluginbench/blob/main/src/pluginbench/evaluation.example.yaml');
@@ -90,6 +114,23 @@ test('Config reference renders a readable GFM table that scrolls within the page
   await expect(region).toBeFocused();
   await page.keyboard.press('ArrowRight');
   await expect.poll(() => region.evaluate((element) => element.scrollLeft)).toBeGreaterThan(0);
+  // The first column stays in view while the rest of the table scrolls under it.
+  const regionBox = await region.boundingBox();
+  const keyCell = await table.getByRole('cell', { name: 'runner.harness', exact: true }).boundingBox();
+  expect(Math.abs((keyCell?.x ?? Infinity) - (regionBox?.x ?? 0))).toBeLessThan(1);
+  await expect(page.getByText('Scroll the table sideways to see every column.').first()).toBeVisible();
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await expect(page.getByText('Scroll the table sideways to see every column.').first()).toBeHidden();
+  await expectNoOverflow(page);
+});
+
+test('Home installs from a clone and copies the commands', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 900 });
+  await page.goto('/pluginbench/');
+  const hero = page.locator('.fg-site-hero');
+  await expect(hero.locator('pre')).toHaveText(/git clone https:\/\/github\.com\/filipgutica\/pluginbench\.git[\s\S]*pip install -e \./);
+  await expect(hero.getByRole('button', { name: 'Copy code' })).toBeVisible();
+  await expect(page.getByRole('main').getByRole('link', { name: 'Full reference', exact: true })).toHaveAttribute('href', 'https://github.com/filipgutica/pluginbench#readme');
   await expectNoOverflow(page);
 });
 
@@ -97,7 +138,7 @@ test('shared project menu, header links, and appearance picker work', async ({ p
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.goto('/pluginbench/');
   await expect(page.getByRole('navigation', { name: 'Site links' }).getByRole('link')).toHaveText(['GitHub', 'Releases']);
-  await expect(page.getByRole('navigation', { name: 'Project links' }).getByRole('link')).toHaveText(['Issues', 'Releases']);
+  await expect(page.getByRole('navigation', { name: 'Project links' }).getByRole('link')).toHaveText(['Report an issue', 'Releases']);
   const trigger = page.getByLabel('Project: PluginBench', { exact: true });
   await trigger.click();
   const projects = page.getByRole('navigation', { name: 'Projects', exact: true });

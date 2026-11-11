@@ -7,7 +7,7 @@ for (const width of [320, 390, 720, 801, 1280]) {
     await page.goto('/pluginbench/');
     for (const route of routes) {
       if (width <= 800) await page.locator('.fg-site-rail__menu > summary').click();
-      const nav = page.getByRole('navigation', { name: 'On this page', exact: true });
+      const nav = page.getByRole('navigation', { name: 'Documentation', exact: true });
       await nav.getByRole('link', { name: route.label, exact: true }).click();
       await expect(page).toHaveURL(route.path);
       await expect(page.getByRole('heading', { level: 1 })).toHaveText(route.heading);
@@ -19,10 +19,16 @@ for (const width of [320, 390, 720, 801, 1280]) {
     await expect(page.getByRole('navigation', { name: 'Projects', exact: true }).getByRole('link')).toHaveCount(7);
     await trigger.click();
     if (width <= 800) await page.locator('.fg-site-rail__menu > summary').click();
-    await page.getByRole('navigation', { name: 'On this page', exact: true }).getByRole('link', { name: 'Requirements', exact: true }).click();
+    await page.getByRole('navigation', { name: 'Documentation', exact: true }).getByRole('group', { name: 'On this page', exact: true }).getByRole('link', { name: 'Requirements', exact: true }).click();
     await expect(page.locator('#requirements')).toBeInViewport();
   });
 }
+
+test('Home shows the install commands without a dead Copy button', async ({ page }) => {
+  await page.goto('/pluginbench/');
+  await expect(page.locator('.fg-site-hero pre')).toContainText('pip install -e .');
+  await expect(page.getByRole('button', { name: 'Copy code' })).toHaveCount(0);
+});
 
 test('deep heading links, GFM tables, and OS dark mode work without JavaScript', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 900 });
