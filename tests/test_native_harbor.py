@@ -1530,6 +1530,9 @@ def test_git_probe_commits_in_the_coding_image_with_only_the_task_environment(
 
     def docker(*arguments: str, **kwargs: object) -> str:
         calls.append(arguments)
+        if arguments[:2] == ("start", "--attach") and not committed:
+            # As Docker does: an attached start exits with the container's own status.
+            raise ValueError("docker start failed: ")
         return {
             "create": "probe-container\n",
             "wait": "0\n" if committed else "128\n",

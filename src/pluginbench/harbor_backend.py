@@ -1936,8 +1936,10 @@ def probe_coding_environment(identity: dict[str, object]) -> dict[str, object]:
         container = _docker(
             *arguments, str(image["image_id"]), "-c", command, expected_runtime=expected
         ).strip()
-        _docker("start", "--attach", container, timeout=60, expected_runtime=expected)
-        exit_code = _docker("wait", container, expected_runtime=expected).strip()
+        # Not `start --attach`: that exits with the container's status, and a failed commit
+        # would then surface as "docker start failed" without the reason in the logs.
+        _docker("start", container, expected_runtime=expected)
+        exit_code = _docker("wait", container, timeout=60, expected_runtime=expected).strip()
         output = _docker("logs", container, expected_runtime=expected).strip()
         if exit_code == "0":
             receipt.update(status="passed", author=output.splitlines()[-1] if output else None)
