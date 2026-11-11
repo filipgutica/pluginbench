@@ -25,6 +25,7 @@ from pluginbench.measurement_profiles import (
     REMOVED_TEST_OVERLAP,
     MeasurementSettings,
     blocking_findings,
+    not_measured,
     capability_plan,
     prepare_profiles,
     probe_measurements,
@@ -427,14 +428,20 @@ def _reference_agents(
         saved = _object(json.loads(entry.read_text()))
         if saved.get("preparation_key") != key:
             raise ValueError(f"reference agent cache entry changed: {entry}")
-        # A re-prepared image under the same key has not been qualified yet.
-        if saved.get("images") == images:
+        # A re-prepared image under the same key has not been qualified yet, nor has a pass
+        # with a different supplied git identity (absent in both when the task has its own).
+        if saved.get("images") == images and saved.get("supplied_git_identity") == identity.get(
+            "supplied_git_identity"
+        ):
             return TypeAdapter(dict[str, dict[str, object]]).validate_python(saved["rows"])
     rows = _reference_agent_rows(harbor_backend.run_reference_agents(identity, destination))
     if all(row["state"] != "broken" for row in rows.values()):
         cache.mkdir(parents=True, exist_ok=True)
         temporary = cache / f".{key}.{os.getpid()}.tmp"
-        _write(temporary, {"preparation_key": key, "images": images, "rows": rows})
+        passed: dict[str, object] = {"preparation_key": key, "images": images, "rows": rows}
+        if "supplied_git_identity" in identity:
+            passed["supplied_git_identity"] = identity["supplied_git_identity"]
+        _write(temporary, passed)
         temporary.replace(entry)
     return rows
 
@@ -484,9 +491,17 @@ def _coding_environment_row(
     image: dict[str, object], probe: dict[str, object]
 ) -> dict[str, object]:
     passed = probe.get("status") == "passed"
+    supplied = probe.get("supplied_git_identity")
+    note = None
+    if isinstance(supplied, dict):
+        note = (
+            "the task sets no git identity, so PluginBench supplied "
+            f"{supplied['name']} <{supplied['email']}> to its agents"
+        )
     return {
         "state": "ready" if passed else "broken",
         "reason": None if passed else probe.get("reason"),
+        **({"note": note} if note else {}),
         "image_source": image["source"],
         "ignored_dockerfile": image["ignored_dockerfile"],
         "git_probe": probe,
@@ -583,6 +598,11 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
         fixture = Path(str(identity["fixture_dir"]))
         if identity["original_task_assets_sha256"] != _object(comparison["tasks"])[task]:
             raise ValueError("native task assets changed after planning")
+        # Before anything saves the identity: a task without a git identity gets PluginBench's.
+        git_probe = harbor_backend.probe_coding_environment(identity)
+        if "supplied_git_identity" in git_probe:
+            identity["supplied_git_identity"] = git_probe["supplied_git_identity"]
+            codex.write_json(destination / "artifacts/native-preparation.json", identity)
         model = importlib.import_module("harbor.models.task.task").Task(native_task)
         entries.append(
             TaskEntry(
@@ -642,7 +662,7 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
             name: {"state": row["state"], "reason": row.get("reason")} for name, row in rows.items()
         }
         matrix[task]["coding_environment"] = _coding_environment_row(
-            _object(coding_images[task]), harbor_backend.probe_coding_environment(identity)
+            _object(coding_images[task]), git_probe
         )
         matrix[task].update(
             _reference_agents(identity, root / "check" / task, caches.reference_agents)
@@ -651,6 +671,8 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
             for name, row in matrix[task].items():
                 if row["state"] != "ready":
                     progress(f"{task}: {name} {row['state']} — {row['reason']}")
+                elif row.get("note"):
+                    progress(f"{task}: {name} ready — {row['note']}")
     _write(
         prepared / "tasks.json",
         TaskCatalog(schema_version=1, tasks=entries).model_dump(mode="json"),
@@ -682,6 +704,17 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
         identity=vanilla_identity,
     )
     findings = blocking_findings(matrix, require_ready=config.measurement_settings.require_ready)
+    # Decided once here and saved with the run: status and the report read this list. Under
+    # require_ready a broken measure blocks instead, so nothing is skipped.
+    skipped = [] if config.measurement_settings.require_ready else not_measured(matrix)
+    for row in skipped:
+        warning = (
+            f"{row['task']}: {row['measure']} is broken, so it is not measured for this task: "
+            f"{row['reason']}"
+        )
+        if progress:
+            progress("Warning: " + warning)
+        warnings.append(warning)
     report: dict[str, object] = {
         "status": "blocked" if findings else "ready",
         "model_calls": 0,
@@ -690,6 +723,7 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
         "coding_images": coding_images,
         "warnings": warnings,
         "findings": findings,
+        "not_measured": skipped,
         "matrix": matrix,
         "vanilla_cache": vanilla_cache,
     }
@@ -751,8 +785,10 @@ def prepare_evaluation(
             != comparison["review_criteria_sha256"]
         ):
             raise ValueError("fixed review criteria changed during preparation")
+    supplied = any("supplied_git_identity" in _object(row) for row in task_environment.values())
     recipe = {
-        "schema_version": 3,
+        # 4 makes builds that cannot supply a git identity refuse the run before coding.
+        "schema_version": 4 if supplied else 3,
         "backend": "harbor",
         "harness_version": harness_versions[config.runner.harness],
         "container_cpus": config.container_cpus,
@@ -783,6 +819,7 @@ def prepare_evaluation(
         "task_scopes": scopes,
         "measurement_capabilities": capabilities,
         "measurement_readiness": capabilities,
+        "not_measured": checked.report["not_measured"],
         "artifact_base": "evidence",
         "measurement_required": any(profiles.values()),
         "measurement_revision": None,
@@ -933,6 +970,7 @@ def _finish_evaluation(
             revision=revision,
             progress=progress,
             jobs=config.jobs,
+            masks_listed_pairs=bool(selection.get("not_measured")),
         )
         _adopt_measurement_revision(root, selection, revision)
         _save_selection(root, selection)

@@ -459,17 +459,32 @@ def check_gate(
         return Verdict(value, comparator, limit, result, f"{len(tasks)} of {len(tasks)} tasks")
     mine_measure = measure(evidence, gate, candidate, tasks)
     theirs_measure = measure(evidence, gate, gate.against, tasks)
-    if gate.statistic == "total" and (
-        mine_measure.measured < mine_measure.assigned
-        or theirs_measure.measured < theirs_measure.assigned
-    ):
+    # Any assigned attempt without a value leaves the gate open: deciding on the attempts that
+    # were measured could pass a candidate on whatever survived measurement. A ratio gate never
+    # uses a task without a usable reference, so that task's attempts are not counted here.
+    # A set: a split may name a task twice, and its attempts count once.
+    counted = {
+        task
+        for task in tasks
+        if gate.statistic != "mean_of_task_median_ratios"
+        or _reference(evidence, task, gate)[0] is not None
+    }
+    sides = [
+        (
+            sum(side.repeats[task] for task in counted),
+            sum(row.arm == arm and row.task in counted for row in evidence.attempts),
+        )
+        for side, arm in ((mine_measure, candidate), (theirs_measure, gate.against))
+    ]
+    if any(measured < assigned for measured, assigned in sides):
         return Verdict(
             mine_measure.value,
             theirs_measure.value,
             None,
             "undetermined",
-            f"missing values: {mine_measure.measured}/{mine_measure.assigned} and "
-            f"{theirs_measure.measured}/{theirs_measure.assigned} attempts measured",
+            f"missing {', '.join(gate.metrics or [])} values: "
+            + " and ".join(f"{measured}/{assigned}" for measured, assigned in sides)
+            + " attempts measured",
         )
     # Both sides over the same tasks, so a task missing on one side is not compared.
     common = [task for task in tasks if task in mine_measure.tasks and task in theirs_measure.tasks]

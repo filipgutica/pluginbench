@@ -496,8 +496,13 @@ def propose_remeasurement(
     revision: str,
     progress: Callable[[str], None] | None = None,
     jobs: int = 1,
+    masks_listed_pairs: bool = False,
 ) -> Path:
-    """Write a separate proposal; exceptions retain diagnostics and never promote it."""
+    """Write a separate proposal; exceptions retain diagnostics and never promote it.
+
+    masks_listed_pairs: the run's report hides pairs its check listed as not measured. Protocol 3
+    marks that, so an earlier build, which accepts only 2 and would publish those values, refuses.
+    """
     validate_jobs(jobs)
     root = root.resolve()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", revision):
@@ -525,7 +530,7 @@ def propose_remeasurement(
     directory = parent / revision
     directory.mkdir(parents=True, exist_ok=False)
     state: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3 if masks_listed_pairs else 2,
         "status": "collecting",
         "jobs": jobs,
         "revision": revision,
@@ -789,7 +794,7 @@ def validate_remeasurement(root: Path, directory: Path) -> Path:
     ):
         raise ValueError("measurement revision is incomplete")
     validate_jobs(protocol.get("jobs"))
-    if protocol.get("schema_version") != 2:
+    if protocol.get("schema_version") not in {2, 3}:
         raise ValueError("unsupported measurement revision protocol")
     run, original, original_path = _native_state(root)
     if _preserved_inventory(root, original, original_path.parent) != protocol.get("preserved"):

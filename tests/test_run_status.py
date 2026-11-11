@@ -42,6 +42,28 @@ def _finished(evidence: Path, attempt: str, *, behavior: bool | None, usage: obj
     _write(handoff / "verifier-result.json", {"patch_sha256": "ab" * 32, "reason": "overlap"})
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        "the Harbor worker exceeded its budget of 5400 seconds",
+        # Harbor's own record of an agent exception.
+        {"exception_type": "AgentTimeoutError", "exception_message": "agent timed out"},
+    ],
+)
+def test_an_attempt_without_a_submission_gives_its_failed_call_as_the_reason(
+    tmp_path: Path, error: object
+) -> None:
+    root = _run(tmp_path / "run", states={**STATES, "a3": "complete"}, ledger=True)
+    handoff = root / "evidence/attempts/a3/handoff"
+    _write(handoff / "execution.json", {"usage": None, "elapsed_seconds": 600})
+    _write(handoff / "unsupported-submission.json", {"error": error})
+
+    row = next(row for row in run_status.run_status(root)["attempts"] if row["id"] == "a3")
+
+    expected = error if isinstance(error, str) else "AgentTimeoutError: agent timed out"
+    assert (row["outcome"], row["outcome_reason"]) == ("unknown", expected)
+
+
 def _run(root: Path, *, states: dict[str, str], ledger: bool) -> Path:
     """A run directory as Phase 3 writes it: a1 reused and passing, a2 failing, a3 running."""
     evidence = root / "evidence"
@@ -506,3 +528,19 @@ def test_a_withheld_result_gets_the_report_s_outcome(
     row = next(row for row in run_status.run_status(root)["attempts"] if row["id"] == "a3")
 
     assert (row["outcome"], row["outcome_reason"]) == (outcome, None)
+
+
+def test_a_run_saved_before_the_not_measured_list_shows_no_such_warning(tmp_path: Path) -> None:
+    # Readiness rows in the older shape: status and readiness, no state, and no saved list.
+    root = _run(tmp_path / "run", states=dict.fromkeys(STATES, "complete"), ledger=True)
+    selection = json.loads((root / "evaluation.json").read_text())
+    readiness = {
+        "covered": {"coverage": {"status": "available", "readiness": "passed", "reason": None}},
+        "rust": {"coverage": {"status": "unavailable", "readiness": "failed", "reason": "exit 3"}},
+    }
+    _write(root / "evaluation.json", {**selection, "measurement_readiness": readiness})
+
+    status = run_status.run_status(root)
+
+    assert status["measures"]["not_measured"] == []
+    assert "Warning:" not in run_status.format_status(status)

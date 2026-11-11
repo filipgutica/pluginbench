@@ -124,6 +124,33 @@ def test_a_partly_measured_task_below_the_floor_shows_both_notes(tmp_path: Path)
     note = f"cognitive ratio to reference, vanilla, {task}: "
     assert note + "reference below floor (3 < 10)" in printed
     assert note + "1 of 3 attempts unmeasured" in printed
+    # The unmeasured attempt is on the task the floor excludes, so the gate still decides.
+    loaded = load_gates(gates)
+    gate = next(gate for gate in loaded.gates if gate.name == "cognitive ratio to reference")
+    verdict = check_gate(load_evidence(runs), loaded, gate, "vanilla", CLIMB)
+    assert (verdict.result, verdict.detail) == ("pass", "3 of 4 tasks")
+
+
+def test_a_ratio_gate_ignores_missing_values_on_a_task_it_excludes() -> None:
+    metric = "Net cognitive complexity added"
+    values = {("candidate", "A"): 1.0, ("vanilla", "A"): 2.0, ("candidate", "B"): None}
+    evidence = Evidence(
+        attempts=[
+            Attempt(
+                f"{arm}-{task}", "run", task, arm, "pass", {metric: values.get((arm, task), 2.0)}
+            )
+            for arm in ("candidate", "vanilla")
+            for task in ("A", "B")
+        ],
+        references={("A", metric): 10.0, ("B", metric): 0.0},
+    )
+    gate = _gate("cognitive ratio to reference").model_copy(update={"against": "vanilla"})
+
+    verdict = check_gate(
+        evidence, load_gates(FIXTURE / "card-gates.yaml"), gate, "candidate", ["A", "B"]
+    )
+
+    assert (verdict.result, verdict.detail) == ("pass", "1 of 2 tasks")
 
 
 def test_a_missing_value_stays_missing_and_leaves_a_total_undetermined(tmp_path: Path) -> None:
@@ -150,9 +177,12 @@ def test_a_missing_value_stays_missing_and_leaves_a_total_undetermined(tmp_path:
 
     assert (result.measured, result.assigned) == (11, 12)
     assert verdict.result == "undetermined" and "11/12" in verdict.detail
-    # Medians use the repeats each side measured, and the gate names the task where they differ.
+    # A mean gate cannot decide on the repeats that were measured either.
     tokens = check_gate(evidence, gates, _gate("tokens"), "superpowers", CLIMB)
-    assert tokens.detail == f"4 of 4 tasks; measured repeats differ: {first['task']} 2 vs 3"
+    assert tokens.result == "undetermined"
+    assert tokens.detail == (
+        "missing Input tokens, Output tokens values: 11/12 and 12/12 attempts measured"
+    )
     coverage = measure(evidence, _gate("changed-line coverage"), "vanilla", CLIMB)
     assert coverage.missing == {
         "happy-dom-abort-pending-body-reads": (
@@ -168,6 +198,54 @@ def test_a_missing_value_stays_missing_and_leaves_a_total_undetermined(tmp_path:
         cli.app, ["compare", *runs, "--gates", str(FIXTURE / "card-gates.yaml")]
     )
     assert f"tokens, superpowers, {first['task']}: 1 of 3 attempts unmeasured" in printed.stdout
+
+
+@pytest.mark.parametrize(
+    "gate_name", ["changed-line coverage", "tokens", "cognitive ratio to reference"]
+)
+def test_a_mean_gate_with_a_partly_measured_side_is_undetermined(gate_name: str) -> None:
+    gate = _gate(gate_name).model_copy(update={"against": "vanilla"})
+    metrics = gate.metrics or []
+    # The candidate's measured attempt beats the comparator; its two failed attempts have no value.
+    better = 100.0 if gate.direction == "higher" else 1.0
+    worse = 50.0 if gate.direction == "higher" else 1000.0
+
+    def attempts(arm: str, values: list[float | None]) -> list[Attempt]:
+        return [
+            Attempt(
+                f"{arm}-{n}",
+                "run",
+                "task",
+                arm,
+                "pass" if value is not None else "fail",
+                {name: value for name in metrics},
+                {} if value is not None else {name: "unknown" for name in metrics},
+            )
+            for n, value in enumerate(values)
+        ]
+
+    gates = load_gates(FIXTURE / "card-gates.yaml")
+    # A usable reference, so a ratio gate keeps the task.
+    references: dict[tuple[str, str], float | None] = {("task", name): 20.0 for name in metrics}
+    complete = Evidence(
+        attempts("candidate", [better] * 3) + attempts("vanilla", [worse] * 3), references
+    )
+    partial = Evidence(
+        attempts("candidate", [better, None, None]) + attempts("vanilla", [worse] * 3),
+        references,
+    )
+
+    decided = check_gate(complete, gates, gate, "candidate", ["task"])
+    verdict = check_gate(partial, gates, gate, "candidate", ["task"])
+
+    assert (decided.result, decided.detail) == ("pass", "1 of 1 tasks")
+    assert verdict.result == "undetermined" and verdict.limit is None
+    assert verdict.detail == (
+        f"missing {', '.join(metrics)} values: 1/3 and 3/3 attempts measured"
+    )
+    # A split that names the task twice counts its attempts once.
+    repeated = check_gate(partial, gates, gate, "candidate", ["task", "task"])
+    assert (repeated.result, repeated.detail) == (verdict.result, verdict.detail)
 
 
 def test_a_factor_limit_keeps_its_slack_when_the_comparator_is_negative() -> None:

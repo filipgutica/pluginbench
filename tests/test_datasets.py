@@ -6,7 +6,8 @@ import stat
 import pytest
 import yaml
 
-from pluginbench.datasets import load_tasks
+from pluginbench.datasets import load_tasks, portable_native_identity
+from pluginbench.harbor_backend import SUPPLIED_GIT_IDENTITY
 from native_support import task_entry
 
 
@@ -75,3 +76,17 @@ def test_rejects_unbound_or_unsafe_native_inputs(tmp_path: Path, fault: str) -> 
     config.write_text(yaml.safe_dump(document))
     with pytest.raises(ValueError):
         load_tasks(config)
+
+
+def test_a_saved_identity_without_a_supplied_git_identity_keeps_its_portable_form(
+    tmp_path: Path,
+) -> None:
+    # Identities saved before PluginBench could supply one have no such field: they must keep
+    # comparing equal, so their cached preparations, vanilla attempts and runs stay usable.
+    provenance = task_entry(tmp_path, "task-a")["provenance"]
+    assert isinstance(provenance, dict)
+    saved = json.loads(provenance["native_task_identity"])
+    portable = portable_native_identity(saved)
+    assert "supplied_git_identity" not in portable
+    supplied = portable_native_identity({**saved, "supplied_git_identity": SUPPLIED_GIT_IDENTITY})
+    assert supplied == {**portable, "supplied_git_identity": SUPPLIED_GIT_IDENTITY}
