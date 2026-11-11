@@ -24,7 +24,7 @@ from native_support import (
     synthetic_contract,
     task_entry,
 )
-from pluginbench import baselines, harbor_backend, ledger, study, submissions
+from pluginbench import baselines, harbor_backend, ledger, study, submissions, trial_containers
 from pluginbench.datasets import native_identity, portable_native_identity
 
 # Where the child kills itself, relative to its Nth native call or Nth completed attempt.
@@ -86,6 +86,8 @@ def install(
     identity = runtime_identity()
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: identity)
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
+    # No killed attempt left a container running; test_resume covers the ones that did.
+    monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
     lock = threading.Lock()
     pair = threading.Barrier(2)
     counts = {"receipt": 0, "verify": 0, "complete": 0, "publish": 0}

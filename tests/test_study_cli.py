@@ -34,6 +34,7 @@ from pluginbench import (
     run_lock,
     study,
     submissions,
+    trial_containers,
 )
 from pluginbench.compare import Gate, Gates, check_gate, load_evidence
 from pluginbench.harbor_backend import assert_runtime as checked_runtime
@@ -90,6 +91,7 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> evaluation.Evalua
     # Docker-backed checks pass here; tests that exercise a failing check replace one of these.
     monkeypatch.setattr(harbor_backend, "probe_coding_environment", passing_git_probe)
     monkeypatch.setattr(harbor_backend, "run_reference_agents", passing_reference_agents)
+    monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
     monkeypatch.setattr(
         isolation, "codex_code_mode_host", lambda: Path("/fixture/codex-code-mode-host")
     )
