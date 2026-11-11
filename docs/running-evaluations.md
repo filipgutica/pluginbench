@@ -162,8 +162,10 @@ LCOV callbacks can share names. When mixed hit counts cannot be matched to sourc
 | State | Meaning | Blocks the run |
 | --- | --- | --- |
 | `ready` | Measured, or the check passed | No |
-| `not_configured` | No collector for this task, such as coverage without a profile | Only with `measurement_settings.require_ready: true` |
-| `broken` | Configured but failing, such as a missing tool or a probe that failed | Yes |
+| `not_configured` | No collector for this task, such as coverage without a profile | Only with `measurement_settings.require_ready: true`, or when the measure is ready on no task |
+| `broken` | Configured but failing, such as a missing tool or a probe that failed | For a measure, only with `measurement_settings.require_ready: true`, or when the measure is ready on no task. For every other check, yes |
+
+A measure that is `broken` for a task is not measured for that task. Other tasks still measure it. `check` prints a warning with the task, the measure, and the reason, and saves it under `warnings` in `check.json`. `check` also saves the list of pairs it did not measure, in `check.json` and with the run. `status` and the report read that list. `status` shows the same warning. With `measurement_settings.require_ready: true`, the check stops instead, so it saves no list and prints no such warning. The report shows each listed measure as unavailable for each attempt on that task, with the reason. It shows no value, result counts, or population for it, counts it as incomplete, and reports its reference value as unavailable too. One collector can serve several measures, so a listed measure's collector can still run after coding. Any value it produces for the listed measure is not reported. If that collector fails as unavailable, only its own measures on that task are affected. Any other failure of that collector after coding fails the measurement of every task, and the run stops without a report or reviews. Such failures include malformed output, evidence that fails validation, and a change to the source or profile it measures. A run with listed pairs saves its measurement revision with protocol version 3. An earlier PluginBench reads only version 2, so it refuses to rebuild that run's report instead of publishing the hidden values. A run saved before this list existed has no such warning, and its report does not change. A measure that is `ready` on no task stops the run in both modes, because the run would measure nothing for it. A broken coding environment, submission source, oracle, or nop always stops the run.
 
 The checks:
 
@@ -247,7 +249,7 @@ Resume then completes pending measurements or starts a review phase that has not
 | `reuse` | `vanilla_attempts`, `planned_hits` (from the plan's cache decisions), and `reused` (imported from the cache) |
 | `discarded` | Interrupted attempts a resume replaced: `id`, `slot`, `task`, `arm`, `repeat`, `replaced_by`, `tokens`, `tokens_status` |
 | `arms` | Per arm: `attempts`, `states`, `outcomes`, `reused`, and `tokens` (reused attempts included) |
-| `measures` | `selected` measurements; `measurement_revisions` and `review_revisions` as `revision`, `status`, `selected`, and for reviews `reviewed` of `assigned`; `references`: task → metric → `status`, `value`, `reason` |
+| `measures` | `selected` measurements; `measurement_revisions` and `review_revisions` as `revision`, `status`, `selected`, and for reviews `reviewed` of `assigned`; `references`: task → metric → `status`, `value`, `reason`; `not_measured`: the measures `check` saved as not measured for a task, as `task`, `measure`, `reason`; empty for a run saved before that list existed |
 | `report`, `log` | Paths to `report/report.html` and `run.log`, or null |
 | `attempts` | One row per live slot: `id`, `slot`, `task`, `arm`, `repeat`, `state`, `outcome`, `outcome_reason`, `reused`, `tokens`, `tokens_status`, `minutes`, and `measures` (metric → `status`, `value`, `unit`, `reason`, from `report/results.json` once it exists) |
 

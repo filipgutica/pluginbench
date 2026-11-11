@@ -560,7 +560,8 @@ def test_integrated_evaluation_and_report_regeneration(
         source_scope=["src/**"],
     )
     if no_profiles:
-        config.measurement_settings.coverage = None
+        # A selected measure that no task can collect now stops the check, so select none.
+        config.measurements.remove("coverage")
 
     def prepare(**kwargs: Any) -> dict[str, object]:
         destination = kwargs["destination"]
@@ -805,8 +806,9 @@ def test_integrated_evaluation_and_report_regeneration(
             prepared_collection = harbor_backend.run_native_command
 
             def failed_collection(**kwargs: Any) -> dict[str, object]:
-                # A collector broken before coding blocks the check; only the required-readiness
-                # case keeps it broken there. Otherwise collection fails after coding.
+                # Coverage broken on every task before coding blocks the check, so only the
+                # required-readiness case keeps it broken there. Otherwise collection fails
+                # after coding.
                 if not readiness_required and "measurement-readiness" in str(
                     kwargs.get("destination")
                 ):
@@ -893,7 +895,7 @@ def test_integrated_evaluation_and_report_regeneration(
         "lines",
         "coverage",
         "review",
-    }
+    } - ({"coverage"} if no_profiles else set())
     assert len(judge_calls) == (8 if unavailable else 9)
     expected_review_timeout = 1800 if review_timeout is None else 600
     assert all(call["timeout"] == expected_review_timeout for call in judge_calls)
@@ -904,7 +906,7 @@ def test_integrated_evaluation_and_report_regeneration(
     )
     coverage = [row for row in data["observations"] if row["metric"] == "Branch coverage %"]
     findings = [row for row in data["observations"] if row["metric"] == "Total review findings"]
-    assert len(coverage) == len(findings) == 9
+    assert len(findings) == 9 and len(coverage) == (0 if no_profiles else 9)
     if separate_coverage_scope:
         assert all(row["status"] == "measured" for row in coverage)
         source_lines = [
@@ -912,7 +914,7 @@ def test_integrated_evaluation_and_report_regeneration(
         ]
         assert sorted(row["value"] for row in source_lines) == [1] + [2] * 8
     assert sum(row["value"] is None for row in coverage) == (
-        9 if collection_unavailable or no_profiles else int(unavailable)
+        9 if collection_unavailable else 0 if no_profiles else int(unavailable)
     )
     assert sum(row["value"] is None for row in findings) == int(unavailable)
     assert data["comparison_identity"]["observed_reviewer_profiles"]
@@ -1220,6 +1222,223 @@ def test_run_measures_a_task_that_has_no_collector_beside_a_covered_task(
         for row in data["observations"]
         if row["metric"] == "Source lines added" and row["status"] == "measured"
     } == {"covered-native-task", "arbitrary-native-task"}
+
+
+def _coverage_broken_on_one_task(
+    checkable: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    require_ready: bool = False,
+    after_coding: str = "valid",
+) -> None:
+    """Both tasks configure coverage; only arbitrary-native-task's probe fails before coding.
+
+    After coding, that task's collector returns a valid report, fails as unavailable, or
+    returns evidence that fails an integrity check.
+    """
+    raw = yaml.safe_load(checkable["path"].read_text())
+    settings = raw["measurement_settings"]
+    settings["coverage"] = settings["coverage_profiles"]["https://example.invalid/covered"]
+    settings["require_ready"] = require_ready
+    checkable["path"].write_text(yaml.safe_dump(raw))
+
+    def collect(**kwargs: Any) -> dict[str, object]:
+        if "arbitrary-native-task" in str(kwargs["task_identity"]):
+            if "measurement-readiness" in str(kwargs["destination"]):
+                return {"exit_code": 3, "timed_out": False, "report_collected": False}
+            if after_coding == "unavailable":
+                return {"exit_code": 3, "timed_out": False, "report_collected": False}
+            if after_coding == "integrity":
+                kwargs["destination"].mkdir(parents=True, exist_ok=True)
+                (kwargs["destination"] / "report.raw").write_text("SF:../escape.py\nend_of_record\n")
+                return {"exit_code": 0, "timed_out": False, "report_collected": True}
+        return _lcov(**kwargs)
+
+    monkeypatch.setattr(harbor_backend, "run_native_command", collect)
+
+
+@pytest.mark.parametrize("require_ready", [False, True])
+def test_check_records_a_measure_broken_on_one_task_as_not_measured(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch, require_ready: bool
+) -> None:
+    _coverage_broken_on_one_task(checkable, monkeypatch, require_ready=require_ready)
+
+    result = CliRunner().invoke(
+        cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"])]
+    )
+
+    report = json.loads((checkable["output"] / "check.json").read_text())
+    row = report["matrix"]["arbitrary-native-task"]["coverage"]
+    assert row["state"] == "broken" and row["reason"]
+    assert report["matrix"]["covered-native-task"]["coverage"]["state"] == "ready"
+    if require_ready:
+        assert result.exit_code == 2
+        assert f"arbitrary-native-task: coverage is broken: {row['reason']}" in result.stderr
+        # The check blocks, so it saves no list of skipped pairs and warns of none.
+        assert report["not_measured"] == []
+        assert "is not measured for this task" not in result.stdout + result.stderr
+    else:
+        assert result.exit_code == 0, result.stderr
+        warning = (
+            "arbitrary-native-task: coverage is broken, so it is not measured for this task: "
+            + row["reason"]
+        )
+        assert report["status"] == "ready" and warning in report["warnings"]
+        assert "Warning: " + warning in result.stdout
+    assert not checkable["calls"]
+
+
+@pytest.mark.parametrize("require_ready", [False, True])
+def test_check_refuses_a_measure_that_no_task_can_measure(
+    checkable: dict[str, Any], require_ready: bool
+) -> None:
+    raw = yaml.safe_load(checkable["path"].read_text())
+    raw["measurement_settings"]["coverage_profiles"] = {}
+    raw["measurement_settings"]["require_ready"] = require_ready
+    checkable["path"].write_text(yaml.safe_dump(raw))
+
+    result = CliRunner().invoke(
+        cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"])]
+    )
+
+    assert result.exit_code == 2
+    assert "coverage is ready on no task, so the run would measure nothing for it" in result.stderr
+    assert not checkable["calls"]
+
+
+def _run_checkable(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Any, list[str], list[str]]:
+    """Run the checkable config with stubbed coding and reviews: run root, result, calls."""
+    raw = yaml.safe_load(checkable["path"].read_text())
+    calls: list[str] = []
+    reviews: list[str] = []
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=raw["timeout_seconds"], interrupt_at=None
+    )
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    root = checkable["output"]
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["run", str(checkable["path"]), "--output", str(root), "--yes", "--foreground"],
+    )
+    return root, result, calls, reviews
+
+
+def test_run_reports_a_measure_broken_on_one_task_as_not_measured(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _coverage_broken_on_one_task(checkable, monkeypatch)
+    root, result, _, _ = _run_checkable(checkable, monkeypatch)
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    reason = json.loads((root / "check.json").read_text())["matrix"]["arbitrary-native-task"][
+        "coverage"
+    ]["reason"]
+    data = json.loads((root / "report/results.json").read_text())
+    coverage = [row for row in data["observations"] if row["metric"] == "Line coverage %"]
+    # The collector still ran after coding on the broken task; its values are not reported.
+    assert {
+        (row["task"], row["status"], row["value"] is None) for row in coverage
+    } == {
+        ("covered-native-task", "measured", False),
+        ("arbitrary-native-task", "unavailable", True),
+    }
+    assert {row["reason"] for row in coverage if row["value"] is None} == {reason}
+    # The broken pair takes no other measure of that task with it.
+    assert {
+        row["status"]
+        for row in data["observations"]
+        if (row["task"], row["metric"]) == ("arbitrary-native-task", "Source lines added")
+    } == {"measured"}
+    assert not [
+        row
+        for row in data["medians"] + data["raw_medians"]
+        if (row["task"], row["metric"]) == ("arbitrary-native-task", "Line coverage %")
+    ]
+    # The marked pair is incomplete, though its collector counted a full population after coding.
+    complete = {
+        (row["task"], row["counts"]["Coverage covered/total counts"])
+        for row in data["measurement_completeness"]
+    }
+    assert complete == {("arbitrary-native-task", False), ("covered-native-task", True)}
+    assert not any(
+        row["complete"]
+        for row in data["measurement_completeness"]
+        if row["task"] == "arbitrary-native-task"
+    )
+    matrix = {(row["task"], row["metric"]): row["cells"] for row in data["completeness_matrix"]}
+    cells = matrix["arbitrary-native-task", "Line coverage %"].values()
+    assert {cell["state"] for cell in cells} == {"unknown"}
+    assert all(cell["measured"] == 0 and cell["reasons"] == [reason] for cell in cells)
+    assert {
+        cell["state"] for cell in matrix["covered-native-task", "Line coverage %"].values()
+    } == {"measured"}
+
+    status = CliRunner().invoke(cli.app, ["status", str(root)])
+    assert status.exit_code == 0, status.stderr
+    assert f"Warning: arbitrary-native-task: coverage not measured: {reason}" in status.stdout
+    shown = json.loads(CliRunner().invoke(cli.app, ["status", str(root), "--json"]).stdout)
+    assert shown["measures"]["not_measured"] == [
+        {"task": "arbitrary-native-task", "measure": "coverage", "reason": reason}
+    ]
+
+    # The saved list is the only source: without it, the collected values come back.
+    selection = evaluation._load_selection(root)
+    assert selection["not_measured"] == shown["measures"]["not_measured"]
+    del selection["not_measured"]
+    evaluation._save_selection(root, selection)
+    evaluation.regenerate_report(root)
+    unmarked = json.loads((root / "report/results.json").read_text())
+    assert {
+        row["status"]
+        for row in unmarked["observations"]
+        if (row["task"], row["metric"]) == ("arbitrary-native-task", "Line coverage %")
+    } == {"measured"}
+    assert "Warning:" not in CliRunner().invoke(cli.app, ["status", str(root)]).stdout
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "integrity"])
+def test_a_failing_collector_on_a_not_measured_pair_after_coding(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    # The pair is not measured, but one collector can serve several measures, so it still runs.
+    _coverage_broken_on_one_task(checkable, monkeypatch, after_coding=failure)
+    root, result, calls, reviews = _run_checkable(checkable, monkeypatch)
+
+    revision = json.loads(
+        (root / "evidence/observer-revisions/measurements/revision.json").read_text()
+    )
+    if failure == "unavailable":
+        # An unavailable collector costs only its own pair: the run finishes and reports.
+        assert result.exit_code == 0, result.stderr
+        assert revision["status"] == "complete"
+        data = json.loads((root / "report/results.json").read_text())
+        assert data["measurement_collection"]["status"] == "partial"
+        assert {row["task"] for row in data["measurement_collection"]["failures"]} == {
+            "arbitrary-native-task"
+        }
+        assert {
+            (row["task"], row["metric"], row["status"])
+            for row in data["observations"]
+            if row["metric"] in {"Line coverage %", "Source lines added"}
+        } == {
+            ("arbitrary-native-task", "Line coverage %", "unavailable"),
+            ("arbitrary-native-task", "Source lines added", "measured"),
+            ("covered-native-task", "Line coverage %", "measured"),
+            ("covered-native-task", "Source lines added", "measured"),
+        }
+        assert reviews
+    else:
+        # Evidence that fails an integrity check stays fatal, even for a pair not measured: the
+        # measurement revision fails, so no task gets measurements, a report, or reviews.
+        assert result.exit_code == 2
+        assert "Coverage source is absent from the frozen snapshot" in result.stderr
+        assert revision["status"] == "failed"
+        assert not (root / "report/results.json").exists()
+        assert calls and not reviews
 
 
 def _failing_reference_agents(oracle: dict[str, object], nop: dict[str, object]) -> Any:
@@ -2058,6 +2277,26 @@ def _tree(root: Path) -> dict[str, str]:
     }
 
 
+def _exported(commit: str, tmp_path: Path) -> Path:
+    """An earlier build's src and tests, from this clone's history; skips when it is absent."""
+    repository = Path(__file__).resolve().parents[1]
+    present = subprocess.run(
+        ["git", "-C", str(repository), "cat-file", "-e", f"{commit}^{{commit}}"],
+        capture_output=True,
+    )
+    if present.returncode:
+        pytest.skip(f"{commit} is not in this clone's history")
+    export = tmp_path / commit
+    export.mkdir()
+    archive = subprocess.run(
+        ["git", "-C", str(repository), "archive", commit, "src", "tests"],
+        capture_output=True,
+        check=True,
+    )
+    subprocess.run(["tar", "-x", "-C", str(export)], input=archive.stdout, check=True)
+    return export
+
+
 # Runs 942f12c's own `run <run-dir>` command. Docker and coding are stubbed out, so reaching
 # coding ends the process with a line instead of starting an agent.
 _OLD_RESUME = """
@@ -2095,21 +2334,7 @@ def test_942f12c_refuses_a_run_this_build_saved(
 ) -> None:
     # The owner runs 942f12c beside newer builds. It cannot read launcher versions, so it must
     # refuse this build's runs instead of coding them with another launcher.
-    repository = Path(__file__).resolve().parents[1]
-    present = subprocess.run(
-        ["git", "-C", str(repository), "cat-file", "-e", "942f12c^{commit}"],
-        capture_output=True,
-    )
-    if present.returncode:
-        pytest.skip("942f12c is not in this clone's history")
-    export = tmp_path / "942f12c"
-    export.mkdir()
-    archive = subprocess.run(
-        ["git", "-C", str(repository), "archive", "942f12c", "src", "tests"],
-        capture_output=True,
-        check=True,
-    )
-    subprocess.run(["tar", "-x", "-C", str(export)], input=archive.stdout, check=True)
+    export = _exported("942f12c", tmp_path)
     if started:
         root, _, _ = _stopped_after_two_attempts(config, tmp_path, monkeypatch)
     else:
@@ -2135,6 +2360,87 @@ def test_942f12c_refuses_a_run_this_build_saved(
     # study; it writes nothing else, and starts no coding.
     changed = {name for name in before.keys() | after.keys() if before.get(name) != after.get(name)}
     assert changed <= {"run.lock", "events.jsonl"}, changed
+
+
+# Runs an earlier build's own `report <run-dir>` command, which reads saved evidence only.
+_OLD_REPORT = """
+import sys
+from pathlib import Path
+export, root = Path(sys.argv[1]), Path(sys.argv[2])
+sys.path[:0] = [str(export / "src"), str(export / "tests")]
+import native_support, pluginbench
+from pluginbench import harbor_backend, submissions
+assert Path(pluginbench.__file__).is_relative_to(export), pluginbench.__file__
+def refuse_docker(*args, **kwargs):
+    raise SystemExit("the earlier build ran a Docker command")
+harbor_backend._docker = refuse_docker
+submissions.reviewed_contract = native_support.synthetic_contract
+from typer.testing import CliRunner
+from pluginbench import cli
+result = CliRunner().invoke(cli.app, ["report", str(root)])
+print("exit:", result.exit_code, result.stderr)
+"""
+
+# The build before the not-measured list: its report would publish a listed pair's values.
+_BEFORE_LIST = "febdf03"
+
+
+def _old_report(export: Path, root: Path, tmp_path: Path) -> str:
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", _OLD_REPORT, str(export), str(root)],
+        env={
+            "PATH": os.environ["PATH"],
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "XDG_CACHE_HOME": str(tmp_path / "xdg"),
+        },
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    return result.stdout
+
+
+def test_an_earlier_build_refuses_the_report_of_a_run_with_listed_pairs(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    export = _exported(_BEFORE_LIST, tmp_path)
+    _coverage_broken_on_one_task(checkable, monkeypatch)
+    root, result, _, _ = _run_checkable(checkable, monkeypatch)
+    assert result.exit_code == 0, result.stderr
+    path = root / "evidence/observer-revisions/measurements/revision.json"
+    revision = json.loads(path.read_text())
+    assert revision["schema_version"] == 3
+
+    refused = _old_report(export, root, tmp_path)
+
+    assert refused.startswith("exit: 2") and "unsupported measurement revision protocol" in refused
+    # Control: without the barrier the earlier build reports, and publishes the hidden values.
+    path.write_text(json.dumps({**revision, "schema_version": 2}, indent=2) + "\n")
+    assert _old_report(export, root, tmp_path).startswith("exit: 0")
+    data = json.loads((root / "report/results.json").read_text())
+    assert "measured" in {
+        row["status"]
+        for row in data["observations"]
+        if (row["task"], row["metric"]) == ("arbitrary-native-task", "Line coverage %")
+    }
+
+
+def test_an_earlier_build_writes_the_same_report_for_a_run_without_listed_pairs(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    export = _exported(_BEFORE_LIST, tmp_path)
+    root, result, _, _ = _run_checkable(checkable, monkeypatch)
+    assert result.exit_code == 0, result.stderr
+    assert evaluation._load_selection(root)["not_measured"] == []
+    revision = root / "evidence/observer-revisions/measurements/revision.json"
+    assert json.loads(revision.read_text())["schema_version"] == 2
+    names = ("results.json", "results.csv", "report.html")
+    ours = {name: (root / "report" / name).read_bytes() for name in names}
+
+    assert _old_report(export, root, tmp_path).startswith("exit: 0")
+
+    assert {name: (root / "report" / name).read_bytes() for name in names} == ours
 
 
 def test_report_on_a_run_stopped_during_coding_covers_the_finished_attempts_and_says_so(

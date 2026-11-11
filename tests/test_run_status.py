@@ -506,3 +506,19 @@ def test_a_withheld_result_gets_the_report_s_outcome(
     row = next(row for row in run_status.run_status(root)["attempts"] if row["id"] == "a3")
 
     assert (row["outcome"], row["outcome_reason"]) == (outcome, None)
+
+
+def test_a_run_saved_before_the_not_measured_list_shows_no_such_warning(tmp_path: Path) -> None:
+    # Readiness rows in the older shape: status and readiness, no state, and no saved list.
+    root = _run(tmp_path / "run", states=dict.fromkeys(STATES, "complete"), ledger=True)
+    selection = json.loads((root / "evaluation.json").read_text())
+    readiness = {
+        "covered": {"coverage": {"status": "available", "readiness": "passed", "reason": None}},
+        "rust": {"coverage": {"status": "unavailable", "readiness": "failed", "reason": "exit 3"}},
+    }
+    _write(root / "evaluation.json", {**selection, "measurement_readiness": readiness})
+
+    status = run_status.run_status(root)
+
+    assert status["measures"]["not_measured"] == []
+    assert "Warning:" not in run_status.format_status(status)

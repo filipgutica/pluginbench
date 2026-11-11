@@ -172,15 +172,52 @@ def readiness_state(row: dict[str, object]) -> str:
     return "not_configured" if row.get("configured") is False else "broken"
 
 
+def _ready_nowhere(matrix: dict[str, dict[str, dict[str, object]]]) -> list[str]:
+    """Selected measures that no task can measure: a run would produce nothing for them."""
+    measures = dict.fromkeys(
+        name for rows in matrix.values() for name in rows if name in MEASUREMENT_NAMES
+    )
+    return [
+        name
+        for name in measures
+        if all(rows[name].get("state") != "ready" for rows in matrix.values() if name in rows)
+    ]
+
+
 def blocking_findings(
     matrix: dict[str, dict[str, dict[str, object]]], *, require_ready: bool
 ) -> list[str]:
-    """Broken rows always block; not-configured rows block only when every measure is required."""
-    return [
+    """Rows that stop the run before any coding call.
+
+    A broken check of the coding environment, submission source or reference agents blocks. A
+    broken measure blocks only when no task can measure it; otherwise that task is recorded as not
+    measured (see not_measured). require_ready makes every row that is not ready block.
+    """
+    nowhere = _ready_nowhere(matrix)
+    findings = [
         f"{task}: {name} is {row['state']}: {row.get('reason')}"
         for task, rows in matrix.items()
         for name, row in rows.items()
-        if row["state"] == "broken" or (require_ready and row["state"] == "not_configured")
+        if row["state"] != "ready"
+        and (
+            require_ready
+            or (name in nowhere if name in MEASUREMENT_NAMES else row["state"] == "broken")
+        )
+    ]
+    return findings + [
+        f"{name} is ready on no task, so the run would measure nothing for it"
+        for name in nowhere
+    ]
+
+
+def not_measured(matrix: dict[str, dict[str, dict[str, object]]]) -> list[dict[str, object]]:
+    """Broken measures that the run skips on their task while other tasks still measure them."""
+    nowhere = _ready_nowhere(matrix)
+    return [
+        {"task": task, "measure": name, "reason": row.get("reason")}
+        for task, rows in matrix.items()
+        for name, row in rows.items()
+        if name in MEASUREMENT_NAMES and name not in nowhere and row.get("state") == "broken"
     ]
 
 
