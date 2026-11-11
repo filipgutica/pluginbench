@@ -35,15 +35,15 @@ PluginBench runs on Linux or macOS. Every run needs:
 | Git | Any recent | Task sources and patches |
 | Docker | Linux containers on a local Unix socket, with Compose and Buildx | Each attempt and its verifier run in containers |
 | Codex CLI | Exactly 0.162.1 or 0.167.0, logged in | Coding agent. PluginBench checks the `codex` on your `PATH` and copies its login from `~/.codex/auth.json`. Other versions fail `check`. |
-| Bubblewrap (`bwrap` on `PATH`, Linux) or `sandbox-exec` (macOS) | Any | Measures and reviews that run on the host use this sandbox |
 
-Some measures need more:
+Some measures and commands need more:
 
 | Needed for | Tool |
 | --- | --- |
 | JS/TS complexity and dead code | Node (this repository pins 22.20), Corepack, and Fallow 3.18.0 |
 | Python, Go, Rust analysis | Pinned analyzers; see [Measurements](docs/running-evaluations.md#measurements) |
 | `coverage` | A coverage command that the task image supports |
+| Analysis measures that run on the host, and `review` | Bubblewrap (`bwrap` on `PATH`) on Linux, or `sandbox-exec` on macOS |
 | `pluginbench tasks pick` | `fzf`, and for `--copy` a clipboard tool (`pbcopy`, `wl-copy`, `xclip`, or `xsel`) |
 
 ## Install
@@ -148,13 +148,13 @@ treatments:
     guidance: [./AGENTS.md]
 ```
 
-**Measurements.** Before any paid call, PluginBench runs each selected collector twice on the starting code. A measure with no collector for a task is `not_configured`, and one whose collector fails its probe is `broken`. Neither blocks the run, unless `measurement_settings.require_ready: true`; that task is then not measured for it. Selecting `review` requires a `reviewer` block. [Measurements](docs/running-evaluations.md#measurements).
+**Measurements.** Before any paid call, PluginBench runs each selected collector twice on the starting code. A measure with no collector for a task is `not_configured`, and one whose collector fails its probe is `broken`. That task is then not measured for it, and the run continues, as long as another task can measure it. A measure that is ready on no task stops the run. With `measurement_settings.require_ready: true`, any such task stops the run. Selecting `review` requires a `reviewer` block. [Measurements](docs/running-evaluations.md#measurements).
 
 **Concurrency.** `jobs` defaults to 2 and accepts 1 to 4. A value above Docker capacity fails the check; PluginBench does not lower it. [Concurrency and resume](docs/running-evaluations.md#concurrency-and-resume).
 
 ## Stop, resume, and reuse
 
-- `pluginbench stop runs/<run>` stops new attempts. Attempts already coding finish and are kept.
+- `pluginbench stop runs/<run>` stops new attempts. With `jobs` above 1, attempts already coding finish and are kept. With `jobs: 1`, the attempt in progress is interrupted, and a resume codes its slot again with a new attempt.
 - `pluginbench run runs/<run>` resumes. A run that was killed, for example by a host shutdown, shows `interrupted`, and `status` prints this command. Complete attempts are kept and never coded again. An attempt cut off mid-call is recorded as `discarded-interrupted` and a new attempt takes its slot. Resume cannot repair a failing solution.
 - If Codex fails before its first model turn, for example during a network outage, the run stops instead of scoring the attempt. Resume when Codex is reachable.
 - Vanilla attempts are cached in `$XDG_CACHE_HOME/pluginbench` (default `~/.cache/pluginbench`) and reused by any later run with the same task, model, and settings. Grading and measures run again. Reports mark reused attempts. [Baselines and reports](docs/running-evaluations.md#baselines-and-reports).
