@@ -171,10 +171,10 @@ The checks:
 - A Codex reviewer needs `codex-code-mode-host` beside the launched `codex`, inside the review sandbox.
 - Selected collectors run twice on the starting source. Selected unused-code measurements also require unambiguous declaration matching in the starting population.
 - The submission source must qualify when the task has a reviewed patch-grading contract.
-- `git commit` must work in the coding image with only the task's environment. Graded patches are `git diff BASE HEAD`, so a failing commit makes every patch empty. A prebuilt `docker_image` is used as published; `check` warns when a Dockerfile beside it is never built.
+- `git commit` must work in the coding image. Graded patches are `git diff BASE HEAD`, so a failing commit makes every patch empty. The first probe uses only the task's environment. If git has no author or committer identity there, PluginBench supplies `PluginBench Agent <agent@pluginbench.invalid>` to that task's agents and probes again. `check` and `check.json` say when this happens, and the identity becomes part of the task's cache key. A task that sets its own identity gets nothing added. A prebuilt `docker_image` is used as published; `check` warns when a Dockerfile beside it is never built.
 - Harbor's oracle agent must produce a nonempty patch with reward 1, and its nop agent must get reward 0, through the same commit, patch and verifier path.
 
-Oracle and nop results are cached by preparation key and image IDs. A prepared entry reused from an older key keeps that key, so its oracle and nop results are reused too. Only passing results are cached, so a failure is retried on the next check.
+Oracle and nop results are cached by preparation key, image IDs and any supplied git identity. A prepared entry reused from an older key keeps that key, so its oracle and nop results are reused too. Only passing results are cached, so a failure is retried on the next check.
 
 `check` also prints hit or miss for every vanilla attempt, computed from saved entries and their contexts without validating their evidence. `run` validates each hit again before it reuses it.
 

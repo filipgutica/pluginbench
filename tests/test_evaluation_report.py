@@ -118,6 +118,29 @@ def test_each_guidance_set_has_its_own_delta_against_the_same_evaluation_baselin
     assert "winner" not in data and "score" not in data
 
 
+def test_study_details_name_each_task_given_a_supplied_git_identity() -> None:
+    config = _config()
+    config["comparison_identity"] = {
+        "task_environment": {
+            "own-identity": {"source_digest": "a"},
+            "no-identity": {
+                "source_digest": "b",
+                "supplied_git_identity": {
+                    "name": "PluginBench Agent",
+                    "email": "agent@pluginbench.invalid",
+                },
+            },
+        }
+    }
+    limitations = evaluation_data(_token_report(), config)["limitations"]
+    assert isinstance(limitations, list)
+    supplied = [row for row in limitations if "git identity" in str(row)]
+    assert supplied == [
+        "Task no-identity sets no git identity, so PluginBench supplied "
+        "PluginBench Agent <agent@pluginbench.invalid> to its agents."
+    ]
+
+
 def test_reused_baseline_is_disclosed_without_recounting_original_calls() -> None:
     report = _token_report()
     report["baseline_origin"] = {
