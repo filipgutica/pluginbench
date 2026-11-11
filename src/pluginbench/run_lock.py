@@ -170,8 +170,8 @@ def hold(root: Path) -> Iterator[RunLock]:
         os.pwrite(fd, (json.dumps(owner, indent=2) + "\n").encode(), 0)
         os.fsync(fd)
         previous_handler = signal.signal(signal.SIGTERM, _interrupt)
-        _held.add(root)
         try:
+            _held.add(root)
             yield RunLock(root, fd)
         finally:
             _held.discard(root)
