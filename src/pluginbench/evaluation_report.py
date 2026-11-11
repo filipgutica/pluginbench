@@ -142,14 +142,20 @@ def correctness_state(status: object, grading: object) -> str:
     PluginBench withholds confirmation when trusted verifier tests overwrite paths the agent
     changed. The verifier still grades the agent's production code against its own tests, so
     reward 1 with every fail-to-pass and pass-to-pass test passing is an overlap pass, and
-    reward 0 is a fail. Any other withheld result stays unknown.
+    reward 0 is a fail. One exception stays unknown: reward 0 with no pass-to-pass test passing.
+    A replaced test file can remove code the agent's other test files use, so the existing suite
+    may fail to build before any test runs. Any other withheld result stays unknown.
     """
     grading = _map(grading)
     if status != "unknown" or grading.get("reason") != TRUSTED_TEST_OVERLAP:
         return str(status)
     rewards = _map(_map(grading.get("native_verifier_result")).get("rewards"))
     if rewards.get("reward") == 0:
-        return "fail"
+        p2p_total = rewards.get("p2p_total")
+        no_existing_test_ran = (
+            isinstance(p2p_total, int) and p2p_total > 0 and rewards.get("p2p_passed") == 0
+        )
+        return "unknown" if no_existing_test_ran else "fail"
     every_test_passed = all(
         isinstance(rewards.get(f"{kind}_total"), int)
         and rewards.get(f"{kind}_passed") == rewards.get(f"{kind}_total")

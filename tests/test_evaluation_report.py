@@ -765,9 +765,9 @@ def test_writer_headlines_separate_task_check_failures_from_execution_failures(
     assert report == original
 
 
-def _overlap_grading(reward: int, f2p_passed: int = 4) -> dict[str, object]:
+def _overlap_grading(reward: int, f2p_passed: int = 4, p2p_passed: int = 9) -> dict[str, object]:
     rewards = {"reward": reward, "f2p_passed": f2p_passed, "f2p_total": 4}
-    rewards.update(p2p_passed=9, p2p_total=9)
+    rewards.update(p2p_passed=p2p_passed, p2p_total=9)
     return {
         "pass": None,
         "reason": "trusted verifier tests overwrite authored patch paths",
@@ -783,6 +783,8 @@ def test_trusted_test_overlap_with_every_test_passing_is_an_overlap_pass(
     cases = {
         "overlap-reward-1": ("unknown", _overlap_grading(1)),
         "overlap-reward-0": ("unknown", _overlap_grading(0, f2p_passed=3)),
+        # The replaced test file held code the agent's other tests used: the suite never built.
+        "overlap-no-existing-test-ran": ("unknown", _overlap_grading(0, p2p_passed=0)),
         "overlap-missing-test": ("unknown", _overlap_grading(1, f2p_passed=3)),
         "confirmed": ("pass", None),
     }
@@ -805,6 +807,7 @@ def test_trusted_test_overlap_with_every_test_passing_is_an_overlap_pass(
     assert states == {
         "overlap-reward-1": "overlap_pass",
         "overlap-reward-0": "fail",
+        "overlap-no-existing-test-ran": "unknown",
         "overlap-missing-test": "unknown",
         "confirmed": "pass",
     }
@@ -812,8 +815,8 @@ def test_trusted_test_overlap_with_every_test_passing_is_an_overlap_pass(
         states.items()
     )
     visible = _outcome_text(data, tmp_path, package=True)
-    assert "1/4 attempts passed" in visible
-    assert "1 failed task check · 1 overlap pass · 0 execution failures · 1 unknown" in visible
+    assert "1/5 attempts passed" in visible
+    assert "1 failed task check · 1 overlap pass · 0 execution failures · 2 unknown" in visible
 
 
 @pytest.mark.parametrize("execution_state", ["provider", "timeout", "complete", "missing"])
