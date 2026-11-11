@@ -127,7 +127,7 @@ A *treatment* is the guidance you want to test. It can be instruction files, ski
    ```text
    my-eval/
    ├── evaluation.yaml
-   ├── AGENTS.md                     # instructions: any UTF-8 .md or .txt file
+   ├── AGENTS.md                     # instructions: UTF-8 .md or .txt files, 32 KiB in all
    ├── skills/
    │   └── write-tests/
    │       └── SKILL.md              # a skill
@@ -195,7 +195,7 @@ A *treatment* is the guidance you want to test. It can be instruction files, ski
 
 4. Run it with `pluginbench run evaluation.yaml`, as in the quickstart. The report compares each treatment with vanilla.
 
-Treatments need the Codex harness. Instruction files become the agent's private `AGENTS.md`; they are never added to the task prompt or to the repository. Skills and plugins are copied whole, including their scripts. MCP servers, apps, custom agents, commands, and plugin dependencies are not supported yet, and a treatment that declares one stops the run before any model call. Before coding, PluginBench checks that Codex found every declared skill. That proves the skill was available, not that the agent used it. [Native treatments](docs/running-evaluations.md#native-treatments).
+Treatments need the Codex harness. Instruction files become the agent's private `AGENTS.md`; they are never added to the task prompt or to the repository. Skills and plugins are copied whole, including their scripts, except Git internals; symlinks, special files, and `.env` files are refused. Skill dependencies, MCP servers, apps, custom agents, commands, plugin dependencies, and hooks other than synchronous command hooks are not supported yet, and a treatment that declares one stops the run before any model call. Before coding, PluginBench checks that Codex found every declared skill. That proves the skill was available, not that the agent used it. [Native treatments](docs/running-evaluations.md#native-treatments).
 
 ## Commands
 
