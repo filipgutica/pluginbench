@@ -1182,6 +1182,99 @@ def test_one_model_output_record_blocks_pre_model_retry(item_type: str) -> None:
     assert codex_events.failed_before_first_turn(parsed) is None
 
 
+@pytest.mark.parametrize("version", ["0.162.1", "0.167.0", "0.167.1"])
+@pytest.mark.parametrize("kind", ["task_complete", "turn_complete"])
+@pytest.mark.parametrize(
+    "timing, last_message, model_ran",
+    [(12, None, True), (0, None, True), (None, "partial output", True),
+     (None, "", True), (None, None, False)],
+)
+def test_failed_completion_retains_partial_stream_evidence(
+    version: str, kind: str, timing: int | None, last_message: str | None, model_ran: bool,
+) -> None:
+    trace = outage_trace("header", version=version) + "\n" + stream({
+        "type": "event_msg", "payload": {
+            "type": kind, "turn_id": "synthetic-turn",
+            "error": {"message": "stream disconnected before response.completed"},
+            "time_to_first_token_ms": timing, "last_agent_message": last_message,
+        },
+    })
+    parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
+    assert parsed["usage"] is None
+    assert parsed["observed_token_usage"] is model_ran
+    assert codex_events.failed_before_first_turn(parsed) == (
+        None if model_ran else "workspace routing discovery failed"
+    )
+
+
+@pytest.mark.parametrize("version", ["0.162.1", "0.167.0", "0.167.1"])
+@pytest.mark.parametrize(
+    "kind",
+    ["agent_message", "agent_reasoning", "agent_reasoning_raw_content",
+     "agent_reasoning_section_break", "agent_message_content_delta", "plan_delta",
+     "reasoning_content_delta", "reasoning_raw_content_delta"],
+)
+def test_stream_output_event_blocks_pre_model_retry(version: str, kind: str) -> None:
+    trace = outage_trace("header", version=version) + "\n" + stream({
+        "type": "event_msg", "payload": {
+            "type": kind, "thread_id": _OUTAGE[0]["thread_id"],
+            "turn_id": "synthetic-turn", "item_id": "synthetic-output",
+            "message": "partial output", "text": "partial output", "delta": "partial output",
+            "summary_index": 0, "content_index": 0,
+        },
+    })
+    parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
+    assert parsed["observed_token_usage"] is True
+    assert codex_events.failed_before_first_turn(parsed) is None
+
+
+@pytest.mark.parametrize("version", ["0.162.1", "0.167.0", "0.167.1"])
+@pytest.mark.parametrize(
+    "item_type",
+    ["AgentMessage", "Reasoning", "Plan", "FunctionCallOutput", "CommandExecution",
+     "DynamicToolCall", "CollabAgentToolCall", "WebSearch", "ImageView", "ImageGeneration",
+     "FileChange", "McpToolCall", "ContextCompaction"],
+)
+def test_completed_model_output_item_blocks_pre_model_retry(version: str, item_type: str) -> None:
+    trace = outage_trace("header", version=version) + "\n" + stream({
+        "type": "event_msg", "payload": {
+            "type": "item_completed", "thread_id": _OUTAGE[0]["thread_id"],
+            "turn_id": "synthetic-turn", "item": {"type": item_type, "id": "synthetic-output"},
+        },
+    })
+    parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
+    assert parsed["observed_token_usage"] is True
+    assert codex_events.failed_before_first_turn(parsed) is None
+
+
+@pytest.mark.parametrize(
+    "item, model_ran",
+    [({"type": "SubAgentActivity", "kind": "completed"}, True),
+     ({"type": "SubAgentActivity", "kind": "started"}, False),
+     ({"type": "Extension", "kind": "image_gen.generation"}, True),
+     ({"type": "Extension", "kind": "web.search"}, True),
+     ({"type": "Extension", "kind": "clock.sleep"}, True),
+     ({"type": "Extension", "kind": "unknown.extension"}, False),
+     ({"type": "UserMessage", "content": []}, False),
+     ({"type": "HookPrompt", "fragments": []}, False),
+     ({"type": "EnteredReviewMode"}, False),
+     ({"type": "ExitedReviewMode", "review_output": None}, False),
+     ({"type": "ExitedReviewMode", "review_output": {"findings": []}}, True),
+     ({"type": "UnknownOutput"}, False)],
+)
+def test_completed_item_requires_positive_output_evidence(
+    item: dict[str, object], model_ran: bool,
+) -> None:
+    trace = outage_trace("header") + "\n" + stream({
+        "type": "event_msg", "payload": {"type": "item_completed", "item": item},
+    })
+    parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
+    assert parsed["observed_token_usage"] is model_ran
+    assert codex_events.failed_before_first_turn(parsed) == (
+        None if model_ran else "workspace routing discovery failed"
+    )
+
+
 @pytest.mark.parametrize(
     "item_type",
     ["agent_message", "reasoning", "command_execution", "file_change", "mcp_tool_call",

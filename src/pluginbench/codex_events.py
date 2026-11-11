@@ -177,9 +177,38 @@ def _trace_model_evidence(events: list[dict[str, object]]) -> bool:
         kind = payload.get("type")
         # session/mod.rs:5320-5338 emits token_count after sampling. The presence of
         # non-null info is evidence even when numeric accounting cannot validate it.
-        if event.get("type") == "event_msg" and kind == "token_count":
-            if payload.get("info") is not None:
+        if event.get("type") == "event_msg":
+            if kind == "token_count" and payload.get("info") is not None:
                 return True
+            # EventMsg uses these names in all three verified versions. Deltas and
+            # failed completions can survive even when no response item or usage did.
+            if kind in (
+                "agent_message", "agent_reasoning", "agent_reasoning_raw_content",
+                "agent_reasoning_section_break", "agent_message_content_delta", "plan_delta",
+                "reasoning_content_delta", "reasoning_raw_content_delta",
+            ):
+                return True
+            # TTFT is an Option<i64>; zero still means that a model token arrived.
+            if kind in ("task_complete", "turn_complete") and (
+                payload.get("time_to_first_token_ms") is not None
+                or payload.get("last_agent_message") is not None
+            ):
+                return True
+            if kind == "item_completed" and isinstance(item := payload.get("item"), dict):
+                if item.get("type") in (
+                    "AgentMessage", "Reasoning", "Plan", "FunctionCallOutput", "CommandExecution",
+                    "DynamicToolCall", "CollabAgentToolCall", "WebSearch", "ImageView",
+                    "ImageGeneration", "FileChange", "McpToolCall", "ContextCompaction",
+                ):
+                    return True
+                if item.get("type") == "SubAgentActivity" and item.get("kind") == "completed":
+                    return True
+                if item.get("type") == "Extension" and item.get("kind") in (
+                    "image_gen.generation", "web.search", "clock.sleep",
+                ):
+                    return True
+                if item.get("type") == "ExitedReviewMode" and item.get("review_output") is not None:
+                    return True
         # protocol/models.rs:1062-1340 defines these output items (including the
         # compaction_summary alias). User messages and request controls are inputs.
         if event.get("type") == "response_item" and (
