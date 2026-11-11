@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import tempfile
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -17,7 +18,16 @@ from collections.abc import Callable
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
-from pluginbench import baselines, claude, codex, components, harbor_backend, isolation, submissions
+from pluginbench import (
+    baselines,
+    claude,
+    codex,
+    components,
+    harbor_backend,
+    isolation,
+    run_lock,
+    submissions,
+)
 from pluginbench.treatments import Treatment, resolve_treatment, treatment_inventory
 from pluginbench.native_treatments import NativeCapabilities, DELIVERY_POLICY, admit
 from pluginbench.task_sources import Tasks, cache_root
@@ -955,11 +965,7 @@ def _finish_evaluation(
     evidence = root / "evidence"
     config = _saved_evaluation(selection)
     if profiles and selection["measurement_revision"] is None:
-        revision = "measurements"
-        index = 2
-        while (evidence / "observer-revisions" / revision).exists():
-            revision = f"measurements-{index}"
-            index += 1
+        revision = _next_measurement_revision(evidence)
         if selection.get("pending_measurement_revision") is not None:
             selection["recovery_measurement_revision"] = selection["pending_measurement_revision"]
         selection["pending_measurement_revision"] = revision
@@ -1052,14 +1058,73 @@ def _adopt_measurement_revision(root: Path, selection: dict[str, object], revisi
     selection.pop("recovery_measurement_revision", None)
 
 
+def _next_measurement_revision(evidence: Path) -> str:
+    revision = "measurements"
+    index = 2
+    while (evidence / "observer-revisions" / revision).exists():
+        revision = f"measurements-{index}"
+        index += 1
+    return revision
+
+
+def _sole_owner(root: Path) -> bool:
+    """Whether this process may treat a measurement left active as dead.
+
+    `resume_evaluation` measures only while it holds run.lock, and the flock ends with its
+    process, even on SIGKILL. So a measurement the holder finds still active was left by a process
+    that ended. A plan may assume the same while no live process holds the lock. A held lock with
+    no owner record yet counts as another owner.
+    """
+    return run_lock.held_here(root) or run_lock.owner(root) is None
+
+
+def _measurement_to_recover(
+    evidence: Path, selection: dict[str, object]
+) -> tuple[str, dict[str, object]] | None:
+    """The first revision a resume names whose saved state it can use, with that state.
+
+    None when each one has no state file or failed before it saved frozen profiles.
+    """
+    for candidate in (
+        selection.get("pending_measurement_revision", "measurements"),
+        selection.get("recovery_measurement_revision"),
+    ):
+        if candidate is None:
+            continue
+        revision = str(candidate)
+        directory = evidence / "observer-revisions" / revision
+        if (
+            directory.is_symlink()
+            or directory.resolve().parent != (evidence / "observer-revisions").resolve()
+        ):
+            raise ValueError("observer recovery must stay inside its native study")
+        if not (directory / "revision.json").exists():
+            continue
+        state = _object(json.loads((directory / "revision.json").read_text()))
+        if state["status"] != "failed" or all(
+            key in state for key in ("profile_inventory", "frozen_profiles")
+        ):
+            return revision, state
+    return None
+
+
 def _resume_inputs(
-    root: Path,
+    root: Path, *, resuming: bool, progress: Callable[[str], None] | None = None
 ) -> tuple[dict[str, object], dict[str, list[Collector]], list[Path], int]:
+    """What a resume has left after coding. With `resuming`, dead active state is closed on disk."""
     selection = _load_selection(root)
     config = _saved_evaluation(selection)
     evidence = root / "evidence"
     run, manifest, original = _native_state(evidence)
     profiles: dict[str, list[Collector]] = {}
+
+    def measuring_again(abandoned: str, why: str) -> None:
+        if progress:
+            progress(
+                f"Measurement revision {abandoned} {why}, so it cannot continue. Its files stay; "
+                f"measurement starts again as {_next_measurement_revision(evidence)}"
+            )
+
     if selection["measurement_revision"] is not None:
         validate_remeasurement(
             evidence, evidence / "observer-revisions" / str(selection["measurement_revision"])
@@ -1067,45 +1132,55 @@ def _resume_inputs(
     elif _measurement_unstarted(root, selection):
         profiles = _saved_profiles(root)
     elif selection["measurement_required"]:
-        candidates = (
-            selection.get("pending_measurement_revision", "measurements"),
-            selection.get("recovery_measurement_revision"),
-        )
-        for candidate in candidates:
-            if candidate is None:
-                continue
-            revision = str(candidate)
+        found = _measurement_to_recover(evidence, selection)
+        if found is None:
+            # Each named revision ended before it saved frozen profiles: a kill left its
+            # directory with no state file, or a stop recorded it as failed first. Its directory
+            # stays as it is; measurement starts again under a new name with the prepared profiles.
+            if not _sole_owner(root):
+                raise ValueError(
+                    "observer recovery has no saved frozen profiles and another process may own "
+                    "this run; cannot replay it"
+                )
+            measuring_again(
+                str(selection.get("pending_measurement_revision", "measurements")),
+                "ended before it saved its frozen profiles",
+            )
+            # Nothing to bind in measurement history: the revision saved no state.
+            selection["pending_measurement_revision"] = None
+            profiles = _saved_profiles(root)
+        else:
+            revision, state = found
             directory = evidence / "observer-revisions" / revision
-            if (
-                directory.is_symlink()
-                or directory.resolve().parent != (evidence / "observer-revisions").resolve()
-            ):
-                raise ValueError("observer recovery must stay inside its native study")
-            if not (directory / "revision.json").exists():
-                continue
-            state = json.loads((directory / "revision.json").read_text())
-            if state["status"] != "failed" or all(
-                key in state for key in ("profile_inventory", "frozen_profiles")
-            ):
-                break
-        else:
-            raise ValueError("observer recovery has no saved frozen profiles")
-        selection["pending_measurement_revision"] = revision
-        if state["status"] == "complete":
-            validate_remeasurement(evidence, directory)
-            _adopt_measurement_revision(root, selection, revision)
-        elif state["status"] == "failed":
-            if (
-                study._bound_document(evidence, state["source_run"]) != run
-                or study._bound_path(evidence, state["source_assessment"]) != original
-                or _preserved_inventory(evidence, manifest, original.parent) != state["preserved"]
-            ):
-                raise ValueError("saved native inputs changed after failed observer collection")
-            if study._inventory(directory / "profiles") != state["profile_inventory"]:
-                raise ValueError("frozen observer profiles changed")
-            profiles = load_profiles(study._bound_path(evidence, state["frozen_profiles"]))
-        else:
-            raise ValueError("observer collection is still marked active; cannot replay it")
+            selection["pending_measurement_revision"] = revision
+            if state["status"] == "collecting" and _sole_owner(root):
+                # Its process ended without recording why; record it as failed, keep its files.
+                state.update(
+                    status="failed",
+                    error="its process ended while collecting; found by a later resume",
+                )
+                if resuming:
+                    study._write(directory / "revision.json", state)
+                measuring_again(revision, "was left collecting by a process that ended")
+            if state["status"] == "complete":
+                validate_remeasurement(evidence, directory)
+                _adopt_measurement_revision(root, selection, revision)
+            elif state["status"] == "failed":
+                if (
+                    study._bound_document(evidence, state["source_run"]) != run
+                    or study._bound_path(evidence, state["source_assessment"]) != original
+                    or _preserved_inventory(evidence, manifest, original.parent)
+                    != state["preserved"]
+                ):
+                    raise ValueError("saved native inputs changed after failed observer collection")
+                if study._inventory(directory / "profiles") != state["profile_inventory"]:
+                    raise ValueError("frozen observer profiles changed")
+                profiles = load_profiles(study._bound_path(evidence, state["frozen_profiles"]))
+            else:
+                raise ValueError(
+                    "observer collection is still marked active and another process may own "
+                    "this run; cannot replay it"
+                )
     guidance = []
     calls = 0
     if config.reviewer:
@@ -1168,7 +1243,7 @@ def plan_resume(root: Path) -> dict[str, object]:
             "jobs": selection["jobs"],
             "vanilla": "keep complete attempts; code pending slots and replace interrupted ones",
         }
-    selection, profiles, _, calls = _resume_inputs(root)
+    selection, profiles, _, calls = _resume_inputs(root, resuming=False)
     return {
         "name": selection["name"],
         "coding_calls": 0,
@@ -1185,15 +1260,26 @@ def resume_evaluation(
     progress: Callable[[str], None] | None = None,
     guard: Callable[[], None] | None = None,
 ) -> Path:
-    """Run whatever a prepared evaluation has left: coding, then measurement and reviews."""
+    """Run whatever a prepared evaluation has left: coding, then measurement and reviews.
+
+    Holds run.lock for the whole call, taking it unless this process already has it, so a run
+    never has two processes working on it. Must then run in the main thread.
+    """
     root = root.expanduser().resolve()
+    with nullcontext() if run_lock.held_here(root) else run_lock.hold(root):
+        return _resume(root, progress=progress, guard=guard)
+
+
+def _resume(
+    root: Path, *, progress: Callable[[str], None] | None, guard: Callable[[], None] | None
+) -> Path:
     selection = _load_selection(root)
     if not _coding_done(root):
         _assert_resumable(root, selection)
         _code(root, selection, progress=progress, guard=guard)
     if guard:
         guard()
-    selection, profiles, guidance, calls = _resume_inputs(root)
+    selection, profiles, guidance, calls = _resume_inputs(root, resuming=True, progress=progress)
     if calls:
         _review_preflight(selection)
     return _finish_evaluation(
@@ -1260,11 +1346,13 @@ def review_evaluation(
 
 
 def _save_selection(root: Path, selection: object) -> None:
-    _write(root / "evaluation.json", selection)
-    _write(
-        root / "evaluation-binding.json",
-        {"sha256": hashlib.sha256((root / "evaluation.json").read_bytes()).hexdigest()},
-    )
+    # A stop between these writes would leave settings that every later command refuses.
+    with run_lock.deferred_stop():
+        _write(root / "evaluation.json", selection)
+        _write(
+            root / "evaluation-binding.json",
+            {"sha256": hashlib.sha256((root / "evaluation.json").read_bytes()).hexdigest()},
+        )
 
 
 def _measurement_collection(root: Path, selection: dict[str, object]) -> dict[str, object] | None:

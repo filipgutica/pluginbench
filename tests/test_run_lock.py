@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -149,3 +152,109 @@ def test_a_brief_status_probe_does_not_refuse_a_run_starting_at_that_moment(
 
     with run_lock.hold(tmp_path):
         assert run_lock.owner(tmp_path) is not None
+
+
+@pytest.mark.parametrize("stop", [signal.SIGTERM, signal.SIGINT], ids=["stop", "ctrl-c"])
+def test_a_stop_between_the_settings_and_their_binding_leaves_them_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop: signal.Signals
+) -> None:
+    from pluginbench import evaluation
+
+    evaluation._save_selection(tmp_path, {"name": "before"})
+    write = evaluation._write
+
+    def stopped_after_the_settings(path: Path, value: object) -> None:
+        write(path, value)
+        if path.name == "evaluation.json":
+            signal.raise_signal(stop)
+
+    monkeypatch.setattr(evaluation, "_write", stopped_after_the_settings)
+    with run_lock.hold(tmp_path):
+        with pytest.raises(KeyboardInterrupt):
+            evaluation._save_selection(tmp_path, {"name": "after"})
+
+    assert evaluation._load_selection(tmp_path) == {"name": "after"}
+
+
+def _stopped(signum: int, frame: object) -> None:
+    raise KeyboardInterrupt(signal.Signals(signum).name)
+
+
+@pytest.fixture
+def stop_handlers() -> Iterator[None]:
+    """SIGTERM and SIGINT raise KeyboardInterrupt naming the signal; pytest's return afterwards."""
+    saved = {item: signal.getsignal(item) for item in (signal.SIGTERM, signal.SIGINT)}
+    for item in saved:
+        signal.signal(item, _stopped)
+    try:
+        yield
+    finally:
+        for item, handler in saved.items():
+            signal.signal(item, handler)
+
+
+def test_an_ignored_ctrl_c_never_hides_a_later_stop(stop_handlers: None) -> None:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    with pytest.raises(KeyboardInterrupt, match="SIGTERM"):
+        with run_lock.deferred_stop():
+            signal.raise_signal(signal.SIGINT)
+            signal.raise_signal(signal.SIGTERM)
+    assert signal.getsignal(signal.SIGINT) is signal.SIG_IGN
+    assert signal.getsignal(signal.SIGTERM) is _stopped
+
+
+def test_a_ctrl_c_handler_that_returns_never_hides_a_later_stop(stop_handlers: None) -> None:
+    seen = []
+    signal.signal(signal.SIGINT, lambda item, frame: seen.append(item))
+    with pytest.raises(KeyboardInterrupt, match="SIGTERM"):
+        with run_lock.deferred_stop():
+            signal.raise_signal(signal.SIGINT)
+            signal.raise_signal(signal.SIGTERM)
+    assert seen == [signal.SIGINT]
+
+
+def test_a_stop_while_handlers_are_restored_still_restores_ctrl_c(
+    stop_handlers: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    restore = signal.signal
+    sent = False
+
+    def stopped_once_the_stop_handler_is_back(item: int, handler: Any) -> Any:
+        nonlocal sent
+        previous = restore(item, handler)
+        if item == signal.SIGTERM and handler is _stopped and not sent:
+            sent = True
+            signal.raise_signal(signal.SIGTERM)
+        return previous
+
+    monkeypatch.setattr(signal, "signal", stopped_once_the_stop_handler_is_back)
+    with pytest.raises(KeyboardInterrupt, match="SIGTERM"):
+        with run_lock.deferred_stop():
+            pass
+    assert sent
+    assert signal.getsignal(signal.SIGINT) is _stopped
+    assert signal.getsignal(signal.SIGTERM) is _stopped
+
+
+def test_nested_blocks_deliver_a_stop_when_the_outer_block_ends(stop_handlers: None) -> None:
+    finished = []
+    with pytest.raises(KeyboardInterrupt, match="SIGTERM"):
+        with run_lock.deferred_stop():
+            with run_lock.deferred_stop():
+                signal.raise_signal(signal.SIGTERM)
+            finished.append("inner")
+    assert finished == ["inner"]
+    assert signal.getsignal(signal.SIGTERM) is _stopped
+    assert signal.getsignal(signal.SIGINT) is _stopped
+
+
+def test_an_error_leaving_the_block_still_restores_handlers_and_delivers_the_stop(
+    stop_handlers: None,
+) -> None:
+    with pytest.raises(KeyboardInterrupt, match="SIGINT") as raised:
+        with run_lock.deferred_stop():
+            signal.raise_signal(signal.SIGINT)
+            raise OSError("disk full")
+    assert isinstance(raised.value.__context__, OSError)
+    assert signal.getsignal(signal.SIGTERM) is _stopped
+    assert signal.getsignal(signal.SIGINT) is _stopped
