@@ -48,11 +48,16 @@ def test_bounded_jobs_overlap_and_coordinator_updates_execute_once() -> None:
 def test_one_job_preserves_serial_execution_and_callback_order() -> None:
     thread = get_ident()
     events: list[tuple[str, int]] = []
+    update_threads: list[int] = []
+
+    def update(item: int) -> None:
+        update_threads.append(get_ident())
+        events.append(("update", item))
 
     def operation(item: int, cancelled: Event, emit: Callable[[Callable[[], None]], None]) -> None:
-        assert get_ident() == thread and not cancelled.is_set()
+        assert get_ident() != thread and not cancelled.is_set()
         events.append(("start", item))
-        emit(lambda: events.append(("update", item)))
+        emit(lambda: update(item))
         events.append(("finish", item))
 
     parallel.run_jobs(
@@ -61,14 +66,21 @@ def test_one_job_preserves_serial_execution_and_callback_order() -> None:
         operation=operation,
         on_submit=lambda item: events.append(("submit", item)),
     )
-    assert events == [
-        (phase, item) for item in (2, 0, 1) for phase in ("submit", "start", "update", "finish")
+    assert [event for event in events if event[0] != "update"] == [
+        (phase, item) for item in (2, 0, 1) for phase in ("submit", "start", "finish")
     ]
+    assert [event for event in events if event[0] in ("submit", "update")] == [
+        (phase, item) for item in (2, 0, 1) for phase in ("submit", "update")
+    ]
+    assert update_threads == [thread] * 3
 
 
 @pytest.mark.parametrize("failure", [RuntimeError("fatal"), KeyboardInterrupt("interrupt")])
-def test_worker_failure_stops_admission_and_drains_active_results(failure: BaseException) -> None:
-    gate = Barrier(2)
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_worker_failure_stops_admission_and_drains_active_results(
+    failure: BaseException, jobs: int
+) -> None:
+    gate = Barrier(jobs)
     lock = Lock()
     started: list[int] = []
     saved: list[int] = []
@@ -86,9 +98,9 @@ def test_worker_failure_stops_admission_and_drains_active_results(failure: BaseE
             repairs.append(item)
 
     with pytest.raises(type(failure), match=str(failure)):
-        parallel.run_jobs(list(range(10)), jobs=2, operation=operation)
-    assert sorted(started) == [0, 1]
-    assert saved == [1] and repairs == []
+        parallel.run_jobs(list(range(10)), jobs=jobs, operation=operation)
+    assert sorted(started) == list(range(jobs))
+    assert saved == list(range(1, jobs)) and repairs == []
 
 
 def test_coordinator_interrupt_drains_worker_updates_without_admitting_more(
