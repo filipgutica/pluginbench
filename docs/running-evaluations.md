@@ -162,8 +162,12 @@ LCOV callbacks can share names. When mixed hit counts cannot be matched to sourc
 | State | Meaning | Blocks the run |
 | --- | --- | --- |
 | `ready` | Measured, or the check passed | No |
-| `not_configured` | No collector for this task, such as coverage without a profile | Only with `measurement_settings.require_ready: true` |
-| `broken` | Configured but failing, such as a missing tool or a probe that failed | Yes |
+| `not_configured` | No collector for this task, such as coverage without a profile | Only with `measurement_settings.require_ready: true`, or when the measure is ready on no task |
+| `broken` | Configured but failing, such as a missing tool or a probe that failed | For a measure, only with `measurement_settings.require_ready: true`, or when the measure is ready on no task. For every other check, yes |
+
+A measure that is `broken` for a task is not measured for that task. Other tasks still measure it. `check` prints a warning with the task, the measure, and the reason, and saves it under `warnings` in `check.json`. `check` also saves the list of pairs it did not measure, in `check.json` and with the run. `status` and the report read that list. `status` shows the same warning. With `measurement_settings.require_ready: true`, the check stops instead, so it saves no list and prints no such warning. The report shows each listed measure as unavailable for each attempt on that task, with the reason. It shows no value, result counts, or population for it, counts it as incomplete, and reports its reference value as unavailable too. One collector can serve several measures, so a listed measure's collector can still run after coding. Any value it produces for the listed measure is not reported. If that collector fails as unavailable, only its own measures on that task are affected. Any other failure of that collector after coding fails the measurement of every task, and the run stops without a report or reviews. Such failures include malformed output, evidence that fails validation, and a change to the source or profile it measures. A run with listed pairs saves its measurement revision with protocol version 3. An earlier PluginBench reads only version 2, so it refuses to rebuild that run's report instead of publishing the hidden values. A run saved before this list existed has no such warning, and its report does not change. A measure that is `ready` on no task stops the run in both modes, because the run would measure nothing for it. A broken coding environment, submission source, oracle, or nop always stops the run.
+
+When `dead_code` is `broken` because of an unresolved import, the reason names the importing file and the import. Fallow could not find that file or package, often a build output that the source snapshot does not hold, so it cannot tell which exports are used. To measure dead code without the importing file, add it to `ignorePatterns` in the task's `fallow_config`. Otherwise the measure stays not measured for that task.
 
 The checks:
 
@@ -171,10 +175,10 @@ The checks:
 - A Codex reviewer needs `codex-code-mode-host` beside the launched `codex`, inside the review sandbox.
 - Selected collectors run twice on the starting source. Selected unused-code measurements also require unambiguous declaration matching in the starting population.
 - The submission source must qualify when the task has a reviewed patch-grading contract.
-- `git commit` must work in the coding image with only the task's environment. Graded patches are `git diff BASE HEAD`, so a failing commit makes every patch empty. A prebuilt `docker_image` is used as published; `check` warns when a Dockerfile beside it is never built.
+- `git commit` must work in the coding image. Graded patches are `git diff BASE HEAD`, so a failing commit makes every patch empty. The first probe uses only the task's environment. If git has no author or committer identity there, PluginBench supplies `PluginBench Agent <agent@pluginbench.invalid>` to that task's agents and probes again. `check` and `check.json` say when this happens, and the identity becomes part of the task's cache key. A task that sets its own identity gets nothing added. A prebuilt `docker_image` is used as published; `check` warns when a Dockerfile beside it is never built.
 - Harbor's oracle agent must produce a nonempty patch with reward 1, and its nop agent must get reward 0, through the same commit, patch and verifier path.
 
-Oracle and nop results are cached by preparation key and image IDs. A prepared entry reused from an older key keeps that key, so its oracle and nop results are reused too. Only passing results are cached, so a failure is retried on the next check.
+Oracle and nop results are cached by preparation key, image IDs and any supplied git identity. A prepared entry reused from an older key keeps that key, so its oracle and nop results are reused too. Only passing results are cached, so a failure is retried on the next check.
 
 `check` also prints hit or miss for every vanilla attempt, computed from saved entries and their contexts without validating their evidence. `run` validates each hit again before it reuses it.
 
@@ -251,7 +255,7 @@ Resume then completes pending measurements or starts a review phase that has not
 | `reuse` | `vanilla_attempts`, `planned_hits` (from the plan's cache decisions), and `reused` (imported from the cache) |
 | `discarded` | Interrupted attempts a resume replaced: `id`, `slot`, `task`, `arm`, `repeat`, `replaced_by`, `tokens`, `tokens_status` |
 | `arms` | Per arm: `attempts`, `states`, `outcomes`, `reused`, and `tokens` (reused attempts included) |
-| `measures` | `selected` measurements; `measurement_revisions` and `review_revisions` as `revision`, `status`, `selected`, and for reviews `reviewed` of `assigned`; `references`: task → metric → `status`, `value`, `reason` |
+| `measures` | `selected` measurements; `measurement_revisions` and `review_revisions` as `revision`, `status`, `selected`, and for reviews `reviewed` of `assigned`; `references`: task → metric → `status`, `value`, `reason`; `not_measured`: the measures `check` saved as not measured for a task, as `task`, `measure`, `reason`; empty for a run saved before that list existed |
 | `report`, `log` | Paths to `report/report.html` and `run.log`, or null |
 | `attempts` | One row per live slot: `id`, `slot`, `task`, `arm`, `repeat`, `state`, `outcome`, `outcome_reason`, `reused`, `tokens`, `tokens_status`, `minutes`, and `measures` (metric → `status`, `value`, `unit`, `reason`, from `report/results.json` once it exists) |
 
@@ -292,7 +296,7 @@ gates:
     factor: 1.1
 ```
 
-Statistics are taken per task first, then averaged. A missing value is never 0: tasks without a value, and tasks measured on only some attempts, are listed under "Missing values" with their reasons. A `total` with any unmeasured attempt is `undetermined`. Each gate compares both sides over the tasks both have and says how many, and names tasks whose measured repeat counts differ.
+Statistics are taken per task first, then averaged. A missing value is never 0: tasks without a value, and tasks measured on only some attempts, are listed under "Missing values" with their reasons. A metric gate is `undetermined` when either package has an assigned attempt without a value for its metrics. This applies to `total` and to both mean statistics. The detail names the metrics and the measured and assigned attempts on each side. Assigned attempts are the attempts the run kept. An interrupted attempt that a resume discarded, and its token use, are not in the report or in token gates. A task that never has a value, such as a task where the measure is not configured or not measured, therefore also makes the gate `undetermined`. To decide the gate, define a named split without that task. The `all` section still includes it, so that gate stays `undetermined` there. A ratio gate leaves out a task without a usable reference: missing, zero, or below `reference_floor`. That task's missing values do not make the gate `undetermined`, and the gate says how many tasks it compared. Each gate compares both sides over the tasks both have and says how many, and names tasks whose measured repeat counts differ.
 
 Each split also has a paired section for every package against each comparator named in the gates file. It matches tasks across runs, including inputs selected with `DIR=ARM,ARM`. For each task, it reports:
 
@@ -324,7 +328,7 @@ gates:
     factor: 1.3                   # upper geometric-mean token ratio must be <= 1.3
 ```
 
-Bound gates omit `statistic`: they always average repeats within task. They cannot use `per_task`, `tolerance`, or `reference_floor`. Correctness bounds require `bound: lower`, `direction: higher`, and `margin`. Token bounds require both token metrics, `bound: upper`, `direction: lower`, and `factor`. A bound gate is `undetermined` with fewer than six usable pairs or any excluded task in its split. Otherwise, `pass` means its endpoint meets the declared limit; `fail` means the bound does not establish that requirement. Gates without `bound` keep their existing behavior.
+Bound gates omit `statistic`: they always average repeats within task. They cannot use `per_task`, `tolerance`, or `reference_floor`. Correctness bounds require `bound: lower`, `direction: higher`, and `margin`. Token bounds require both token metrics, `bound: upper`, `direction: lower`, and `factor`. A bound gate is `undetermined` with fewer than six usable pairs or any excluded task in its split. Otherwise, `pass` means its endpoint meets the declared limit; `fail` means the bound does not establish that requirement. Gates without `bound` work as described above.
 
 ## Judging
 
@@ -339,9 +343,9 @@ pluginbench judge run judging/r3 --judge codex:gpt-6-astra:high \
 pluginbench judge tally judging/r3
 ```
 
-`prepare` takes two `RUN_DIR=ARM` specs. They can name one run or two runs, and `vanilla` matches the arm older runs call `baseline`. It reads each run's `report/results.json` and review packets and nothing else.
+`prepare` takes two `RUN_DIR=ARM` specs. They can name one run or two runs, and `vanilla` matches the arm older runs call `baseline`. It reads each run's `report/results.json` and review packets. For a submission with no review packet, it reads the attempt's saved snapshots and the frozen task instruction instead.
 - It refuses any task that `--exclude` lists. Put holdout tasks there.
-- Each submission's diff comes from its review packet. A run needs a finished review, and the packet must be bound to the attempt's submission and starting source.
+- Each submission's diff comes from its review packet, which must be bound to the attempt's submission and starting source. A run without a reviewer, or one that stopped before review, has no packets: its diffs are built from the saved snapshots, checked against the digests in the report, and written under numbered folders in `submissions/` in the output directory. An attempt with no saved submission, such as one that was not coded, cannot be judged. It is left out with its pair, and `prepare` names it on stderr and under `omitted` in the key.
 - Both sides of a pair must start from the same source. They must also have the same instruction.
 - Diff headers become `a/` and `b/` with no `index` lines, so neither side's tooling identifies it.
 - The seed randomizes A and B for each pair.

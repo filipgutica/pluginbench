@@ -82,6 +82,21 @@ def _object(value: object, label: str) -> dict[str, Any]:
     return {key: item for key, item in value.items()}
 
 
+def _base_inventory_command(base: str) -> str:
+    """Shell that prints HEAD and the base tree; on failure it prints git's error instead.
+
+    `docker logs` returns only the container's standard output, and the inventory must stay free
+    of warnings, so git's standard error is held back and printed only when a command fails.
+    """
+    git = "git -c safe.directory=/app"
+    return (
+        "set -eu; exec 3>&1; "
+        f"error=$({{ {git} rev-parse --verify HEAD >&3 && "
+        f"{git} ls-tree -r -z --full-tree {base} >&3; }} 2>&1) "
+        '|| { code=$?; printf \'%s\\n\' "$error"; exit "$code"; }'
+    )
+
+
 def _docker(
     *arguments: str,
     timeout: int = _DOCKER_TIMEOUT,
@@ -1242,6 +1257,7 @@ def _native_config(
     prompt: str = "",
     treatment: Treatment | None = None,
     capabilities: NativeCapabilities | None = None,
+    agent_env: dict[str, str] | None = None,
 ) -> dict[str, object]:
     kwargs: dict[str, object] = {
         "version": version,
@@ -1272,6 +1288,8 @@ def _native_config(
             "skills": [str(path) for path in treatment.skills] if treatment is not None else [],
             "mcp_servers": [],
             "extra_allowed_hosts": NATIVE_PROVIDER_HOSTS[harness],
+            # Set only when PluginBench supplies a git identity, so other launches are unchanged.
+            **({"env": agent_env} if agent_env else {}),
         },
         "environment": {
             "type": "docker",
@@ -1399,10 +1417,7 @@ def _qualify_native_source(
         startup = submissions.grader_startup(
             config=frozen_grader.get("Config"), image_id=grader["image_id"]
         )
-        command = (
-            "set -eu; git -c safe.directory=/app rev-parse --verify HEAD; "
-            "git -c safe.directory=/app ls-tree -r -z --full-tree " + base
-        )
+        command = _base_inventory_command(base)
         container_id = _docker(
             "create",
             "--label",
@@ -1426,10 +1441,16 @@ def _qualify_native_source(
             command,
             expected_runtime=expected,
         ).strip()
-        _docker("start", "--attach", container_id, timeout=60, expected_runtime=expected)
-        if _docker("wait", container_id, expected_runtime=expected).strip() != "0":
-            raise ValueError("native grader base inventory command failed")
+        # Not `start --attach`: that exits with the container's status, and a failed inventory
+        # would then surface as "docker start failed" without the reason in the logs.
+        _docker("start", container_id, expected_runtime=expected)
+        exit_code = _docker("wait", container_id, timeout=60, expected_runtime=expected).strip()
         output = _docker("logs", container_id, expected_runtime=expected)
+        if exit_code != "0":
+            raise ValueError(
+                f"native grader base inventory command failed (exit {exit_code}): "
+                + output.strip()
+            )
         (destination / "base-tree.raw").write_text(output)
         head, separator, inventory = output.partition("\n")
         if not separator or head != base:
@@ -1891,13 +1912,53 @@ def _saved_preparation(
     return None
 
 
+# The neutral git identity PluginBench supplies to a task whose image and environment set none.
+SUPPLIED_GIT_IDENTITY = {"name": "PluginBench Agent", "email": "agent@pluginbench.invalid"}
+# The probe's exit status when git has no author or committer identity (git itself uses 1 and 128).
+_NO_GIT_IDENTITY_EXIT = "3"
+# The same, in a task that already sets the variable the supplied identity travels in.
+_GIT_PARAMETERS_SET_EXIT = "4"
+
+
+def supplied_git_env(identity: dict[str, object]) -> dict[str, str]:
+    """The agent environment variables that carry the git identity PluginBench supplied, if any.
+
+    A task with its own identity has no `supplied_git_identity` and gets nothing. The probe and
+    every agent launch take the identity from here, so they set the same variables. The probe
+    supplies an identity only to a task that does not set GIT_CONFIG_PARAMETERS itself, so this
+    never replaces a task's own git settings.
+    """
+    if "supplied_git_identity" not in identity:
+        return {}
+    supplied = _native_object(identity["supplied_git_identity"], "supplied git identity")
+    # The variable git uses to pass `git -c` settings, in the quoted `key=value` form every git
+    # version reads. Not GIT_CONFIG_KEY_n or GIT_AUTHOR_*: Harbor treats a name containing KEY or
+    # AUTH as a secret and redacts its value from all trial output.
+    return {
+        "GIT_CONFIG_PARAMETERS": f"'user.name={supplied['name']}' 'user.email={supplied['email']}'"
+    }
+
+
 def probe_coding_environment(identity: dict[str, object]) -> dict[str, object]:
     """No-model proof that an agent can commit in the frozen coding image.
 
-    Graded patches are `git diff BASE HEAD`, so an image where `git commit` fails (for example,
-    with no git identity) makes every attempt an empty patch. The probe uses only the task's own
-    environment and agent user, exactly as Harbor starts the agent.
+    Graded patches are `git diff BASE HEAD`, so an image where `git commit` fails makes every
+    attempt an empty patch. The first probe uses only the task's own environment and agent user,
+    exactly as Harbor starts the agent. Only when git there has no identity does a second probe
+    add PluginBench's neutral identity; the receipt then names it in `supplied_git_identity`.
     """
+    receipt, exit_code = _git_probe(identity)
+    if exit_code != _NO_GIT_IDENTITY_EXIT:
+        return receipt
+    supplied = dict(SUPPLIED_GIT_IDENTITY)
+    second, _ = _git_probe({**identity, "supplied_git_identity": supplied})
+    if second["status"] != "passed":
+        second["reason"] = "with the git identity PluginBench supplied, " + str(second["reason"])
+    return {**second, "supplied_git_identity": supplied, "task_identity_probe": receipt}
+
+
+def _git_probe(identity: dict[str, object]) -> tuple[dict[str, object], str | None]:
+    """One commit probe and the container's exit status (None if it did not run to the end)."""
     expected = _native_object(identity["isolation"], "probe runtime")
     limits = _native_object(expected["resources"], "probe resources")
     image = _native_object(identity["image_identity"], "probe coding image")
@@ -1905,8 +1966,20 @@ def probe_coding_environment(identity: dict[str, object]) -> dict[str, object]:
     resolve_env = importlib.import_module("harbor.utils.env").resolve_env_vars
     workdir = shlex.quote(str(identity["workdir"]))
     git = "git -c safe.directory=" + workdir
+    supplied_env = supplied_git_env(identity)
+    # Agent variables replace the task's own, so a task that sets GIT_CONFIG_PARAMETERS would
+    # lose its settings to a supplied identity. The task-only probe reports that case apart.
+    no_identity = f"exit {_NO_GIT_IDENTITY_EXIT}"
+    if not supplied_env:
+        no_identity = (
+            f'test -z "${{GIT_CONFIG_PARAMETERS:-}}" || exit {_GIT_PARAMETERS_SET_EXIT}; '
+            + no_identity
+        )
+    # `git var` applies the same identity rules as `git commit`; its own message stays in the logs.
     command = (
         f"exec 2>&1; set -eu; cd {workdir}; before=$({git} rev-parse HEAD); "
+        f"{git} var GIT_AUTHOR_IDENT >/dev/null && {git} var GIT_COMMITTER_IDENT >/dev/null "
+        f"|| {{ {no_identity}; }}; "
         f"{git} commit --allow-empty --no-verify -q -m pluginbench-git-probe; "
         f'test "$({git} rev-parse HEAD)" != "$before"; {git} var GIT_AUTHOR_IDENT'
     )
@@ -1927,20 +2000,32 @@ def probe_coding_environment(identity: dict[str, object]) -> dict[str, object]:
         "--entrypoint",
         "bash",
     ]
-    for key, value in sorted(resolve_env(task.config.environment.env).items()):
+    environment = {**resolve_env(task.config.environment.env), **supplied_env}
+    for key, value in sorted(environment.items()):
         arguments.extend(["--env", f"{key}={value}"])
     if task.config.agent.user is not None:
         arguments.extend(["--user", str(task.config.agent.user)])
     receipt: dict[str, object] = {"status": "failed", "image_id": image["image_id"]}
+    exit_code: str | None = None
     try:
         container = _docker(
             *arguments, str(image["image_id"]), "-c", command, expected_runtime=expected
         ).strip()
-        _docker("start", "--attach", container, timeout=60, expected_runtime=expected)
-        exit_code = _docker("wait", container, expected_runtime=expected).strip()
+        # Not `start --attach`: that exits with the container's status, and a failed commit
+        # would then surface as "docker start failed" without the reason in the logs.
+        _docker("start", container, expected_runtime=expected)
+        exit_code = _docker("wait", container, timeout=60, expected_runtime=expected).strip()
         output = _docker("logs", container, expected_runtime=expected).strip()
         if exit_code == "0":
             receipt.update(status="passed", author=output.splitlines()[-1] if output else None)
+        elif exit_code == _NO_GIT_IDENTITY_EXIT:
+            receipt["reason"] = f"git has no author or committer identity in the coding image: {output}"
+        elif exit_code == _GIT_PARAMETERS_SET_EXIT:
+            receipt["reason"] = (
+                "git has no author or committer identity in the coding image, and PluginBench "
+                "cannot supply one because the task sets GIT_CONFIG_PARAMETERS. Add user.name "
+                f"and user.email to the task's git settings: {output}"
+            )
         else:
             receipt["reason"] = (
                 f"git commit failed in the coding image (exit {exit_code}): {output}"
@@ -1953,7 +2038,8 @@ def probe_coding_environment(identity: dict[str, object]) -> dict[str, object]:
         except (OSError, ValueError, subprocess.TimeoutExpired) as error:
             receipt["cleanup"] = {"status": "incomplete", "error": str(error)}
             receipt.update(status="failed", reason="git probe cleanup incomplete: " + str(error))
-    return receipt
+            exit_code = None
+    return receipt, exit_code
 
 
 def binary_native_reward(verifier: object) -> bool | None:
@@ -1981,6 +2067,7 @@ def run_reference_agents(identity: dict[str, object], destination: Path) -> dict
     expected = _native_object(identity["isolation"], "reference runtime")
     toolchain = _native_object(identity["toolchain_identity"], "reference toolchain")
     solve = importlib.import_module("harbor.models.task.task").Task(task_dir).paths.solve_path
+    agent_env = supplied_git_env(identity)
     results: dict[str, object] = {}
     for agent in ("oracle", "nop"):
         if agent == "oracle" and not solve.is_file():
@@ -2002,11 +2089,13 @@ def run_reference_agents(identity: dict[str, object], destination: Path) -> dict
             limits=_native_object(expected["resources"], "reference resources"),
             timeout=_REFERENCE_AGENT_TIMEOUT,
         )
-        # Harbor's built-in agents take no coding-CLI settings or provider hosts.
+        # Harbor's built-in agents take no coding-CLI settings or provider hosts; the oracle
+        # commits with the same git identity a coding agent gets.
         config["agent"] = {
             "name": agent,
             "override_timeout_sec": _REFERENCE_AGENT_TIMEOUT,
             "kwargs": {},
+            **({"env": agent_env} if agent_env else {}),
         }
         row: dict[str, object] = {"status": "failed"}
         result: dict[str, object] = {}
@@ -2294,6 +2383,7 @@ def invoke_native(
         prompt=prompt,
         treatment=treatment,
         capabilities=capabilities,
+        agent_env=supplied_git_env(identity),
     )
     config["pluginbench_boundary"] = {
         "treatment": treatment.model_dump(mode="json"),

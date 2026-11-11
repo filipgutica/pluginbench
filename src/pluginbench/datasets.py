@@ -78,13 +78,17 @@ def portable_native_identity(identity: dict[str, object]) -> dict[str, object]:
     missing = keys - identity.keys()
     if missing:
         raise ValueError("native coding identity is incomplete: " + ", ".join(sorted(missing)))
-    return {
+    portable = {
         **{key: identity[key] for key in sorted(keys)},
         "source_policy": identity.get("source_policy", "legacy-unqualified"),
         "source_qualification": submissions.portable_qualification(
             identity.get("source_qualification")
         ),
     }
+    # Absent when the task sets its own git identity, so identities saved before it still match.
+    if "supplied_git_identity" in identity:
+        portable["supplied_git_identity"] = identity["supplied_git_identity"]
+    return portable
 
 
 def _catalog_path(source: Path, item: Path) -> Path:
