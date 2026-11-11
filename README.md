@@ -177,6 +177,9 @@ treatments:
 ## More
 
 - [Evaluation details](docs/running-evaluations.md): every setting, check, and output
+- [Config reference](docs/config-reference.md): every config key, its type, default, and meaning
+- [Metrics](docs/metrics.md): what each measure means and its name in a gates file
+- [Reproduce a result](docs/reproduce.md): what a run pins, and a worked example
 - [Measurement specification](docs/measurement-spec.md)
 - [Security](SECURITY.md)
 - [License: Apache-2.0](LICENSE)
