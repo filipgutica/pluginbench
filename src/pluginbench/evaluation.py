@@ -1283,11 +1283,13 @@ def review_evaluation(
 
 
 def _save_selection(root: Path, selection: object) -> None:
-    _write(root / "evaluation.json", selection)
-    _write(
-        root / "evaluation-binding.json",
-        {"sha256": hashlib.sha256((root / "evaluation.json").read_bytes()).hexdigest()},
-    )
+    # A stop between these writes would leave settings that every later command refuses.
+    with run_lock.deferred_stop():
+        _write(root / "evaluation.json", selection)
+        _write(
+            root / "evaluation-binding.json",
+            {"sha256": hashlib.sha256((root / "evaluation.json").read_bytes()).hexdigest()},
+        )
 
 
 def _measurement_collection(root: Path, selection: dict[str, object]) -> dict[str, object] | None:

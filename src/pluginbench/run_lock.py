@@ -11,6 +11,7 @@ import json
 import os
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -74,6 +75,49 @@ def _owner(fd: int) -> dict[str, object] | None:
 def _interrupt(signum: int, frame: FrameType | None) -> None:
     # Reuse the interrupt path: no new attempts start and saved work is checkpointed.
     raise KeyboardInterrupt("stopped by SIGTERM")
+
+
+@contextmanager
+def deferred_stop() -> Iterator[None]:
+    """Hold SIGTERM and SIGINT until the block ends, then deliver the first that arrived.
+
+    For writes that must land together: `stop` and Ctrl-C otherwise interrupt between any two
+    bytecodes. Keep the block to those writes. Only the main thread runs signal handlers, so
+    elsewhere nothing can interrupt the block and it runs as is.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    pending: list[int] = []
+
+    def defer(signum: int, frame: FrameType | None) -> None:
+        pending.append(signum)
+
+    # An ignored signal stays ignored. A handler installed outside Python cannot be put back.
+    previous = {
+        item: handler
+        for item in (signal.SIGTERM, signal.SIGINT)
+        if (handler := signal.getsignal(item)) not in (None, signal.SIG_IGN)
+    }
+    try:
+        for item in previous:
+            signal.signal(item, defer)
+        yield
+    finally:
+        failure: BaseException | None = None
+        for item, handler in previous.items():
+            while True:
+                try:
+                    signal.signal(item, handler)
+                    break
+                except BaseException as exc:
+                    # A signal that arrives now runs a handler already restored, which may raise.
+                    # Keep the first error and finish restoring before raising it.
+                    failure = failure or exc
+        if failure is not None:
+            raise failure
+        if pending:
+            signal.raise_signal(pending[0])
 
 
 @contextmanager
