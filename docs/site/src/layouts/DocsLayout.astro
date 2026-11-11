@@ -50,5 +50,8 @@ const noScriptDarkCss = `@media (prefers-color-scheme: dark) { :root:not(.dark) 
     <SiteFrame groups={groups} client:load>
       <slot />
     </SiteFrame>
+    <script>
+      import '../lib/enhance-document';
+    </script>
   </body>
 </html>

@@ -6,6 +6,7 @@ import { UiCodeBlock } from '@filipgutica/ui';
 const enhanced = ref(false);
 onMounted(() => { enhanced.value = true; });
 
+// Untitled, so the library draws a command plate with $ prompts. Long lines scroll rather than wrap.
 const code = [
   'git clone https://github.com/filipgutica/pluginbench.git',
   'cd pluginbench',
@@ -16,5 +17,5 @@ const code = [
 </script>
 
 <template>
-  <UiCodeBlock :code="code" language="bash" variant="compact" :copyable="enhanced" :wrap="true" />
+  <UiCodeBlock :code="code" language="bash" :copyable="enhanced" />
 </template>

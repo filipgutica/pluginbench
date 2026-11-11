@@ -42,3 +42,9 @@ test('deep heading links, GFM tables, and OS dark mode work without JavaScript',
   await expect.poll(() => page.locator('html').evaluate((element) => getComputedStyle(element).colorScheme)).toBe('dark');
   await expectNoOverflow(page);
 });
+
+test('Markdown shell commands render as command plates without a dead Copy button', async ({ page }) => {
+  await page.goto('/pluginbench/reproduce/');
+  await expect(page.locator('.fg-code-block[data-command="true"]')).toHaveCount(4);
+  await expect(page.getByRole('button', { name: 'Copy code' })).toHaveCount(0);
+});

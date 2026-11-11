@@ -43,8 +43,20 @@ for (const width of [320, 390, 720, 801, 1280]) {
         expect(main?.width ?? 0).toBeGreaterThan(rail?.width ?? Infinity);
       }
       await expectNoOverflow(page);
-      for (const region of await page.getByRole('region', { name: 'Scrollable table' }).all()) {
+      for (const region of await page.locator('main .table-scroll').all()) {
         expect(await region.evaluate((element) => element.clientWidth <= innerWidth)).toBe(true);
+        // A table that scrolls sideways always has a visible cue above it.
+        const scrollsWithoutCue = await region.evaluate((element) => {
+          const cue = element.previousElementSibling;
+          const cueVisible = cue?.classList.contains('table-cue') && getComputedStyle(cue).display !== 'none';
+          return element.scrollWidth > element.clientWidth && !cueVisible;
+        });
+        expect(scrollsWithoutCue, `${route.path} table under ${await region.getAttribute('aria-labelledby')}`).toBe(false);
+        // Row names stay whole: an identifier in a first column never breaks across lines.
+        const splitNames = await region.locator('tbody td:first-child code').evaluateAll((codes) => codes
+          .filter((code) => !/\s/.test(code.textContent ?? '') && code.getClientRects().length > 1)
+          .map((code) => code.textContent));
+        if (!await region.evaluate((element) => element.previousElementSibling?.classList.contains('table-cue'))) expect(splitNames).toEqual([]);
       }
     }
     await expect(page.locator('.fg-site-rail')).toHaveAttribute('data-enhanced', 'true');
@@ -104,7 +116,7 @@ test('every internal link and heading anchor resolves; document links stay on th
 test('Config reference renders a readable GFM table that scrolls within the page', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 900 });
   await page.goto('/pluginbench/config-reference/');
-  const region = page.getByRole('region', { name: 'Scrollable table' }).first();
+  const region = page.getByRole('region', { name: 'Evaluation file', exact: true }).first();
   const table = region.getByRole('table');
   await expect(table.getByRole('columnheader')).toHaveText(['Key path', 'Type', 'Default', 'Required', 'Description']);
   await expect(table.getByRole('cell', { name: 'runner.harness', exact: true })).toBeVisible();
@@ -130,6 +142,10 @@ test('Home installs from a clone and copies the commands', async ({ page }) => {
   const hero = page.locator('.fg-site-hero');
   await expect(hero.locator('pre')).toHaveText(/git clone https:\/\/github\.com\/filipgutica\/pluginbench\.git[\s\S]*pip install -e \./);
   await expect(hero.getByRole('button', { name: 'Copy code' })).toBeVisible();
+  // Lines scroll rather than wrap, so the clone URL never breaks mid-word.
+  const lineHeights = await hero.locator('.fg-code-block__line').evaluateAll((lines) => lines.map((line) => line.getBoundingClientRect().height));
+  expect(lineHeights).toHaveLength(5);
+  expect(new Set(lineHeights).size).toBe(1);
   await expect(page.getByRole('main').getByRole('link', { name: 'Full reference', exact: true })).toHaveAttribute('href', 'https://github.com/filipgutica/pluginbench#readme');
   await expectNoOverflow(page);
 });
@@ -153,4 +169,66 @@ test('shared project menu, header links, and appearance picker work', async ({ p
   await expect(page.locator('html')).toHaveClass('dark');
   await page.getByRole('button', { name: 'Light theme', exact: true }).click();
   await expect(page.locator('html')).not.toHaveClass('dark');
+});
+
+test('Markdown shell commands are command plates: $ on each command, none on continuations, and Copy', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.setViewportSize({ width: 390, height: 900 });
+  await page.goto('/pluginbench/running-evaluations/');
+  // Scrolling and the drawer re-render the frame island; the mounted blocks must survive both.
+  await page.locator('#judging').scrollIntoViewIfNeeded();
+  await expect(page.locator('.fg-site-rail')).toHaveAttribute('data-enhanced', 'true');
+  await page.locator('.fg-site-rail__toggle').click();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+
+  const block = page.locator('.fg-code-block[data-command="true"]').filter({ hasText: 'pluginbench judge prepare' });
+  const prompts = await block.locator('.fg-code-block__line').evaluateAll((lines) => lines.map((line) => getComputedStyle(line, '::before').content.includes('$')));
+  expect(prompts).toEqual([true, false, false, true, false, true]);
+  await block.getByRole('button', { name: 'Copy code' }).click();
+  await expect(block.getByRole('status')).toHaveText('Code copied to clipboard.');
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe([
+    'pluginbench judge prepare runs/r3=workflow-r3 runs/r2=workflow-main \\',
+    '  --tasks task-a,task-b --exclude holdout-a,holdout-b \\',
+    '  --criteria review-standard.md --seed 11 --output judging/r3',
+    'pluginbench judge run judging/r3 --judge codex:gpt-6-astra:high \\',
+    '  --judge claude:claude-opus-5-5:high --jobs 3',
+    'pluginbench judge tally judging/r3',
+  ].join('\n'));
+});
+
+test('Markdown source samples are library code blocks; JSON gets syntax colours', async ({ page }) => {
+  await page.goto('/pluginbench/running-evaluations/');
+  await expect(page.locator('[data-code-language="yaml"] > .fg-code-block:not([data-command])')).toHaveCount(5);
+  const json = page.locator('[data-code-language="json"] .fg-code-block__pre');
+  await expect(json.locator('span[style*="--color-syntax-string"]').first()).toBeVisible();
+});
+
+test('code blocks and tables are Tab stops only while they scroll', async ({ page }) => {
+  const tabStop = (locator: ReturnType<typeof page.locator>) => locator.evaluate((element) => element.getAttribute('tabindex'));
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto('/pluginbench/reproduce/');
+  const shortCommand = page.locator('.fg-code-block__pre').filter({ hasText: 'pluginbench compare runs/testem-vanilla' });
+  await expect.poll(() => tabStop(shortCommand)).toBeNull();
+  await page.goto('/pluginbench/running-evaluations/');
+  const narrowTable = page.getByRole('region', { name: 'Measurements', exact: true }).first();
+  await expect.poll(() => tabStop(narrowTable)).toBeNull();
+
+  await page.setViewportSize({ width: 390, height: 900 });
+  const longCommand = page.locator('.fg-code-block__pre').filter({ hasText: 'pluginbench judge prepare' });
+  await expect.poll(() => tabStop(longCommand)).toBe('0');
+  await page.goto('/pluginbench/config-reference/');
+  await expect.poll(() => tabStop(page.getByRole('region', { name: 'Evaluation file', exact: true }))).toBe('0');
+});
+
+test('code blocks keep their height when Copy appears, so deep links do not drift', async ({ page, browser }) => {
+  const heights = (target: typeof page) => target.locator('main .fg-code-block').evaluateAll((blocks) => blocks.map((block) => block.getBoundingClientRect().height));
+  const staticContext = await browser.newContext({ javaScriptEnabled: false, baseURL: 'http://127.0.0.1:4188' });
+  const staticPage = await staticContext.newPage();
+  await staticPage.goto('/pluginbench/running-evaluations/');
+  const before = await heights(staticPage);
+  await staticContext.close();
+  await page.goto('/pluginbench/running-evaluations/');
+  await expect(page.locator('[data-code-language] .fg-code-block__copy')).toHaveCount(9);
+  expect(await heights(page)).toEqual(before);
 });

@@ -16,7 +16,7 @@ const docsLoader: Loader = {
       const body = await readFile(fileURL, 'utf8');
       const rendered = await renderMarkdown(body, { fileURL });
       // Heading IDs and GFM tables remain owned by Astro.
-      rendered.html = transformDocumentHtml({ html: rendered.html, source: page.source, pageHref });
+      rendered.html = await transformDocumentHtml({ html: rendered.html, source: page.source, pageHref });
       store.set({ id: page.slug, data: page, body, rendered, filePath: relative(fileURLToPath(config.root), fileURLToPath(fileURL)) });
     };
 

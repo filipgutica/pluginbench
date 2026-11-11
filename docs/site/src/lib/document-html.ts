@@ -1,7 +1,11 @@
+import { UiCodeBlock } from '@filipgutica/ui';
 import type { Element, ElementContent, Properties } from 'hast';
 import { fromHtml } from 'hast-util-from-html';
 import { toHtml } from 'hast-util-to-html';
 import { SKIP, visit } from 'unist-util-visit';
+import { createSSRApp, h } from 'vue';
+import { renderToString } from 'vue/server-renderer';
+import { continuesCommand, libraryCodeLanguages } from './code-blocks';
 import { documents } from './pages';
 
 const repository = 'https://github.com/filipgutica/pluginbench/blob/main/';
@@ -30,22 +34,45 @@ const columnCount = (table: Element) => {
   return count;
 };
 
+const hasClass = (node: Element, name: string) => Array.isArray(node.properties.className) && node.properties.className.includes(name);
+
+/**
+ * Renders a fence with the library's UiCodeBlock, without Copy until scripts mount it.
+ * An untitled `sh` block is a command plate whose lines get a `$` prompt; lines that
+ * continue a command after a trailing backslash are marked so they get none.
+ */
+const renderCodeBlock = async ({ code, language }: { code: string; language: string }) => {
+  const html = await renderToString(createSSRApp({ render: () => h(UiCodeBlock, { code, language, copyable: false }) }));
+  const block = fromHtml(html, { fragment: true });
+  const continued = continuesCommand(code);
+  let line = 0;
+  visit(block, 'element', (node) => {
+    if (!hasClass(node, 'fg-code-block__line')) return;
+    if (continued[line]) node.properties.dataContinuation = '';
+    line += 1;
+  });
+  return block.children.filter((node): node is ElementContent => node.type !== 'doctype');
+};
+
 /**
  * Adapts Astro's rendered Markdown to the site frame. It works on the parsed
  * tree, so text in inline code and code samples is never rewritten.
  * - Repository-relative links to published documents point at their site pages;
  *   other relative links point at the file on GitHub.
- * - Code samples lose Shiki's inline theme, so the library's code block styles them.
- * - Tables scroll inside a keyboard-focusable region; wide ones get a scroll cue.
+ * - `sh`, `yaml`, and `json` samples render as the library's UiCodeBlock; other
+ *   samples lose Shiki's inline theme, so the library's code block styles them.
+ * - Tables scroll inside a keyboard-focusable region named after their section;
+ *   wide ones get a scroll cue.
  * - Each h2 starts a section, which opts it into the library's ruled ## heading.
  */
-export const transformDocumentHtml = ({ html, source, pageHref }: {
+export const transformDocumentHtml = async ({ html, source, pageHref }: {
   html: string;
   /** Repository path of the Markdown file, which relative links resolve against. */
   source: string;
   pageHref: (slug: string) => string;
-}): string => {
+}): Promise<string> => {
   const tree = fromHtml(html, { fragment: true });
+  const codeBlocks: { container: Element; code: string; language: string }[] = [];
 
   visit(tree, 'element', (node, index, parent) => {
     if (node.tagName === 'a' && typeof node.properties.href === 'string') {
@@ -58,6 +85,14 @@ export const transformDocumentHtml = ({ html, source, pageHref }: {
     }
     if (!parent || index === undefined) return;
     if (node.tagName === 'pre') {
+      const language = String(node.properties.dataLanguage ?? '');
+      if (libraryCodeLanguages.includes(language)) {
+        // The client script mounts UiCodeBlock into this container to add Copy.
+        const container = element('div', { dataCodeLanguage: language }, []);
+        codeBlocks.push({ container, code: textOf(node), language });
+        parent.children[index] = container;
+        return SKIP;
+      }
       const code = element('code', {}, [{ type: 'text', value: textOf(node) }]);
       parent.children[index] = element('div', { className: ['fg-code-block'] }, [
         element('pre', { className: ['fg-code-block__pre'], tabIndex: 0 }, [code]),
@@ -65,7 +100,7 @@ export const transformDocumentHtml = ({ html, source, pageHref }: {
       return SKIP;
     }
     if (node.tagName === 'table') {
-      const region = element('div', { className: ['table-scroll'], role: 'region', ariaLabel: 'Scrollable table', tabIndex: 0 }, [node]);
+      const region = element('div', { className: ['table-scroll'], role: 'region', tabIndex: 0 }, [node]);
       const replacement = columnCount(node) >= wideTableColumns
         ? [element('p', { className: ['fg-site-meta', 'table-cue'] }, [{ type: 'text', value: 'Scroll the table sideways to see every column.' }]), region]
         : [region];
@@ -75,12 +110,25 @@ export const transformDocumentHtml = ({ html, source, pageHref }: {
     }
   });
 
+  for (const { container, code, language } of codeBlocks) {
+    container.children = await renderCodeBlock({ code, language });
+  }
+
   const sections: Element[] = [];
+  // Table regions take the name of their section's h2, or of the h1 before the first h2.
+  let headingId: string | undefined;
   for (const node of tree.children) {
     if (node.type === 'doctype') continue;
     const startsSection = node.type === 'element' && node.tagName === 'h2';
     if (startsSection || !sections.length) sections.push(element('section', {}, []));
     sections[sections.length - 1].children.push(node);
+    if (node.type !== 'element') continue;
+    if (['h1', 'h2'].includes(node.tagName) && typeof node.properties.id === 'string') headingId = node.properties.id;
+    visit(node, 'element', (child) => {
+      if (!hasClass(child, 'table-scroll')) return;
+      if (headingId) child.properties.ariaLabelledBy = [headingId];
+      else child.properties.ariaLabel = 'Table';
+    });
   }
   return toHtml(sections);
 };
