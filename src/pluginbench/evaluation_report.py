@@ -881,6 +881,14 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         "Each guidance set is compared with the same vanilla cohort. Compare separate evaluations through compatible baseline deltas.",
         "Deltas are differences in observed medians, not a winner or composite quality score. A negative delta is not automatically better.",
     ]
+    environments = _map(_map(config.get("comparison_identity")).get("task_environment"))
+    for task, environment in sorted(environments.items()):
+        supplied = _map(_map(environment).get("supplied_git_identity"))
+        if supplied:
+            limitations.append(
+                f"Task {task} sets no git identity, so PluginBench supplied "
+                f"{supplied.get('name')} <{supplied.get('email')}> to its agents."
+            )
     unfinished = _map(config.get("unfinished_run"))
     if unfinished:
         limitations.insert(
