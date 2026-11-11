@@ -18,6 +18,7 @@ import yaml
 from typer.testing import CliRunner
 from typer.main import get_group
 
+import pluginbench
 from pluginbench import (
     claude,
     cli,
@@ -115,7 +116,7 @@ def test_public_commands_cover_evaluations_reports_and_task_selection() -> None:
     }
     assert set(get_group(cli.tasks_app).commands) == {"pick"}
     assert set(get_group(cli.judge_app).commands) == {"prepare", "run", "tally"}
-    assert CliRunner().invoke(cli.app, ["--version"]).stdout.strip() == "0.4.0"
+    assert CliRunner().invoke(cli.app, ["--version"]).stdout.strip() == pluginbench.__version__
 
 
 def test_config_dry_run_includes_fresh_vanilla_and_every_package(
