@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@astrojs/vue": "7.0.3",
-    "@filipgutica/ui": "1.31.2",
+    "@filipgutica/ui": "1.34.0",
     "astro": "7.3.6",
     "hast-util-from-html": "2.1.0",
     "hast-util-to-html": "9.0.6",
