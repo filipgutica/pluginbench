@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { continuesCommand } from '../src/lib/code-blocks';
 import { transformDocumentHtml } from '../src/lib/document-html';
 
 const pageHref = (slug: string) => `/pluginbench/${slug ? `${slug}/` : ''}`;
@@ -57,6 +58,19 @@ test('sh fences render as library command blocks; continuation lines are marked 
   expect(output.match(/tabindex/gi)).toHaveLength(1);
 });
 
+test('only an unescaped backslash outside comments, or an open quote, continues a shell command', () => {
+  const lines = [
+    'pluginbench run a \\',
+    "  --flag 'x\\'",
+    "printf '%s\\n' \\\\",
+    'echo NEXT # ends in \\',
+    'echo "open',
+    'quote"',
+    'echo done',
+  ];
+  expect(continuesCommand(lines.join('\n'))).toEqual([false, true, false, false, false, true, false]);
+});
+
 test('table regions are named after their section heading, or the page title before the first section', async ({ page }) => {
   const table = '<table><thead><tr><th>Key</th></tr></thead><tbody><tr><td>value</td></tr></tbody></table>';
   const html = `<h1 id="page">Page</h1>${table}<h2 id="first">First</h2><p>Text</p>${table}`;
@@ -64,4 +78,12 @@ test('table regions are named after their section heading, or the page title bef
   await expect(page.getByRole('region')).toHaveCount(2);
   await expect(page.getByRole('region', { name: 'Page', exact: true })).toHaveCount(1);
   await expect(page.getByRole('region', { name: 'First', exact: true })).toHaveCount(1);
+});
+
+test('several tables under one heading get numbered region names', async ({ page }) => {
+  const table = '<table><thead><tr><th>Key</th></tr></thead><tbody><tr><td>value</td></tr></tbody></table>';
+  const html = `<h1 id="page">Page</h1><h2 id="first">First</h2>${table}<p>Text</p>${table}`;
+  await page.setContent(await transformDocumentHtml({ html, source: 'docs/metrics.md', pageHref }));
+  await expect(page.getByRole('region', { name: 'First, table 1 of 2', exact: true })).toHaveCount(1);
+  await expect(page.getByRole('region', { name: 'First, table 2 of 2', exact: true })).toHaveCount(1);
 });

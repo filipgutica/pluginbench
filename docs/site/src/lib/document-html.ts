@@ -116,18 +116,24 @@ export const transformDocumentHtml = async ({ html, source, pageHref }: {
 
   const sections: Element[] = [];
   // Table regions take the name of their section's h2, or of the h1 before the first h2.
-  let headingId: string | undefined;
+  // Several tables under one heading are numbered, so each region's name is unique.
+  const regionsByHeading: { heading?: Element; regions: Element[] }[] = [{ regions: [] }];
   for (const node of tree.children) {
     if (node.type === 'doctype') continue;
     const startsSection = node.type === 'element' && node.tagName === 'h2';
     if (startsSection || !sections.length) sections.push(element('section', {}, []));
     sections[sections.length - 1].children.push(node);
     if (node.type !== 'element') continue;
-    if (['h1', 'h2'].includes(node.tagName) && typeof node.properties.id === 'string') headingId = node.properties.id;
+    if (['h1', 'h2'].includes(node.tagName) && typeof node.properties.id === 'string') regionsByHeading.push({ heading: node, regions: [] });
     visit(node, 'element', (child) => {
-      if (!hasClass(child, 'table-scroll')) return;
-      if (headingId) child.properties.ariaLabelledBy = [headingId];
-      else child.properties.ariaLabel = 'Table';
+      if (hasClass(child, 'table-scroll')) regionsByHeading[regionsByHeading.length - 1].regions.push(child);
+    });
+  }
+  for (const { heading, regions } of regionsByHeading) {
+    regions.forEach((region, index) => {
+      if (!heading) region.properties.ariaLabel = 'Table';
+      else if (regions.length === 1) region.properties.ariaLabelledBy = [String(heading.properties.id)];
+      else region.properties.ariaLabel = `${textOf(heading)}, table ${index + 1} of ${regions.length}`;
     });
   }
   return toHtml(sections);

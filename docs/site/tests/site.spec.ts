@@ -142,12 +142,13 @@ test('Home installs from a clone and copies the commands', async ({ page }) => {
   const hero = page.locator('.fg-site-hero');
   await expect(hero.locator('pre')).toHaveText(/git clone https:\/\/github\.com\/filipgutica\/pluginbench\.git[\s\S]*pip install -e \./);
   await expect(hero.getByRole('button', { name: 'Copy code' })).toBeVisible();
-  // Lines scroll rather than wrap, so the clone URL never breaks mid-word.
-  const lineHeights = await hero.locator('.fg-code-block__line').evaluateAll((lines) => lines.map((line) => line.getBoundingClientRect().height));
-  expect(lineHeights).toHaveLength(5);
-  expect(new Set(lineHeights).size).toBe(1);
+  // Lines wrap rather than scroll, so the repository name is never hidden, at phone or desktop width.
+  const scrollsSideways = () => hero.locator('pre').evaluate((element) => element.scrollWidth > element.clientWidth);
+  expect(await scrollsSideways()).toBe(false);
   await expect(page.getByRole('main').getByRole('link', { name: 'Full reference', exact: true })).toHaveAttribute('href', 'https://github.com/filipgutica/pluginbench#readme');
   await expectNoOverflow(page);
+  await page.setViewportSize({ width: 1280, height: 900 });
+  expect(await scrollsSideways()).toBe(false);
 });
 
 test('shared project menu, header links, and appearance picker work', async ({ page }) => {
@@ -211,7 +212,7 @@ test('code blocks and tables are Tab stops only while they scroll', async ({ pag
   const shortCommand = page.locator('.fg-code-block__pre').filter({ hasText: 'pluginbench compare runs/testem-vanilla' });
   await expect.poll(() => tabStop(shortCommand)).toBeNull();
   await page.goto('/pluginbench/running-evaluations/');
-  const narrowTable = page.getByRole('region', { name: 'Measurements', exact: true }).first();
+  const narrowTable = page.getByRole('region', { name: 'Measurements, table 1 of 2', exact: true });
   await expect.poll(() => tabStop(narrowTable)).toBeNull();
 
   await page.setViewportSize({ width: 390, height: 900 });
