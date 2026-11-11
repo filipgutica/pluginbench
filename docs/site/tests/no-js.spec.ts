@@ -26,7 +26,7 @@ for (const width of [320, 390, 720, 801, 1280]) {
 
 test('Home shows the install commands without a dead Copy button', async ({ page }) => {
   await page.goto('/pluginbench/');
-  await expect(page.locator('.fg-site-hero pre')).toContainText('pip install -e .');
+  await expect(page.locator('.fg-site-hero pre')).toContainText('pipx install pluginbench');
   await expect(page.getByRole('button', { name: 'Copy code' })).toHaveCount(0);
 });
 
