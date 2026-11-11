@@ -1,7 +1,8 @@
 """Blinded pairwise judging of two arms' matched submissions: prepare, run, and tally.
 
-`prepare` reads saved evidence only. Each submission's diff comes from its review packet,
-with headers normalized so neither arm's tooling fingerprints it. `run` sends one read-only
+`prepare` reads saved evidence only. Each submission's diff comes from its review packet, or
+from its saved snapshots when the run has no packet for it, with headers normalized so
+neither arm's tooling fingerprints it. `run` sends one read-only
 call per judge and task through the reviewer launch path; the judge's workspace is a copy of
 one task folder, so the key, arm names, traces, and verifier results are never inside it.
 `tally` unblinds with the key and applies the correctness-first, strict-majority rule.
@@ -22,14 +23,22 @@ from pathlib import Path
 from threading import Event
 from typing import Any, Literal
 
+import yaml
 from pydantic import StrictInt, StrictStr
 
 from pluginbench import codex, study
-from pluginbench.assessment_models import InputModel
+from pluginbench.assessment import _load_manifest
+from pluginbench.assessment_models import Attempt, InputModel, Snapshot
 from pluginbench.compare import ARM_NAMES
 from pluginbench.evaluation_report import correctness_state
 from pluginbench.parallel import run_jobs, validate_jobs
-from pluginbench.study_review import check_read_only_trace, verified_final
+from pluginbench.datasets import TaskCatalog
+from pluginbench.study_review import (
+    check_read_only_trace,
+    copy_source,
+    verified_final,
+    write_source_diff,
+)
 
 KEY = "key.json"
 PANEL = "panel.json"
@@ -77,6 +86,15 @@ class Verdicts(InputModel):
 
 
 @dataclass(frozen=True)
+class Saved:
+    """What a review packet is built from: an attempt's snapshots and its task instruction."""
+
+    before: Snapshot
+    after: Snapshot
+    instruction: str
+
+
+@dataclass(frozen=True)
 class Submission:
     run: Path
     arm: str
@@ -84,7 +102,8 @@ class Submission:
     repeat: int
     correctness: str
     before_digest: str
-    packet: Path
+    # The review packet, or what stands in for it when the run has none.
+    source: Path | Saved
 
 
 def normalize_diff(text: str) -> str:
@@ -170,10 +189,56 @@ def _packets(run: Path, base: str, wanted: set[str]) -> dict[str, tuple[str, Pat
     return found
 
 
+def _saved_evidence(evidence: Path) -> tuple[dict[str, Attempt], dict[str, str]]:
+    """A run's attempts with their snapshots, and each task's instruction.
+
+    Checked as a review checks them before it builds packets: the frozen inputs against their
+    inventory, the attempt records against the run's reference, each snapshot against its digest.
+    """
+    evidence = evidence.resolve()
+    try:
+        study._assert_frozen(evidence)
+        run = json.loads((evidence / "run.json").read_text())
+        _, records = _load_manifest(study._bound_path(evidence, run["assessment_input"]))
+        tasks = json.loads((evidence / "frozen/tasks.json").read_text())
+    except (OSError, KeyError, TypeError, yaml.YAMLError) as error:
+        raise ValueError(
+            f"{evidence.parent} has an attempt with no review packet, and its saved snapshots "
+            f"cannot be read: {error}"
+        ) from error
+    catalog = TaskCatalog.model_validate(tasks)
+    return {record.id: record for record in records}, {
+        entry.id: entry.prompt for entry in catalog.tasks
+    }
+
+
+def _packet_files(submission: Submission, target: Path) -> Path:
+    """The submission's review packet, or the same files built in `target` from its snapshots.
+
+    A run without a reviewer, or one that stopped before review, has no packets. The built
+    folder holds what `prepare` reads from a packet: `before/`, `task.txt`, and `source.diff`.
+    """
+    saved = submission.source
+    if isinstance(saved, Path):
+        return saved
+    target.mkdir(parents=True)
+    copy_source(saved.before, target / "before")
+    copy_source(saved.after, target / "after")
+    write_source_diff(target)
+    shutil.rmtree(target / "after")
+    (target / "task.txt").write_text(saved.instruction)
+    return target
+
+
 def load_submissions(
     run: Path, arm: str, tasks: Sequence[str]
-) -> dict[tuple[str, int], Submission]:
-    """One arm's submissions on the given tasks, keyed by (task, repeat), bound to packets."""
+) -> tuple[dict[tuple[str, int], Submission], list[tuple[str, int]]]:
+    """One arm's submissions on the given tasks, keyed by (task, repeat).
+
+    Each is bound to its review packet, or to its saved snapshots when it has no packet. Also
+    returned: the (task, repeat) slots whose attempt left no submission, such as one that was
+    not coded yet. They cannot be judged.
+    """
     results = run / "report" / "results.json"
     if not results.is_file():
         raise ValueError(f"{run} has no report/results.json; run `pluginbench report`")
@@ -185,22 +250,45 @@ def load_submissions(
     ]
     if not rows:
         raise ValueError(f"{run} has no {arm} attempts on the given tasks")
-    packets = _packets(run, str(data.get("artifact_base", "evidence")), {row["id"] for row in rows})
+    base = str(data.get("artifact_base", "evidence"))
+    packets = _packets(run, base, {row["id"] for row in rows})
+    records, instructions = (
+        ({}, {}) if all(row["id"] in packets for row in rows) else _saved_evidence(run / base)
+    )
     submissions: dict[tuple[str, int], Submission] = {}
+    unavailable: list[tuple[str, int]] = []
     for row in rows:
         key = (row["task"], int(row["repeat"]))
         where = f"{run} {arm} {row['task']} repeat {key[1]}"
         if key in submissions:
             raise ValueError(f"{where} appears twice")
-        if row["id"] not in packets:
-            raise ValueError(f"{where} has no review packet with source.diff")
-        digest, packet = packets[row["id"]]
         artifacts = row["artifacts"]
-        binding = json.loads(packet.with_name(packet.name + ".json").read_text())
-        if digest != artifacts["snapshot_digest"]:
-            raise ValueError(f"{where}: review packet is bound to another submission")
-        if binding["before_digest"] != artifacts["before_digest"]:
-            raise ValueError(f"{where}: review packet is bound to another starting source")
+        source: Path | Saved
+        if row["id"] in packets:
+            digest, source = packets[row["id"]]
+            binding = json.loads(source.with_name(source.name + ".json").read_text())
+            if digest != artifacts["snapshot_digest"]:
+                raise ValueError(f"{where}: review packet is bound to another submission")
+            if binding["before_digest"] != artifacts["before_digest"]:
+                raise ValueError(f"{where}: review packet is bound to another starting source")
+        else:
+            record = records.get(row["id"])
+            if record is None:
+                raise ValueError(f"{where}: the run's records have no such attempt")
+            before, after = record.before, record.stages[0].snapshot
+            if before is None or after is None:
+                # Left out only when the report agrees that nothing was submitted.
+                if artifacts["snapshot_digest"] is not None:
+                    raise ValueError(f"{where}: the report names a submission the run did not save")
+                unavailable.append(key)
+                continue
+            if after.digest != artifacts["snapshot_digest"]:
+                raise ValueError(f"{where}: the saved snapshot is not the reported submission")
+            if before.digest != artifacts["before_digest"]:
+                raise ValueError(f"{where}: the saved starting source is not the reported one")
+            if row["task"] not in instructions:
+                raise ValueError(f"{where}: the run's frozen task catalog has no such task")
+            source = Saved(before, after, instructions[row["task"]])
         submissions[key] = Submission(
             run=run,
             arm=arm,
@@ -208,9 +296,9 @@ def load_submissions(
             repeat=key[1],
             correctness=correctness_state(row["correctness"], row.get("native_grading")),
             before_digest=artifacts["before_digest"],
-            packet=packet,
+            source=source,
         )
-    return submissions
+    return submissions, unavailable
 
 
 def prepare(
@@ -236,12 +324,28 @@ def prepare(
     if output.exists():
         raise ValueError(f"{output} already exists; give a new directory")
     standard = criteria.read_text()
-    sides = {
+    loaded = {
         first_arm: load_submissions(first_run, first_arm, tasks),
         second_arm: load_submissions(second_run, second_arm, tasks),
     }
+    sides = {arm: submissions for arm, (submissions, _) in loaded.items()}
+    # Slots with no submission are left out of the pairs and named in the key.
+    omitted = [
+        {"arm": arm, "task": task, "repeat": repeat}
+        for arm, (_, unavailable) in loaded.items()
+        for task, repeat in unavailable
+    ]
     rng = random.Random(seed)
     output.mkdir(parents=True)
+    built: dict[tuple[str, str], Path] = {}
+
+    def packet_of(submission: Submission) -> Path:
+        key = (submission.arm, submission.attempt)
+        if key not in built:
+            # Numbered, because arm names and attempt IDs are not safe path components.
+            built[key] = _packet_files(submission, output / "submissions" / str(len(built) + 1))
+        return built[key]
+
     folders: dict[str, object] = {}
     for index, task in enumerate(tasks, start=1):
         name = f"task-{index}"
@@ -262,14 +366,14 @@ def prepare(
             if pair[0].before_digest != pair[1].before_digest:
                 raise ValueError(f"{task} repeat {repeat}: the arms start from different source")
             for submission in pair:
-                text = (submission.packet / "task.txt").read_bytes()
+                text = (packet_of(submission) / "task.txt").read_bytes()
                 if instruction not in (None, text):
                     raise ValueError(f"{task}: the arms were given different instructions")
                 instruction = text
             if rng.random() < 0.5:
                 pair = (pair[1], pair[0])
             for side, submission in zip("AB", pair, strict=True):
-                diff = (submission.packet / "source.diff").read_text()
+                diff = (packet_of(submission) / "source.diff").read_text()
                 (folder / f"pair-{number}-{side}.diff").write_text(normalize_diff(diff))
             pairs[str(number)] = {
                 side: {
@@ -286,7 +390,7 @@ def prepare(
         (folder / "instruction.md").write_bytes(instruction)
         (folder / "review-standard.md").write_text(standard)
         (folder / "source").symlink_to(
-            (sides[first_arm][task, repeats[0]].packet / "before").resolve()
+            (packet_of(sides[first_arm][task, repeats[0]]) / "before").resolve()
         )
         study._write(folder / SCHEMA, Verdicts.model_json_schema())
         (output / f"{name}.brief.md").write_text(BRIEF.format(pairs="\n".join(lines)))
@@ -299,6 +403,7 @@ def prepare(
             "seed": seed,
             "criteria": str(criteria.resolve()),
             "tasks": folders,
+            "omitted": omitted,
         },
     )
     return output

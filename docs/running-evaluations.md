@@ -337,9 +337,9 @@ pluginbench judge run judging/r3 --judge codex:gpt-6-astra:high \
 pluginbench judge tally judging/r3
 ```
 
-`prepare` takes two `RUN_DIR=ARM` specs. They can name one run or two runs, and `vanilla` matches the arm older runs call `baseline`. It reads each run's `report/results.json` and review packets and nothing else.
+`prepare` takes two `RUN_DIR=ARM` specs. They can name one run or two runs, and `vanilla` matches the arm older runs call `baseline`. It reads each run's `report/results.json` and review packets. For a submission with no review packet, it reads the attempt's saved snapshots and the frozen task instruction instead.
 - It refuses any task that `--exclude` lists. Put holdout tasks there.
-- Each submission's diff comes from its review packet. A run needs a finished review, and the packet must be bound to the attempt's submission and starting source.
+- Each submission's diff comes from its review packet, which must be bound to the attempt's submission and starting source. A run without a reviewer, or one that stopped before review, has no packets: its diffs are built from the saved snapshots, checked against the digests in the report, and written under numbered folders in `submissions/` in the output directory. An attempt with no saved submission, such as one that was not coded, cannot be judged. It is left out with its pair, and `prepare` names it on stderr and under `omitted` in the key.
 - Both sides of a pair must start from the same source. They must also have the same instruction.
 - Diff headers become `a/` and `b/` with no `index` lines, so neither side's tooling identifies it.
 - The seed randomizes A and B for each pair.

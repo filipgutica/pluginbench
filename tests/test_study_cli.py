@@ -2572,3 +2572,87 @@ def test_report_on_a_run_stopped_during_coding_covers_the_finished_attempts_and_
     assert data["limitations"][0].startswith("This run is not finished: 2 of 9 attempts")
     graded = [row for row in data["attempts"] if row["correctness"] != "unknown"]
     assert len(data["attempts"]) == 9 and len(graded) == 2
+
+
+def test_judge_prepare_reads_saved_snapshots_when_a_run_has_no_review_packets(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pluginbench import judge
+
+    config.jobs = 1
+    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.167.0"})
+    monkeypatch.setattr(codex, "runtime_environment", lambda *args, **kwargs: ({}, ()))
+    monkeypatch.setattr(harbor_backend, "prepare_native_task", _prepare_fixture_task)
+    backend = _coding_and_review_backend([], [], timeout=config.timeout_seconds, interrupt_at=None)
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    root = tmp_path / "run"
+    evaluation.run_evaluation(config, root)  # No reviewer, so no review packets.
+    assert not (root / "evidence/review-revisions").exists()
+    criteria = tmp_path / "standard.md"
+    criteria.write_text("1. Correct behavior.\n")
+
+    def prepare(output: Path) -> Path:
+        return judge.prepare(
+            arms=[f"{root}=vanilla", f"{root}=workflow"],
+            tasks=["arbitrary-native-task"],
+            exclude=[],
+            criteria=criteria,
+            seed=7,
+            output=output,
+        )
+
+    folder = prepare(tmp_path / "judging") / "task-1"
+    # The same folder a run with review packets gives: instruction, source, and blinded diffs.
+    assert (folder / "instruction.md").read_text() == "Implement the task.\n"
+    assert (folder / "source/src/answer.py").read_text() == "answer = 0\n"
+    diffs = sorted(path.name for path in folder.glob("pair-*.diff"))
+    assert diffs == [f"pair-{number}-{side}.diff" for number in (1, 2, 3) for side in "AB"]
+    diff = (folder / "pair-1-A.diff").read_text()
+    assert "diff --git a/src/answer.py b/src/answer.py" in diff and "+answer = 1" in diff
+    assert "before/" not in diff and "after/" not in diff
+    # Only the starting source is kept beside the diff; the submission's files are not.
+    built = sorted(path.name for path in (tmp_path / "judging/submissions").iterdir())
+    assert built == ["1", "2", "3", "4", "5", "6"]  # Numbered: no arm or attempt in a path.
+    assert not list((tmp_path / "judging/submissions").glob("*/after"))
+    key = json.loads((tmp_path / "judging" / judge.KEY).read_text())
+    assert {side["arm"] for side in key["tasks"]["task-1"]["pairs"]["1"].values()} == {
+        "vanilla",
+        "workflow",
+    }
+    # A report that names another submission than the saved snapshot is refused.
+    results = root / "report/results.json"
+    saved = results.read_text()
+    report = json.loads(saved)
+    report["attempts"][0]["artifacts"]["snapshot_digest"] = "sha256:" + "0" * 64
+    results.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="saved snapshot is not the reported submission"):
+        prepare(tmp_path / "judging-1")
+    results.write_text(saved)
+    # So is a task instruction that changed after the run.
+    catalog = root / "evidence/frozen/tasks.json"
+    frozen = catalog.read_text()
+    catalog.write_text(frozen.replace("Implement the task.", "Do something else."))
+    with pytest.raises(ValueError, match="frozen study inputs changed"):
+        prepare(tmp_path / "judging-0")
+    catalog.write_text(frozen)
+    # A saved snapshot that changed after the run is refused, as a changed packet is.
+    answer = next((root / "evidence").glob("attempts/*/handoff/snapshot/src/answer.py"))
+    answer.write_text("answer = 2\n")
+    with pytest.raises(ValueError, match="snapshot digest mismatch"):
+        prepare(tmp_path / "judging-2")
+
+
+def test_judging_a_run_stopped_during_coding_leaves_out_attempts_without_a_submission(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pluginbench import judge
+
+    root, _, _ = _stopped_after_two_attempts(config, tmp_path, monkeypatch)
+    evaluation.regenerate_report(root)
+    task = "arbitrary-native-task"
+    # Both finished attempts are vanilla; the run stopped before any review packet was built.
+    vanilla, missing = judge.load_submissions(root, "vanilla", [task])
+    assert len(vanilla) == 2 and len(missing) == 1
+    workflow, missing = judge.load_submissions(root, "workflow", [task])
+    assert workflow == {} and sorted(missing) == [(task, 1), (task, 2), (task, 3)]
