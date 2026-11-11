@@ -34,7 +34,7 @@ See [running evaluations](running-evaluations.md) for cache identities and runti
 
 ## One public task, vanilla only
 
-Install Python 3.12 or newer, PluginBench, a [supported coding CLI](running-evaluations.md#supported-coding-clis),
+Install Python 3.12 or newer, PluginBench, a [coding CLI](running-evaluations.md#verified-coding-clis),
 and its provider credentials. Start Docker with Compose and Buildx available.
 See [execution and isolation](running-evaluations.md#execution-and-isolation) for platform and sandbox requirements.
 From a source checkout, create and activate a virtual environment, then install PluginBench:

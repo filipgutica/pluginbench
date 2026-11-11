@@ -23,7 +23,9 @@ def test_codex_final_message_excludes_earlier_progress_for_structured_review() -
             {"type": "turn.completed", "usage": {"input_tokens": 20, "output_tokens": 10}},
         )
     )
-    parsed = codex.parse_events(stdout, [], "codex")
+    parsed = codex.parse_events(
+        stdout, [native_session("root", [{"input_tokens": 20, "output_tokens": 10}])], "codex"
+    )
     assert json.loads(parsed["final"]) == {"issues": []}
     assert parsed["agent_messages"] == ["I will inspect the source.", '{"issues": []}']
     assert parsed["usage"] == {"input_tokens": 20, "output_tokens": 10}
@@ -90,29 +92,30 @@ def test_cli_version_without_native_session_metadata_is_unknown(startup: object)
     assert codex.parse_events("", [], "codex")["observed_cli_version"] is None
 
 
-def test_turn_usage_is_summed_and_missing_fields_stay_unknown() -> None:
+def test_turn_usage_is_checked_against_trace_totals_and_missing_fields_stay_unknown() -> None:
     parsed = codex.parse_events(
         stream(
             {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 3}},
             {"type": "turn.completed", "usage": {"input_tokens": 4, "output_tokens": 2}},
         ),
-        [],
+        [native_session("root", [{"input_tokens": 14, "output_tokens": 5}])],
         "codex",
         requested_effort="high",
     )
     assert parsed["usage"] == {"input_tokens": 14, "output_tokens": 5}
-    assert parsed["actual_primary_models"] == []
-    assert parsed["runtime_effort_evidence"] == []
+    assert parsed["actual_primary_models"] == ["primary"]
+    assert parsed["runtime_effort_evidence"] == ["high"]
     assert parsed["requested_effort"] == "high"
     missing = codex.parse_events(
         stream(
             {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 3}},
             {"type": "turn.completed", "usage": {"input_tokens": 4}},
         ),
-        [],
+        [native_session("root", [{"input_tokens": 14, "output_tokens": 5}])],
         "codex",
     )
-    assert missing["usage"] == {"input_tokens": 14}
+    assert missing["usage"] is None
+    assert "invalid turn usage" in missing["stream_errors"]
 
 
 @pytest.mark.parametrize(
@@ -126,7 +129,7 @@ def test_turn_usage_is_summed_and_missing_fields_stay_unknown() -> None:
 )
 def test_malformed_trace_cannot_count_as_success(bad_trace: str) -> None:
     parsed = codex.parse_events(
-        stream({"type": "turn.completed", "usage": {"input_tokens": 10}}),
+        stream({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 3}}),
         [bad_trace],
         "codex",
     )
@@ -201,14 +204,15 @@ def test_invoke_uses_explicit_auth_and_effort_and_removes_private_data(
     token = "fake-token-which-must-never-remain-in-evidence"
     auth = tmp_path / "selected-auth.json"
     auth.write_text(json.dumps({"token": token}))
+    trace = native_session("root", [{"input_tokens": 10, "output_tokens": 3}])
+    trace = trace.replace('"0.162.1"', '"0.134.0"').replace('"primary"', '"observed-model"')
+    trace = trace.replace('"high"', '"low"')
     script = (
         "import json,os,pathlib,sys; "
         "home=pathlib.Path(os.environ['CODEX_HOME']); "
         "token=json.loads((home/'auth.json').read_text())['token']; "
         "(home/'sessions').mkdir(); "
-        "(home/'sessions/test.jsonl').write_text(json.dumps({'type':'session_meta',"
-        "'payload':{'cli_version':'0.134.0'}})+'\\n'+json.dumps({'type':'turn_context',"
-        "'payload':{'model':'observed-model','effort':'low'}})); "
+        f"(home/'sessions/test.jsonl').write_text({trace!r}); "
         "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':token}})); "
         "print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'output_tokens':3}})); "
         f"sys.exit({exit_code})"
@@ -442,7 +446,7 @@ def test_invocation_cannot_overwrite_existing_execution_evidence(tmp_path: Path)
     assert existing.read_text() == '{"exit_code":0}'
 
 
-def test_truncated_trace_reports_usage_lower_bound_without_completed_usage() -> None:
+def test_truncated_trace_without_session_identity_cannot_supply_usage_or_lower_bound() -> None:
     trace = (
         stream(
             {
@@ -465,8 +469,10 @@ def test_truncated_trace_reports_usage_lower_bound_without_completed_usage() -> 
     parsed = codex.parse_events("", [trace], "codex")
     assert parsed["usage"] is None
     assert not parsed["successful_native_completion"]
-    assert parsed["partial_usage"][0]["tokens"] == {"input_tokens": 15, "output_tokens": 5}
-    assert parsed["partial_usage"][0]["trace_sha256"].startswith("sha256:")
+    assert parsed["partial_usage"] == []
+    assert "trace lacks one unambiguous session identity" in (
+        parsed["usage_accounting"]["reasons"]
+    )
 
 
 def native_session(
@@ -780,7 +786,7 @@ def named_native_spawn() -> list[dict[str, object]]:
     ]
 
 
-@pytest.mark.parametrize("version", ["0.162.1", "0.167.0"])
+@pytest.mark.parametrize("version", ["0.162.1", "0.167.0", "0.167.1"])
 def test_native_inherited_child_counts_only_own_history_and_deduplicates_copies(
     version: str,
 ) -> None:
@@ -918,18 +924,155 @@ def test_native_named_spawn_rejects_two_session_identities_for_one_child_path() 
     )
 
 
-@pytest.mark.parametrize("version", ["0.162.1", "0.167.0"])
+@pytest.mark.parametrize("version", ["0.162.1", "0.167.0", "0.167.1"])
 def test_version_admission_accepts_versions_the_usage_parser_was_checked_against(
     version: str,
 ) -> None:
     codex.admit_version(version)
 
 
-@pytest.mark.parametrize("version", ["0.168.0", "0.162.0", "0.167.1"])
-def test_version_admission_rejects_versions_whose_usage_would_be_lost(version: str) -> None:
-    # 0.167.0 forked rollouts were silently recorded with no usage under a 0.162.1-only parser.
-    with pytest.raises(ValueError, match=f"Codex CLI {version} is not supported"):
-        codex.admit_version(version)
+@pytest.mark.parametrize("include_descendants", [False, True])
+def test_unverified_plain_session_is_measured_when_its_structure_matches(
+    include_descendants: bool,
+) -> None:
+    trace = native_session("root", [{"input_tokens": 20, "output_tokens": 5}])
+    trace = trace.replace('"0.162.1"', '"0.168.0"')
+    parsed = codex.parse_events("", [trace], "codex", include_descendants=include_descendants)
+    assert parsed["usage"] == {"input_tokens": 20, "output_tokens": 5}
+    assert parsed["usage_accounting"]["status"] == "complete"
+
+
+@pytest.mark.parametrize("include_descendants", [False, True])
+def test_plain_paginated_gap_cannot_hide_a_missing_spawn(include_descendants: bool) -> None:
+    trace = native_session(
+        "root", [{"input_tokens": 20, "output_tokens": 5}],
+        extra=[{"type": "event_msg", "payload": {
+            "type": "collab_agent_spawn_end", "new_thread_id": "missing-child",
+        }}],
+    )
+    events = [json.loads(line) for line in trace.splitlines()]
+    events[0]["payload"]["history_mode"] = "paginated"
+    events = [{**event, "ordinal": ordinal} for ordinal, event in enumerate(events)]
+    intact = codex.parse_events(
+        "", [stream(*events)], "codex", include_descendants=include_descendants
+    )
+    assert "missing descendant session missing-child" in intact["usage_accounting"]["reasons"]
+    del events[3]  # Remove the spawn without renumbering the surviving rollout records.
+    damaged = codex.parse_events(
+        "", [stream(*events)], "codex", include_descendants=include_descendants
+    )
+    assert damaged["usage"] is None
+    assert damaged["partial_usage"] == []
+    assert "noncontiguous rollout ordinals for session root" in (
+        damaged["usage_accounting"]["reasons"]
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_counts",
+    [
+        {"cached_input_tokens": 40},
+        {"cache_write_input_tokens": 40},
+        {"reasoning_output_tokens": 6},
+        {"total_tokens": 999999},
+        {"cached_input_tokens": 40, "total_tokens": 999999},
+    ],
+)
+def test_contradictory_counters_cannot_supply_exact_usage_or_a_lower_bound(
+    bad_counts: dict[str, int],
+) -> None:
+    counts = {"input_tokens": 20, "output_tokens": 5, **bad_counts}
+    parsed = codex.parse_events(
+        "", [native_session("root", [counts])], "codex", include_descendants=True
+    )
+    assert parsed["usage"] is None
+    assert parsed["partial_usage"] == []
+    assert parsed["usage_accounting"]["observed_usage_lower_bound"] is None
+    assert "invalid cumulative usage for session root" in parsed["usage_accounting"]["reasons"]
+
+
+@pytest.mark.parametrize("channel", ["stdout", "trace"])
+def test_invalid_stdout_or_child_counters_cannot_supply_a_lower_bound(channel: str) -> None:
+    counts = {"input_tokens": 20, "output_tokens": 5, "cached_input_tokens": 40}
+    stdout = stream({"type": "turn.completed", "usage": counts}) if channel == "stdout" else ""
+    root = native_session("root", [{"input_tokens": 20, "output_tokens": 5}])
+    traces = [root]
+    if channel == "trace":
+        traces.append(native_session("child", [counts], parent="root"))
+    parsed = codex.parse_events(stdout, traces, "codex", include_descendants=True)
+    assert parsed["usage"] is None
+    assert parsed["partial_usage"] == []
+    assert parsed["usage_accounting"]["observed_usage_lower_bound"] is None
+
+
+@pytest.mark.parametrize("include_descendants", [False, True])
+def test_unverified_inherited_history_makes_tokens_unavailable(
+    include_descendants: bool,
+) -> None:
+    root = native_session(
+        "root", [{"input_tokens": 20, "output_tokens": 5}], extra=named_native_spawn()
+    )
+    child = stream(*inherited_native_child()).replace('"0.162.1"', '"0.168.0"')
+    parsed = codex.parse_events(
+        stream({"type": "turn.completed", "usage": {"input_tokens": 20, "output_tokens": 5}}),
+        [root, child], "codex", include_descendants=include_descendants,
+    )
+    assert parsed["usage"] is None
+    assert parsed["partial_usage"] == []
+    assert "inherited-history layout of Codex 0.168.0 is unverified" in (
+        parsed["usage_accounting"]["reasons"]
+    )
+
+
+@pytest.mark.parametrize("include_descendants", [False, True])
+@pytest.mark.parametrize(
+    "bad_event",
+    [
+        {"type": [], "payload": {}},
+        {"type": "event_msg", "payload": {"type": []}},
+        {"type": "event_msg", "payload": False},
+        {"type": "event_msg", "payload": {"type": "token_count", "info": []}},
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"input_tokens": 15}},
+            },
+        },
+    ],
+)
+def test_malformed_session_makes_tokens_unavailable_without_crashing(
+    bad_event: dict[str, object], include_descendants: bool,
+) -> None:
+    trace = native_session("root", [{"input_tokens": 20, "output_tokens": 5}])
+    lines = trace.splitlines()
+    lines.insert(2, json.dumps(bad_event))
+    parsed = codex.parse_events(
+        stream({"type": "turn.completed", "usage": {"input_tokens": 20, "output_tokens": 5}}),
+        ["\n".join(lines)], "codex", include_descendants=include_descendants,
+    )
+    assert parsed["usage"] is None
+    assert parsed["usage_accounting"]["status"] == "incomplete"
+    assert parsed["usage_accounting"]["reasons"]
+
+
+@pytest.mark.parametrize("include_descendants", [False, True])
+@pytest.mark.parametrize("header", ["missing", "late"])
+def test_session_without_a_leading_identity_cannot_supply_tokens(
+    header: str, include_descendants: bool,
+) -> None:
+    lines = native_session("root", [{"input_tokens": 20, "output_tokens": 5}]).splitlines()
+    metadata = lines.pop(0)
+    if header == "late":
+        lines.insert(1, metadata)
+    parsed = codex.parse_events(
+        stream({"type": "turn.completed", "usage": {"input_tokens": 20, "output_tokens": 5}}),
+        ["\n".join(lines)], "codex", include_descendants=include_descendants,
+    )
+    assert parsed["usage"] is None
+    assert "trace lacks one unambiguous session identity" in (
+        parsed["usage_accounting"]["reasons"]
+    )
 
 
 # Minimized from a real attempt during a network outage: Codex retried, then failed the turn.
@@ -953,10 +1096,262 @@ _USAGE_TRACE = stream(
 )
 
 
+def outage_trace(startup: str, *, version: str = "0.167.0") -> str:
+    """Synthetic initial rollout before a model response, including paginated input."""
+    events: list[dict[str, object]] = [{"type": "session_meta", "payload": {
+        "id": _OUTAGE[0]["thread_id"], "cli_version": version, "source": "exec",
+    }}]
+    if startup != "header":
+        events.append({"type": "turn_context", "payload": {
+            "model": "gpt-6.1-sol", "effort": "medium",
+        }})
+    if startup == "user_input":
+        events.extend([
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Synthetic task"}],
+            }},
+            {"type": "event_msg", "payload": {
+                "type": "item_completed", "thread_id": _OUTAGE[0]["thread_id"],
+                "turn_id": "synthetic-turn", "item": {
+                    "type": "UserMessage", "id": "synthetic-input",
+                    "content": [{"type": "text", "text": "Synthetic task", "text_elements": []}],
+                },
+            }},
+        ])
+        metadata = events[0]["payload"]
+        assert isinstance(metadata, dict)
+        metadata["history_mode"] = "paginated"
+    if startup == "rate_limit":
+        events.append({"type": "event_msg", "payload": {
+            "type": "token_count", "info": None, "rate_limits": {"primary": None},
+        }})
+    if startup == "user_input":
+        events = [{**event, "ordinal": ordinal} for ordinal, event in enumerate(events)]
+    return stream(*events)
+
+
+@pytest.mark.parametrize("version", ["0.162.1", "0.167.0", "0.167.1"])
+@pytest.mark.parametrize("startup", ["header", "user_input", "rate_limit"])
+@pytest.mark.parametrize(
+    "extra",
+    [
+        None,
+        {"type": "world_state", "payload": {"full": True, "state": {}}},
+        {"type": "event_msg", "payload": {
+            "type": "task_complete", "error": {"message": "terminal error"},
+            "last_agent_message": None, "time_to_first_token_ms": None,
+        }},
+        {"type": "new_unknown_record", "payload": {}},
+        "{broken",
+    ],
+)
+def test_outage_without_positive_model_evidence_stays_retryable(
+    version: str, startup: str, extra: dict[str, object] | str | None,
+) -> None:
+    trace = outage_trace(startup, version=version)
+    if isinstance(extra, dict):
+        record = {**extra, **({"ordinal": len(trace.splitlines())} if startup == "user_input" else {})}
+        trace += "\n" + stream(record)
+    elif extra is not None:
+        trace += "\n" + extra
+    parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
+    assert parsed["usage"] is None
+    assert parsed["observed_token_usage"] is False
+    assert codex_events.failed_before_first_turn(parsed) == "workspace routing discovery failed"
+
+
+@pytest.mark.parametrize(
+    "item_type",
+    [
+        "message", "agent_message", "reasoning", "function_call", "function_call_output",
+        "custom_tool_call", "custom_tool_call_output", "local_shell_call", "tool_search_call",
+        "tool_search_output", "web_search_call", "image_generation_call", "compaction",
+        "compaction_summary", "context_compaction",
+    ],
+)
+def test_one_model_output_record_blocks_pre_model_retry(item_type: str) -> None:
+    item: dict[str, object] = {"type": item_type}
+    if item_type == "message":
+        item.update(role="assistant", content=[])
+    if item_type == "function_call":
+        item["name"] = "shell"
+    trace = outage_trace("header") + "\n" + stream({"type": "response_item", "payload": item})
+    parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
+    assert parsed["observed_token_usage"] is True
+    assert codex_events.failed_before_first_turn(parsed) is None
+
+
+@pytest.mark.parametrize("version", ["0.162.1", "0.167.0", "0.167.1"])
+@pytest.mark.parametrize("kind", ["task_complete", "turn_complete"])
+@pytest.mark.parametrize(
+    "timing, last_message, model_ran",
+    [(12, None, True), (0, None, True), (None, "partial output", True),
+     (None, "", True), (None, None, False)],
+)
+def test_failed_completion_retains_partial_stream_evidence(
+    version: str, kind: str, timing: int | None, last_message: str | None, model_ran: bool,
+) -> None:
+    trace = outage_trace("header", version=version) + "\n" + stream({
+        "type": "event_msg", "payload": {
+            "type": kind, "turn_id": "synthetic-turn",
+            "error": {"message": "stream disconnected before response.completed"},
+            "time_to_first_token_ms": timing, "last_agent_message": last_message,
+        },
+    })
+    parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
+    assert parsed["usage"] is None
+    assert parsed["observed_token_usage"] is model_ran
+    assert codex_events.failed_before_first_turn(parsed) == (
+        None if model_ran else "workspace routing discovery failed"
+    )
+
+
+@pytest.mark.parametrize("version", ["0.162.1", "0.167.0", "0.167.1"])
+@pytest.mark.parametrize(
+    "kind",
+    ["agent_message", "agent_reasoning", "agent_reasoning_raw_content",
+     "agent_reasoning_section_break", "agent_message_content_delta", "plan_delta",
+     "reasoning_content_delta", "reasoning_raw_content_delta"],
+)
+def test_stream_output_event_blocks_pre_model_retry(version: str, kind: str) -> None:
+    trace = outage_trace("header", version=version) + "\n" + stream({
+        "type": "event_msg", "payload": {
+            "type": kind, "thread_id": _OUTAGE[0]["thread_id"],
+            "turn_id": "synthetic-turn", "item_id": "synthetic-output",
+            "message": "partial output", "text": "partial output", "delta": "partial output",
+            "summary_index": 0, "content_index": 0,
+        },
+    })
+    parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
+    assert parsed["observed_token_usage"] is True
+    assert codex_events.failed_before_first_turn(parsed) is None
+
+
+@pytest.mark.parametrize("version", ["0.162.1", "0.167.0", "0.167.1"])
+@pytest.mark.parametrize(
+    "item_type",
+    ["AgentMessage", "Reasoning", "Plan", "FunctionCallOutput", "CommandExecution",
+     "DynamicToolCall", "CollabAgentToolCall", "WebSearch", "ImageView", "ImageGeneration",
+     "FileChange", "McpToolCall", "ContextCompaction"],
+)
+def test_completed_model_output_item_blocks_pre_model_retry(version: str, item_type: str) -> None:
+    trace = outage_trace("header", version=version) + "\n" + stream({
+        "type": "event_msg", "payload": {
+            "type": "item_completed", "thread_id": _OUTAGE[0]["thread_id"],
+            "turn_id": "synthetic-turn", "item": {"type": item_type, "id": "synthetic-output"},
+        },
+    })
+    parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
+    assert parsed["observed_token_usage"] is True
+    assert codex_events.failed_before_first_turn(parsed) is None
+
+
+@pytest.mark.parametrize(
+    "item, model_ran",
+    [({"type": "SubAgentActivity", "kind": "completed"}, True),
+     ({"type": "SubAgentActivity", "kind": "started"}, False),
+     ({"type": "Extension", "kind": "image_gen.generation"}, True),
+     ({"type": "Extension", "kind": "web.search"}, True),
+     ({"type": "Extension", "kind": "clock.sleep"}, True),
+     ({"type": "Extension", "kind": "unknown.extension"}, False),
+     ({"type": "UserMessage", "content": []}, False),
+     ({"type": "HookPrompt", "fragments": []}, False),
+     ({"type": "EnteredReviewMode"}, False),
+     ({"type": "ExitedReviewMode", "review_output": None}, False),
+     ({"type": "ExitedReviewMode", "review_output": {"findings": []}}, True),
+     ({"type": "UnknownOutput"}, False)],
+)
+def test_completed_item_requires_positive_output_evidence(
+    item: dict[str, object], model_ran: bool,
+) -> None:
+    trace = outage_trace("header") + "\n" + stream({
+        "type": "event_msg", "payload": {"type": "item_completed", "item": item},
+    })
+    parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
+    assert parsed["observed_token_usage"] is model_ran
+    assert codex_events.failed_before_first_turn(parsed) == (
+        None if model_ran else "workspace routing discovery failed"
+    )
+
+
+@pytest.mark.parametrize(
+    "item_type",
+    ["agent_message", "reasoning", "command_execution", "file_change", "mcp_tool_call",
+     "collab_tool_call", "web_search", "todo_list"],
+)
+def test_one_stdout_output_item_blocks_pre_model_retry(item_type: str) -> None:
+    stdout = stream(*_OUTAGE, {"type": "item.completed", "item": {"type": item_type}})
+    parsed = codex.parse_events(stdout, [], "codex")
+    assert parsed["observed_token_usage"] is True
+    assert codex_events.failed_before_first_turn(parsed) is None
+
+
 def test_session_that_failed_before_its_first_model_turn_is_a_backend_failure() -> None:
     execution = codex.parse_events(stream(*_OUTAGE), [], "codex")
     execution["timed_out"] = False
     assert codex_events.failed_before_first_turn(execution) == "workspace routing discovery failed"
+
+
+@pytest.mark.parametrize(
+    "evidence", ["token_count", "response_item", "stdout_usage"]
+)
+def test_model_call_evidence_does_not_require_valid_accounting(evidence: str) -> None:
+    counts = {"input_tokens": 20, "output_tokens": 5, "new_nullable_field": None}
+    stdout = stream(*_OUTAGE)
+    if evidence == "token_count":
+        trace = stream({"type": "event_msg", "payload": {
+            "type": "token_count", "info": {"total_token_usage": counts},
+        }})
+    elif evidence == "response_item":
+        trace = stream({"type": "response_item", "payload": {"type": "reasoning"}})
+    elif evidence == "stdout_usage":
+        trace = ""
+        stdout += "\n" + stream({"type": "turn.completed", "usage": counts})
+    parsed = codex.parse_events(stdout, [trace] if trace else [], "codex")
+    assert parsed["usage"] is None
+    assert codex_events.failed_before_first_turn(parsed) is None
+    assert parsed["observed_token_usage"] is True
+
+
+@pytest.mark.parametrize("record", [
+    "{broken", "[]", '{"type":"new_unknown_event"}',
+    '{"type":"item.completed","item":{"type":"new_unknown_item"}}',
+])
+def test_malformed_or_unknown_stdout_does_not_block_pre_model_retry(record: str) -> None:
+    parsed = codex.parse_events(stream(*_OUTAGE) + "\n" + record, [], "codex")
+    assert codex_events.failed_before_first_turn(parsed) == "workspace routing discovery failed"
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "session_meta", "payload": {
+            "id": _OUTAGE[0]["thread_id"], "cli_version": "0.167.0", "source": [],
+        }},
+        {"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "output_text", "text": "x"}],
+        }},
+        {"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": 5}],
+        }},
+        {"type": "turn_context", "payload": {"model": []}},
+        {"type": "event_msg", "payload": {"type": "token_count"}},
+        {"type": "event_msg", "payload": {
+            "type": "token_count", "info": None, "rate_limits": [],
+        }},
+        {"type": "event_msg", "payload": {"type": "new_unknown_event"}},
+    ],
+)
+def test_non_model_records_do_not_block_pre_model_retry(
+    event: dict[str, object],
+) -> None:
+    header: dict[str, object] = {"type": "session_meta", "payload": {
+        "id": _OUTAGE[0]["thread_id"], "cli_version": "0.167.0", "source": "exec",
+    }}
+    records = [event] if event["type"] == "session_meta" else [header, event]
+    parsed = codex.parse_events(stream(*_OUTAGE), [stream(*records)], "codex")
+    assert codex_events.failed_before_first_turn(parsed) == "workspace routing discovery failed"
 
 
 @pytest.mark.parametrize(
@@ -965,6 +1360,12 @@ def test_session_that_failed_before_its_first_model_turn_is_a_backend_failure() 
         # Reconnected and finished the turn.
         (
             [*_OUTAGE[:4], {"type": "turn.completed", "usage": {"input_tokens": 9}}],
+            [],
+            False,
+        ),
+        # A completed turn proves a call even when no trace could validate its token measure.
+        (
+            [*_OUTAGE, {"type": "turn.completed", "usage": {"input_tokens": 9}}],
             [],
             False,
         ),

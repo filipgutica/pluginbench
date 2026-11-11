@@ -62,9 +62,11 @@ New native treatment runs currently require Codex. Legacy file-only `guidance` m
 
 Installing PluginBench also installs Harbor 0.24.0; see [Install](../README.md#install). Docker must run Linux containers through a local Unix endpoint, with Compose and Buildx available. The current runner accepts single-step Linux CPU tasks with separate verifiers and Dockerfiles or prebuilt images. Shared verifiers, task-authored Compose, multistep tasks, GPUs, and TPUs are rejected before model calls.
 
-### Supported coding CLIs
+### Verified coding CLIs
 
-New coding runs support Codex CLI **0.162.1** and **0.167.0**, as checked by `admit_version` in [`codex_events.py`](../src/pluginbench/codex_events.py).
+Codex CLI trace layouts are verified for **0.162.1**, **0.167.0**, and **0.167.1** in [`codex_events.py`](../src/pluginbench/codex_events.py).
+Other versions warn once and continue: matching plain sessions are measured, while incompatible traces or unverified inherited-history layouts leave that attempt's tokens unavailable.
+Reports mark missing tokens as unknown rather than zero; comparisons show unmeasured attempts, and token gates cannot pass on missing measurements.
 The installed CLI must also expose the isolation flags checked by [`codex.preflight`](../src/pluginbench/codex.py).
 PluginBench pins that exact version into the prepared image, checks the installed image version, and requires the frozen version on resume.
 Codex reviews also require an executable `codex-code-mode-host` beside `codex`.

@@ -26,6 +26,8 @@ from legacy_support import current_runtime, legacy_json
 from native_support import execution as native_execution
 from pluginbench import harbor_backend, ledger, parallel, run_status, study, trial_containers
 from pluginbench.ledger import Ledger
+from pluginbench import codex
+from test_codex import _OUTAGE, outage_trace, stream
 
 _REAL_RUNNING = trial_containers.running
 _PATH = os.pathsep.join([str(Path(pluginbench.__file__).parents[1]), str(Path(__file__).parent)])
@@ -363,8 +365,9 @@ def _vanilla_first(tmp_path: Path) -> study.ResolvedStudy:
     )
 
 
+@pytest.mark.parametrize("startup", ["header", "user_input", "rate_limit"])
 def test_backend_failure_before_the_first_turn_stops_the_run_unscored_and_uncached(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, startup: str,
 ) -> None:
     resolved = _vanilla_first(tmp_path)
     cache, root = tmp_path / "cache", tmp_path / "run"
@@ -377,15 +380,8 @@ def test_backend_failure_before_the_first_turn_stops_the_run_unscored_and_uncach
         execution = native_execution(
             kwargs["area"], kwargs["protocol"]["native_task_identity"], reward=0
         )
-        execution.update(
-            usage=None,
-            timed_out=False,
-            successful_native_completion=False,
-            stream_errors=[
-                {"type": "error", "message": "workspace routing discovery failed"},
-                {"type": "turn.failed", "error": {"message": "workspace routing discovery failed"}},
-            ],
-        )
+        execution.update(codex.parse_events(stream(*_OUTAGE), [outage_trace(startup)], "codex"))
+        execution["timed_out"] = False
         return execution
 
     monkeypatch.setattr(harbor_backend, "invoke_native", outage)

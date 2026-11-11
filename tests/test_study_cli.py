@@ -1153,6 +1153,27 @@ def test_check_passes_tasks_with_and_without_a_coverage_tool_in_one_config(
     assert not (checkable["output"] / "evidence").exists()
 
 
+def test_check_accepts_an_unverified_codex_version_and_warns_once(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.168.0"})
+    with pytest.warns(UserWarning, match="Codex CLI 0.168.0 has not been checked") as warnings:
+        result = CliRunner().invoke(
+            cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"])]
+        )
+        codex.admit_version("0.168.0")
+        codex.admit_version("0.168.0")
+    assert result.exit_code == 0, result.stderr
+    assert len(warnings) == 1
+    message = str(warnings[0].message)
+    assert "0.162.1, 0.167.0, 0.167.1" in message
+    assert "token usage is verified per attempt" in message
+    report = json.loads((checkable["output"] / "check.json").read_text())
+    assert report["status"] == "ready" and report["model_calls"] == 0
+    assert report["harness_versions"]["codex"] == "0.168.0"
+    assert checkable["calls"] == []
+
+
 def test_required_measure_that_is_not_configured_blocks_the_check(
     checkable: dict[str, Any],
 ) -> None:
@@ -1488,7 +1509,6 @@ def _failing_reference_agents(oracle: dict[str, object], nop: dict[str, object])
 @pytest.mark.parametrize(
     "failure,expected",
     [
-        ("codex 0.168.0", "Codex CLI 0.168.0 is not supported"),
         ("no code-mode host", "codex-code-mode-host"),
         ("git commit fails", "coding_environment is broken: git commit failed"),
         (
@@ -1508,9 +1528,7 @@ def test_each_predictable_failure_stops_before_any_coding_call(
     failure: str,
     expected: str,
 ) -> None:
-    if failure == "codex 0.168.0":
-        monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.168.0"})
-    elif failure == "no code-mode host":
+    if failure == "no code-mode host":
         launcher = tmp_path / "launcher"
         launcher.mkdir()
         (launcher / "codex").write_text("#!/bin/sh\n")
