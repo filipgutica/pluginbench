@@ -230,6 +230,8 @@ def test_cli_cross_run_pairs_match_a_single_run(tmp_path: Path) -> None:
         (report / "results.json").write_text(
             json.dumps(
                 {
+                    # Identical saved identities: the runs are comparable.
+                    "comparison_identity": {"runner": {"model": "model-a"}},
                     "attempts": [
                         {
                             "id": row.id,
