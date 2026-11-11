@@ -48,7 +48,14 @@ Some measures and commands need more:
 
 ## Install
 
-There is no registry release yet. Install from a clone:
+```sh
+pipx install pluginbench
+pluginbench --version
+```
+
+`uv tool install pluginbench` works too. Either one also installs Harbor 0.24.0. If your default Python is older than 3.12, add `--python python3.12`.
+
+To change PluginBench itself, install from a clone instead:
 
 ```sh
 git clone https://github.com/filipgutica/pluginbench.git
@@ -56,7 +63,6 @@ cd pluginbench
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-pluginbench --version
 ```
 
 ## Quickstart

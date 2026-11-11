@@ -6,16 +6,10 @@ import { UiCodeBlock } from '@filipgutica/ui';
 const enhanced = ref(false);
 onMounted(() => { enhanced.value = true; });
 
-// Untitled, so the library draws a command plate with $ prompts. Long lines wrap, so the repository name stays in view.
-const code = [
-  'git clone https://github.com/filipgutica/pluginbench.git',
-  'cd pluginbench',
-  'python3 -m venv .venv',
-  'source .venv/bin/activate',
-  'pip install -e .',
-].join('\n');
+// One command, so the compact variant puts Copy beside it.
+const code = 'pipx install pluginbench';
 </script>
 
 <template>
-  <UiCodeBlock :code="code" language="bash" :copyable="enhanced" :wrap="true" />
+  <UiCodeBlock :code="code" language="bash" variant="compact" :copyable="enhanced" />
 </template>

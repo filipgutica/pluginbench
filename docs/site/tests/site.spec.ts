@@ -136,13 +136,13 @@ test('Config reference renders a readable GFM table that scrolls within the page
   await expectNoOverflow(page);
 });
 
-test('Home installs from a clone and copies the commands', async ({ page }) => {
+test('Home installs from PyPI and copies the command', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 900 });
   await page.goto('/pluginbench/');
   const hero = page.locator('.fg-site-hero');
-  await expect(hero.locator('pre')).toHaveText(/git clone https:\/\/github\.com\/filipgutica\/pluginbench\.git[\s\S]*pip install -e \./);
+  await expect(hero.locator('pre')).toHaveText('pipx install pluginbench');
   await expect(hero.getByRole('button', { name: 'Copy code' })).toBeVisible();
-  // Lines wrap rather than scroll, so the repository name is never hidden, at phone or desktop width.
+  // The command fits without scrolling, at phone or desktop width.
   const scrollsSideways = () => hero.locator('pre').evaluate((element) => element.scrollWidth > element.clientWidth);
   expect(await scrollsSideways()).toBe(false);
   await expect(page.getByRole('main').getByRole('link', { name: 'Full reference', exact: true })).toHaveAttribute('href', 'https://github.com/filipgutica/pluginbench#readme');

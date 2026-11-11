@@ -60,7 +60,7 @@ New native treatment runs currently require Codex. Legacy file-only `guidance` m
 
 ## Execution and isolation
 
-Install with `pip install -e .`, which also installs Harbor 0.24.0. Docker must run Linux containers through a local Unix endpoint, with Compose and Buildx available. The current runner accepts single-step Linux CPU tasks with separate verifiers and Dockerfiles or prebuilt images. Shared verifiers, task-authored Compose, multistep tasks, GPUs, and TPUs are rejected before model calls.
+Installing PluginBench also installs Harbor 0.24.0; see [Install](../README.md#install). Docker must run Linux containers through a local Unix endpoint, with Compose and Buildx available. The current runner accepts single-step Linux CPU tasks with separate verifiers and Dockerfiles or prebuilt images. Shared verifiers, task-authored Compose, multistep tasks, GPUs, and TPUs are rejected before model calls.
 
 ### Supported coding CLIs
 
