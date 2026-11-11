@@ -70,7 +70,8 @@ export const transformDocumentHtml = ({ html, source, pageHref }: {
         ? [element('p', { className: ['fg-site-meta', 'table-cue'] }, [{ type: 'text', value: 'Scroll the table sideways to see every column.' }]), region]
         : [region];
       parent.children.splice(index, 1, ...replacement);
-      return [SKIP, index + replacement.length];
+      // Carry on into the table's cells, whose links still need rewriting, then past the replacement.
+      return index + replacement.length;
     }
   });
 

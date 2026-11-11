@@ -13,6 +13,7 @@ test('links are rewritten only in anchors, never in code, for either quote style
     "<span class=\"line\"><span style=\"color:#E1E4E8\">&lt;a href='reproduce.md'&gt;</span></span>",
     '</code></pre>',
     "<p><a href='config-reference.md#gates-file'>gates</a> and <a href=\"metrics.md\">metrics</a> and <a href=\"../README.md#install\">install</a></p>",
+    '<table><thead><tr><th>Gate</th></tr></thead><tbody><tr><td><a href="metrics.md#correctness">table metric</a></td></tr></tbody></table>',
   ].join('');
   const output = transformDocumentHtml({ html, source: 'docs/running-evaluations.md', pageHref });
   await page.setContent(output);
@@ -22,11 +23,13 @@ test('links are rewritten only in anchors, never in code, for either quote style
   await expect(page.getByRole('link', { name: 'gates' })).toHaveAttribute('href', '/pluginbench/config-reference/#gates-file');
   await expect(page.getByRole('link', { name: 'metrics' })).toHaveAttribute('href', '/pluginbench/metrics/');
   await expect(page.getByRole('link', { name: 'install' })).toHaveAttribute('href', 'https://github.com/filipgutica/pluginbench/blob/main/README.md#install');
+  await expect(page.locator('.table-scroll a')).toHaveAttribute('href', '/pluginbench/metrics/#correctness');
 
   // Code samples take the library's code block styles: no Shiki theme and one tabindex.
   const pre = page.locator('.fg-code-block > pre.fg-code-block__pre');
   await expect(pre).toHaveAttribute('class', 'fg-code-block__pre');
   await expect(pre).not.toHaveAttribute('style', /./);
   await expect(pre.locator('span')).toHaveCount(0);
-  expect(output.match(/tabindex/gi)).toHaveLength(1);
+  const codeBlock = output.match(/<div class="fg-code-block">.*?<\/div>/s)?.[0] ?? '';
+  expect(codeBlock.match(/tabindex/gi)).toHaveLength(1);
 });
