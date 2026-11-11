@@ -63,12 +63,31 @@ def _validate_scopes(scopes: Iterable[list[str] | None]) -> None:
 class CoverageSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    command: list[str] = Field(min_length=1)
-    report_path: str = Field(min_length=1)
-    tool_version: str = Field(min_length=1)
-    format: Literal["lcov", "coverage-py-json", "go-coverprofile"] = "lcov"
-    timeout_seconds: int = Field(default=600, ge=1, le=7200)
-    source_scope: list[str] | None = Field(default=None, min_length=1)
+    command: list[str] = Field(
+        min_length=1, description="Provides the coverage command as a nonempty argument list."
+    )
+    report_path: str = Field(
+        min_length=1,
+        description="Names the coverage report relative to the repository without parent traversal.",
+    )
+    tool_version: str = Field(
+        min_length=1,
+        description="Records the nonempty coverage tool version in the measurement profile.",
+    )
+    format: Literal["lcov", "coverage-py-json", "go-coverprofile"] = Field(
+        default="lcov", description="Selects the parser for the coverage report."
+    )
+    timeout_seconds: int = Field(
+        default=600,
+        ge=1,
+        le=7200,
+        description="Sets the coverage command timeout in seconds from one to 7200.",
+    )
+    source_scope: list[str] | None = Field(
+        default=None,
+        min_length=1,
+        description="Selects repository-relative source patterns for this coverage profile.",
+    )
 
     @model_validator(mode="after")
     def safe_report_path(self) -> CoverageSettings:
@@ -91,14 +110,37 @@ class CoverageSettings(BaseModel):
 class MeasurementSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    source_scope: list[str] | None = Field(default=None, min_length=1)
-    test_scope: list[str] | None = Field(default=None, min_length=1)
-    fallow_config: Path | None = None
-    coverage: CoverageSettings | None = None
-    coverage_profiles: dict[str, CoverageSettings] = Field(default_factory=dict)
+    source_scope: list[str] | None = Field(
+        default=None,
+        min_length=1,
+        description="Selects repository-relative source patterns for measurements.",
+    )
+    test_scope: list[str] | None = Field(
+        default=None,
+        min_length=1,
+        description="Selects repository-relative test patterns for measurements.",
+    )
+    fallow_config: Path | None = Field(
+        default=None,
+        description="Selects a Fallow configuration file relative to the evaluation config.",
+    )
+    coverage: CoverageSettings | None = Field(
+        default=None,
+        description="Provides the default coverage profile when no repository or language profile matches.",
+    )
+    coverage_profiles: dict[str, CoverageSettings] = Field(
+        default_factory=dict,
+        description="Maps repository URLs or language names to coverage profiles, with repository matches taking precedence.",
+    )
     # Saved evaluations record this removed setting as null; only null is accepted.
-    test_contribution: None = None
-    require_ready: bool = False
+    test_contribution: None = Field(
+        default=None,
+        description="Retains the removed test contribution setting as null for saved evaluations.",
+    )
+    require_ready: bool = Field(
+        default=False,
+        description="Requires every selected measurement to be ready on every task before coding.",
+    )
 
     @field_validator("test_contribution", mode="before")
     @classmethod

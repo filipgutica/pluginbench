@@ -16,7 +16,6 @@ The screen candidate pool has 25 tasks from 24 repositories: 5 JavaScript/TypeSc
 7 Python tasks, 9 Go tasks, and 4 Rust tasks. Anko contributes two tasks; every other
 repository contributes one.
 Adaptix aliases and CSSTree shorthand support are included as requested.
-The four named exclusions from the worker brief are absent from the candidate pool.
 
 Selection favors library changes with explicit public behavior and local regression tests:
 parsing, transformations, structured data, diagnostics, formatting, and state restoration.
@@ -59,7 +58,7 @@ Collectors still measure the canonical submitted patch, as for the existing cont
 Prepared tasks are under:
 
 ```text
-/home/filip/.t3/worktrees/pluginbench/feat-deepswe-panel/.panel/tasks
+.panel/tasks
 ```
 
 `prepare-tasks.sh <new output directory>` fetches only the manifest's candidates at the pin.
@@ -68,10 +67,10 @@ It sets `umask 022`, checks verifier hashes/modes, and repairs Git identity only
 It does not change the verifier or hidden tests.
 The output must not exist; the script will not overwrite a previous preparation.
 
-`vanilla-x2.yaml` uses the prepared path above. Change only `tasks.source` if you prepare elsewhere.
+`vanilla-x2.yaml` resolves its relative task path to the directory above from the repository root. Change only `tasks.source` if you prepare elsewhere.
 It has no treatments or reviewer, two repeats, two jobs, and the existing 1,800-second agent budget.
 For this correctness screen, selected measurements are tokens, lines, and coverage.
-The CSSTree and Adaptix coverage profiles are copied unchanged from the existing round-3 configuration.
+The CSSTree and Adaptix coverage profiles use task-specific commands.
 Other tasks report coverage as `not_configured` with `require_ready: false`.
 Complexity and unused-code collection are outside this screen's selected measurements.
 
@@ -80,7 +79,7 @@ Use a scratch cache and new output directories, outside the existing study runs:
 ```sh
 umask 022
 export PYTHONPATH="$PWD/src"
-export PATH="/home/filip/code/pluginbench/.venv/bin:$HOME/.local/bin:$PATH"
+export PATH="$PWD/.venv/bin:$HOME/.local/bin:$PATH"
 export XDG_CACHE_HOME="$PWD/.panel/cache"
 python -W ignore -m pluginbench check docs/evidence/deepswe-panel-20261109/vanilla-x2.yaml --output .panel/check-panel-qualified
 python -W ignore -m pluginbench run docs/evidence/deepswe-panel-20261109/vanilla-x2.yaml --dry-run
@@ -97,7 +96,7 @@ Both now accept an empty map; validation of named treatments is unchanged.
 One regression test covers the two-attempt CLI plan and frozen recipe loading.
 Coverage admission was already optional and has no implementation change.
 
-Cache-key compatibility is checked using the existing round-3 configuration against baseline main commit `01597a8`
+Cache-key compatibility was checked using a private configuration against baseline main commit `01597a8`
 and this branch, with scratch outputs and a scratch cache.
 The saved comparison records task keys and attempt decisions from both `check` outputs.
 
@@ -116,3 +115,12 @@ The focused CLI, submission, and measurement-profile tests pass: 159 passed, fou
 skipped because saved diagnostic cohorts are unavailable.
 The one new regression failed before removing the schema constraints and passed afterward.
 The preparation script reproduced all 39 verifier trees with identical bytes and modes.
+
+## Privacy edits
+
+Machine-specific paths in `manifest.json` and `verification.json` are now relative to the repository root.
+`cache-keys.json` replaces the private configuration path with `<private-config-redacted>`.
+`vanilla-x2.yaml` uses a config-relative task source and a neutral temporary coverage filename.
+The commands above use a repository-local virtual environment.
+Historical hashes and readiness results retain their original values; they describe the original inputs,
+not the edited YAML bytes. No evidence files were removed.
