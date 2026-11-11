@@ -15,6 +15,7 @@ from pluginbench.measurement_profiles import (
     MeasurementSettings,
     blocking_findings,
     capability_plan,
+    not_measured,
     prepare_profiles,
     readiness_state,
 )
@@ -557,7 +558,9 @@ def test_missing_collector_is_not_configured_but_a_failing_tool_is_broken(
 
 
 @pytest.mark.parametrize("require_ready", [False, True])
-def test_only_broken_rows_block_unless_every_measure_is_required(require_ready: bool) -> None:
+def test_unready_measures_block_only_when_required_or_ready_on_no_task(
+    require_ready: bool,
+) -> None:
     matrix: dict[str, dict[str, dict[str, object]]] = {
         "covered": {"coverage": {"state": "ready", "reason": None}},
         "uncovered": {"coverage": {"state": "not_configured", "reason": "no coverage tool"}},
@@ -565,7 +568,53 @@ def test_only_broken_rows_block_unless_every_measure_is_required(require_ready: 
     assert blocking_findings(matrix, require_ready=require_ready) == (
         ["uncovered: coverage is not_configured: no coverage tool"] if require_ready else []
     )
+    # Now no task can measure coverage.
     matrix["covered"]["coverage"] = {"state": "broken", "reason": "test command exited 3"}
     assert "covered: coverage is broken: test command exited 3" in blocking_findings(
         matrix, require_ready=require_ready
     )
+
+
+@pytest.mark.parametrize("require_ready", [False, True])
+def test_a_measure_broken_on_one_task_is_not_measured_there(require_ready: bool) -> None:
+    matrix: dict[str, dict[str, dict[str, object]]] = {
+        "rust": {
+            "dead_code": {"state": "broken", "reason": "No escaped character"},
+            "cyclomatic": {"state": "ready", "reason": None},
+            "oracle": {"state": "ready", "reason": None},
+        },
+        "python": {
+            "dead_code": {"state": "ready", "reason": None},
+            "cyclomatic": {"state": "ready", "reason": None},
+            "oracle": {"state": "ready", "reason": None},
+        },
+    }
+
+    assert blocking_findings(matrix, require_ready=require_ready) == (
+        ["rust: dead_code is broken: No escaped character"] if require_ready else []
+    )
+    assert not_measured(matrix) == [
+        {"task": "rust", "measure": "dead_code", "reason": "No escaped character"}
+    ]
+    # Checks that protect paid attempts still block in both modes.
+    matrix["python"]["oracle"] = {"state": "broken", "reason": "verifier reward is 0"}
+    assert "python: oracle is broken: verifier reward is 0" in blocking_findings(
+        matrix, require_ready=require_ready
+    )
+
+
+@pytest.mark.parametrize("require_ready", [False, True])
+def test_a_measure_ready_on_no_task_blocks(require_ready: bool) -> None:
+    matrix: dict[str, dict[str, dict[str, object]]] = {
+        "rust": {"coverage": {"state": "broken", "reason": "test command exited 3"}},
+        "cobol": {"coverage": {"state": "not_configured", "reason": "no coverage tool"}},
+    }
+
+    findings = blocking_findings(matrix, require_ready=require_ready)
+
+    assert findings[-1] == "coverage is ready on no task, so the run would measure nothing for it"
+    assert "rust: coverage is broken: test command exited 3" in findings
+    assert not_measured(matrix) == []
+    # A measure that no task configures is ready nowhere too.
+    matrix["rust"]["coverage"] = {"state": "not_configured", "reason": "no coverage tool"}
+    assert blocking_findings(matrix, require_ready=require_ready)[-1] == findings[-1]

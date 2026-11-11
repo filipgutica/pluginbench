@@ -1163,6 +1163,47 @@ def _fallow(
     )
     if not syntax_valid:
         complete_complexity = complete_graph = False
+
+    def graph_incomplete_reason() -> str | None:
+        if complete_graph:
+            return None
+        prefix = "dead-code graph is incomplete: "
+        if not scoped_source_files:
+            return prefix + "no scoped source files found"
+        if unsupported_source_files:
+            paths = sorted(unsupported_source_files)
+            preview = ", ".join(paths[:3])
+            if len(paths) > 3:
+                preview += f", and {len(paths) - 3} more"
+            return prefix + f"unsupported source files in scope ({preview})"
+        if not (
+            isinstance(discovered, list)
+            and all(isinstance(path, str) for path in discovered)
+            and isinstance(discovery, dict)
+            and discovery.get("file_count") == len(discovered)
+            and len(discovered) == len(set(discovered))
+            and set(discovered) == scoped_source_files
+        ):
+            return prefix + "the discovered files differ from the scoped source files"
+        unresolved = check.get("unresolved_imports")
+        if unresolved != []:
+            if not isinstance(unresolved, list) or not unresolved:
+                return prefix + "unresolved imports were not reported as an empty list"
+            imports = [
+                f"{item.get('path', 'unknown file')} imports {item.get('specifier', 'unknown target')}"
+                if isinstance(item, dict)
+                else "unknown import"
+                for item in unresolved[:3]
+            ]
+            if len(unresolved) > 3:
+                imports.append(f"and {len(unresolved) - 3} more")
+            noun = "import" if len(unresolved) == 1 else "imports"
+            return prefix + f"{len(unresolved)} unresolved {noun} ({', '.join(imports)})"
+        if not rooted:
+            return prefix + "no entry point found"
+        return prefix + "syntax validation failed"
+
+    graph_reason = graph_incomplete_reason()
     eligible = duplicate_stats.get("total_files")
     groups = dupes.get("clone_groups")
     complete_clones = (
@@ -1183,6 +1224,7 @@ def _fallow(
         "scoped_supported_files": sorted(scoped_source_files),
         "scoped_unsupported_files": sorted(unsupported_source_files),
         "dead_code_complete_for_declared_scope": complete_graph,
+        **({"dead_code_incomplete_reason": graph_reason} if graph_reason is not None else {}),
         "cycles_complete_for_declared_scope": complete_graph,
         "boundary_violations_complete_for_declared_scope": complete_graph and boundary_rules,
         "graph_detection": "matching discovery population, declared entries, no unresolved imports; static findings only"

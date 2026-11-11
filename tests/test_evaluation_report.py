@@ -19,7 +19,7 @@ from pluginbench.evaluation_report import (
     evaluation_data,
     write_evaluation_report,
 )
-from pluginbench.assessment_charts import chart_data
+from pluginbench.assessment_charts import _map, chart_data
 from test_assessment_charts import (
     _attempt,
     _code_added,
@@ -116,6 +116,29 @@ def test_each_guidance_set_has_its_own_delta_against_the_same_evaluation_baselin
     assert raw == [80, 100, 120]
     assert data["comparison_identity"] == _config()["comparison_identity"]
     assert "winner" not in data and "score" not in data
+
+
+def test_study_details_name_each_task_given_a_supplied_git_identity() -> None:
+    config = _config()
+    config["comparison_identity"] = {
+        "task_environment": {
+            "own-identity": {"source_digest": "a"},
+            "no-identity": {
+                "source_digest": "b",
+                "supplied_git_identity": {
+                    "name": "PluginBench Agent",
+                    "email": "agent@pluginbench.invalid",
+                },
+            },
+        }
+    }
+    limitations = evaluation_data(_token_report(), config)["limitations"]
+    assert isinstance(limitations, list)
+    supplied = [row for row in limitations if "git identity" in str(row)]
+    assert supplied == [
+        "Task no-identity sets no git identity, so PluginBench supplied "
+        "PluginBench Agent <agent@pluginbench.invalid> to its agents."
+    ]
 
 
 def test_reused_baseline_is_disclosed_without_recounting_original_calls() -> None:
@@ -277,6 +300,72 @@ def test_selected_coverage_requires_collected_denominators_not_just_numeric_rate
         row["counts"] == {"Coverage covered/total counts": False} and not row["complete"]
         for row in _rows(data, "measurement_completeness")
     )
+
+
+def _branch_coverage(data: dict[str, object]) -> set[tuple[object, object, object]]:
+    return {
+        (row["value"], row["status"], row["reason"] if row["value"] is None else None)
+        for row in _rows(data, "observations")
+        if row["metric"] == "Branch coverage %"
+    }
+
+
+def test_a_report_without_a_not_measured_list_keeps_collected_values(tmp_path: Path) -> None:
+    # A capability saved as not configured, as earlier versions saved it, beside collected values.
+    config = _config("coverage")
+    config["measurement_capabilities"] = {
+        "fixture-task": {
+            "coverage": {"status": "unavailable", "reason": "no tool", "configured": False}
+        }
+    }
+
+    data = json.loads(write_evaluation_report(_report(), config, tmp_path).read_text())
+
+    assert _branch_coverage(data) == {(75.0, "measured", None)}
+    assert any(row["metric"] == "Branch coverage %" for row in _rows(data, "medians"))
+
+
+def test_a_pair_the_check_marked_is_reported_as_not_measured(tmp_path: Path) -> None:
+    config = _config("tokens", "coverage")
+    config["not_measured"] = [
+        {"task": "fixture-task", "measure": "coverage", "reason": "test command exited 3"}
+    ]
+
+    data = json.loads(write_evaluation_report(_report(), config, tmp_path).read_text())
+
+    assert _branch_coverage(data) == {(None, "unavailable", "test command exited 3")}
+    assert not [
+        row
+        for row in _rows(data, "medians") + _rows(data, "raw_medians")
+        if row["metric"] == "Branch coverage %"
+    ]
+    # Other measures of the task stay reported.
+    assert any(row["metric"] == "Input tokens" for row in _rows(data, "medians"))
+    counts = [row["counts"] for row in _rows(data, "measurement_completeness")]
+    assert counts and all(
+        isinstance(count, dict) and count["Coverage covered/total counts"] is False
+        for count in counts
+    )
+    # Unmasked, the same rows carry result counts; masked, neither published copy keeps them.
+    unmasked = evaluation_data(_report(), _config("tokens", "coverage"))
+    assert any(
+        "covered" in _map(row["provenance"])
+        for row in _rows(unmasked, "observations")
+        if row["family"] == "coverage"
+    )
+    csv_rows = list(csv.DictReader(io.StringIO((tmp_path / "results.csv").read_text())))
+    html = (tmp_path / "report.html").read_text()
+    payload = re.search(
+        r'<script id="assessment-data" type="application/json">(.*?)</script>', html, re.S
+    )
+    assert payload is not None
+    embedded = _rows(json.loads(payload.group(1)), "observations")
+    for rows in (csv_rows, embedded):
+        coverage = [row for row in rows if row["family"] == "coverage"]
+        assert coverage and all(
+            row["provenance"] in ({}, "{}") and row["per_test_count"] in (None, "")
+            for row in coverage
+        )
 
 
 def _evaluation_plot_rows(
@@ -1252,6 +1341,30 @@ def _reference(**code_added: object) -> dict[str, object]:
         },
         "code_size": {"source_lines_added": 12, "source_lines_removed": 3},
     }
+
+
+def test_a_listed_pair_masks_its_reference_value(tmp_path: Path) -> None:
+    report = _complete_selected_population_report()
+    report["references"] = {"fixture-task": _reference(net_cognitive=7)}
+    config = _config("cognitive", "lines")
+    config["not_measured"] = [
+        {"task": "fixture-task", "measure": "cognitive", "reason": "analysis failed"}
+    ]
+
+    data = evaluation_data(report, config)
+
+    references = {row["metric"]: row for row in _rows(data, "reference_values")}
+    masked = references["Net cognitive complexity added"]
+    assert (masked["value"], masked["status"], masked["reason"]) == (
+        None,
+        "unavailable",
+        "analysis failed",
+    )
+    # Unlisted measures of the same task keep their reference.
+    assert references["Source lines added"]["value"] == 12
+    assert not [
+        row for row in _rows(data, "reference_comparisons") if row["metric"] == masked["metric"]
+    ]
 
 
 def test_reference_values_measure_the_reference_like_a_submission_and_keep_unknown() -> None:
