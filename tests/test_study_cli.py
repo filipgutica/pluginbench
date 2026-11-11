@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import inspect
 import json
 import hashlib
@@ -9,6 +10,8 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -27,6 +30,8 @@ from pluginbench import (
     evaluation,
     harbor_backend,
     isolation,
+    remeasure,
+    run_lock,
     study,
     submissions,
     trial_containers,
@@ -2152,6 +2157,178 @@ def test_run_interrupted_after_its_last_attempt_finishes_measurement_and_reviews
     assert evaluation._load_selection(root)["review_revision"] == "review"
 
 
+class _Killed(BaseException):
+    """Stands in for SIGKILL: once raised, no handler writes anything."""
+
+
+def _recorded_calls(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[evaluation.Evaluation, list[str], list[str]]:
+    """The measured and reviewed config, with fake coding and review calls recorded."""
+    config = _measured_and_reviewed(config, tmp_path, monkeypatch)
+    calls: list[str] = []
+    reviews: list[str] = []
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=config.timeout_seconds, interrupt_at=None
+    )
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    return config, calls, reviews
+
+
+def _killed_while_measuring(
+    config: evaluation.Evaluation,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    write: int,
+    torn: bool,
+) -> tuple[Path, list[str], list[str]]:
+    """Code and start measuring, then die at the given revision.json write, as SIGKILL would."""
+    config, calls, reviews = _recorded_calls(config, tmp_path, monkeypatch)
+    write_text = Path.write_text
+    writes = 0
+    dead = False
+
+    def killed_at_that_write(path: Path, data: str, *args: Any, **kwargs: Any) -> int:
+        # The first revision.json write saves the frozen profiles; the second records progress.
+        nonlocal writes, dead
+        if dead:
+            raise _Killed
+        if path.name.startswith("revision.json"):
+            writes += 1
+            if writes == write:
+                dead = True
+                if torn:
+                    write_text(path, data[: len(data) // 2], *args, **kwargs)
+                raise _Killed
+        return write_text(path, data, *args, **kwargs)
+
+    root = tmp_path / "run"
+    with monkeypatch.context() as patched:
+        patched.setattr(Path, "write_text", killed_at_that_write)
+        with pytest.raises(_Killed):
+            evaluation.run_evaluation(config, root)
+    return root, calls, reviews
+
+
+@contextmanager
+def _held_by_another_process(root: Path, record: dict[str, object]) -> Iterator[None]:
+    """Hold run.lock as another process that has not replaced the owner record yet."""
+    fd = os.open(root / run_lock.LOCK_NAME, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        saved = os.pread(fd, 1 << 16, 0)
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, json.dumps(record).encode(), 0)
+        try:
+            yield
+        finally:
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, saved, 0)
+    finally:
+        os.close(fd)
+
+
+def _assert_only_a_free_run_is_recovered(root: Path) -> None:
+    # No record yet, or one that still names this process, which held the lock before.
+    records: tuple[dict[str, object], ...] = ({}, {"pid": os.getpid()})
+    for record in records:
+        with _held_by_another_process(root, record):
+            with pytest.raises(ValueError, match="another process may own this run"):
+                evaluation.plan_resume(root)
+            with pytest.raises(ValueError, match="run is already active"):
+                evaluation.resume_evaluation(root)
+    assert evaluation.plan_resume(root)["collect_measurements"] is True
+
+
+@pytest.mark.parametrize("torn", [False, True], ids=["before-a-write", "during-a-write"])
+def test_run_resumes_a_measurement_that_a_kill_left_collecting(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, torn: bool
+) -> None:
+    root, calls, reviews = _killed_while_measuring(
+        config, tmp_path, monkeypatch, write=2, torn=torn
+    )
+    killed = root / "evidence/observer-revisions/measurements/revision.json"
+    assert json.loads(killed.read_text())["status"] == "collecting"
+    _assert_only_a_free_run_is_recovered(root)
+    assert json.loads(killed.read_text())["status"] == "collecting"
+    coded = len(calls)
+
+    result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert (
+        "Measurement revision measurements was left collecting by a process that ended, so it "
+        "cannot continue. Its files stay; measurement starts again as measurements-2"
+    ) in " ".join((result.stderr + result.stdout).split())
+    assert len(calls) == coded and len(reviews) == 9
+    state = json.loads(killed.read_text())
+    assert state["status"] == "failed" and "ended while collecting" in state["error"]
+    assert (killed.parent / "profiles").is_dir()
+    selection = evaluation._load_selection(root)
+    assert selection["measurement_revision"] == "measurements-2"
+    assert selection["measurement_history"] == [study._reference(root / "evidence", killed)]
+    assert (root / "report/report.html").is_file()
+    status = CliRunner().invoke(cli.app, ["status", str(root), "--json"])
+    assert status.exit_code == 0, status.stderr
+    assert json.loads(status.stdout)["measures"]["measurement_revisions"] == [
+        {"revision": "measurements", "status": "failed", "selected": False},
+        {"revision": "measurements-2", "status": "complete", "selected": True},
+    ]
+
+
+@pytest.mark.parametrize("ended", ["killed", "stopped"])
+def test_run_measures_again_when_measurement_ended_before_saving_its_profiles(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ended: str
+) -> None:
+    abandoned = tmp_path / "run/evidence/observer-revisions/measurements"
+    if ended == "killed":
+        # Killed before the first revision.json write: the directory has no state file.
+        root, calls, reviews = _killed_while_measuring(
+            config, tmp_path, monkeypatch, write=1, torn=False
+        )
+        assert abandoned.is_dir() and not (abandoned / "revision.json").exists()
+    else:
+        # Stopped while freezing collectors: its state says failed, with no frozen profiles.
+        config, calls, reviews = _recorded_calls(config, tmp_path, monkeypatch)
+        root = tmp_path / "run"
+
+        def stopped(*args: Any, **kwargs: Any) -> None:
+            raise KeyboardInterrupt("stopped by SIGTERM")
+
+        with monkeypatch.context() as patched:
+            patched.setattr(remeasure, "freeze_collectors", stopped)
+            with pytest.raises(KeyboardInterrupt):
+                evaluation.run_evaluation(config, root)
+        state = json.loads((abandoned / "revision.json").read_text())
+        assert state["status"] == "failed" and "frozen_profiles" not in state
+    kept = study._inventory(abandoned)
+    _assert_only_a_free_run_is_recovered(root)
+    coded = len(calls)
+
+    result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert (
+        "Measurement revision measurements ended before it saved its frozen profiles, so it "
+        "cannot continue. Its files stay; measurement starts again as measurements-2"
+    ) in " ".join((result.stderr + result.stdout).split())
+    assert len(calls) == coded and len(reviews) == 9
+    assert study._inventory(abandoned) == kept
+    selection = evaluation._load_selection(root)
+    assert selection["measurement_revision"] == "measurements-2"
+    assert selection["measurement_history"] == []
+    assert (root / "report/report.html").is_file()
+    # status lists revisions that saved a state; a directory killed before its first has none.
+    revisions = [{"revision": "measurements-2", "status": "complete", "selected": True}]
+    if ended == "stopped":
+        revisions.insert(0, {"revision": "measurements", "status": "failed", "selected": False})
+    status = CliRunner().invoke(cli.app, ["status", str(root), "--json"])
+    assert status.exit_code == 0, status.stderr
+    assert json.loads(status.stdout)["measures"]["measurement_revisions"] == revisions
+
+
 def _stopped_after_two_attempts(
     config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Path, list[str], list[str]]:
@@ -2199,6 +2376,10 @@ def test_stopped_run_copied_to_a_new_path_resumes_there(
     shutil.copytree(root, moved, symlinks=True)
     shutil.rmtree(root)
     coded = len(calls)
+    # The copied run.lock still names the old path; deleting it is the documented way on.
+    refused = CliRunner().invoke(cli.app, ["run", str(moved), "--yes", "--foreground"])
+    assert refused.exit_code == 2 and "delete" in refused.stderr
+    (moved / "run.lock").unlink()
     result = CliRunner().invoke(cli.app, ["run", str(moved), "--yes", "--foreground"])
     assert result.exit_code == 0, result.stderr + result.stdout
     assert len(calls) == coded + 7 and len(reviews) == 9

@@ -11,6 +11,7 @@ import json
 import os
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -61,6 +62,16 @@ class RunLock:
             raise RunMoved(f"run directory moved away from {self.root}; no further work starts")
 
 
+# Roots whose lock this process holds now. The owner record can lag a handover, so it cannot
+# say whether this process still holds a lock.
+_held: set[Path] = set()
+
+
+def held_here(root: Path) -> bool:
+    """Whether this process holds root/run.lock right now."""
+    return root.resolve() in _held
+
+
 def _owner(fd: int) -> dict[str, object] | None:
     text = os.pread(fd, 1 << 16, 0).decode()
     if not text.strip():
@@ -74,6 +85,50 @@ def _owner(fd: int) -> dict[str, object] | None:
 def _interrupt(signum: int, frame: FrameType | None) -> None:
     # Reuse the interrupt path: no new attempts start and saved work is checkpointed.
     raise KeyboardInterrupt("stopped by SIGTERM")
+
+
+@contextmanager
+def deferred_stop() -> Iterator[None]:
+    """Hold SIGTERM and SIGINT until the block ends, then deliver them in arrival order.
+
+    For writes that must land together: `stop` and Ctrl-C otherwise interrupt between any two
+    bytecodes. Keep the block to those writes. Only the main thread runs signal handlers, so
+    elsewhere nothing can interrupt the block and it runs as is.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    pending: list[int] = []
+
+    def defer(signum: int, frame: FrameType | None) -> None:
+        pending.append(signum)
+
+    # An ignored signal stays ignored. A handler installed outside Python cannot be put back.
+    previous = {
+        item: handler
+        for item in (signal.SIGTERM, signal.SIGINT)
+        if (handler := signal.getsignal(item)) not in (None, signal.SIG_IGN)
+    }
+    try:
+        for item in previous:
+            signal.signal(item, defer)
+        yield
+    finally:
+        failure: BaseException | None = None
+        while True:
+            try:
+                for item, handler in previous.items():
+                    signal.signal(item, handler)
+                break
+            except BaseException as exc:
+                # A signal that arrives now runs a handler already restored, which may raise
+                # anywhere in the loop. Keep the first error and restore every handler again.
+                failure = failure or exc
+        if failure is not None:
+            raise failure
+        # In arrival order: a handler that returns must not swallow a later stop.
+        for signum in pending:
+            signal.raise_signal(signum)
 
 
 @contextmanager
@@ -116,8 +171,10 @@ def hold(root: Path) -> Iterator[RunLock]:
         os.fsync(fd)
         previous_handler = signal.signal(signal.SIGTERM, _interrupt)
         try:
+            _held.add(root)
             yield RunLock(root, fd)
         finally:
+            _held.discard(root)
             signal.signal(signal.SIGTERM, previous_handler)
     finally:
         os.close(fd)
