@@ -7,13 +7,14 @@ import inspect
 import json
 import hashlib
 import os
+import signal
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from typing import Any
 
 import pytest
@@ -30,6 +31,7 @@ from pluginbench import (
     evaluation,
     harbor_backend,
     isolation,
+    parallel,
     remeasure,
     run_lock,
     study,
@@ -1894,7 +1896,7 @@ def test_parser_only_change_keeps_the_vanilla_cache_identity(
 
 def _coding_and_review_backend(
     calls: list[str], reviews: list[str], *, timeout: int, interrupt_at: int | None
-) -> Any:
+) -> Callable[..., dict[str, Any]]:
     usage = {"input_tokens": 10, "output_tokens": 5}
 
     def invoke(**kwargs: Any) -> dict[str, Any]:
@@ -1962,6 +1964,55 @@ def _measured_and_reviewed(
     monkeypatch.setattr(harbor_backend, "prepare_native_task", _prepare_fixture_task)
     monkeypatch.setattr(harbor_backend, "run_native_command", _lcov)
     return config
+
+
+@pytest.mark.parametrize("stop", [signal.SIGTERM, signal.SIGINT], ids=["stop", "ctrl-c"])
+def test_single_job_stop_keeps_the_active_attempt_and_resume_never_recodes_it(
+    config: evaluation.Evaluation,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stop: signal.Signals,
+) -> None:
+    config = _measured_and_reviewed(config, tmp_path, monkeypatch)
+    calls: list[str] = []
+    reviews: list[str] = []
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=config.timeout_seconds, interrupt_at=None
+    )
+    cancelled = Event()
+
+    def invoke(**kwargs: Any) -> dict[str, Any]:
+        # Deliver a real signal during coding, then keep the call active until admission stops.
+        os.kill(os.getpid(), stop)
+        assert cancelled.wait(timeout=5)
+        return backend(**kwargs)
+
+    monkeypatch.setattr(codex, "invoke", backend)
+    handlers = {item: signal.getsignal(item) for item in (signal.SIGTERM, signal.SIGINT)}
+    root = tmp_path / "run"
+    with monkeypatch.context() as stopping:
+        stopping.setattr(parallel, "Event", lambda: cancelled)
+        stopping.setattr(harbor_backend, "invoke_native", invoke)
+        with pytest.raises(KeyboardInterrupt):
+            evaluation.run_evaluation(config, root)
+
+    assert {item: signal.getsignal(item) for item in handlers} == handlers
+    stopped = json.loads(CliRunner().invoke(cli.app, ["status", str(root), "--json"]).stdout)
+    assert stopped["phase"] == "stopped" and stopped["states_source"] == "ledger"
+    assert stopped["states"] == {"complete": 1, "pending": 8}
+    assert len(calls) == 1 and reviews == []
+    attempt_id = calls[0]
+    receipt = root / "evidence/records" / f"{attempt_id}.json"
+    recorded = receipt.read_bytes()
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    resumed = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+    assert resumed.exit_code == 0, resumed.stderr + resumed.stdout
+    done = json.loads(CliRunner().invoke(cli.app, ["status", str(root), "--json"]).stdout)
+    assert done["phase"] == "complete" and done["states"] == {"complete": 9}
+    assert done["discarded"] == []
+    assert len(calls) == len(set(calls)) == 9 and calls.count(attempt_id) == 1
+    assert receipt.read_bytes() == recorded
 
 
 def test_status_follows_a_stopped_run_through_its_resume(
@@ -2505,6 +2556,8 @@ def test_a_run_killed_after_its_last_attempt_finished_resumes_with_a_newer_launc
         stopped.setattr(study, "_write", writing)
         stopped.setattr(Ledger, "complete", completing)
         stopped.setattr(study, "_checkpoint", checkpointing)
+        # A killed process cannot report on the checkpoint it never finished writing.
+        stopped.setattr(study, "report_study", lambda *args, **kwargs: None)
         with pytest.raises(KeyboardInterrupt):
             evaluation.run_evaluation(config, tmp_path / "run")
     states = json.loads((evidence / "run.json").read_text())["attempt_states"]

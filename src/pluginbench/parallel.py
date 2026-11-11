@@ -23,16 +23,6 @@ def run_jobs[T](
     """Stop admission on failure; drain active calls and coordinator updates before raising."""
     validate_jobs(jobs)
     cancelled = Event()
-    if jobs == 1:
-        try:
-            for item in items:
-                if on_submit:
-                    on_submit(item)
-                operation(item, cancelled, lambda callback: callback())
-        except BaseException:
-            cancelled.set()
-            raise
-        return
     updates: SimpleQueue[Callable[[], None]] = SimpleQueue()
     failures: SimpleQueue[BaseException] = SimpleQueue()
     first_failure: BaseException | None = None
