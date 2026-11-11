@@ -22,7 +22,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from pluginbench import codex, harbor_backend, submissions
+from pluginbench import codex, harbor_backend, submissions, trial_containers
 from pluginbench.codex_events import failed_before_first_turn
 from pluginbench.harbor_backend import binary_native_reward as _binary_native_reward
 from pluginbench.treatments import (
@@ -1108,6 +1108,7 @@ def resume_study(
         baseline_cache=baseline_cache,
         baseline_identity=baseline_identity,
         guard=guard,
+        resumed=True,
     )
 
 
@@ -1138,8 +1139,12 @@ def _run_attempts(
     baseline_cache: Path | None,
     baseline_identity: dict[str, object] | None,
     guard: Callable[[], None] | None,
+    resumed: bool = False,
 ) -> Path:
-    """Code every slot whose attempt is not complete, checkpointing each state change."""
+    """Code every slot whose attempt is not complete, checkpointing each state change.
+
+    A resumed pass first stops the containers a killed attempt left running.
+    """
     root, frozen, plan, manifest, states, ledger = (
         run.root, run.study, run.plan, run.manifest, run.states, run.ledger
     )
@@ -1175,6 +1180,10 @@ def _run_attempts(
                 )
             )
             _assert_task_runtimes(frozen, expected_runtime)
+            if resumed:
+                trial_containers.stop_left_running(
+                    root, expected_runtime=expected_runtime, progress=progress
+                )
         if baseline_cache is not None:
             assert baseline_identity is not None
             try:

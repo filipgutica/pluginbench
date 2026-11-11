@@ -9,12 +9,13 @@ from __future__ import annotations
 import json
 import shlex
 import sqlite3
+import subprocess
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from pluginbench import run_lock
+from pluginbench import run_lock, trial_containers
 from pluginbench.evaluation_report import correctness_state
 from pluginbench.ledger import LEDGER_NAME, Ledger
 
@@ -241,6 +242,24 @@ def _phase(
     return "not_started" if run is None else "stopped"
 
 
+def _left_running(evidence: Path) -> dict[str, Any]:
+    """Containers of this run's trials still running with no live owner, or why none was read."""
+    try:
+        # Status only reports, so it uses the selected Docker context: the engine a coding
+        # attempt picks. Pinning the saved runtime would hide them once the Docker CLI changed.
+        containers = trial_containers.running(evidence, expected_runtime=None)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        return {"checked": False, "error": str(exc), "containers": [], "stop_command": None}
+    return {
+        "checked": True,
+        "error": None,
+        "containers": containers,
+        "stop_command": shlex.join(["docker", "stop", *(row["id"] for row in containers)])
+        if containers
+        else None,
+    }
+
+
 def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
     """Everything `status` shows, as the documented JSON object; reads only."""
     root = root.expanduser().absolute()
@@ -378,6 +397,8 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
         if (root / "report/report.html").is_file()
         else None,
         "log": str(log) if log.is_file() else None,
+        # Only the run.lock holder stops them, so they are named while no process owns the run.
+        "left_running": None if active else _left_running(evidence),
         "attempts": attempts,
     }
 
@@ -425,6 +446,13 @@ def format_status(status: dict[str, Any]) -> str:
         lines.append(f"Error: {status['error']}")
     if status["resume_command"]:
         lines.append(f"Resume: {status['resume_command']}")
+    left = status["left_running"]
+    if left and not left["checked"]:
+        lines.append(f"Containers: could not check for ones left running: {left['error']}")
+    elif left and left["containers"]:
+        projects = ", ".join(dict.fromkeys(row["project"] for row in left["containers"]))
+        lines.append(f"Containers left running with no live owner: {projects}")
+        lines.append(f"Stop them: {left['stop_command']}")
     states: Counter[str] = Counter()
     for state, count in status["states"].items():
         states[_shown_state(state, status["active"])] += count
