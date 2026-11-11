@@ -494,6 +494,8 @@ def _metric_readiness(metric: str, first: dict[str, object]) -> tuple[bool, obje
             )
             ready = first.get(key) is True
             reason = None if ready else "analysis population is incomplete"
+            if metric == "dead_code" and not ready:
+                reason = first.get("dead_code_incomplete_reason") or reason
         if metric == "dead_code" and ready:
             comparison = _dead_changes(first, first)
             ready = comparison["status"] == "available"
