@@ -1,7 +1,6 @@
 <script setup lang="ts">
-import { UiSiteNav } from '@filipgutica/ui/site';
+import { UiSiteHeader, UiSiteNav } from '@filipgutica/ui/site';
 import type { UiSiteNavGroup } from '@filipgutica/ui/site';
-import SiteHeader from './SiteHeader.vue';
 
 defineProps<{ groups: UiSiteNavGroup[] }>();
 const headerLinks = [
@@ -13,7 +12,7 @@ const headerLinks = [
 <template>
   <a class="fg-site-skip" href="#main">Skip to content</a>
   <div class="fg-site-docs">
-    <SiteHeader project="pluginbench" :links="headerLinks" />
+    <UiSiteHeader project="pluginbench" :links="headerLinks" />
     <UiSiteNav label="Documentation" :groups="groups" />
     <main id="main" class="fg-site-prose doc-content">
       <slot />

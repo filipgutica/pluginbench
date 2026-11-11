@@ -159,7 +159,7 @@ test('shared project menu, header links, and appearance picker work', async ({ p
   const trigger = page.getByLabel('Project: PluginBench', { exact: true });
   await trigger.click();
   const projects = page.getByRole('navigation', { name: 'Projects', exact: true });
-  await expect(projects.getByRole('link')).toHaveText(['annoterm', 'wtree', 'devps', 'Workbench', 'Filip Stack', 'UI', 'PluginBench']);
+  await expect(projects.getByRole('link')).toHaveText(['annoterm', 'wtree', 'devps', 'PluginBench', 'Workbench', 'Filip Stack', 'UI']);
   await expect(projects.locator('[aria-current="page"]')).toHaveText('PluginBench');
   await page.keyboard.press('Escape');
   await expect(projects).toBeHidden();
