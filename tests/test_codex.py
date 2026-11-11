@@ -1135,6 +1135,41 @@ def test_malformed_capture_cannot_be_classified_as_a_pre_model_outage() -> None:
 
 
 @pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "session_meta", "payload": {
+            "id": _OUTAGE[0]["thread_id"], "cli_version": "0.167.0", "source": [],
+        }},
+        {"type": "response_item", "payload": {
+            "type": "message", "role": "assistant", "content": [],
+        }},
+        {"type": "response_item", "payload": {"type": "function_call", "name": "shell"}},
+        {"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "output_text", "text": "x"}],
+        }},
+        {"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": 5}],
+        }},
+        {"type": "turn_context", "payload": {"model": []}},
+        {"type": "event_msg", "payload": {"type": "token_count"}},
+        {"type": "event_msg", "payload": {
+            "type": "token_count", "info": None, "rate_limits": [],
+        }},
+        {"type": "event_msg", "payload": {"type": "new_unknown_event"}},
+    ],
+)
+def test_only_validated_startup_records_can_preserve_a_pre_model_outage(
+    event: dict[str, object],
+) -> None:
+    header: dict[str, object] = {"type": "session_meta", "payload": {
+        "id": _OUTAGE[0]["thread_id"], "cli_version": "0.167.0", "source": "exec",
+    }}
+    records = [event] if event["type"] == "session_meta" else [header, event]
+    parsed = codex.parse_events(stream(*_OUTAGE), [stream(*records)], "codex")
+    assert codex_events.failed_before_first_turn(parsed) is None
+
+
+@pytest.mark.parametrize(
     ("events", "traces", "timed_out"),
     [
         # Reconnected and finished the turn.
