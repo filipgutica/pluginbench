@@ -1,0 +1,57 @@
+---
+import { siteThemeBootScript } from '@filipgutica/ui/site';
+import type { MarkdownHeading } from 'astro';
+import SiteFrame from '../components/SiteFrame.vue';
+import { pageHref, pages } from '../lib/pages';
+import libraryThemeCss from '@filipgutica/ui/theme.css?raw';
+import sitePaletteCss from '@filipgutica/ui/themes/graphite-indigo.css?raw';
+import projectThemeCss from '../styles/site.css?raw';
+import '../styles/site.css';
+
+interface Props {
+  slug: string;
+  title: string;
+  description: string;
+  headings: MarkdownHeading[];
+}
+const { slug, title, description, headings } = Astro.props;
+const sections = headings.filter(({ depth }) => depth === 2);
+const groups = [
+  { items: pages.map((page) => ({ label: page.title, href: pageHref(page.slug), current: page.slug === slug })) },
+  ...(sections.length ? [{ label: 'On this page', items: sections.map(({ text, slug }) => ({ label: text, href: `#${slug}` })) }] : []),
+];
+const canonical = new URL(pageHref(slug), Astro.site);
+// Keep the library roles and page branding consistent without the theme boot script.
+const darkTokens = [libraryThemeCss, sitePaletteCss, projectThemeCss].map((css) => {
+  const tokens = css.match(/:root\.dark\s*\{([^}]+)\}/)?.[1];
+  if (!tokens) throw new Error('The dark theme tokens are missing.');
+  return tokens;
+}).join('\n');
+const noScriptDarkCss = `@media (prefers-color-scheme: dark) { :root:not(.dark) { ${darkTokens} } }`;
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>{title} · PluginBench</title>
+    <meta name="description" content={description} />
+    <meta property="og:title" content={`${title} · PluginBench`} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content={canonical} />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23222326'/%3E%3Ctext x='16' y='23' font-family='ui-monospace,Menlo,monospace' font-size='20' font-weight='700' text-anchor='middle' fill='white'%3Ep%3C/text%3E%3C/svg%3E" />
+    <script is:inline set:html={siteThemeBootScript}></script>
+    <noscript><style is:global set:html={noScriptDarkCss}></style></noscript>
+  </head>
+  <body>
+    <SiteFrame groups={groups} client:load>
+      <slot />
+    </SiteFrame>
+    <script>
+      import '../lib/enhance-document';
+    </script>
+  </body>
+</html>

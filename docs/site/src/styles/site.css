@@ -1,0 +1,69 @@
+@layer base, components, utilities;
+
+@import 'tailwindcss/utilities.css' source(none);
+@import '@filipgutica/ui/theme.css';
+@import '@filipgutica/ui/components.css';
+@import '@filipgutica/ui/themes/graphite-indigo.css';
+@import '@filipgutica/ui/site.css';
+
+/* Text in the hue reaches 5.1:1 on every light surface and 7:1 on every dark one. */
+:root { --color-project: #1f5fbf; --color-project-dark: #6ea8ff; }
+:root.dark { --color-project: #6ea8ff; --color-project-dark: #6ea8ff; }
+
+/* The library owns the frame, type, controls, and palette. Markdown adds only
+ * document spacing and scroll containment for its code and reference tables. */
+@layer base {
+  @media (prefers-reduced-motion: no-preference) {
+    html { scroll-behavior: smooth; }
+  }
+}
+.lede { max-width: 56ch; margin-top: calc(-1 * var(--space-2)); color: var(--color-muted); font-size: var(--text-lg); }
+.install { display: grid; gap: var(--space-3); min-width: 0; }
+.doc-content section:not(.fg-site-hero) {
+  display: grid;
+  align-content: start;
+  gap: var(--space-4);
+  min-width: 0;
+}
+.doc-content section:not(.fg-site-hero) > * { min-width: 0; }
+/* The grid supplies paragraph spacing; prose's adjacent margins would double it. */
+.doc-content section > :is(p, ul, ol) { margin-block: 0; }
+.doc-content :is(p, li, h1, h2, h3) { overflow-wrap: anywhere; }
+.doc-content :is(ul, ol) { padding-inline-start: var(--space-6); }
+.doc-content li + li { margin-top: var(--space-2); }
+.doc-content .fg-code-block { min-width: 0; }
+/* Copy appears once scripts run; reserving its height keeps the page from shifting then. */
+.doc-content .fg-code-block[data-variant="default"] .fg-code-block__actions { min-height: var(--control-lg); }
+/* A line that continues a command after a trailing backslash gets no prompt.
+ * The library's command plate prompts every line, so this belongs upstream. */
+.fg-code-block[data-command="true"] .fg-code-block__line[data-continuation]::before { content: '  ' / ''; }
+.table-scroll { max-width: 100%; overflow-x: auto; }
+/* Separate borders stay attached to the sticky first column; collapsed ones do not. */
+.table-scroll table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: var(--text-md); }
+.table-scroll :is(th, td) {
+  padding: var(--space-3);
+  border-bottom: 1px solid var(--color-border-subtle);
+  text-align: start;
+  vertical-align: top;
+}
+.table-scroll th { color: var(--color-muted); font-weight: var(--weight-medium); }
+/* The first column names each row, so it stays in view while the rest scrolls under it. */
+.table-scroll :is(th, td):first-child {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: var(--color-bg);
+}
+.table-scroll code { overflow-wrap: anywhere; }
+/* Narrow tables have no cue, so like prose they break a long word rather than scroll.
+ * The first column keeps whole words, or the table would squeeze it to a letter a line. */
+.table-scroll:not(.table-cue + *) :is(th, td):not(:first-child) { overflow-wrap: anywhere; }
+.table-scroll:not(.table-cue + *) :is(th, td):first-child code { overflow-wrap: normal; }
+/* A wide table needs this width; on a phone its third column is cut, which shows there is more.
+ * The cue shows only while the section is narrower than the table, so the table scrolls. */
+.doc-content section:has(> .table-cue) { container-type: inline-size; }
+.table-cue + .table-scroll table { min-width: 40rem; }
+.table-cue + .table-scroll :is(th, td):first-child { min-width: 9rem; }
+@container (min-width: 40rem) {
+  .table-cue { display: none; }
+}
