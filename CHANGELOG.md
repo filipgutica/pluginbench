@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.1](https://github.com/filipgutica/pluginbench/compare/v0.5.0...v0.5.1) (2026-11-11)
+
+
+### Documentation
+
+* install from PyPI with pipx or uv ([ce546f8](https://github.com/filipgutica/pluginbench/commit/ce546f8a48a3366eb8ded0d1c35e6b8d2a454bda))
+* install from PyPI with pipx or uv ([882b6f5](https://github.com/filipgutica/pluginbench/commit/882b6f52e35e07ade62520833ebae11737fd440f))
+* **site:** use the library's site header and YAML highlighting from @filipgutica/ui 1.34.0 ([413da50](https://github.com/filipgutica/pluginbench/commit/413da502762633731e195ba5c1e4a976d60d9ac0))
+* **site:** use the shared site header from @filipgutica/ui 1.34.0 ([e39864d](https://github.com/filipgutica/pluginbench/commit/e39864d34a591425d7aabf0181410af5060c906d))
+
 ## [0.5.0](https://github.com/filipgutica/pluginbench/compare/v0.4.0...v0.5.0) (2026-11-11)
 
 
