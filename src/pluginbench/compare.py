@@ -5,11 +5,12 @@ Reads each evaluation's report/results.json and nothing else: no rebuild, no mod
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
@@ -21,10 +22,35 @@ from pluginbench.evaluation_report import correctness_state
 # Older runs call the package without guidance "baseline".
 ARM_NAMES = {"baseline": "vanilla"}
 PASS_STATES = {"pass"}
+# Any other correctness, such as unknown, could be a pass or a fail.
+GRADED_STATES = {"pass", "fail", "overlap_pass"}
 TOKEN_METRICS = ["Input tokens", "Output tokens"]
 BOOTSTRAP_DRAWS = 10_000
 BOOTSTRAP_SEED = 0
 MIN_PAIRED_TASKS = 6
+# Saved comparison-identity fields two runs must share before a gate compares their packages on a
+# task. `{task}` is that task; `*` is each key both runs saved. The guidance packages (the
+# treatment under test), jobs, seed, container limits, and the Docker runtime may differ.
+IDENTITY_FIELDS = (
+    "runner.harness",
+    "runner.model",
+    "runner.reasoning",
+    "harness_version",
+    "capabilities",
+    "tasks.{task}",
+    "task_limits.{task}.effective.agent_timeout_seconds",
+    "measurement_settings.source_scope",
+    "measurement_settings.test_scope",
+    "measurement_settings.coverage",
+    "measurement_settings.coverage_profiles.*",
+    "fallow_config_sha256",
+    "effective_observer_scripts.{task}.*",
+    "measurement_capabilities.{task}.*.tool_version",
+    "reviewer.harness",
+    "reviewer.model",
+    "reviewer.reasoning",
+    "review_criteria_sha256",
+)
 
 
 class Gate(BaseModel):
@@ -163,6 +189,8 @@ class Attempt:
 class Evidence:
     attempts: list[Attempt] = field(default_factory=list)
     references: dict[tuple[str, str], float | None] = field(default_factory=dict)
+    # Each run's saved comparison identity; None for a run saved before reports carried one.
+    identities: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -244,11 +272,7 @@ def paired_comparison(
             )
             missing_passes[task] = missing_tokens[task] = why
             continue
-        if any(
-            row.correctness not in {"pass", "fail", "overlap_pass"}
-            for rows in sides
-            for row in rows
-        ):
+        if any(row.correctness not in GRADED_STATES for rows in sides for row in rows):
             missing_passes[task] = "unknown correctness on at least one attempt"
         else:
             rates = [sum(row.correctness in states for row in rows) / len(rows) for rows in sides]
@@ -289,6 +313,7 @@ def load_evidence(specs: list[str]) -> Evidence:
         if not results.is_file():
             raise ValueError(f"{directory} has no report/results.json; run `pluginbench report`")
         data = json.loads(results.read_text())
+        evidence.identities[directory] = data.get("comparison_identity")
         values: dict[str, dict[str, float | None]] = {}
         reasons: dict[str, dict[str, str]] = {}
         for row in data["observations"]:
@@ -334,24 +359,101 @@ def load_evidence(specs: list[str]) -> Evidence:
     return evidence
 
 
+def _identity_values(identity: object, path: str, task: str) -> dict[str, object]:
+    """The values saved at a dotted IDENTITY_FIELDS path, by their resolved path."""
+    found: dict[str, object] = {"": identity}
+    for part in path.split("."):
+        found = {
+            f"{label}.{key}".lstrip("."): value[key]
+            for label, value in found.items()
+            if isinstance(value, dict)
+            for key in (value if part == "*" else [task if part == "{task}" else part])
+            if key in value
+        }
+    return found
+
+
+def _shown(value: object) -> str:
+    text = json.dumps(value, sort_keys=True)
+    # Long enough for a quoted SHA-256 digest; longer values, such as commands, show as a digest.
+    return text if len(text) <= 80 else "sha256:" + hashlib.sha256(text.encode()).hexdigest()[:12]
+
+
+def _check_comparable(evidence: Evidence, gates: Gates) -> list[str]:
+    """Refuse runs whose packages a gate compares on a task when their saved identities differ.
+
+    Returns notes on what could not be checked: a run saved before reports carried an identity,
+    or a field only one of the two runs saved.
+    """
+    runs = {(row.arm, row.task): row.run for row in evidence.attempts}
+    pairs: dict[tuple[str, str], set[str]] = {}
+    for against in {gate.against for gate in gates.gates}:
+        for (_, task), run in runs.items():
+            other = runs.get((against, task))
+            if other is not None and other != run:
+                first, second = sorted((run, other))
+                pairs.setdefault((first, second), set()).add(task)
+    notes: list[str] = []
+    errors: list[str] = []
+    for (first, second), tasks in sorted(pairs.items()):
+        identities = (evidence.identities.get(first), evidence.identities.get(second))
+        old = [
+            run for run, identity in zip((first, second), identities, strict=True) if not identity
+        ]
+        if old:
+            notes.append(f"{' and '.join(old)} saved no comparison identity; not checked")
+            continue
+        differ: dict[str, str] = {}
+        unchecked: set[str] = set()
+        for task in sorted(tasks):
+            for path in IDENTITY_FIELDS:
+                mine, theirs = (_identity_values(identity, path, task) for identity in identities)
+                unchecked |= mine.keys() ^ theirs.keys()
+                differ |= {
+                    label: f"{_shown(mine[label])} vs {_shown(theirs[label])}"
+                    for label in sorted(mine.keys() & theirs.keys())
+                    if mine[label] != theirs[label]
+                }
+        if differ:
+            errors += [
+                f"{first} and {second} differ, so their packages cannot be compared on "
+                + ", ".join(sorted(tasks))
+                + ":",
+                *(f"  {label}: {values}" for label, values in differ.items()),
+            ]
+        if unchecked:
+            notes.append(
+                f"{first} and {second}: saved by only one, not checked: "
+                + ", ".join(sorted(unchecked))
+            )
+    if errors:
+        raise ValueError("\n".join(errors))
+    return notes
+
+
 def _sum(values: dict[str, float | None], metrics: list[str]) -> float | None:
     parts = [values.get(metric) for metric in metrics]
     return None if any(part is None for part in parts) else sum(part or 0.0 for part in parts)
 
 
+def _reference_total(evidence: Evidence, task: str, metrics: list[str]) -> float | None:
+    parts = [evidence.references.get((task, metric)) for metric in metrics]
+    return None if any(part is None for part in parts) else sum(part or 0.0 for part in parts)
+
+
 def _reference(evidence: Evidence, task: str, gate: Gate) -> tuple[float | None, str | None]:
     assert gate.metrics is not None
-    parts = [evidence.references.get((task, metric)) for metric in gate.metrics]
-    if any(part is None for part in parts):
+    reference = _reference_total(evidence, task, gate.metrics)
+    if reference is None:
         return None, "no measured reference"
-    reference = sum(part or 0.0 for part in parts)
     if gate.reference_floor is not None and reference < gate.reference_floor:
         return (
             None,
             f"reference below floor ({_number(reference)} < {_number(gate.reference_floor)})",
         )
-    if reference == 0:
-        return None, "reference is zero"
+    # A negative reference would invert the ratio: adding complexity would score below removing it.
+    if reference <= 0:
+        return None, f"reference is not positive ({_number(reference)})"
     return reference, None
 
 
@@ -449,6 +551,28 @@ def _correctness_counts(
     return counts
 
 
+def _count_verdict(
+    gate: Gate, mine: dict[str, int], theirs: dict[str, int], tasks: list[str]
+) -> Verdict:
+    if gate.per_task:
+        failing = [
+            task for task in tasks if not _within(gate, mine[task], _limit(gate, theirs[task]))
+        ]
+        return Verdict(
+            None,
+            None,
+            None,
+            "fail" if failing else "pass",
+            f"{len(tasks) - len(failing)} of {len(tasks)} tasks within limit"
+            + (": fails " + ", ".join(failing) if failing else ""),
+        )
+    value = float(sum(mine.values()))
+    comparator = float(sum(theirs.values()))
+    limit = _limit(gate, comparator)
+    result = "pass" if _within(gate, value, limit) else "fail"
+    return Verdict(value, comparator, limit, result, f"{len(tasks)} of {len(tasks)} tasks")
+
+
 def check_gate(
     evidence: Evidence, gates: Gates, gate: Gate, candidate: str, tasks: list[str]
 ) -> Verdict:
@@ -477,30 +601,68 @@ def check_gate(
             f"{detail}; {gate.bound} bound of two-sided 90% interval",
         )
     if gate.correctness is not None:
-        mine = _correctness_counts(evidence, gates, candidate, tasks, gate.correctness)
-        theirs = _correctness_counts(evidence, gates, gate.against, tasks, gate.correctness)
-        absent = sorted(task for task in tasks if mine[task] is None or theirs[task] is None)
+        arms = (candidate, gate.against)
+        attempts = {
+            arm: [row for row in evidence.attempts if row.arm == arm and row.task in tasks]
+            for arm in arms
+        }
+        repeats = {
+            arm: {task: sum(row.task == task for row in attempts[arm]) for task in tasks}
+            for arm in arms
+        }
+        absent = sorted(task for task in tasks if not all(repeats[arm][task] for arm in arms))
         if absent:
             return Verdict(None, None, None, "undetermined", "no attempts: " + ", ".join(absent))
-        if gate.per_task:
-            failing = [
-                task
-                for task in tasks
-                if not _within(gate, float(mine[task] or 0), _limit(gate, float(theirs[task] or 0)))
-            ]
+        # Counts over different repeats do not compare: 3 passes of 5 beat 2 of 3 at a lower rate.
+        unequal = [
+            f"{task} {repeats[candidate][task]} vs {repeats[gate.against][task]}"
+            for task in dict.fromkeys(tasks)
+            if repeats[candidate][task] != repeats[gate.against][task]
+        ]
+        if unequal:
             return Verdict(
-                None,
-                None,
-                None,
-                "fail" if failing else "pass",
-                f"{len(tasks) - len(failing)} of {len(tasks)} tasks within limit"
-                + (": fails " + ", ".join(failing) if failing else ""),
+                None, None, None, "undetermined", "attempts per task differ: " + ", ".join(unequal)
             )
-        value = float(sum(count or 0 for count in mine.values()))
-        comparator = float(sum(count or 0 for count in theirs.values()))
-        limit = _limit(gate, comparator)
-        result = "pass" if _within(gate, value, limit) else "fail"
-        return Verdict(value, comparator, limit, result, f"{len(tasks)} of {len(tasks)} tasks")
+        # Every task has attempts on both sides now, so no count is None.
+        mine, theirs = (
+            {
+                task: count or 0
+                for task, count in _correctness_counts(
+                    evidence, gates, arm, tasks, gate.correctness
+                ).items()
+            }
+            for arm in arms
+        )
+        verdict = _count_verdict(gate, mine, theirs, tasks)
+        unknown = [
+            [row for row in attempts[arm] if row.correctness not in GRADED_STATES] for arm in arms
+        ]
+        if gate.correctness != "passes" or not any(unknown):
+            return verdict
+        # Each unknown could be a pass or a fail. Pass counts only grow with more passes, so
+        # counting each side's unknowns all as passes or all as fails gives the extreme results.
+        mine_high, theirs_high = (
+            {task: counts[task] + sum(row.task == task for row in rows) for task in counts}
+            for counts, rows in zip((mine, theirs), unknown, strict=True)
+        )
+        results = {
+            _count_verdict(gate, side, other, tasks).result
+            for side in (mine, mine_high)
+            for other in (theirs, theirs_high)
+        }
+        unknowns = (
+            f"{len(unknown[0])} candidate and {len(unknown[1])} comparator attempts "
+            "with unknown correctness"
+        )
+        if len(results) > 1:
+            return Verdict(
+                verdict.candidate,
+                verdict.comparator,
+                None,
+                "undetermined",
+                f"{unknowns} could change the result",
+            )
+        return replace(verdict, detail=f"{verdict.detail}; {unknowns} cannot change the result")
     mine_measure = measure(evidence, gate, candidate, tasks)
     theirs_measure = measure(evidence, gate, gate.against, tasks)
     # Any assigned attempt without a value leaves the gate open: deciding on the attempts that
@@ -529,6 +691,20 @@ def check_gate(
             f"missing {', '.join(gate.metrics or [])} values: "
             + " and ".join(f"{measured}/{assigned}" for measured, assigned in sides)
             + " attempts measured",
+        )
+    # A task one package was never run on would drop out of the comparison silently.
+    present = [
+        {row.task for row in evidence.attempts if row.arm == arm}
+        for arm in (candidate, gate.against)
+    ]
+    one_sided = sorted(task for task in counted if (task in present[0]) != (task in present[1]))
+    if one_sided:
+        return Verdict(
+            mine_measure.value,
+            theirs_measure.value,
+            None,
+            "undetermined",
+            "attempts on one side only: " + ", ".join(one_sided),
         )
     # Both sides over the same tasks, so a task missing on one side is not compared.
     common = [task for task in tasks if task in mine_measure.tasks and task in theirs_measure.tasks]
@@ -680,8 +856,8 @@ def _section(evidence: Evidence, gates: Gates, split: str, tasks: list[str]) -> 
             continue
         shown.add(key)
         cells = []
-        for arm in arms:
-            result = measure(evidence, gate, arm, tasks)
+        results = {arm: measure(evidence, gate, arm, tasks) for arm in arms}
+        for arm, result in results.items():
             count = f"{result.measured}/{result.assigned} attempts"
             if gate.statistic != "total":
                 count = f"{len(result.tasks)}/{len(tasks)} tasks, {count}"
@@ -692,6 +868,13 @@ def _section(evidence: Evidence, gates: Gates, split: str, tasks: list[str]) -> 
                 for task, why in found.items()
             ]
         rows.append([gate.name, *cells])
+        # Per-task values, so one task (or a tiny reference) cannot move the mean unseen.
+        for task in dict.fromkeys(tasks):
+            label = f"{gate.name}: {task}"
+            if gate.statistic == "mean_of_task_median_ratios":
+                reference = _reference_total(evidence, task, gate.metrics)
+                label += f" (reference {_number(reference)})"
+            rows.append([label, *(_number(results[arm].tasks.get(task)) for arm in arms)])
     lines += ["", *_table(rows)]
     if notes:
         lines += ["", "Missing values (not counted as 0):", *(f"  {note}" for note in notes)]
@@ -732,10 +915,12 @@ def compare(specs: list[str], gates_path: Path) -> str:
     gates = load_gates(gates_path)
     evidence = load_evidence(specs)
     all_tasks = sorted({row.task for row in evidence.attempts})
+    notes = _check_comparable(evidence, gates)
     lines = [
         "Overlap passes count as passes."
         if gates.count_overlap_passes
-        else "Overlap passes do not count as passes."
+        else "Overlap passes do not count as passes.",
+        *(f"Run identity: {note}" for note in notes),
     ]
     for split, tasks in [*gates.splits.items(), ("all", all_tasks)]:
         lines += ["", *_section(evidence, gates, split, tasks)]

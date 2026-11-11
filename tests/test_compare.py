@@ -240,9 +240,7 @@ def test_a_mean_gate_with_a_partly_measured_side_is_undetermined(gate_name: str)
 
     assert (decided.result, decided.detail) == ("pass", "1 of 1 tasks")
     assert verdict.result == "undetermined" and verdict.limit is None
-    assert verdict.detail == (
-        f"missing {', '.join(metrics)} values: 1/3 and 3/3 attempts measured"
-    )
+    assert verdict.detail == (f"missing {', '.join(metrics)} values: 1/3 and 3/3 attempts measured")
     # A split that names the task twice counts its attempts once.
     repeated = check_gate(partial, gates, gate, "candidate", ["task", "task"])
     assert (repeated.result, repeated.detail) == (verdict.result, verdict.detail)
@@ -304,6 +302,11 @@ def test_round_one_takes_the_incumbent_from_the_pilot_only_when_selected() -> No
     result = CliRunner().invoke(cli.app, ["compare", *round_one, *incumbent, "--gates", gates])
 
     assert result.exit_code == 0, result.stderr
+    # These reports predate saved comparison identities, so they compare unchecked.
+    assert (
+        f"Run identity: {PILOT[0]} and {round_one[0]} saved no comparison identity; not checked"
+        in result.stdout
+    )
     climb = result.stdout.split("Split climb")[1].split("Split holdout")[0]
     table, verdicts = climb.split("\nGates\n")
     cells = [re.split(r"\s{2,}", line) for line in table.splitlines() if line]
@@ -316,3 +319,216 @@ def test_round_one_takes_the_incumbent_from_the_pilot_only_when_selected() -> No
     assert ["workflow-r1", "vanilla", "2.91M", "1.67M", "≤", "2.17M", "fail"] in [
         line[1:8] for line in gate_lines
     ]
+
+
+def _write_run(directory: Path, attempts: list[Attempt], references: dict[str, float]) -> str:
+    """A minimal saved report holding these attempts and one reference metric per task."""
+    report = directory / "report"
+    report.mkdir(parents=True)
+    data = {
+        "attempts": [
+            {"id": row.id, "task": row.task, "guidance": row.arm, "correctness": row.correctness}
+            for row in attempts
+        ],
+        "observations": [
+            {"attempt_id": row.id, "metric": metric, "value": value, "status": "measured"}
+            for row in attempts
+            for metric, value in row.values.items()
+        ],
+        "reference_values": [
+            {"task": task, "metric": "Net cognitive complexity added", "value": value}
+            | {"status": "measured"}
+            for task, value in references.items()
+        ],
+    }
+    (report / "results.json").write_text(json.dumps(data))
+    return str(directory)
+
+
+def test_a_ratio_gate_leaves_out_a_task_with_a_negative_reference(tmp_path: Path) -> None:
+    # Against a reference of -20, adding 10 would score -0.5 and beat removing 15 (0.75).
+    metric = "Net cognitive complexity added"
+    evidence = Evidence(
+        attempts=[
+            Attempt(f"{arm}-{n}", "run", "task", arm, "pass", {metric: value})
+            for arm, value in (("candidate", 10.0), ("vanilla", -15.0))
+            for n in range(3)
+        ],
+        references={("task", metric): -20.0},
+    )
+    gate = _gate("cognitive ratio to reference").model_copy(update={"against": "vanilla"})
+
+    verdict = check_gate(
+        evidence, load_gates(FIXTURE / "card-gates.yaml"), gate, "candidate", ["task"]
+    )
+
+    assert (verdict.result, verdict.detail) == ("undetermined", "0 of 1 tasks comparable")
+    run = _write_run(tmp_path / "run", evidence.attempts, {"task": -20.0})
+    raw = yaml.safe_load((FIXTURE / "card-gates.yaml").read_text())
+    for row in raw["gates"]:
+        row["against"] = "vanilla"
+    (tmp_path / "gates.yaml").write_text(yaml.safe_dump(raw))
+    printed = (
+        CliRunner()
+        .invoke(cli.app, ["compare", run, "--gates", str(tmp_path / "gates.yaml")])
+        .stdout
+    )
+    assert "cognitive ratio to reference, candidate, task: reference is not positive (-20)" in (
+        printed
+    )
+    # Each task's value is printed, with the reference a ratio divides by.
+    assert re.search(r"cognitive ratio to reference: task \(reference -20\)\s+missing", printed)
+    assert re.search(r"tokens: task\s+missing\s+missing", printed)
+
+
+def test_a_pass_count_gate_with_unequal_attempts_per_task_is_undetermined() -> None:
+    # 3 passes of 5 would beat 2 of 3 on count, at a lower pass rate.
+    evidence = Evidence(
+        attempts=[
+            Attempt(f"{arm}-{n}", "run", "task", arm, "pass" if n < passes else "fail", {})
+            for arm, passes, repeats in (("candidate", 3, 5), ("vanilla", 2, 3))
+            for n in range(repeats)
+        ]
+    )
+    gates = load_gates(FIXTURE / "card-gates.yaml")
+
+    for name in ("passes", "passes per task"):
+        gate = _gate(name).model_copy(update={"tolerance": 0})
+        verdict = check_gate(evidence, gates, gate, "candidate", ["task"])
+        assert (verdict.result, verdict.detail) == (
+            "undetermined",
+            "attempts per task differ: task 5 vs 3",
+        )
+
+
+@pytest.mark.parametrize("name", ["passes", "passes per task"])
+@pytest.mark.parametrize("counted", [True, False])
+def test_unknown_grades_leave_a_pass_count_gate_open_when_they_could_change_it(
+    tmp_path: Path, name: str, counted: bool
+) -> None:
+    evidence = Evidence(
+        attempts=[
+            Attempt(f"{arm}-{n}", "run", "task", arm, state, {})
+            for arm, states in (
+                ("candidate", ["pass", "overlap_pass", "unknown"]),
+                ("vanilla", ["pass", "pass", "pass"]),
+            )
+            for n, state in enumerate(states)
+        ]
+    )
+    gates = load_gates(_gates_file(tmp_path, count_overlap_passes=counted))
+    gate = next(gate for gate in gates.gates if gate.name == name)
+
+    verdict = check_gate(evidence, gates, gate, "candidate", ["task"])
+
+    unknowns = "1 candidate and 0 comparator attempts with unknown correctness"
+    if counted:
+        # 2 or 3 passes against 3 with tolerance 1: the unknown cannot change the result.
+        assert verdict.result == "pass"
+        assert verdict.detail.endswith(f"; {unknowns} cannot change the result")
+    else:
+        # An overlap pass is a known non-pass here: 1 or 2 passes, and the unknown decides.
+        assert (verdict.result, verdict.detail) == (
+            "undetermined",
+            f"{unknowns} could change the result",
+        )
+
+
+def test_a_metric_gate_with_a_task_on_one_side_only_is_undetermined() -> None:
+    metric = "Net cognitive complexity added"
+    values: dict[str, float | None] = {"Input tokens": 10.0, "Output tokens": 10.0, metric: 5.0}
+    evidence = Evidence(
+        attempts=[
+            Attempt(f"{arm}-{task}-{n}", "run", task, arm, "pass", values)
+            for arm, tasks in (("candidate", ["A", "B"]), ("vanilla", ["A"]))
+            for task in tasks
+            for n in range(3)
+        ],
+        references={("A", metric): 10.0},
+    )
+    gates = load_gates(FIXTURE / "card-gates.yaml")
+
+    tokens = check_gate(evidence, gates, _gate("tokens"), "candidate", ["A", "B"])
+    ratio = _gate("cognitive ratio to reference").model_copy(update={"against": "vanilla"})
+    excluded = check_gate(evidence, gates, ratio, "candidate", ["A", "B"])
+
+    assert (tokens.result, tokens.detail) == ("undetermined", "attempts on one side only: B")
+    # A ratio gate leaves B out for its missing reference, so B's attempts do not matter.
+    assert (excluded.result, excluded.detail) == ("pass", "1 of 2 tasks")
+
+
+def _with_identities(tmp_path: Path, identities: dict[str, dict[str, object]]) -> list[str]:
+    """Round 1 with the pilot's incumbent, each report given a saved comparison identity."""
+    specs = []
+    for name in ("round-1-coverage", "round-1-no-coverage", "pilot-coverage", "pilot-no-coverage"):
+        shutil.copytree(FIXTURE / name, tmp_path / name)
+        results = tmp_path / name / "report/results.json"
+        data = json.loads(results.read_text())
+        data["comparison_identity"] = identities[name]
+        results.write_text(json.dumps(data))
+        specs.append(str(tmp_path / name) + ("=workflow-main" if name.startswith("pilot") else ""))
+    return specs
+
+
+def _identity(**changes: object) -> dict[str, object]:
+    identity: dict[str, object] = {
+        "runner": {"harness": "codex", "model": "model-a", "reasoning": "high"},
+        "tasks": {task: f"digest-{task}" for task in CLIMB},
+        "jobs": 2,
+        "fallow_config_sha256": "config-a",
+    }
+    return identity | changes
+
+
+def test_compare_refuses_runs_whose_saved_identities_differ(tmp_path: Path) -> None:
+    gates = str(FIXTURE / "card-gates.yaml")
+    task = "csstree-shorthand-expansion-compression"
+    differing = _identity(
+        runner={"harness": "codex", "model": "model-b", "reasoning": "high"},
+        tasks={**{name: f"digest-{name}" for name in CLIMB}, task: "digest-changed"},
+    )
+    refused = CliRunner().invoke(
+        cli.app,
+        [
+            "compare",
+            *_with_identities(
+                tmp_path / "refused",
+                {
+                    "round-1-coverage": _identity(),
+                    "round-1-no-coverage": _identity(),
+                    "pilot-coverage": differing,
+                    "pilot-no-coverage": _identity(),
+                },
+            ),
+            "--gates",
+            gates,
+        ],
+    )
+
+    assert refused.exit_code == 2
+    assert 'runner.model: "model-b" vs "model-a"' in refused.stderr
+    assert f'tasks.{task}: "digest-changed" vs "digest-{task}"' in refused.stderr
+    assert "pilot-no-coverage" not in refused.stderr
+
+    # Jobs may differ, and a field only one run saved is named but not compared.
+    accepted = CliRunner().invoke(
+        cli.app,
+        [
+            "compare",
+            *_with_identities(
+                tmp_path / "accepted",
+                {
+                    "round-1-coverage": _identity(jobs=4, review_criteria_sha256="criteria"),
+                    "round-1-no-coverage": _identity(),
+                    "pilot-coverage": _identity(),
+                    "pilot-no-coverage": _identity(),
+                },
+            ),
+            "--gates",
+            gates,
+        ],
+    )
+
+    assert accepted.exit_code == 0, accepted.stderr
+    assert "saved by only one, not checked: review_criteria_sha256" in accepted.stdout
+    assert "saved no comparison identity" not in accepted.stdout
