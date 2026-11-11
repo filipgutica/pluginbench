@@ -94,7 +94,11 @@ def _outcome(handoff: Path) -> tuple[str, str | None]:
     outcome = correctness_state("unknown", verifier)
     if outcome != "unknown":
         return outcome, None
-    return "unknown", verifier.get("reason") or "no correctness receipt"
+    # An attempt with no graded submission keeps why: a failed call names its error here.
+    failure = (_read(handoff / "unsupported-submission.json") or {}).get("error")
+    if isinstance(failure, dict):  # Harbor's exception_info for the agent.
+        failure = f"{failure.get('exception_type')}: {failure.get('exception_message')}"
+    return "unknown", verifier.get("reason") or failure or "no correctness receipt"
 
 
 def _slots(evidence: Path, run: dict[str, Any] | None) -> tuple[list[dict[str, Any]], str]:
