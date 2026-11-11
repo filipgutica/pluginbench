@@ -35,10 +35,6 @@ from pluginbench.collectors import (
 )
 
 
-def _json(path: Path, value: object) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
-
-
 def _object(value: object) -> dict[str, object]:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         raise ValueError("remeasurement requires a JSON object")
@@ -545,7 +541,7 @@ def propose_remeasurement(
             for index, (task, collectors) in enumerate(sorted(profiles.items()))
         }
         profile_path = directory / "profiles.json"
-        _json(
+        study._write(
             profile_path,
             {
                 task: [item.model_dump(mode="json") for item in collectors]
@@ -557,7 +553,7 @@ def propose_remeasurement(
             frozen_profiles=study._reference(root, profile_path),
             profile_inventory=profile_inventory,
         )
-        _json(directory / "revision.json", state)
+        study._write(directory / "revision.json", state)
         revised = _rebased(manifest, original.parent, directory)
         observations: dict[tuple[str, str, str], CollectedInput] = {}
         inputs: list[MeasurementInput] = []
@@ -611,7 +607,7 @@ def propose_remeasurement(
                     progress(
                         f"{item.key[0]}/{item.stage}: collecting input {item.index + 1}, repeat {repeat + 1}/2"
                     )
-            _json(directory / "revision.json", state)
+            study._write(directory / "revision.json", state)
 
         def accept(item: MeasurementInput, collected: CollectedInput) -> None:
             observations[item.key] = collected
@@ -640,7 +636,7 @@ def propose_remeasurement(
                         evidence.resolve(),
                     )
                     normalized.append(_normalized(result))
-                    _json(evidence / "normalized.json", normalized[-1])
+                    study._write(evidence / "normalized.json", normalized[-1])
                     refs: dict[MetricKind, ArtifactRef] = {}
                     for collector in frozen[item.key[0]]:
                         path = paths.get(collector.kind)
@@ -648,7 +644,7 @@ def propose_remeasurement(
                             path = evidence / collector.kind / "failure.json"
                             failure = _object(json.loads(path.read_text()))
                             failure["repeat_index"] = repeat
-                            _json(path, failure)
+                            study._write(path, failure)
                             _validate_failure(
                                 path=path,
                                 collector=collector,
@@ -729,14 +725,14 @@ def propose_remeasurement(
         if progress:
             progress("Measuring task reference solutions")
         references_path = directory / "references.json"
-        _json(
+        study._write(
             references_path, _collect_references(root, directory, manifest, original.parent, frozen)
         )
         proposed_path = directory / "assessment-input.json"
-        _json(proposed_path, revised.model_dump(mode="json"))
+        study._write(proposed_path, revised.model_dump(mode="json"))
         assessment = build_assessment(proposed_path)
         report_path = directory / "assessment-report.json"
-        _json(report_path, assessment)
+        study._write(report_path, assessment)
         state.pop("current_input", None)
         state.update(
             status="complete",
@@ -762,7 +758,7 @@ def propose_remeasurement(
             repeats=2,
             unique_inputs=len(observations),
         )
-        _json(directory / "revision.json", state)
+        study._write(directory / "revision.json", state)
         if progress:
             progress(
                 f"Observer proposal complete: {len(observations)} unique inputs, two repeats per family"
@@ -770,7 +766,7 @@ def propose_remeasurement(
         return directory / "revision.json"
     except BaseException as exc:
         state.update(status="failed", error=f"{type(exc).__name__}: {exc}")
-        _json(directory / "revision.json", state)
+        study._write(directory / "revision.json", state)
         raise
 
 
