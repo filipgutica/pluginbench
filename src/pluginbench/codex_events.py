@@ -138,16 +138,34 @@ def parse_events(
         "usage": accounting["usage"],
         "partial_usage": accounting["partial_usage"],
         "usage_accounting": accounting["usage_accounting"],
+        # Captured traces and unfamiliar stdout records leave the pre-model claim unproven.
+        "pre_model_failure_uncertain": bool(traces) or any(
+            event.get("type") not in {
+                "thread.started", "turn.started", "turn.failed", "error",
+                "item.started", "item.updated", "item.completed", "turn.completed",
+            }
+            for event in stdout_events
+        ),
         # Evidence that a model turn occurred survives an unavailable token measure.
         "observed_token_usage": any(
-            event.get("type") == "turn.completed" and _token_usage(event.get("usage")) is not None
+            "usage" in event
+            or "token_usage" in event
+            or event.get("type") in {
+                "turn.completed", "token_count", "token_usage", "token_usage_record", "response_item",
+            }
+            or (
+                event.get("type", "").startswith("item.")
+                and isinstance(item := event.get("item"), dict)
+                and item.get("type") != "error"
+            )
             for event in stdout_events
         ) or any(
-            event.get("type") == "event_msg"
-            and isinstance(payload := event.get("payload"), dict)
-            and payload.get("type") == "token_count"
-            and isinstance(info := payload.get("info"), dict)
-            and _token_usage(info.get("total_token_usage")) is not None
+            event.get("type") in {"response_item", "token_usage_record"}
+            or (
+                event.get("type") == "event_msg"
+                and isinstance(payload := event.get("payload"), dict)
+                and payload.get("type") in ("token_count", "token_usage")
+            )
             for events in trace_events
             for event in events
         ),
@@ -179,6 +197,8 @@ def failed_before_first_turn(execution: dict[str, Any]) -> str | None:
         execution.get("timed_out") is True
         or execution.get("usage") is not None
         or execution.get("observed_token_usage") is True
+        or execution.get("pre_model_failure_uncertain") is True
+        or any(not isinstance(error, dict) for error in execution.get("stream_errors") or [])
         or any(execution.get(key) for key in ("partial_usage", "command_items", "agent_messages"))
     ):
         return None
@@ -205,6 +225,22 @@ def _token_usage(value: object) -> dict[str, int] | None:
             isinstance(count, int) and not isinstance(count, bool) and count >= 0
             for count in value.values()
         )
+    ):
+        return None
+    # Codex maps cache read/write and reasoning counts from input/output details (rust-v0.167.1,
+    # codex-api/src/sse/responses.rs:131-143). These are subsets, not extra tokens.
+    for subset, parent in (
+        ("cached_input_tokens", "input_tokens"),
+        ("cache_write_input_tokens", "input_tokens"),
+        ("reasoning_output_tokens", "output_tokens"),
+    ):
+        if subset in value and (parent not in value or value[subset] > value[parent]):
+            return None
+    # Exact response totals sum input and output. protocol.rs:2554-2567 also emits
+    # synthetic context-window totals; those cannot establish exact usage or a lower bound.
+    if "total_tokens" in value and (
+        not {"input_tokens", "output_tokens"}.issubset(value)
+        or value["total_tokens"] != value["input_tokens"] + value["output_tokens"]
     ):
         return None
     return value
@@ -237,6 +273,16 @@ def _session_history(
         or first.get("history_base") is not None
         or first.get("subagent_history_start_ordinal") is not None
     )
+    if isinstance(first, dict) and (
+        first.get("history_mode") == "paginated" or any("ordinal" in event for event in events)
+    ) and not all(
+        isinstance(event.get("ordinal"), int)
+        and not isinstance(event.get("ordinal"), bool)
+        and event["ordinal"] == ordinal
+        for ordinal, event in enumerate(events)
+    ):
+        reasons.add(f"noncontiguous rollout ordinals for session {first.get('id')}")
+        return None
     if not inherited:
         if len(metadata) != 1 or not isinstance(first, dict):
             reasons.add("trace lacks one unambiguous session identity")
@@ -273,12 +319,6 @@ def _session_history(
         and isinstance(boundary, int)
         and not isinstance(boundary, bool)
         and 1 <= boundary < len(events)
-        and all(
-            isinstance(event.get("ordinal"), int)
-            and not isinstance(event.get("ordinal"), bool)
-            and event["ordinal"] == ordinal
-            for ordinal, event in enumerate(events)
-        )
         and not any(event.get("type") == "session_meta" for event in events[boundary:])
     )
     if not valid:
@@ -339,7 +379,7 @@ def _descendant_usage(
             "root_session_id": meta.get("session_id"),
         }
 
-    identity_safe = not reasons
+    identity_safe = not reasons and "invalid turn usage" not in stream_errors
     roots = sorted(
         identity for identity, session in sessions.items() if session["parent_thread_id"] is None
     )
@@ -464,6 +504,7 @@ def _descendant_usage(
                 if observed is not None:
                     if not {"input_tokens", "output_tokens"}.issubset(observed):
                         reasons.add(f"invalid cumulative usage for session {identity}")
+                        identity_safe = False
                     if session["inherited"] and own_turn is None:
                         reasons.add(f"unverified own turn for session {identity}")
                         identity_safe = False
@@ -483,9 +524,11 @@ def _descendant_usage(
                         key not in observed or observed[key] < value for key, value in total.items()
                     ):
                         reasons.add(f"nonmonotonic cumulative usage for session {identity}")
+                        identity_safe = False
                     total = observed
                 elif info is not None:
                     reasons.add(f"invalid cumulative usage for session {identity}")
+                    identity_safe = False
             if kind == "collab_agent_spawn_begin":
                 call_id = payload.get("call_id")
                 if isinstance(call_id, str):
