@@ -964,11 +964,7 @@ def _finish_evaluation(
     evidence = root / "evidence"
     config = _saved_evaluation(selection)
     if profiles and selection["measurement_revision"] is None:
-        revision = "measurements"
-        index = 2
-        while (evidence / "observer-revisions" / revision).exists():
-            revision = f"measurements-{index}"
-            index += 1
+        revision = _next_measurement_revision(evidence)
         if selection.get("pending_measurement_revision") is not None:
             selection["recovery_measurement_revision"] = selection["pending_measurement_revision"]
         selection["pending_measurement_revision"] = revision
@@ -1061,6 +1057,15 @@ def _adopt_measurement_revision(root: Path, selection: dict[str, object], revisi
     selection.pop("recovery_measurement_revision", None)
 
 
+def _next_measurement_revision(evidence: Path) -> str:
+    revision = "measurements"
+    index = 2
+    while (evidence / "observer-revisions" / revision).exists():
+        revision = f"measurements-{index}"
+        index += 1
+    return revision
+
+
 def _sole_owner(root: Path, *, resuming: bool) -> bool:
     """Whether this process may treat measurement or review state left active as dead.
 
@@ -1106,7 +1111,7 @@ def _measurement_to_recover(
 
 
 def _resume_inputs(
-    root: Path, *, resuming: bool
+    root: Path, *, resuming: bool, progress: Callable[[str], None] | None = None
 ) -> tuple[dict[str, object], dict[str, list[Collector]], list[Path], int]:
     """What a resume has left after coding. With `resuming`, dead active state is closed on disk."""
     selection = _load_selection(root)
@@ -1114,6 +1119,14 @@ def _resume_inputs(
     evidence = root / "evidence"
     run, manifest, original = _native_state(evidence)
     profiles: dict[str, list[Collector]] = {}
+
+    def measuring_again(abandoned: str, why: str) -> None:
+        if progress:
+            progress(
+                f"Measurement revision {abandoned} {why}, so it cannot continue. Its files stay; "
+                f"measurement starts again as {_next_measurement_revision(evidence)}"
+            )
+
     if selection["measurement_revision"] is not None:
         validate_remeasurement(
             evidence, evidence / "observer-revisions" / str(selection["measurement_revision"])
@@ -1131,6 +1144,10 @@ def _resume_inputs(
                     "observer recovery has no saved frozen profiles and another process may own "
                     "this run; cannot replay it"
                 )
+            measuring_again(
+                str(selection.get("pending_measurement_revision", "measurements")),
+                "ended before it saved its frozen profiles",
+            )
             # Nothing to bind in measurement history: the revision saved no state.
             selection["pending_measurement_revision"] = None
             profiles = _saved_profiles(root)
@@ -1146,6 +1163,7 @@ def _resume_inputs(
                 )
                 if resuming:
                     study._write(directory / "revision.json", state)
+                measuring_again(revision, "was left collecting by a process that ended")
             if state["status"] == "complete":
                 validate_remeasurement(evidence, directory)
                 _adopt_measurement_revision(root, selection, revision)
@@ -1254,7 +1272,7 @@ def resume_evaluation(
         _code(root, selection, progress=progress, guard=guard)
     if guard:
         guard()
-    selection, profiles, guidance, calls = _resume_inputs(root, resuming=True)
+    selection, profiles, guidance, calls = _resume_inputs(root, resuming=True, progress=progress)
     if calls:
         _review_preflight(selection)
     return _finish_evaluation(

@@ -2223,6 +2223,10 @@ def test_run_resumes_a_measurement_that_a_kill_left_collecting(
     result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
 
     assert result.exit_code == 0, result.stderr + result.stdout
+    assert (
+        "Measurement revision measurements was left collecting by a process that ended, so it "
+        "cannot continue. Its files stay; measurement starts again as measurements-2"
+    ) in " ".join((result.stderr + result.stdout).split())
     assert len(calls) == coded and len(reviews) == 9
     state = json.loads(killed.read_text())
     assert state["status"] == "failed" and "ended while collecting" in state["error"]
@@ -2274,6 +2278,10 @@ def test_run_measures_again_when_measurement_ended_before_saving_its_profiles(
     result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
 
     assert result.exit_code == 0, result.stderr + result.stdout
+    assert (
+        "Measurement revision measurements ended before it saved its frozen profiles, so it "
+        "cannot continue. Its files stay; measurement starts again as measurements-2"
+    ) in " ".join((result.stderr + result.stdout).split())
     assert len(calls) == coded and len(reviews) == 9
     assert study._inventory(abandoned) == kept
     selection = evaluation._load_selection(root)
