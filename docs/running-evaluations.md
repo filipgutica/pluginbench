@@ -10,7 +10,7 @@ An evaluation runs the same tasks with vanilla and each named guidance package. 
 
 ## Choose inputs
 
-`pluginbench init [path]` writes [the starter config](../src/pluginbench/evaluation.example.yaml) to `evaluation.yaml`, or to the path you give, and never overwrites a file. JSON accepts the same fields. Paths are relative to the config file. Every setting lives in the config. `run` takes only `--output` (the new run directory, default `runs/<timestamp>`), `--dry-run`, `--json` (with `--dry-run`, the full plan as JSON), `--yes`, `--foreground`, and `--notify`. A run directory resumes with its saved settings, so `--output` applies only to a config.
+`pluginbench init [path]` writes [the starter config](https://github.com/filipgutica/pluginbench/blob/main/src/pluginbench/evaluation.example.yaml) to `evaluation.yaml`, or to the path you give, and never overwrites a file. JSON accepts the same fields. Paths are relative to the config file. Every setting lives in the config. `run` takes only `--output` (the new run directory, default `runs/<timestamp>`), `--dry-run`, `--json` (with `--dry-run`, the full plan as JSON), `--yes`, `--foreground`, and `--notify`. A run directory resumes with its saved settings, so `--output` applies only to a config.
 
 Choose one task source: a Harbor `dataset` with `version` and `ids`, GitHub task-folder `urls`, or a local `source` with `ids`.
 
@@ -64,13 +64,13 @@ Install with `pip install -e .`, which also installs Harbor 0.24.0. Docker must 
 
 ### Supported coding CLIs
 
-New coding runs support Codex CLI **0.162.1** and **0.167.0**, as checked by `admit_version` in [`codex_events.py`](../src/pluginbench/codex_events.py).
-The installed CLI must also expose the isolation flags checked by [`codex.preflight`](../src/pluginbench/codex.py).
+New coding runs support Codex CLI **0.162.1** and **0.167.0**, as checked by `admit_version` in [`codex_events.py`](https://github.com/filipgutica/pluginbench/blob/main/src/pluginbench/codex_events.py).
+The installed CLI must also expose the isolation flags checked by [`codex.preflight`](https://github.com/filipgutica/pluginbench/blob/main/src/pluginbench/codex.py).
 PluginBench pins that exact version into the prepared image, checks the installed image version, and requires the frozen version on resume.
 Codex reviews also require an executable `codex-code-mode-host` beside `codex`.
 
 Claude Code is available for independent reviews; new native treatment coding is qualified for Codex only.
-There is no numeric Claude Code version allowlist. [`claude.preflight`](../src/pluginbench/claude.py) checks the required isolation flags and records `claude --version`.
+There is no numeric Claude Code version allowlist. [`claude.preflight`](https://github.com/filipgutica/pluginbench/blob/main/src/pluginbench/claude.py) checks the required isolation flags and records `claude --version`.
 It does not claim compatibility with every Claude Code release.
 
 ### Container boundary
@@ -93,7 +93,7 @@ Every task, guidance package, and repeat gets a fresh coding container. PluginBe
 
 Fresh repository exports omit generated `.pytest_cache` directories and record those exclusions. Archived snapshots keep their original bytes and hashes; measurement replays do not apply this cleanup.
 
-Canonical submission support covers the explicitly reviewed DeepSWE verifier contracts in [`submissions.py`](../src/pluginbench/submissions.py). The [panel manifest](evidence/deepswe-panel-20261109/manifest.json) records the additional contracts reviewed at DeepSWE commit `0b9fabbb`. Admission checks the complete trusted verifier payload and exact artifact-collection command. Preparation rejects grader entrypoints or path settings that could redirect verification. It also checks the grader image's starting source, Git base inventory, file modes, and verifier payload against the frozen inputs, then records cleanup.
+Canonical submission support covers the explicitly reviewed DeepSWE verifier contracts in [`submissions.py`](https://github.com/filipgutica/pluginbench/blob/main/src/pluginbench/submissions.py). The [panel manifest](https://github.com/filipgutica/pluginbench/blob/main/docs/evidence/deepswe-panel-20261109/manifest.json) records the additional contracts reviewed at DeepSWE commit `0b9fabbb`. Admission checks the complete trusted verifier payload and exact artifact-collection command. Preparation rejects grader entrypoints or path settings that could redirect verification. It also checks the grader image's starting source, Git base inventory, file modes, and verifier payload against the frozen inputs, then records cleanup.
 
 For these contracts, PluginBench reconstructs the hash-bound `model.patch` over the frozen starting source. That reconstruction supplies measurements and review. Generated files present only in the stopped working tree remain diagnostics; files included in the patch remain part of the submission. Unsupported contracts, missing preparation proof, or unsafe/unverifiable patches produce no canonical submission. They never fall back to the diagnostic tree.
 
@@ -103,7 +103,7 @@ CPU and memory budgets must cover both coding and verifier requirements. Tasks w
 
 `timeout_seconds` is the coding agent budget, defaulting to 1,800 seconds. Set `reviewer.timeout_seconds: 600` to give each independent review a separate 600-second budget. The review timeout must be a positive integer; when omitted or null, it inherits `timeout_seconds`, including for saved evaluations. The plan records native and effective coding budgets. Setup, artifact collection, and verification have separate bounded allowances. A timeout preserves the attempt; incomplete usage remains unknown or a labelled lower bound.
 
-Cleanup removes owned containers, networks, sidecars, temporary homes, and job copies, and records residual resources. Frozen evidence and reusable task/prepared-image/baseline caches remain. A restart can bypass cleanup; PluginBench does not delete unowned resources. See [Security](../SECURITY.md).
+Cleanup removes owned containers, networks, sidecars, temporary homes, and job copies, and records residual resources. Frozen evidence and reusable task/prepared-image/baseline caches remain. A restart can bypass cleanup; PluginBench does not delete unowned resources. See [Security](https://github.com/filipgutica/pluginbench/security/policy).
 
 ## Measurements
 
@@ -177,9 +177,9 @@ for per-test data. Both snapshots need per-test data. The frozen input must not
 already contain the sidecar, to prevent stale attribution. Native collection
 retains it as `report.raw.per-test.json` beside `report.raw`.
 
-The [JavaScript inspector spike](../tests/fixtures/js-per-test-coverage/README.md)
+The [JavaScript inspector spike](https://github.com/filipgutica/pluginbench/blob/main/tests/fixtures/js-per-test-coverage/README.md)
 demonstrates serial plain JavaScript and awaited async work with `node:test`.
-[Coverage profiles](coverage-profiles/README.md) has per-test helpers for Mocha
+[Coverage profiles](https://github.com/filipgutica/pluginbench/blob/main/docs/coverage-profiles/README.md) has per-test helpers for Mocha
 with c8 and for Vitest's v8 provider, with the csstree and true-myth profiles
 that use them. Vitest needs AST-aware remapping: its default remapping reports
 never-called TypeScript lines as executed.

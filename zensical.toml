@@ -1,0 +1,42 @@
+[project]
+site_name = "PluginBench"
+site_description = "Test whether skills help coding agents make fewer mistakes."
+site_url = "https://filipgutica.github.io/pluginbench/"
+repo_url = "https://github.com/filipgutica/pluginbench"
+repo_name = "filipgutica/pluginbench"
+docs_dir = "docs"
+
+# Saved run evidence and coverage-profile helper files are repository material, not pages.
+# Pages link to them on GitHub instead.
+exclude_docs = """
+evidence/
+coverage-profiles/
+"""
+
+nav = [
+  { "Home" = "index.md" },
+  { "Running evaluations" = "running-evaluations.md" },
+  { "Config reference" = "config-reference.md" },
+  { "Metrics" = "metrics.md" },
+  { "Reproduce a result" = "reproduce.md" },
+  { "Measurement specification" = "measurement-spec.md" },
+  # SECURITY.md sits at the repository root, outside docs/, so the nav links to it on GitHub.
+  { "Security" = "https://github.com/filipgutica/pluginbench/security/policy" },
+]
+
+[project.theme]
+language = "en"
+features = [
+  "content.code.copy",
+  "navigation.footer",
+  "navigation.top",
+  "search.highlight",
+]
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"

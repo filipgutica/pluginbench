@@ -136,7 +136,7 @@ Stop emitting these derived metrics from new reports. Saved raw evidence is unch
 
 ### Gate
 
-- **G4. JavaScript/TypeScript per-test coverage.** Met for Mocha with c8 and Vitest 3.2 with the v8 provider by the [coverage profiles](coverage-profiles/README.md), which take per-test samples in a second run. Other JavaScript/TypeScript setups keep redundant added tests unknown.
+- **G4. JavaScript/TypeScript per-test coverage.** Met for Mocha with c8 and Vitest 3.2 with the v8 provider by the [coverage profiles](https://github.com/filipgutica/pluginbench/blob/main/docs/coverage-profiles/README.md), which take per-test samples in a second run. Other JavaScript/TypeScript setups keep redundant added tests unknown.
 
 ### Assumptions
 
