@@ -621,6 +621,13 @@ def judge_prepare(
         _error(exc)
         return
     typer.echo(f"Prepared {directory}. The key is {directory / 'key.json'}; keep it from judges.")
+    omitted = json.loads((directory / "key.json").read_text()).get("omitted") or []
+    if omitted:
+        slots = ", ".join(f"{row['arm']} {row['task']} repeat {row['repeat']}" for row in omitted)
+        typer.echo(
+            f"Left out, with their pairs, the attempts that have no saved submission: {slots}.",
+            err=True,
+        )
 
 
 @judge_app.command("run")

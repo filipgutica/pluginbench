@@ -10,6 +10,7 @@ import pytest
 from typer.testing import CliRunner
 
 from pluginbench import cli, codex, judge
+from pluginbench.assessment_models import Attempt, Stage
 from pluginbench.judge import normalize_diff, prepare, tally
 
 TASKS = ["alpha", "beta"]
@@ -223,6 +224,73 @@ def test_prepare_refuses_unbound_or_unmatched_submissions(
         data = json.loads(results.read_text())
         data["attempts"][0]["artifacts"]["snapshot_digest"] = "sha256:another"
         results.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match=message):
+        _prepare(tmp_path, run)
+
+
+def test_prepare_names_an_attempt_that_has_neither_a_packet_nor_readable_snapshots(
+    tmp_path: Path,
+) -> None:
+    run = _two_arms(tmp_path)
+    (run / "evidence/review-revisions/review/packets/packet-wa1/source.diff").unlink()
+    with pytest.raises(ValueError, match="no review packet, and its saved snapshots cannot be"):
+        _prepare(tmp_path, run)
+
+
+def _unreviewed(run: Path, *, reported: str | None) -> None:
+    """Make attempt wa1 one with no packet, whose report row names `reported` as its submission."""
+    shutil.rmtree(run / "evidence/review-revisions/review/packets/packet-wa1")
+    results = run / "report/results.json"
+    data = json.loads(results.read_text())
+    row = next(row for row in data["attempts"] if row["id"] == "wa1")
+    row["artifacts"]["snapshot_digest"] = reported
+    results.write_text(json.dumps(data))
+
+
+def _never_coded() -> Attempt:
+    stage = Stage(id="handoff", snapshot=None, correctness=None, evidence=None, work=None)
+    return Attempt("wa1", "alpha", 1, "workflow-r9", None, None, (stage,), {})
+
+
+def test_an_attempt_with_no_submission_is_left_out_and_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = _two_arms(tmp_path)
+    _unreviewed(run, reported=None)
+    monkeypatch.setattr(judge, "_saved_evidence", lambda evidence: ({"wa1": _never_coded()}, {}))
+    criteria = tmp_path / "standard.md"
+    criteria.write_text("1. Correct behavior.\n")
+    output = tmp_path / "judging"
+    arguments = ["judge", "prepare", f"{run}=vanilla", f"{run}=workflow-r9", "--tasks", "alpha"]
+    arguments += ["--criteria", str(criteria), "--seed", "7", "--output", str(output)]
+    prepared = CliRunner().invoke(cli.app, arguments)
+    assert prepared.exit_code == 0, prepared.output
+    assert (
+        "Left out, with their pairs, the attempts that have no saved submission: "
+        "workflow-r9 alpha repeat 1." in prepared.stderr
+    )
+    key = json.loads((output / "key.json").read_text())
+    assert key["omitted"] == [{"arm": "workflow-r9", "task": "alpha", "repeat": 1}]
+    assert sorted(key["tasks"]["task-1"]["pairs"]) == ["1", "2"]  # Repeats 2 and 3 remain.
+
+
+@pytest.mark.parametrize(
+    ("records", "reported", "message"),
+    [
+        ({}, None, "the run's records have no such attempt"),
+        ({"wa1": _never_coded()}, "sha256:after-wa1", "a submission the run did not save"),
+    ],
+)
+def test_evidence_that_contradicts_the_report_is_refused_not_left_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    records: dict[str, Attempt],
+    reported: str | None,
+    message: str,
+) -> None:
+    run = _two_arms(tmp_path)
+    _unreviewed(run, reported=reported)
+    monkeypatch.setattr(judge, "_saved_evidence", lambda evidence: (records, {}))
     with pytest.raises(ValueError, match=message):
         _prepare(tmp_path, run)
 
