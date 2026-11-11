@@ -1,0 +1,41 @@
+@layer base, components, utilities;
+
+@import 'tailwindcss/utilities.css' source(none);
+@import '@filipgutica/ui/theme.css';
+@import '@filipgutica/ui/components.css';
+@import '@filipgutica/ui/themes/graphite-indigo.css';
+@import '@filipgutica/ui/site.css';
+
+/* The library owns the frame, type, controls, and palette. Markdown adds only
+ * document spacing and scroll containment for its code and reference tables. */
+@layer base {
+  @media (prefers-reduced-motion: no-preference) {
+    html { scroll-behavior: smooth; }
+  }
+}
+.doc-content section {
+  display: grid;
+  align-content: start;
+  gap: var(--space-4);
+  min-width: 0;
+}
+.doc-content section > * { min-width: 0; }
+/* The grid supplies paragraph spacing; prose's adjacent margins would double it. */
+.doc-content section > :is(p, ul, ol) { margin-block: 0; }
+.doc-content :is(p, li, h1, h2, h3) { overflow-wrap: anywhere; }
+.doc-content :is(ul, ol) { padding-inline-start: var(--space-6); }
+.doc-content li + li { margin-top: var(--space-2); }
+.doc-content .fg-code-block { min-width: 0; }
+.table-scroll { max-width: 100%; overflow-x: auto; }
+/* Inset keeps the keyboard ring inside the horizontally scrolling region. */
+.table-scroll:focus-visible { outline-offset: calc(var(--focus-width) * -1); }
+.table-scroll table { width: 100%; min-width: 52rem; border-collapse: collapse; font-size: var(--text-md); }
+.table-scroll :is(th, td) {
+  padding: var(--space-3);
+  border-bottom: 1px solid var(--color-border-subtle);
+  text-align: start;
+  vertical-align: top;
+}
+.table-scroll th { color: var(--color-muted); font-weight: var(--weight-medium); }
+.table-scroll th:first-child { min-width: 12rem; }
+.table-scroll code { overflow-wrap: anywhere; }
