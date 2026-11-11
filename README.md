@@ -118,6 +118,85 @@ This run uses one public DeepSWE task, vanilla only, and one repeat. It needs no
 
 Paths under `runs/` are relative to the directory where you run the command. For a fuller template, `pluginbench init template.yaml` writes a starter config with `/path/to` placeholders to replace.
 
+## Test your own guidance
+
+A *treatment* is the guidance you want to test. It can be instruction files, skills, plugins, or a mix. Every treatment runs on the same tasks as vanilla, so you can see what each one changes.
+
+1. Put the guidance next to your config. Paths in the config are relative to the config file.
+
+   ```text
+   my-eval/
+   ├── evaluation.yaml
+   ├── AGENTS.md                     # instructions: UTF-8 .md or .txt files, 32 KiB in all
+   ├── skills/
+   │   └── write-tests/
+   │       └── SKILL.md              # a skill
+   └── review-plugin/
+       ├── .codex-plugin/
+       │   └── plugin.json           # a Codex plugin
+       └── skills/
+           └── self-review/
+               └── SKILL.md
+   ```
+
+   Each `SKILL.md` starts with YAML front matter that has a kebab-case `name` and a `description`:
+
+   ```markdown
+   ---
+   name: write-tests
+   description: Add focused tests for every behaviour you change.
+   ---
+
+   Write one test per changed behaviour. Run it and confirm it fails without your change.
+   ```
+
+   A plugin needs a manifest with a kebab-case `name`. Its skills go in `skills/`:
+
+   ```json
+   {
+     "name": "review-plugin",
+     "version": "0.1.0",
+     "description": "Review your own diff before you finish."
+   }
+   ```
+
+2. Declare one treatment per thing you want to compare:
+
+   ```yaml
+   name: Guidance comparison
+   runner:
+     harness: codex
+     model: gpt-6.1-sol
+     reasoning: medium
+   treatments:
+     instructions:
+       guidance: [./AGENTS.md]
+     test-skill:
+       skills: [./skills]            # one skill folder, or a folder of skills
+     review-plugin:
+       plugins: [./review-plugin]
+   tasks:
+     urls:
+       - https://github.com/datacurve-ai/deep-swe/tree/0b9fabbb63b9104d678fe965e1632f2dd9eaa2ea/tasks/testem-per-launcher-reports
+   measurements: [tokens, lines]
+   repeats: 1
+   ```
+
+   One treatment can also combine them, for example `guidance` and `skills` together.
+
+3. Check it, then look at the plan:
+
+   ```sh
+   pluginbench check evaluation.yaml
+   pluginbench run evaluation.yaml --dry-run
+   ```
+
+   The plan lists the arms `vanilla, instructions, test-skill, review-plugin` and 4 coding attempts: one per arm, task, and repeat. Add tasks and `repeats: 3` or more before you trust a difference.
+
+4. Run it with `pluginbench run evaluation.yaml`, as in the quickstart. The report compares each treatment with vanilla.
+
+Treatments need the Codex harness. Instruction files become the agent's private `AGENTS.md`; they are never added to the task prompt or to the repository. Skills and plugins are copied whole, including their scripts, except Git internals; symlinks, special files, and `.env` files are refused. Skill dependencies, MCP servers, apps, custom agents, commands, plugin dependencies, and hooks other than synchronous command hooks are not supported yet, and a treatment that declares one stops the run before any model call. Before coding, PluginBench checks that Codex found every declared skill. That proves the skill was available, not that the agent used it. [Native treatments](docs/running-evaluations.md#native-treatments).
+
 ## Commands
 
 Every setting lives in the config. Flags only control how a command runs.
@@ -140,13 +219,7 @@ Every setting lives in the config. Flags only control how a command runs.
 
 **Tasks.** Use one source: a Harbor `dataset` with `version` and `ids`, GitHub task-folder `urls`, or a local `source` with `ids`. PluginBench accepts single-step Harbor tasks with a Linux CPU environment and a separate verifier. To browse DeepSWE, run `pluginbench tasks pick --dataset datacurve/deep-swe-1-1 --copy`, press Tab to select several tasks, and paste the YAML it prints. [Choose inputs](docs/running-evaluations.md#choose-inputs).
 
-**Treatments.** Each treatment lists `guidance` (instruction files), `skills`, or `plugins`. Coding with treatments needs the Codex harness. The task prompt is the same for every arm. Unsupported components, such as MCP servers or custom agents, stop the run before any model call. [Native treatments](docs/running-evaluations.md#native-treatments).
-
-```yaml
-treatments:
-  my-guidance:
-    guidance: [./AGENTS.md]
-```
+**Treatments.** Each treatment lists `guidance` (instruction files), `skills`, or `plugins`; see [Test your own guidance](#test-your-own-guidance). The task prompt is the same for every arm.
 
 **Measurements.** Before any paid call, PluginBench runs each selected collector twice on the starting code. A measure with no collector for a task is `not_configured`, and one whose collector fails its probe is `broken`. That task is then not measured for it, and the run continues, as long as another task can measure it. A measure that is ready on no task stops the run. With `measurement_settings.require_ready: true`, any such task stops the run. Selecting `review` requires a `reviewer` block. [Measurements](docs/running-evaluations.md#measurements).
 
