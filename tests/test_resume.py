@@ -24,9 +24,10 @@ import native_support
 import resume_support
 from legacy_support import current_runtime, legacy_json
 from native_support import execution as native_execution
-from pluginbench import harbor_backend, ledger, parallel, run_status, study
+from pluginbench import harbor_backend, ledger, parallel, run_status, study, trial_containers
 from pluginbench.ledger import Ledger
 
+_REAL_RUNNING = trial_containers.running
 _PATH = os.pathsep.join([str(Path(pluginbench.__file__).parents[1]), str(Path(__file__).parent)])
 
 
@@ -128,6 +129,120 @@ def test_resume_after_sigkill_at_each_stage_boundary(
     report = _json(root / "report/assessment-report.json")
     assert len(report["attempts"]) == 12
     assert set(report["discarded_attempts"]) == set(run["discarded_attempts"])
+
+
+class _Docker:
+    """A Docker engine holding labelled containers; answers only `ps` and `stop`."""
+
+    def __init__(self, containers: list[dict[str, Any]]) -> None:
+        self.containers = containers
+        self.stopped: list[list[str]] = []
+        self.runtimes: list[object] = []
+
+    def __call__(self, *arguments: str, expected_runtime: object = None, **kwargs: Any) -> str:
+        self.runtimes.append(expected_runtime)
+        if arguments[0] == "stop":
+            ids = list(arguments[3:])
+            self.stopped.append(ids)
+            for container in self.containers:
+                if container["id"] in ids:
+                    container["running"] = False
+            return "\n".join(ids)
+        assert arguments[0] == "ps", arguments
+        listed = [
+            container
+            for container in self.containers
+            # Without --all, `docker ps` lists running containers only.
+            if container["running"] or "--all" in arguments or "-a" in arguments
+        ]
+        return "".join(
+            json.dumps([row["id"], row["name"], row["project"], row["working_dir"]]) + "\n"
+            for row in listed
+        )
+
+
+def _container(
+    container: str, project: str, working_dir: str, *, running: bool = True
+) -> dict[str, Any]:
+    name = f"{project}-{container}-1"
+    return {
+        "id": container,
+        "name": name,
+        "project": project,
+        "working_dir": working_dir,
+        "running": running,
+    }
+
+
+def test_resume_stops_only_the_containers_its_killed_attempt_left_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _killed_run(tmp_path, boundary="during-call", at=3)
+    task = str((root / "frozen/suite/0/task").resolve())
+    other_run = str(tmp_path / "other-run/evidence/frozen/suite/0/task/environment")
+    killed = "pluginbench-" + "a" * 32 + "__env"
+    finished = "pluginbench-" + "b" * 32 + "__env"
+    foreign = "pluginbench-" + "c" * 32 + "__env"
+    here = task + "/environment"
+    docker = _Docker(
+        [
+            # The killed attempt's agent and its egress sidecar share one compose project.
+            _container("main", killed, here),
+            _container("sidecar", killed, here),
+            # Already stopped: never stopped again.
+            _container("exited", finished, here, running=False),
+            # Another run's trial, and a non-trial project inside this run: never touched.
+            _container("foreign", foreign, other_run),
+            _container("measure", "pluginbench-measure-1", here),
+        ]
+    )
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+    monkeypatch.setattr(trial_containers, "running", _REAL_RUNNING)
+    monkeypatch.setattr(harbor_backend, "_docker", docker)
+    progress: list[str] = []
+
+    study.resume_study(root, progress=progress.append)
+
+    assert docker.stopped == [["main", "sidecar"]]
+    assert {row["id"] for row in docker.containers if row["running"]} == {"foreign", "measure"}
+    stopped = f"Stopped {killed} (2 containers): left running by an attempt that a kill interrupted"
+    # Named before the first attempt is coded again.
+    coding = next(index for index, line in enumerate(progress) if line.startswith("Coding"))
+    assert stopped in progress[:coding]
+    # Every Docker call runs with the runtime the resume verified, never the ambient context.
+    assert docker.runtimes and None not in docker.runtimes
+    assert _json(root / "run.json")["status"] == "complete"
+
+
+def test_a_left_container_removed_while_it_is_stopped_does_not_stop_the_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = tmp_path / "evidence"
+    environment = evidence / "frozen/suite/0/task/environment"
+    environment.mkdir(parents=True)
+    project = "pluginbench-" + "a" * 32 + "__env"
+    container = _container("main", project, str(environment.resolve()))
+    docker = _Docker([container])
+    errors = iter(["No such container: main", "permission denied"])
+
+    def failing_stop(*arguments: str, **kwargs: Any) -> str:
+        if arguments[0] != "stop":
+            return docker(*arguments, **kwargs)
+        error = next(errors)
+        if error.startswith("No such"):
+            docker.containers.clear()  # The killed run's Harbor worker removed it first.
+        raise ValueError(f"docker stop failed: {error}")
+
+    monkeypatch.setattr(harbor_backend, "_docker", failing_stop)
+    progress: list[str] = []
+
+    trial_containers.stop_left_running(evidence, expected_runtime={}, progress=progress.append)
+    assert progress == []
+    # A container that is still running after a failed stop stops the resume before coding.
+    docker.containers.append(container)
+    with pytest.raises(ValueError, match="permission denied"):
+        trial_containers.stop_left_running(evidence, expected_runtime={}, progress=progress.append)
 
 
 def test_interrupted_pilot_shape_resumes_without_recoding_complete_attempts(
