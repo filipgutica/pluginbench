@@ -155,7 +155,7 @@ treatments:
 ## Stop, resume, and reuse
 
 - `pluginbench stop runs/<run>` stops new attempts. With `jobs` above 1, attempts already coding finish and are kept. With `jobs: 1`, the attempt in progress is interrupted, and a resume codes its slot again with a new attempt.
-- `pluginbench run runs/<run>` resumes. A run that was killed, for example by a host shutdown, shows `interrupted`, and `status` prints this command. Complete attempts are kept and never coded again. An attempt cut off mid-call is recorded as `discarded-interrupted` and a new attempt takes its slot. Resume cannot repair a failing solution.
+- `pluginbench run runs/<run>` resumes. A run that was killed, for example by a host shutdown, shows `interrupted`, and `status` prints this command. Complete attempts are kept and never coded again. An attempt cut off mid-call is recorded as `discarded-interrupted` and a new attempt takes its slot. Containers the killed attempt left running are stopped before coding resumes, and `status` names them until then. Resume cannot repair a failing solution.
 - If Codex fails before its first model turn, for example during a network outage, the run stops instead of scoring the attempt. Resume when Codex is reachable.
 - Vanilla attempts are cached in `$XDG_CACHE_HOME/pluginbench` (default `~/.cache/pluginbench`) and reused by any later run with the same task, model, and settings. Grading and measures run again. Reports mark reused attempts. [Baselines and reports](docs/running-evaluations.md#baselines-and-reports).
 
@@ -177,6 +177,9 @@ treatments:
 ## More
 
 - [Evaluation details](docs/running-evaluations.md): every setting, check, and output
+- [Config reference](docs/config-reference.md): every config key, its type, default, and meaning
+- [Metrics](docs/metrics.md): what each measure means and its name in a gates file
+- [Reproduce a result](docs/reproduce.md): what a run pins, and a worked example
 - [Measurement specification](docs/measurement-spec.md)
 - [Security](SECURITY.md)
 - [License: Apache-2.0](LICENSE)

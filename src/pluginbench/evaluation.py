@@ -71,9 +71,14 @@ Measurement = Literal[
 
 class Runner(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    harness: Literal["codex", "claude"]
-    model: str = Field(min_length=1)
-    reasoning: Literal["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+    harness: Literal["codex", "claude"] = Field(description="Selects the coding or review CLI.")
+    model: str = Field(
+        min_length=1,
+        description="Selects the model ID, with an exact claude-* ID required for Claude.",
+    )
+    reasoning: Literal["minimal", "low", "medium", "high", "xhigh", "max", "ultra"] = Field(
+        description="Selects reasoning effort, subject to harness and evaluation validation."
+    )
 
     @model_validator(mode="after")
     def supported_effort(self) -> Runner:
@@ -93,28 +98,84 @@ class Runner(BaseModel):
 
 
 class Reviewer(Runner):
-    timeout_seconds: int | None = Field(default=None, strict=True, ge=1)
-    guidance: list[Path] = Field(default_factory=list)
+    timeout_seconds: int | None = Field(
+        default=None,
+        strict=True,
+        ge=1,
+        description="Sets the review timeout in seconds, or inherits the evaluation timeout when null.",
+    )
+    guidance: list[Path] = Field(
+        default_factory=list,
+        description="Selects files or directories of review criteria relative to the config file.",
+    )
 
 
 class Evaluation(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    name: str = Field(default="evaluation", min_length=1)
-    runner: Runner
-    treatments: dict[str, Treatment]
-    capabilities: NativeCapabilities = Field(default_factory=NativeCapabilities)
-    tasks: Tasks
-    measurements: list[Measurement] = Field(min_length=1)
-    measurement_settings: MeasurementSettings = Field(default_factory=MeasurementSettings)
-    reviewer: Reviewer | None = None
-    repeats: int = Field(default=3, strict=True, ge=1)
-    seed: int = Field(default=42, strict=True)
-    timeout_seconds: int = Field(default=1800, strict=True, ge=1)
+    name: str = Field(
+        default="evaluation", min_length=1, description="Names the evaluation in plans and reports."
+    )
+    runner: Runner = Field(description="Selects the coding harness, model, and reasoning effort.")
+    treatments: dict[str, Treatment] = Field(
+        description="Maps treatment names to nonempty native packages, with vanilla included automatically."
+    )
+    capabilities: NativeCapabilities = Field(
+        default_factory=NativeCapabilities,
+        description="Sets the same native agent capabilities for vanilla and every treatment.",
+    )
+    tasks: Tasks = Field(
+        description="Selects exactly one task source and a unique nonempty task inventory."
+    )
+    measurements: list[Measurement] = Field(
+        min_length=1,
+        description="Selects unique measurements, with review requiring reviewer settings.",
+    )
+    measurement_settings: MeasurementSettings = Field(
+        default_factory=MeasurementSettings,
+        description="Configures measurement scopes, tools, coverage profiles, and readiness requirements.",
+    )
+    reviewer: Reviewer | None = Field(
+        default=None,
+        description="Configures the independent reviewer exactly when review is selected.",
+    )
+    repeats: int = Field(
+        default=3,
+        strict=True,
+        ge=1,
+        description="Sets the number of attempts for each task and arm.",
+    )
+    seed: int = Field(
+        default=42,
+        strict=True,
+        description="Seeds attempt ordering and identities without guaranteeing deterministic model sampling.",
+    )
+    timeout_seconds: int = Field(
+        default=1800,
+        strict=True,
+        ge=1,
+        description="Sets the coding agent timeout in seconds, including child work.",
+    )
     # A fixed default keeps the comparison identity the same on every machine; 4 is the
     # most harbor_backend.capacity_jobs ever allows.
-    jobs: int = Field(default=2, strict=True, ge=1, le=4)
-    container_cpus: int | None = Field(default=None, strict=True, ge=1)
-    container_memory_mb: int | None = Field(default=None, strict=True, ge=256)
+    jobs: int = Field(
+        default=2,
+        strict=True,
+        ge=1,
+        le=4,
+        description="Sets concurrent jobs from one to four, subject to Docker capacity.",
+    )
+    container_cpus: int | None = Field(
+        default=None,
+        strict=True,
+        ge=1,
+        description="Sets a common CPU limit covering all selected task requirements, or uses their common declaration.",
+    )
+    container_memory_mb: int | None = Field(
+        default=None,
+        strict=True,
+        ge=256,
+        description="Sets a common memory limit in MB covering all selected task requirements, or uses their common declaration.",
+    )
 
     @model_validator(mode="before")
     @classmethod

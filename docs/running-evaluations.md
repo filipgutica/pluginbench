@@ -2,6 +2,12 @@
 
 An evaluation runs the same tasks with vanilla and each named guidance package. Harness, model, reasoning, tasks, and comparison settings stay fixed. Attempt order is randomized; failed attempts are retained.
 
+[Configuration reference](config-reference.md): evaluation and gates fields, types, defaults, and descriptions.
+
+[Metrics glossary](metrics.md): definitions, units, and exact metric names for gates.
+
+[Reproduce an evaluation](reproduce.md): pinned inputs, saved receipts, and a vanilla-only public example.
+
 ## Choose inputs
 
 `pluginbench init [path]` writes [the starter config](../src/pluginbench/evaluation.example.yaml) to `evaluation.yaml`, or to the path you give, and never overwrites a file. JSON accepts the same fields. Paths are relative to the config file. Every setting lives in the config. `run` takes only `--output` (the new run directory, default `runs/<timestamp>`), `--dry-run`, `--json` (with `--dry-run`, the full plan as JSON), `--yes`, `--foreground`, and `--notify`. A run directory resumes with its saved settings, so `--output` applies only to a config.
@@ -55,6 +61,31 @@ New native treatment runs currently require Codex. Legacy file-only `guidance` m
 ## Execution and isolation
 
 Install with `pip install -e .`, which also installs Harbor 0.24.0. Docker must run Linux containers through a local Unix endpoint, with Compose and Buildx available. The current runner accepts single-step Linux CPU tasks with separate verifiers and Dockerfiles or prebuilt images. Shared verifiers, task-authored Compose, multistep tasks, GPUs, and TPUs are rejected before model calls.
+
+### Supported coding CLIs
+
+New coding runs support Codex CLI **0.162.1** and **0.167.0**, as checked by `admit_version` in [`codex_events.py`](../src/pluginbench/codex_events.py).
+The installed CLI must also expose the isolation flags checked by [`codex.preflight`](../src/pluginbench/codex.py).
+PluginBench pins that exact version into the prepared image, checks the installed image version, and requires the frozen version on resume.
+Codex reviews also require an executable `codex-code-mode-host` beside `codex`.
+
+Claude Code is available for independent reviews; new native treatment coding is qualified for Codex only.
+There is no numeric Claude Code version allowlist. [`claude.preflight`](../src/pluginbench/claude.py) checks the required isolation flags and records `claude --version`.
+It does not claim compatibility with every Claude Code release.
+
+### Container boundary
+
+The host home and sibling run directories are not mounted into coding containers.
+Hidden tests and reference solutions stay in the separate verifier environment.
+Only the selected provider credential enters a temporary private runtime; synchronous plugin hooks share the coding agent's access.
+Use trusted task images and packages, and inspect saved traces before sharing them.
+
+Local collectors and reviews require macOS Seatbelt or Linux Bubblewrap; a missing boundary stops execution.
+They can access their job copy, private runtime, selected trusted assets, and read-only toolchain paths.
+Review code and trusted scripts remain read-only. Codex's inner sandbox is disabled inside this mandatory OS wrapper.
+On Linux, Bubblewrap also isolates descendant processes, and `/tmp` is read-only; tools use their private `TMPDIR`.
+On macOS, local processes share host networking and process IDs, and system/runtime paths remain readable.
+Local static analysis and reviews share host resources. This requires a trusted machine and is not a shared-hosting boundary.
 
 Harbor owns the task instructions, environment, artifact collection, and correctness checks. PluginBench freezes both task images, installs the exact selected agent CLI, and removes inherited personal guidance. It exports the initial repository and records the prepared image before looking up a reusable vanilla baseline. Preparation does not run a task-specific PluginBench dependency recipe or calibrate the task's tests.
 

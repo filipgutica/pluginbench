@@ -58,18 +58,55 @@ class Gate(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(min_length=1)
-    against: str = Field(min_length=1)
-    direction: Literal["higher", "lower"]
-    correctness: Literal["passes", "unknown"] | None = None
-    per_task: bool = False
-    metrics: list[str] | None = Field(default=None, min_length=1)
-    statistic: Literal["total", "mean_of_task_medians", "mean_of_task_median_ratios"] | None = None
-    reference_floor: float | None = None
-    tolerance: float | None = Field(default=None, ge=0)
-    factor: float | None = Field(default=None, gt=0)
-    bound: Literal["lower", "upper"] | None = None
-    margin: float | None = Field(default=None, ge=-1, le=1)
+    name: str = Field(min_length=1, description="Names the gate uniquely within the gates file.")
+    against: str = Field(
+        min_length=1, description="Names the comparator arm as it appears in the comparison report."
+    )
+    direction: Literal["higher", "lower"] = Field(
+        description="Selects whether values must meet a lower ceiling or a higher floor."
+    )
+    correctness: Literal["passes", "unknown"] | None = Field(
+        default=None, description="Selects pass or unknown counts instead of metric values."
+    )
+    per_task: bool = Field(
+        default=False,
+        description="Checks correctness separately for each task instead of the aggregate.",
+    )
+    metrics: list[str] | None = Field(
+        default=None,
+        min_length=1,
+        description="Names report metrics to sum for a metric gate instead of correctness.",
+    )
+    statistic: Literal["total", "mean_of_task_medians", "mean_of_task_median_ratios"] | None = (
+        Field(
+            default=None,
+            description="Selects the point statistic for metric gates without a confidence bound.",
+        )
+    )
+    reference_floor: float | None = Field(
+        default=None,
+        description="Excludes tasks whose reference is below this floor when computing reference ratios.",
+    )
+    tolerance: float | None = Field(
+        default=None,
+        ge=0,
+        description="Sets nonnegative additive slack instead of a factor for a point gate.",
+    )
+    factor: float | None = Field(
+        default=None,
+        gt=0,
+        description="Sets multiplicative slack for a point gate or the ceiling for a token-ratio bound.",
+    )
+    bound: Literal["lower", "upper"] | None = Field(
+        default=None,
+        description="Selects a paired confidence endpoint for pass-rate differences or input-plus-output token ratios.",
+    )
+    margin: float | None = Field(
+        default=None,
+        ge=-1,
+        le=1,
+        description="Sets the required lower pass-rate difference from minus one to one for a correctness bound.",
+    )
 
     @model_validator(mode="after")
     def one_measure(self) -> Gate:
@@ -117,9 +154,16 @@ class Gates(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # Required: whether an overlap pass counts as a pass is the study's choice, never a default.
-    count_overlap_passes: bool
-    splits: dict[str, list[str]] = Field(default_factory=dict)
-    gates: list[Gate]
+    count_overlap_passes: bool = Field(
+        description="Declares whether native overlap passes count as passes."
+    )
+    splits: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Maps split names to task IDs, with all tasks also compared automatically.",
+    )
+    gates: list[Gate] = Field(
+        description="Lists uniquely named rules for comparing each candidate with its comparator."
+    )
 
     @model_validator(mode="after")
     def unique_names(self) -> Gates:

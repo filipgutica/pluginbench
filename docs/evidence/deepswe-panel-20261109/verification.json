@@ -45,6 +45,6 @@
     },
     "reference_preparation_keys_match": true,
     "config_sha256": "e365b4c0cccb665d70b7a7ded3db69e8ee07f46780214af6223be24755e32379",
-    "raw_report": "/home/filip/.t3/worktrees/pluginbench/feat-deepswe-panel/.panel/check-panel-qualified/check.json"
+    "raw_report": ".panel/check-panel-qualified/check.json"
   }
 }

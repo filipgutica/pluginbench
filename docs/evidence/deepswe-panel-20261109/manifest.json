@@ -2,7 +2,7 @@
   "schema_version": 1,
   "dataset": "https://github.com/datacurve-ai/deep-swe",
   "dataset_commit": "0b9fabbb63b9104d678fe965e1632f2dd9eaa2ea",
-  "prepared_tasks": "/home/filip/.t3/worktrees/pluginbench/feat-deepswe-panel/.panel/tasks",
+  "prepared_tasks": ".panel/tasks",
   "tasks": [
     {
       "task": "adaptix-name-mapping-aliases",

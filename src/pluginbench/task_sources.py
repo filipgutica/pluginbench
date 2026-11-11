@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import yaml
-from pydantic import BaseModel, ConfigDict, PrivateAttr, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, TypeAdapter, model_validator
 
 from pluginbench.harbor_backend import native_task_assets as task_fingerprint
 
@@ -205,11 +205,25 @@ def materialize_tasks(downloads: list[tuple[Path, dict[str, str]]]) -> Path:
 
 class Tasks(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    source: Path | None = None
-    dataset: str | None = None
-    version: str | None = None
-    ids: list[str] = []
-    urls: list[str] = []
+    source: Path | None = Field(
+        default=None,
+        description="Selects a local task directory instead of a dataset or GitHub URLs.",
+    )
+    dataset: str | None = Field(
+        default=None,
+        description="Selects a Harbor dataset instead of a local source or GitHub URLs.",
+    )
+    version: str | None = Field(
+        default=None,
+        description="Selects the dataset version, which resolves to an immutable content hash.",
+    )
+    ids: list[str] = Field(
+        default=[], description="Selects unique task IDs from the local source or dataset."
+    )
+    urls: list[str] = Field(
+        default=[],
+        description="Selects unique GitHub task-folder URLs whose refs resolve to commits.",
+    )
     _resolved: Path | None = PrivateAttr(default=None)
     _references: list[dict[str, str]] = PrivateAttr(default_factory=list)
 
