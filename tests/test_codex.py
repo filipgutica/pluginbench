@@ -1096,6 +1096,104 @@ _USAGE_TRACE = stream(
 )
 
 
+def outage_trace(startup: str, *, version: str = "0.167.0") -> str:
+    """Synthetic initial rollout before a model response, including paginated input."""
+    events: list[dict[str, object]] = [{"type": "session_meta", "payload": {
+        "id": _OUTAGE[0]["thread_id"], "cli_version": version, "source": "exec",
+    }}]
+    if startup != "header":
+        events.append({"type": "turn_context", "payload": {
+            "model": "gpt-6.1-sol", "effort": "medium",
+        }})
+    if startup == "user_input":
+        events.extend([
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Synthetic task"}],
+            }},
+            {"type": "event_msg", "payload": {
+                "type": "item_completed", "thread_id": _OUTAGE[0]["thread_id"],
+                "turn_id": "synthetic-turn", "item": {
+                    "type": "UserMessage", "id": "synthetic-input",
+                    "content": [{"type": "text", "text": "Synthetic task", "text_elements": []}],
+                },
+            }},
+        ])
+        metadata = events[0]["payload"]
+        assert isinstance(metadata, dict)
+        metadata["history_mode"] = "paginated"
+    if startup == "rate_limit":
+        events.append({"type": "event_msg", "payload": {
+            "type": "token_count", "info": None, "rate_limits": {"primary": None},
+        }})
+    if startup == "user_input":
+        events = [{**event, "ordinal": ordinal} for ordinal, event in enumerate(events)]
+    return stream(*events)
+
+
+@pytest.mark.parametrize("version", ["0.162.1", "0.167.0", "0.167.1"])
+@pytest.mark.parametrize("startup", ["header", "user_input", "rate_limit"])
+@pytest.mark.parametrize(
+    "extra",
+    [
+        None,
+        {"type": "world_state", "payload": {"full": True, "state": {}}},
+        {"type": "event_msg", "payload": {
+            "type": "task_complete", "error": {"message": "terminal error"},
+            "last_agent_message": None, "time_to_first_token_ms": None,
+        }},
+        {"type": "new_unknown_record", "payload": {}},
+        "{broken",
+    ],
+)
+def test_outage_without_positive_model_evidence_stays_retryable(
+    version: str, startup: str, extra: dict[str, object] | str | None,
+) -> None:
+    trace = outage_trace(startup, version=version)
+    if isinstance(extra, dict):
+        record = {**extra, **({"ordinal": len(trace.splitlines())} if startup == "user_input" else {})}
+        trace += "\n" + stream(record)
+    elif extra is not None:
+        trace += "\n" + extra
+    parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
+    assert parsed["usage"] is None
+    assert parsed["observed_token_usage"] is False
+    assert codex_events.failed_before_first_turn(parsed) == "workspace routing discovery failed"
+
+
+@pytest.mark.parametrize(
+    "item_type",
+    [
+        "message", "agent_message", "reasoning", "function_call", "function_call_output",
+        "custom_tool_call", "custom_tool_call_output", "local_shell_call", "tool_search_call",
+        "tool_search_output", "web_search_call", "image_generation_call", "compaction",
+        "compaction_summary", "context_compaction",
+    ],
+)
+def test_one_model_output_record_blocks_pre_model_retry(item_type: str) -> None:
+    item: dict[str, object] = {"type": item_type}
+    if item_type == "message":
+        item.update(role="assistant", content=[])
+    if item_type == "function_call":
+        item["name"] = "shell"
+    trace = outage_trace("header") + "\n" + stream({"type": "response_item", "payload": item})
+    parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
+    assert parsed["observed_token_usage"] is True
+    assert codex_events.failed_before_first_turn(parsed) is None
+
+
+@pytest.mark.parametrize(
+    "item_type",
+    ["agent_message", "reasoning", "command_execution", "file_change", "mcp_tool_call",
+     "collab_tool_call", "web_search", "todo_list"],
+)
+def test_one_stdout_output_item_blocks_pre_model_retry(item_type: str) -> None:
+    stdout = stream(*_OUTAGE, {"type": "item.completed", "item": {"type": item_type}})
+    parsed = codex.parse_events(stdout, [], "codex")
+    assert parsed["observed_token_usage"] is True
+    assert codex_events.failed_before_first_turn(parsed) is None
+
+
 def test_session_that_failed_before_its_first_model_turn_is_a_backend_failure() -> None:
     execution = codex.parse_events(stream(*_OUTAGE), [], "codex")
     execution["timed_out"] = False
@@ -1103,7 +1201,7 @@ def test_session_that_failed_before_its_first_model_turn_is_a_backend_failure() 
 
 
 @pytest.mark.parametrize(
-    "evidence", ["token_count", "response_item", "stdout_usage", "uncertain", "unknown_stdout"]
+    "evidence", ["token_count", "response_item", "stdout_usage"]
 )
 def test_model_call_evidence_does_not_require_valid_accounting(evidence: str) -> None:
     counts = {"input_tokens": 20, "output_tokens": 5, "new_nullable_field": None}
@@ -1117,21 +1215,19 @@ def test_model_call_evidence_does_not_require_valid_accounting(evidence: str) ->
     elif evidence == "stdout_usage":
         trace = ""
         stdout += "\n" + stream({"type": "turn.completed", "usage": counts})
-    elif evidence == "unknown_stdout":
-        trace = ""
-        stdout += "\n" + stream({"type": "new_unknown_event"})
-    else:
-        trace = '{"type": "new_unknown_event", "payload": {}}'
     parsed = codex.parse_events(stdout, [trace] if trace else [], "codex")
     assert parsed["usage"] is None
     assert codex_events.failed_before_first_turn(parsed) is None
-    if evidence not in {"uncertain", "unknown_stdout"}:
-        assert parsed["observed_token_usage"] is True
+    assert parsed["observed_token_usage"] is True
 
 
-def test_malformed_capture_cannot_be_classified_as_a_pre_model_outage() -> None:
-    parsed = codex.parse_events(stream(*_OUTAGE) + "\n{broken", [], "codex")
-    assert codex_events.failed_before_first_turn(parsed) is None
+@pytest.mark.parametrize("record", [
+    "{broken", "[]", '{"type":"new_unknown_event"}',
+    '{"type":"item.completed","item":{"type":"new_unknown_item"}}',
+])
+def test_malformed_or_unknown_stdout_does_not_block_pre_model_retry(record: str) -> None:
+    parsed = codex.parse_events(stream(*_OUTAGE) + "\n" + record, [], "codex")
+    assert codex_events.failed_before_first_turn(parsed) == "workspace routing discovery failed"
 
 
 @pytest.mark.parametrize(
@@ -1140,10 +1236,6 @@ def test_malformed_capture_cannot_be_classified_as_a_pre_model_outage() -> None:
         {"type": "session_meta", "payload": {
             "id": _OUTAGE[0]["thread_id"], "cli_version": "0.167.0", "source": [],
         }},
-        {"type": "response_item", "payload": {
-            "type": "message", "role": "assistant", "content": [],
-        }},
-        {"type": "response_item", "payload": {"type": "function_call", "name": "shell"}},
         {"type": "response_item", "payload": {
             "type": "message", "role": "user", "content": [{"type": "output_text", "text": "x"}],
         }},
@@ -1158,7 +1250,7 @@ def test_malformed_capture_cannot_be_classified_as_a_pre_model_outage() -> None:
         {"type": "event_msg", "payload": {"type": "new_unknown_event"}},
     ],
 )
-def test_only_validated_startup_records_can_preserve_a_pre_model_outage(
+def test_non_model_records_do_not_block_pre_model_retry(
     event: dict[str, object],
 ) -> None:
     header: dict[str, object] = {"type": "session_meta", "payload": {
@@ -1166,7 +1258,7 @@ def test_only_validated_startup_records_can_preserve_a_pre_model_outage(
     }}
     records = [event] if event["type"] == "session_meta" else [header, event]
     parsed = codex.parse_events(stream(*_OUTAGE), [stream(*records)], "codex")
-    assert codex_events.failed_before_first_turn(parsed) is None
+    assert codex_events.failed_before_first_turn(parsed) == "workspace routing discovery failed"
 
 
 @pytest.mark.parametrize(

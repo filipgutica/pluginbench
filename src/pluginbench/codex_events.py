@@ -132,39 +132,25 @@ def parse_events(
         trace_events.append(decoded_trace)
     # Validate trace identity and cumulative usage even when subagents are disabled.
     accounting = _descendant_usage(stdout_events, trace_events, errors)
-    trace_evidence = [_trace_model_evidence(events) for events in trace_events]
     result = {
         "command_items": commands,
         "actual_primary_models": sorted(models),
         "usage": accounting["usage"],
         "partial_usage": accounting["partial_usage"],
         "usage_accounting": accounting["usage_accounting"],
-        # Known startup/input records precede sampling; unfamiliar records remain uncertain.
-        "pre_model_failure_uncertain": any(uncertain for _, uncertain in trace_evidence) or any(
-            event.get("type") not in {
-                "thread.started", "turn.started", "turn.failed", "error",
-                "item.started", "item.updated", "item.completed", "turn.completed",
-            }
-            for event in stdout_events
-        ) or (bool(traces) and any(
-            event.get("type") == "thread.started"
-            and event.get("thread_id") != accounting["usage_accounting"]["root_session_id"]
-            for event in stdout_events
-        )),
         # Evidence that a model turn occurred survives an unavailable token measure.
         "observed_token_usage": any(
-            "usage" in event
-            or "token_usage" in event
-            or event.get("type") in {
-                "turn.completed", "token_count", "token_usage", "token_usage_record", "response_item",
-            }
+            event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict)
             or (
-                event.get("type", "").startswith("item.")
+                event.get("type") in {"item.started", "item.updated", "item.completed"}
                 and isinstance(item := event.get("item"), dict)
-                and item.get("type") != "error"
+                and item.get("type") in (
+                    "agent_message", "reasoning", "command_execution", "file_change",
+                    "mcp_tool_call", "collab_tool_call", "web_search", "todo_list",
+                )
             )
             for event in stdout_events
-        ) or any(observed for observed, _ in trace_evidence),
+        ) or any(_trace_model_evidence(events) for events in trace_events),
         "native_dollars": None,
         "dollars_status": "unknown",
         "requested_effort": requested_effort,
@@ -182,120 +168,31 @@ def parse_events(
     return result
 
 
-def _trace_model_evidence(events: list[dict[str, object]]) -> tuple[bool, bool]:
-    """Return model activity and uncertainty independently of numeric accounting."""
-    reasons: set[str] = set()
-    history = _session_history(events, reasons)
-    uncertain = history is None
-    if history is not None:
-        meta, _, inherited = history
-        source = meta.get("source")
-        source_valid = "source" not in meta or isinstance(source, str) or (
-            isinstance(source, dict) and len(source) == 1 and (
-                isinstance(source.get("custom"), str)
-                or source.get("internal") in ("memory_consolidation", "guardian")
-            )
-        )
-        uncertain = (
-            inherited
-            or not source_valid or meta.get("parent_thread_id") is not None
-            or not isinstance(meta.get("id"), str) or not meta["id"]
-            or not isinstance(meta.get("cli_version"), str) or not meta["cli_version"].strip()
-        )
-    observed = False
+def _trace_model_evidence(events: list[dict[str, object]]) -> bool:
+    """Recognize positive model evidence; other records do not prove a call happened."""
     for event in events:
         payload = event.get("payload")
         if not isinstance(payload, dict):
-            uncertain = True
             continue
         kind = payload.get("type")
-        safe = False
-        if event.get("type") == "session_meta":
-            safe = True  # Identity, inherited history, and ordinals were checked above.
-        elif event.get("type") == "turn_context":
-            safe = isinstance(payload.get("model"), str) and all(
-                payload.get(field) is None or isinstance(payload[field], str)
-                for field in ("effort", "turn_id")
-            )
-        elif event.get("type") == "response_item":
-            # rust-v0.167.0 session/mod.rs:5575-5637 persists admitted input before sampling;
-            # protocol/models.rs:883-915 and :1072-1107 define its role and content variants.
-            if kind == "message" and payload.get("role") in ("user", "system", "developer"):
-                content = payload.get("content")
-                safe = isinstance(content, list) and all(
-                    isinstance(part, dict) and (
-                        (part.get("type") == "input_text" and isinstance(part.get("text"), str))
-                        or (part.get("type") == "input_image" and any(
-                            isinstance(part.get(field), str) for field in ("image_url", "file_id")
-                        ))
-                        or (part.get("type") == "input_audio" and any(
-                            isinstance(part.get(field), str) for field in ("audio_url", "file_id")
-                        ))
-                    ) for part in content
-                )
-            elif kind == "additional_tools":
-                safe = payload.get("role") in ("user", "system", "developer") and isinstance(
-                    payload.get("tools"), list
-                )
-            elif kind == "configuration_update":
-                reasoning = payload.get("reasoning")
-                safe = isinstance(reasoning, dict) and isinstance(reasoning.get("effort"), str)
-            elif (kind == "message" and payload.get("role") == "assistant") or kind in (
+        # session/mod.rs:5320-5338 emits token_count after sampling. The presence of
+        # non-null info is evidence even when numeric accounting cannot validate it.
+        if event.get("type") == "event_msg" and kind == "token_count":
+            if payload.get("info") is not None:
+                return True
+        # protocol/models.rs:1062-1340 defines these output items (including the
+        # compaction_summary alias). User messages and request controls are inputs.
+        if event.get("type") == "response_item" and (
+            (kind == "message" and payload.get("role") == "assistant")
+            or kind in (
                 "agent_message", "reasoning", "function_call", "function_call_output",
                 "custom_tool_call", "custom_tool_call_output", "local_shell_call",
                 "tool_search_call", "tool_search_output", "web_search_call", "image_generation_call",
-                "compaction", "context_compaction",
-            ):
-                observed = safe = True
-        elif event.get("type") == "token_usage_record":
-            observed = safe = True
-        elif event.get("type") == "event_msg":
-            if kind == "token_count":
-                # protocol.rs:1579-1582 and session/mod.rs:5537-5543 allow rate-limit-only
-                # updates with info:null. Non-null info is activity even if counters changed.
-                if "info" in payload and payload["info"] is not None:
-                    observed = safe = True
-                else:
-                    safe = "info" in payload and (
-                        payload.get("rate_limits") is None
-                        or isinstance(payload["rate_limits"], dict)
-                    )
-            elif kind == "user_message":
-                safe = isinstance(payload.get("message"), str)
-            elif kind == "item_completed":
-                # Paginated rollouts retain the admitted input as a TurnItem as well
-                # (rollout/policy.rs:232-294, protocol/items.rs:50-93).
-                item = payload.get("item")
-                if isinstance(item, dict) and item.get("type") == "UserMessage":
-                    content = item.get("content")
-                    safe = isinstance(item.get("id"), str) and isinstance(content, list) and all(
-                        isinstance(part, dict) and (
-                            (part.get("type") == "text" and isinstance(part.get("text"), str)
-                             and isinstance(part.get("text_elements", []), list))
-                            or (part.get("type") == "image" and any(
-                                isinstance(part.get(field), str) for field in ("image_url", "file_id")
-                            ))
-                            or (part.get("type") == "audio" and any(
-                                isinstance(part.get(field), str) for field in ("audio_url", "file_id")
-                            ))
-                            or (part.get("type") in ("local_image", "local_audio")
-                                and isinstance(part.get("path"), str))
-                            or (part.get("type") in ("skill", "mention")
-                                and isinstance(part.get("name"), str)
-                                and isinstance(part.get("path"), str))
-                        ) for part in content
-                    )
-            elif kind in ("task_started", "turn_started"):
-                safe = "turn_id" not in payload or isinstance(payload["turn_id"], str)
-            elif kind == "thread_settings_applied":
-                settings = payload.get("thread_settings")
-                safe = isinstance(settings, dict) and isinstance(settings.get("model"), str)
-            elif kind in ("error", "stream_error", "warning"):
-                safe = isinstance(payload.get("message"), str)
-            elif kind in ("token_usage", "agent_message", "agent_reasoning", "agent_reasoning_raw_content"):
-                observed = safe = True
-        uncertain = uncertain or not safe
-    return observed, uncertain
+                "compaction", "compaction_summary", "context_compaction",
+            )
+        ):
+            return True
+    return False
 
 
 def failed_before_first_turn(execution: dict[str, Any]) -> str | None:
@@ -309,8 +206,6 @@ def failed_before_first_turn(execution: dict[str, Any]) -> str | None:
         execution.get("timed_out") is True
         or execution.get("usage") is not None
         or execution.get("observed_token_usage") is True
-        or execution.get("pre_model_failure_uncertain") is True
-        or any(not isinstance(error, dict) for error in execution.get("stream_errors") or [])
         or any(execution.get(key) for key in ("partial_usage", "command_items", "agent_messages"))
     ):
         return None

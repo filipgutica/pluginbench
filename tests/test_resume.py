@@ -27,7 +27,7 @@ from native_support import execution as native_execution
 from pluginbench import harbor_backend, ledger, parallel, run_status, study, trial_containers
 from pluginbench.ledger import Ledger
 from pluginbench import codex
-from test_codex import _OUTAGE, stream
+from test_codex import _OUTAGE, outage_trace, stream
 
 _REAL_RUNNING = trial_containers.running
 _PATH = os.pathsep.join([str(Path(pluginbench.__file__).parents[1]), str(Path(__file__).parent)])
@@ -380,34 +380,7 @@ def test_backend_failure_before_the_first_turn_stops_the_run_unscored_and_uncach
         execution = native_execution(
             kwargs["area"], kwargs["protocol"]["native_task_identity"], reward=0
         )
-        events: list[dict[str, object]] = [{"type": "session_meta", "payload": {
-            "id": _OUTAGE[0]["thread_id"], "cli_version": "0.167.0", "source": "exec",
-        }}]
-        if startup != "header":
-            events.append({"type": "turn_context", "payload": {
-                "model": "gpt-6.1-sol", "effort": "medium",
-            }})
-        if startup == "user_input":
-            events.append({"type": "response_item", "payload": {
-                "type": "message", "role": "user",
-                "content": [{"type": "input_text", "text": "Synthetic task"}],
-            }})
-            events.append({"type": "event_msg", "payload": {
-                "type": "item_completed", "thread_id": _OUTAGE[0]["thread_id"],
-                "turn_id": "synthetic-turn", "item": {
-                    "type": "UserMessage", "id": "synthetic-input",
-                    "content": [{"type": "text", "text": "Synthetic task", "text_elements": []}],
-                },
-            }})
-            metadata = events[0]["payload"]
-            assert isinstance(metadata, dict)
-            metadata["history_mode"] = "paginated"
-            events = [{**event, "ordinal": ordinal} for ordinal, event in enumerate(events)]
-        if startup == "rate_limit":
-            events.append({"type": "event_msg", "payload": {
-                "type": "token_count", "info": None, "rate_limits": {"primary": None},
-            }})
-        execution.update(codex.parse_events(stream(*_OUTAGE), [stream(*events)], "codex"))
+        execution.update(codex.parse_events(stream(*_OUTAGE), [outage_trace(startup)], "codex"))
         execution["timed_out"] = False
         return execution
 
