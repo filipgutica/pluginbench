@@ -11,6 +11,7 @@ from fallow_fixture import syntax_proof as _syntax_proof
 
 from pluginbench import assessment_metrics
 from pluginbench.coverage_report import lines_to_numbits
+from pluginbench.measurement_profiles import _metric_readiness
 from pluginbench.assessment_metrics import (
     EvidenceBinding,
     bind_evidence,
@@ -764,6 +765,134 @@ def _bound_fallow(
         ),
     )
     return snapshot, evaluate_evidence(snapshot, {"fallow": "evidence.json"}, directory)
+
+
+@pytest.mark.parametrize(
+    ("fault", "detail"),
+    [
+        (
+            "unresolved",
+            "1 unresolved import (bin/sql-formatter-cli.cjs imports ../dist/cjs/index.js)",
+        ),
+        (
+            "many",
+            "5 unresolved imports (bin/sql-formatter-cli.cjs imports ../dist/cjs/index.js, "
+            "src/index.ts imports z, src/index.ts imports a, and 2 more)",
+        ),
+        ("entry", "no entry point found"),
+        (
+            "unsupported",
+            "unsupported source files in scope (src/a.py, src/b.py, src/c.py, and 1 more)",
+        ),
+        ("discovery", "the discovered files differ from the scoped source files"),
+        ("malformed_discovery", "the discovered files differ from the scoped source files"),
+        ("syntax", "syntax validation failed"),
+        ("no_source", "no scoped source files found"),
+    ],
+)
+def test_fallow_dead_code_readiness_names_first_incomplete_condition(
+    tmp_path: Path, fault: str, detail: str
+) -> None:
+    report = _fallow()
+    snapshot, _ = _receipt(tmp_path, "fallow", report)
+    _write(snapshot / "bin/sql-formatter-cli.cjs", 'require("../dist/cjs/index.js");\n')
+    report["health"] = {
+        "findings": [],
+        "summary": {"functions_analyzed": 0, "files_analyzed": 2},
+    }
+    check = report["check"]
+    assert isinstance(check, dict)
+    check["unused_exports"] = []
+    check["entry_points"] = {"total": 1}
+    _syntax_proof(
+        report, snapshot, tmp_path / "config.json", ["src/index.ts", "bin/sql-formatter-cli.cjs"]
+    )
+    if fault in {"unresolved", "many", "unsupported", "discovery", "malformed_discovery"}:
+        check["unresolved_imports"] = [
+            {"path": "bin/sql-formatter-cli.cjs", "specifier": "../dist/cjs/index.js"}
+        ]
+    if fault == "many":
+        check["unresolved_imports"] += [
+            {"path": "src/index.ts", "specifier": name} for name in ("z", "a", "b", "c")
+        ]
+    if fault in {"entry", "unsupported", "discovery", "malformed_discovery"}:
+        check["entry_points"] = {"total": 0}
+    if fault == "unsupported":
+        for name in ("d", "a", "c", "b"):
+            _write(snapshot / f"src/{name}.py", "value = 1\n")
+    elif fault == "discovery":
+        report["discovery"] = {"files": ["src/index.ts"], "file_count": 1}
+    elif fault == "malformed_discovery":
+        report["discovery"] = {"files": [None], "file_count": 1}
+    elif fault == "syntax":
+        report.pop("syntax_validation")
+    elif fault == "no_source":
+        (snapshot / "src/index.ts").unlink()
+        (snapshot / "bin/sql-formatter-cli.cjs").unlink()
+    receipt = _rebind_fallow(tmp_path, snapshot, report, ("src/**", "bin/**"))
+    metrics = _metric(
+        _metric(evaluate_evidence(snapshot, {"fallow": str(receipt)}, tmp_path), "fallow"),
+        "metrics",
+    )
+    assert metrics["dead_code_complete_for_declared_scope"] is False
+    assert _metric_readiness("dead_code", metrics) == (
+        False,
+        f"dead-code graph is incomplete: {detail}",
+    )
+    if fault in {"unresolved", "many", "entry"}:
+        assert metrics["complexity_complete_for_declared_scope"] is True
+    elif fault in {"unsupported", "syntax", "no_source"}:
+        assert _metric_readiness("cognitive", metrics) == (
+            False,
+            "analysis population is incomplete",
+        )
+
+
+def test_complete_fallow_graph_row_and_readiness_are_unchanged(tmp_path: Path) -> None:
+    _, result = _bound_fallow(tmp_path, {"src/index.ts": "export const value = 1;\n"}, [])
+    metrics = _metric(_metric(result, "fallow"), "metrics")
+    # The full pre-change row pins both keys and values, including no diagnostic field.
+    assert metrics == {
+        "functions": [],
+        "function_count_reported": 0,
+        "complexity_distribution": {"cognitive": [], "cyclomatic": [], "line_count": []},
+        "max_cognitive_reported": None,
+        "max_cyclomatic_reported": None,
+        "max_unit_size_reported": None,
+        "complexity_complete_for_declared_scope": True,
+        "complexity_detection": "complete for declared source scope",
+        "scoped_supported_files": ["src/index.ts"],
+        "scoped_unsupported_files": [],
+        "dead_code_complete_for_declared_scope": True,
+        "cycles_complete_for_declared_scope": True,
+        "boundary_violations_complete_for_declared_scope": False,
+        "graph_detection": "matching discovery population, declared entries, no unresolved imports; static findings only",
+        "clone_groups_complete_for_declared_scope": False,
+        "clone_detection": "reported findings only; scoped clone-file population is unsupported or unmeasured",
+        "dead_code": 0,
+        "dead_code_categories": {
+            "unused_files": 0,
+            "unused_exports": 0,
+            "unused_types": 0,
+            "unused_dependencies": 0,
+            "unused_dev_dependencies": 0,
+            "unused_optional_dependencies": 0,
+            "unused_enum_members": 0,
+            "unused_class_members": 0,
+            "unused_catalog_entries": 0,
+            "unused_dependency_overrides": 0,
+        },
+        "dead_finding_identities": [],
+        "clone_input_file_count": 1,
+        "clone_eligible_stream_count": None,
+        "clone_finding_identities": None,
+        "clone_groups": 1,
+        "cycles": 0,
+        "boundary_violations": None,
+        "boundary_rules_declared": False,
+        "unresolved_imports": 0,
+    }
+    assert _metric_readiness("dead_code", metrics) == (True, None)
 
 
 def _function(
