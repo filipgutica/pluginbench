@@ -167,19 +167,21 @@ def test_every_interrupt_while_draining_says_what_it_waits_for(
     ] * 2
 
 
-def test_a_broken_stderr_does_not_stop_the_drain_from_saving_work(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("error", [BrokenPipeError, KeyboardInterrupt])
+def test_a_failed_stop_notice_does_not_stop_the_drain_from_saving_work(
+    monkeypatch: pytest.MonkeyPatch, error: type[BaseException]
 ) -> None:
     gate = Barrier(2)
     saved: list[int] = []
     interrupted = False
 
     class BrokenStream:
+        # A broken pipe, or a second Ctrl-C while a full pipe blocks the write.
         def write(self, text: str) -> int:
-            raise BrokenPipeError
+            raise error
 
         def flush(self) -> None:
-            raise BrokenPipeError
+            raise error
 
     def wait(*args: object, **kwargs: object) -> object:
         nonlocal interrupted

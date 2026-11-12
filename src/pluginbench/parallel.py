@@ -105,5 +105,7 @@ def _report_stop(running: int) -> None:
             file=sys.stderr,
             flush=True,
         )
-    except (OSError, ValueError):
-        pass  # A closed or broken stderr must not stop the drain that saves finished work.
+    except (OSError, ValueError, KeyboardInterrupt):
+        # A broken stderr, or another Ctrl-C while writing, must not stop the drain that
+        # saves finished work; the run is already stopping.
+        pass
