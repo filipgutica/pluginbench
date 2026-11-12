@@ -47,8 +47,8 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         },
     ),
     "local_sandbox": (
-        2,
-        {"isolation.py": "992f724c3c12dbd8b1950261edd980f88b677ccd962d73782ef4241ba0114984"},
+        3,
+        {"isolation.py": "482538e42f57cc5eb3ccd60bd9d10ed9c690863cb111a0d7518420bccc2b8bd4"},
     ),
 }
 

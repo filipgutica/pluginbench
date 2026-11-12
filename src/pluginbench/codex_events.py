@@ -53,6 +53,7 @@ def parse_events(
     startup = []
     errors: list[Any] = []
     tools = []
+    tool_startup_failures = []
     final = []
     successful_completion = False
     stdout_events: list[dict[str, Any]] = []
@@ -114,6 +115,40 @@ def parse_events(
                 errors.append("invalid trace event type")
                 continue
             decoded_trace.append(event)
+            payload = event.get("payload")
+            if (
+                event.get("type") == "response_item"
+                and isinstance(payload, dict)
+                and payload.get("type") in {"function_call_output", "custom_tool_call_output"}
+                and isinstance(output := payload.get("output"), str)
+            ):
+                message = output.strip().lower()
+                # Inspect tool errors only, never task/source text or the judge's explanation.
+                if (
+                    message.startswith(("error", "failed", "could not", "unable"))
+                    and any(
+                        helper in message
+                        for helper in (
+                            "codex-code-mode-host",
+                            "codex-exec-server",
+                            "code mode host",
+                            "code-mode host",
+                        )
+                    )
+                    and any(
+                        failure in message
+                        for failure in (
+                            "failed to start",
+                            "failed to spawn",
+                            "could not start",
+                            "no such file",
+                            "not found",
+                            "missing",
+                            "permission denied",
+                        )
+                    )
+                ):
+                    tool_startup_failures.append(output)
             if event.get("type") in {"session_meta", "turn_context"}:
                 payload = event.get("payload", {})
                 startup.append({"type": event["type"], "payload": payload})
@@ -158,6 +193,7 @@ def parse_events(
         "startup": startup,
         "observed_cli_version": observed_cli_version(startup),
         "other_tools": tools,
+        "tool_startup_failures": tool_startup_failures,
         "stream_errors": errors,
         "final": final[-1] if final else "",
         "agent_messages": final,

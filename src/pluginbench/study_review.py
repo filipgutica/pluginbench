@@ -397,6 +397,11 @@ def _validate_response(
 
 def verified_final(execution: dict[str, object], *, model: str, effort: str, harness: str) -> str:
     """The final message of a completed native call whose model and effort match the request."""
+    if execution.get("tool_startup_failures"):
+        raise ValueError(
+            "judge unable to evaluate: tool startup failed: "
+            + str(execution["tool_startup_failures"])
+        )
     if execution.get("successful_native_completion") is not True:
         raise ValueError("judge native completion failed")
     verified_effort = execution.get("runtime_effort_evidence") == [effort]

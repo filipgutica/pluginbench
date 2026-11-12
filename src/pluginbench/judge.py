@@ -47,6 +47,12 @@ SCHEMA = "response-schema.json"
 PASSING = {"pass", "overlap_pass"}
 HARNESSES = {"codex", "claude"}
 
+UNABLE_INSTRUCTION = (
+    'Use "preferred": "unable", never "tie", for each pair you could not evaluate because '
+    "you could not read the review standard, task, starting source, or either diff, including "
+    "when a tool failed to start. Explain what prevented evaluation in reason."
+)
+
 BRIEF = """\
 You are judging code changes as the engineer who will maintain this code next. Work \
 read-only: do not edit any file, run state-changing commands, or start subagents.
@@ -76,7 +82,7 @@ sentences that name the concrete code that decided it."}}]}}
 
 class PairVerdict(InputModel):
     pair: StrictInt
-    preferred: Literal["A", "B", "tie"]
+    preferred: Literal["A", "B", "tie", "unable"]
     decisive_checks: list[StrictInt]
     reason: StrictStr
 
@@ -393,7 +399,9 @@ def prepare(
             (packet_of(sides[first_arm][task, repeats[0]]) / "before").resolve()
         )
         study._write(folder / SCHEMA, Verdicts.model_json_schema())
-        (output / f"{name}.brief.md").write_text(BRIEF.format(pairs="\n".join(lines)))
+        (output / f"{name}.brief.md").write_text(
+            BRIEF.format(pairs="\n".join(lines)) + "\n" + UNABLE_INSTRUCTION + "\n"
+        )
         folders[name] = {"task": task, "pairs": pairs}
     study._write(
         output / KEY,
@@ -444,6 +452,29 @@ def _verdict_path(directory: Path, judge: str, task: str) -> Path:
     return directory / "results" / judge / f"{task}.json"
 
 
+def _verdict_problem(directory: Path, judge: str, task: str) -> str | None:
+    """Recheck saved verdicts, including ties written before tool failures were rejected."""
+    path = _verdict_path(directory, judge, task)
+    if not path.is_file():
+        return "missing"
+    verdicts = Verdicts.model_validate_json(path.read_text())
+    unable = [str(row.pair) for row in verdicts.pairs if row.preferred == "unable"]
+    if unable:
+        return "pairs " + ", ".join(unable) + ": unable"
+    # Only the latest call produced this verdict; earlier failures may have been retried.
+    calls = [
+        call
+        for call in path.with_suffix("").glob("call-*")
+        if call.is_dir() and call.name.removeprefix("call-").isdigit()
+    ]
+    if calls:
+        latest = max(calls, key=lambda call: int(call.name.removeprefix("call-")))
+        traces = [trace.read_text() for trace in sorted(latest.glob("host-trace-*.jsonl"))]
+        if codex.parse_events("", traces, "codex").get("tool_startup_failures"):
+            return "unable: tool startup failed in saved trace"
+    return None
+
+
 def run(
     directory: Path,
     *,
@@ -466,7 +497,7 @@ def run(
         (judge, task)
         for judge in panel
         for task in tasks
-        if not _verdict_path(directory, judge.label, task).is_file()
+        if _verdict_problem(directory, judge.label, task) is not None
     ]
     progress(f"{len(calls)} judge calls to make; {len(panel) * len(tasks) - len(calls)} done.")
     failures: list[str] = []
@@ -494,6 +525,8 @@ def _judge_task(
 ) -> None:
     """One read-only call; raw evidence goes to a new call-N folder, the verdict file last."""
     verdict = _verdict_path(directory, judge.label, task)
+    # A rejected saved result must not survive a failed retry as an apparently completed call.
+    verdict.unlink(missing_ok=True)
     raw = verdict.with_suffix("")
     raw.mkdir(parents=True, exist_ok=True)
     attempt = raw / f"call-{len(list(raw.glob('call-*'))) + 1}"
@@ -504,12 +537,17 @@ def _judge_task(
         # Copy, never link: the judge's sandbox can read only its workspace.
         shutil.copytree(folder, workspace, symlinks=True, ignore=shutil.ignore_patterns("source"))
         shutil.copytree((folder / "source").resolve(), workspace / "source", symlinks=True)
+        # Old prepared folders also need the updated contract when an unable call is retried.
+        study._write(workspace / SCHEMA, Verdicts.model_json_schema())
+        prompt = (directory / f"{task}.brief.md").read_text()
+        if UNABLE_INSTRUCTION not in prompt:
+            prompt += "\n" + UNABLE_INSTRUCTION + "\n"
         try:
             execution = codex.invoke(
                 area=area,
                 entry={"host": judge.harness},
                 protocol={"models": {judge.harness: judge.model}, "reasoning": judge.effort},
-                prompt=(directory / f"{task}.brief.md").read_text(),
+                prompt=prompt,
                 timeout=timeout,
                 output_schema=workspace / SCHEMA,
             )
@@ -525,6 +563,9 @@ def _judge_task(
     answered = [str(row.pair) for row in verdicts.pairs]
     if sorted(answered) != sorted(expected):
         raise ValueError(f"judge answered pairs {answered}, expected {sorted(expected)}")
+    unable = [str(row.pair) for row in verdicts.pairs if row.preferred == "unable"]
+    if unable:
+        raise ValueError("unable to judge pairs: " + ", ".join(unable))
     study._write(verdict, verdicts.model_dump(mode="json"))
 
 
@@ -555,6 +596,14 @@ def tally(directory: Path) -> dict[str, Any]:
     ]
     if missing:
         raise ValueError("judge results missing: " + ", ".join(missing))
+    failed = [
+        f"{judge} {task} {problem}"
+        for judge in judges
+        for task in tasks
+        if (problem := _verdict_problem(directory, judge, task)) is not None
+    ]
+    if failed:
+        raise ValueError("judge results incomplete: " + ", ".join(failed))
     votes = {
         (judge, task): {
             str(row["pair"]): str(row["preferred"])

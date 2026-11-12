@@ -17,8 +17,8 @@ VERSIONS: dict[str, int] = {
     "launcher": 1,
     "analysis_observer": 1,
     "coverage_observer": 1,
-    # Version 2 denies writes to / and /tmp in the Linux sandbox (b05b459).
-    "local_sandbox": 2,
+    # Version 3 resolves Codex launches and grants its selected release and helper binaries.
+    "local_sandbox": 3,
 }
 
 # The source files each component's version stands for. These are the only hashed files.

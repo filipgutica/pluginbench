@@ -41,6 +41,11 @@ SYSTEM_ROOTS = (
     "/opt/homebrew/Cellar",
     "/opt/homebrew/opt",
 )
+PACKAGE_ROOTS = tuple(
+    Path(prefix) / kind
+    for prefix in ("/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew")
+    for kind in ("Cellar", "Caskroom")
+)
 TOOLS = ("codex", "claude", "node", "npm", "pnpm", "fallow", "git", "python3")
 
 
@@ -70,16 +75,15 @@ def tool_roots() -> list[Path]:
             # Codex code mode spawns a sibling host binary, looked up beside the launched path.
             if name == "codex":
                 for directory in {Path(executable).parent, path.parent}:
-                    host = directory / "codex-code-mode-host"
-                    if host.is_file():
-                        roots.append(host)
+                    for helper_name in ("codex-code-mode-host", "codex-exec-server"):
+                        helper = directory / helper_name
+                        if helper.is_file():
+                            roots.append(helper)
+                releases = Path.home() / ".codex/packages/standalone/releases"
+                if path.is_relative_to(releases) and len(path.relative_to(releases).parts) > 1:
+                    roots.append(releases / path.relative_to(releases).parts[0])
             # Grant package assets, never an arbitrary executable's parent/home.
-            for prefix in (
-                Path("/opt/homebrew/Cellar"),
-                Path("/opt/homebrew/Caskroom"),
-                Path("/usr/local/Cellar"),
-                Path("/usr/local/Caskroom"),
-            ):
+            for prefix in PACKAGE_ROOTS:
                 if path.is_relative_to(prefix) and len(path.relative_to(prefix).parts) > 2:
                     roots.append(prefix.joinpath(*path.relative_to(prefix).parts[:2]))
             nvm = Path.home() / ".nvm/versions/node"
@@ -103,7 +107,7 @@ def codex_code_mode_host() -> Path:
     executable = shutil.which("codex")
     if executable is None:
         raise ValueError("Codex reviews need codex on PATH")
-    host = Path(executable).parent / "codex-code-mode-host"
+    host = Path(executable).resolve().parent / "codex-code-mode-host"
     if not host.is_file() or not os.access(host, os.X_OK):
         raise ValueError(
             f"Codex reviews need an executable {host}: code mode starts it beside the launched "
@@ -201,6 +205,12 @@ def command(
     readable: Iterable[Path] = (),
     expected: dict[str, object] | None = None,
 ) -> tuple[list[str], dict[str, object]]:
+    # Launch the real Codex binary so its sibling helper lookup uses the release directory.
+    # Keep this at the shared host boundary: reviews, judges and trusted adapters all use it.
+    executable = shutil.which(argv[0])
+    codex = shutil.which("codex")
+    if executable and codex and Path(executable).resolve() == Path(codex).resolve():
+        argv = [str(Path(executable).resolve()), *argv[1:]]
     try:
         identity = runtime_identity()
     except (OSError, ValueError) as error:
