@@ -14,6 +14,7 @@ import importlib.metadata
 import inspect
 import json
 import shlex
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -199,15 +200,16 @@ def _by_path(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def session_errors(
-    stream: str, receipt: dict[str, Any], *, model: str, subagents: bool
+    stream: str, receipt: dict[str, Any], *, model: str, subagents: bool, transcript: str
 ) -> list[str]:
     """How a coding session differs from the discovery receipt it was launched after (D2).
 
-    Its `system/init` must report what discovery found and offer the pinned tools, and its
-    hook events must be the listed hooks:
-    the SessionStart hooks that match `startup` start once each and exit 0 before the first
-    assistant message, other listed hooks exit 0 or 2 (a deliberate block), and no other hook
-    event appears.
+    Discovery must have run with the pinned permission rules. The session's `system/init`
+    must report what discovery found, the pinned permission mode and the pinned tools, and
+    its result must record no permission denial. Its hook events must be the listed hooks:
+    each SessionStart hook that matches `startup` runs once, by its command in the root
+    `transcript`, and exits 0 before the first assistant message; other listed hooks exit 0
+    or 2 (a deliberate block), and no other hook event appears.
     """
     events = _events(stream)
     inits = _inits(events)
@@ -219,6 +221,12 @@ def session_errors(
         skills = {skill["name"] for skill in receipt["skills"]}
         plugins = sorted((item["id"], item["loaded_from"]) for item in receipt["plugin_installs"])
         listing = [(hook["event"], hook.get("matcher") or "") for hook in receipt["hooks"]["hooks"]]
+        at_startup = Counter(
+            str(hook["commandText"])
+            for hook in receipt["hooks"]["hooks"]
+            if hook["event"] == "SessionStart" and _matches(hook.get("matcher") or "", "startup")
+        )
+        rules = receipt["settings"].get("permissions")
         expected = {
             "claude_code_version": receipt["cli_version"],
             "model": model,
@@ -250,6 +258,10 @@ def session_errors(
         for key in expected
         if observed[key] != expected[key]
     ]
+    if rules != claude.PINNED_SETTINGS["permissions"]:
+        errors.append("discovery's effective settings lack the pinned permission rules")
+    if init.get("permissionMode") != claude.PERMISSION_MODE:
+        errors.append(f"system/init permissionMode is not {claude.PERMISSION_MODE}")
     tools = init.get("tools")
     refused = set(claude.DISALLOWED_TOOLS) | (set() if subagents else {"Agent", claude.SUBAGENT_TOOL})
     qualified = claude.QUALIFIED_TOOLS.get(str(receipt["cli_version"]))
@@ -259,7 +271,10 @@ def session_errors(
         qualified - (set() if subagents else {claude.SUBAGENT_TOOL})
     ):
         errors.append("system/init tools differ from the pinned tool set")
-    return errors + _hook_errors(events, listing)
+    # Every tool is allowed, so a denial is an action no rule allows: refused, not compared.
+    if any(event.get("permission_denials") != [] for event in events if event.get("type") == "result"):
+        errors.append("the run records permission denials")
+    return errors + _hook_errors(events, listing) + _startup_hook_errors(transcript, at_startup)
 
 
 def _hook_errors(events: list[dict[str, Any]], listing: list[tuple[str, str]]) -> list[str]:
@@ -310,6 +325,39 @@ def _hook_errors(events: list[dict[str, Any]], listing: list[tuple[str, str]]) -
     return errors
 
 
+def _startup_hook_errors(transcript: str, listed: Counter[str]) -> list[str]:
+    """The root transcript names each hook run by its command as declared, with
+    `${CLAUDE_PLUGIN_ROOT}` unexpanded, as discovery lists it (verified on CLI 2.1.322)."""
+    entries = _events(transcript)
+    first_reply = next(
+        (index for index, entry in enumerate(entries) if entry.get("type") == "assistant"),
+        len(entries),
+    )
+    runs = [
+        (index, attachment)
+        for index, entry in enumerate(entries)
+        if isinstance(attachment := entry.get("attachment"), dict)
+        and attachment.get("hookName") == "SessionStart:startup"
+    ]
+    errors = []
+    if Counter(str(run.get("command")) for _, run in runs) != listed:
+        errors.append("the transcript's SessionStart startup hooks are not each listed hook once")
+    if any(
+        index > first_reply or (run.get("type"), run.get("exitCode")) != ("hook_success", 0)
+        for index, run in runs
+    ):
+        errors.append("a SessionStart startup hook failed or ran after the first reply")
+    return errors
+
+
+def root_transcript(sessions: Path, stream: str) -> str:
+    """The text of the coding session's root transcript, or "" without exactly one."""
+    inits = _inits(_events(stream))
+    session = inits[0].get("session_id") if len(inits) == 1 else None
+    found = list((sessions / "projects").glob(f"*/{session}.jsonl")) if session else []
+    return found[0].read_text(errors="replace") if len(found) == 1 else ""
+
+
 def _matches(matcher: str, trigger: str) -> bool:
     """Claude's matcher in the grammar admission allows: empty or `*` matches all; otherwise
     `|`-separated exact names (verified on CLI 2.1.322: `start` does not match `startup`)."""
@@ -327,11 +375,8 @@ def init_tools(stream: str) -> list[str] | None:
 
 
 def permission_denials(stream: str) -> list[str]:
-    """The tools the CLI denied during the run, for the attempt's record.
-
-    Recorded, not refused: in 2.1.322 a subagent can be asked to approve a Bash command even
-    under bypassPermissions (the paid probe's one-subagent run), the same in every arm.
-    """
+    """The tools the CLI denied during the run, for the attempt's record; any denial also
+    fails the attempt (`session_errors`)."""
     return [
         str(denial.get("tool_name"))
         for event in _events(stream)

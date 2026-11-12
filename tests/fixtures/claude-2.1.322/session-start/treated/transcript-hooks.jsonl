@@ -1,0 +1,1 @@
+{"type": "attachment", "sessionId": "ed86760b-5515-47a4-a346-8b0f614be2a1", "attachment": {"type": "hook_success", "hookName": "SessionStart:startup", "toolUseID": "be89af28-7714-45f7-a719-6a4bdbe1e628", "hookEvent": "SessionStart", "exitCode": 0, "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\"}}'", "durationMs": 19}}

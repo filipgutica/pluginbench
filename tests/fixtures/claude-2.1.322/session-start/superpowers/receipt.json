@@ -54,6 +54,7 @@
    "run-skill-generator",
    "security-review",
    "simplify",
+   "team-onboarding",
    "update-config",
    "usage",
    "verify",
@@ -73,12 +74,12 @@
    "--verbose",
    "--output-format=stream-json",
    "--settings",
-   "{\"disableAllHooks\":true}",
+   "{\"disableAllHooks\":true,\"permissions\":{\"allow\":[\"Agent\",\"Bash\",\"CronDelete\",\"CronList\",\"Edit\",\"EnterWorktree\",\"ExitWorktree\",\"ListAgents\",\"Monitor\",\"NotebookEdit\",\"Read\",\"ReportFindings\",\"Skill\",\"TaskStop\",\"ToolSearch\",\"WebFetch\",\"WebSearch\",\"Write\"]}}",
    "--model",
    "claude-opus-5-5",
    "--effort",
    "high",
-   "--permission-mode=bypassPermissions",
+   "--permission-mode=default",
    "--setting-sources",
    "user",
    "--strict-mcp-config",
@@ -296,15 +297,15 @@
    "enabled": true,
    "id": "demo@pluginbench-frozen",
    "installPath": "/logs/agent/sessions/plugins/cache/pluginbench-frozen/demo/unknown",
-   "installedAt": "2026-11-12T22:18:33.730Z",
-   "lastUpdated": "2026-11-12T22:18:33.730Z",
+   "installedAt": "2026-11-12T23:34:04.461Z",
+   "lastUpdated": "2026-11-12T23:34:04.461Z",
    "projectEnabled": false,
    "readFromFolder": "/tmp/pluginbench-treatments/marketplace/plugins/demo",
    "scope": "user",
    "version": "unknown"
   }
  ],
- "session_cost": "Total cost:            $0.0000\nTotal duration (API):  0s\nTotal duration (wall): 0s\nTotal code changes:    0 lines added, 0 lines removed\nUsage:                 0 input, 0 output, 0 cache read, 0 cache write",
+ "session_cost": "Total cost:            $0.0000\nTotal duration (API):  0s\nTotal duration (wall): 19s\nTotal code changes:    0 lines added, 0 lines removed\nUsage:                 0 input, 0 output, 0 cache read, 0 cache write",
  "settings": {
   "disableAllHooks": true,
   "enabledPlugins": {
@@ -317,6 +318,28 @@
      "source": "directory"
     }
    }
+  },
+  "permissions": {
+   "allow": [
+    "Agent",
+    "Bash",
+    "CronDelete",
+    "CronList",
+    "Edit",
+    "EnterWorktree",
+    "ExitWorktree",
+    "ListAgents",
+    "Monitor",
+    "NotebookEdit",
+    "Read",
+    "ReportFindings",
+    "Skill",
+    "TaskStop",
+    "ToolSearch",
+    "WebFetch",
+    "WebSearch",
+    "Write"
+   ]
   }
  },
  "skill_activation": "not observed by discovery; native availability is verified",

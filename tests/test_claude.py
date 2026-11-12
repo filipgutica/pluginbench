@@ -121,9 +121,12 @@ def test_coding_launch_is_the_pinned_contract() -> None:
     )
     assert claude.coding_launch(run) == (
         [
-            "claude", "--verbose", "--output-format=stream-json", "--settings", "{}",
+            "claude", "--verbose", "--output-format=stream-json", "--settings",
+            '{"permissions":{"allow":["Agent","Bash","CronDelete","CronList","Edit",'
+            '"EnterWorktree","ExitWorktree","ListAgents","Monitor","NotebookEdit","Read",'
+            '"ReportFindings","Skill","TaskStop","ToolSearch","WebFetch","WebSearch","Write"]}}',
             "--model", "claude-opus-5-5", "--effort", "high",
-            "--permission-mode=bypassPermissions", "--setting-sources", "user",
+            "--permission-mode=default", "--setting-sources", "user",
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
             "--include-hook-events", "--no-chrome", "--disallowed-tools",
             "RemoteTrigger,CronCreate,ScheduleWakeup,SendMessage,Workflow,Agent", "--print",
@@ -147,7 +150,10 @@ def test_discovery_differs_from_coding_by_exactly_the_discovery_delta(subagents:
     coding, coding_env = claude.coding_launch(run)
     discovery, discovery_env = claude.discovery_launch(run)
     expected = list(coding)
-    expected[coding.index("--settings") + 1] = '{"disableAllHooks":true}'
+    settings = json.loads(coding[coding.index("--settings") + 1])
+    expected[coding.index("--settings") + 1] = json.dumps(
+        {**settings, "disableAllHooks": True}, sort_keys=True, separators=(",", ":")
+    )
     printing = coding.index("--print")
     expected[printing:printing] = ["--input-format", "stream-json", "--no-session-persistence"]
     assert discovery == expected

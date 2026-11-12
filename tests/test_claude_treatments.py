@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import shutil
@@ -151,6 +152,8 @@ def responses(attempt: Attempt) -> dict[str, Any]:
     else:
         settings["effective"] = {"disableAllHooks": True}
         settings["sources"] = []
+    # CLI 2.1.322 reports the pinned permission rules as given (offline capture).
+    settings["effective"]["permissions"] = copy.deepcopy(claude.PINNED_SETTINGS["permissions"])
     return captured
 
 

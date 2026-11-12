@@ -91,7 +91,8 @@ def _guidance(path: Path, base: Path) -> Path:
 
 # Claude Code skill frontmatter that describes the skill or who may invoke it. Keys
 # that change the model, effort, context, subagent, hooks, or activation are refused.
-# `allowed-tools` only pre-approves tools, which is a no-op under bypassPermissions.
+# `allowed-tools` only pre-approves tools, which is a no-op while the pinned launch's
+# permission rules allow every tool it offers (claude.ALLOWED_TOOLS).
 _CLAUDE_SKILL_KEYS = {
     "name", "description", "dependencies", "license", "metadata", "allowed-tools",
     "disable-model-invocation", "user-invocable", "argument-hint",

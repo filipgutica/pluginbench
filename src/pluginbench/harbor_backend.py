@@ -2422,6 +2422,9 @@ def _native_completion(
                     subagents=bool(
                         _native_object(launch["capabilities"], "coding capabilities")["subagents"]
                     ),
+                    transcript=claude_launch.root_transcript(
+                        artifacts / "harbor/trial/agent/sessions", stream
+                    ),
                 )
                 if mismatches:
                     raise ValueError(

@@ -108,8 +108,20 @@ def command(
 
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# The pinned launch runs in `default` permission mode: CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, which
+# keeps the token out of tool subprocesses, makes CLI 2.1.322 force `default` over any
+# --permission-mode. Print mode denies whatever a rule does not allow, so every tool the
+# launch offers is allowed by its bare name, which matches every use of that tool (a bare
+# `Bash` matches every command, compound ones included). Subagents inherit these rules.
+# The subagent tool, named Task in `system/init`, is `Agent` in permission rules.
+PERMISSION_MODE = "default"
+ALLOWED_TOOLS = (
+    "Agent", "Bash", "CronDelete", "CronList", "Edit", "EnterWorktree", "ExitWorktree",
+    "ListAgents", "Monitor", "NotebookEdit", "Read", "ReportFindings", "Skill", "TaskStop",
+    "ToolSearch", "WebFetch", "WebSearch", "Write",
+)
 # Settings every Claude coding launch passes, identical in vanilla and treatment arms.
-PINNED_SETTINGS: dict[str, object] = {}
+PINNED_SETTINGS: dict[str, object] = {"permissions": {"allow": list(ALLOWED_TOOLS)}}
 # Discovery adds only this: it lists hooks without running them.
 DISCOVERY_SETTINGS: dict[str, object] = {"disableAllHooks": True}
 DISALLOWED_TOOLS = ("RemoteTrigger", "CronCreate", "ScheduleWakeup", "SendMessage", "Workflow")
@@ -159,7 +171,7 @@ def coding_launch(run: CodingRun) -> tuple[list[str], dict[str, str]]:
         run.model,
         "--effort",
         run.effort,
-        "--permission-mode=bypassPermissions",
+        f"--permission-mode={PERMISSION_MODE}",
         "--setting-sources",
         "user",
         "--strict-mcp-config",
@@ -198,8 +210,10 @@ _HARBOR_CODING = re.compile(
 def contract_command(command: str, run: CodingRun) -> str:
     """Harbor's coding command with the pinned argv in place of Harbor's own flags.
 
-    Only the exact command Harbor builds for this run is accepted. The pinned command keeps
-    stderr out of the stream-json stdout, and Harbor's `set -o pipefail` keeps the CLI's exit.
+    Only the exact command Harbor builds for this run is accepted. Harbor always asks for
+    bypassPermissions; the pinned argv replaces Harbor's flags, so the CLI runs in the pinned
+    mode. The pinned command keeps stderr out of the stream-json stdout, and Harbor's
+    `set -o pipefail` keeps the CLI's exit.
     """
     match = _HARBOR_CODING.fullmatch(command)
     harbor = (
@@ -392,9 +406,9 @@ def observed_cli_version(startup: object) -> str | None:
 # and token reconciliation) is qualified against. Other versions run with a warning.
 QUALIFIED_VERSIONS = frozenset({"2.1.322"})
 # The tools a qualified CLI offers the pinned coding launch with subagents on, as `system/init`
-# lists them. From the paid 2.1.322 probe (subscription login): an offline, fake-token start
-# omits WebFetch. `system/init` names the subagent tool Task; `--disallowed-tools Agent`
-# removes it.
+# lists them; tests/fixtures/claude-2.1.322/init-tools.json holds the captures. From the paid
+# 2.1.322 probe (subscription login): an offline, fake-token start omits WebFetch.
+# `system/init` names the subagent tool Task; `--disallowed-tools Agent` removes it.
 SUBAGENT_TOOL = "Task"
 QUALIFIED_TOOLS: dict[str, frozenset[str]] = {
     "2.1.322": frozenset({

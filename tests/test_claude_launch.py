@@ -68,6 +68,8 @@ class Container:
     after_sessions: str = ""
     # Changes to the captured events the CLI streams before its first model request.
     edit_start: Callable[[list[dict[str, Any]]], None] = lambda events: None
+    # Changes to the captured hook entries the CLI writes at the head of the root transcript.
+    edit_transcript: Callable[[list[dict[str, Any]]], None] = lambda entries: None
     agent_root: Path | None = None
 
     @property
@@ -105,9 +107,24 @@ class Container:
         self.edit_start(start)
         return "".join(json.dumps(event) + "\n" for event in start + coding if event is not init)
 
+    def sessions(self) -> Path:
+        """The coding fixture's sessions, with this arm's captured hook entries at the head
+        of the root transcript."""
+        sessions = self.root / "sessions"
+        shutil.copytree(FIXTURES / "coding" / self.case / "sessions", sessions)
+        (transcript,) = (sessions / "projects").glob("*/*.jsonl")
+        entries = _jsonl(FIXTURES / "session-start" / self.arm / "transcript-hooks.jsonl")
+        for entry in entries:
+            entry["sessionId"] = transcript.stem
+        self.edit_transcript(entries)
+        transcript.write_text(
+            "".join(json.dumps(entry) + "\n" for entry in entries) + transcript.read_text()
+        )
+        return sessions
+
     def install_cli(self) -> None:
         """The CLI Harbor's PATH export finds first: it replays one coding fixture."""
-        fixture = FIXTURES / "coding" / self.case
+        sessions = self.sessions()
         (self.root / "stream.jsonl").write_text(self.stream())
         binary = self.home / ".local/bin/claude"
         binary.parent.mkdir(parents=True)
@@ -116,7 +133,7 @@ class Container:
             'if [ "$1" = "--version" ]; then echo "2.1.322 (Claude Code)"; exit 0; fi\n'
             f'printf "%s\\n" "$@" > {shlex.quote(str(self.argv_log))}\n'
             f"cat > {shlex.quote(str(self.root / 'prompt.txt'))}\n"
-            f'cp -R {shlex.quote(str(fixture / "sessions"))}/. "$CLAUDE_CONFIG_DIR/"\n'
+            f'cp -R {shlex.quote(str(sessions))}/. "$CLAUDE_CONFIG_DIR/"\n'
             f"{self.after_sessions}\n"
             f"cat {shlex.quote(str(self.root / 'stream.jsonl'))}\n"
             f"echo {shlex.quote(DIAGNOSTIC)} >&2\n"
@@ -618,6 +635,13 @@ def test_the_claude_transport_pins_harbors_run_source(monkeypatch: pytest.Monkey
         claude_launch.transport()
 
 
+def _jsonl(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+INIT_TOOLS = json.loads((FIXTURES / "init-tools.json").read_text())
+
+
 def _as_probed(events: list[dict[str, Any]], *, subagents: bool) -> None:
     """Give a captured offline start the tools of a signed-in 2.1.322 session.
 
@@ -626,7 +650,7 @@ def _as_probed(events: list[dict[str, Any]], *, subagents: bool) -> None:
     `--disallowed-tools Agent`.
     """
     tools = _init(events)["tools"]
-    tools.append("WebFetch")
+    tools.extend(sorted(set(INIT_TOOLS["signed_in"]) - set(INIT_TOOLS["offline"])))
     if not subagents:
         tools.remove("Task")
 
@@ -682,6 +706,10 @@ SESSION_CHANGES: dict[str, tuple[bool, Callable[[list[dict[str, Any]]], None], s
     ),
     "mcp": (False, lambda e: _init(e).update(mcp_servers=[{"name": "m"}]), "mcp_servers differs"),
     "subagent tool": (False, lambda e: _init(e)["tools"].append("Task"), "disallowed tool"),
+    "permission mode": (
+        False, lambda e: _init(e).update(permissionMode="bypassPermissions"),
+        "permissionMode is not default",
+    ),
     "tool removed": (
         False, lambda e: _init(e).update(tools=["Read"]), "tools differ from the pinned tool set",
     ),
@@ -719,7 +747,7 @@ SESSION_CHANGES: dict[str, tuple[bool, Callable[[list[dict[str, Any]]], None], s
 }
 
 
-@pytest.mark.parametrize("arm", ["vanilla", "treated", "superpowers"])
+@pytest.mark.parametrize("arm", ["vanilla", "treated", "superpowers", "two-hooks"])
 def test_each_captured_real_session_matches_its_real_receipt(arm: str) -> None:
     assert _errors(*_captured(arm)) == []
 
@@ -738,34 +766,51 @@ def test_a_session_that_differs_from_its_discovery_receipt_fails_the_attempt(
     assert reason in saved["treatment_error"]
 
 
-def test_a_permission_denial_is_recorded_not_refused(
+def test_a_permission_denial_fails_the_attempt_and_is_recorded(
     attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The paid probe's one-subagent run: the CLI asked to approve the subagent's Bash call
-    # under bypassPermissions and denied it. Every arm meets the same CLI behaviour.
+    # The paid probe's one-subagent run, forced into `default` mode without allow rules:
+    # print mode denied the subagent's Bash call.
     made = attempt(treated=False, case="one-subagent")
     made.invoke(monkeypatch)
     saved = json.loads((made.area / "artifacts/execution.json").read_text())
-    assert saved["successful_native_completion"] is True
-    assert saved.get("treatment_error") is None
+    assert saved["successful_native_completion"] is False
+    assert "the run records permission denials" in saved["treatment_error"]
     assert saved["claude_permission_denials"] == ["Bash"]
 
 
-def _captured(arm: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def test_the_qualified_tool_set_is_the_captured_one() -> None:
+    assert sorted(claude.QUALIFIED_TOOLS[VERSION]) == INIT_TOOLS["signed_in"]
+    # The rules allow each tool the launch offers; the subagent tool's rule name is Agent.
+    offered = set(INIT_TOOLS["signed_in"]) - {"Task"} | {"Agent"}
+    assert set(claude.ALLOWED_TOOLS) == offered
+
+
+def _captured(
+    arm: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
+    """An arm's real session start, discovery receipt and root-transcript hook entries."""
     captured = FIXTURES / "session-start" / arm
-    events = [json.loads(line) for line in (captured / "session-start.jsonl").read_text().splitlines()]
+    events = _jsonl(captured / "session-start.jsonl")
     _as_probed(events, subagents=True)
-    return events, json.loads((captured / "receipt.json").read_text())
+    receipt = json.loads((captured / "receipt.json").read_text())
+    return events, receipt, _jsonl(captured / "transcript-hooks.jsonl")
 
 
-def _errors(events: list[dict[str, Any]], receipt: dict[str, Any]) -> list[str]:
-    stream = "".join(json.dumps(event) + "\n" for event in events)
-    return claude_launch.session_errors(stream, receipt, model=MODEL, subagents=True)
+def _errors(
+    events: list[dict[str, Any]], receipt: dict[str, Any], transcript: list[dict[str, Any]]
+) -> list[str]:
+    def text(items: list[dict[str, Any]]) -> str:
+        return "".join(json.dumps(item) + "\n" for item in items)
+
+    return claude_launch.session_errors(
+        text(events), receipt, model=MODEL, subagents=True, transcript=text(transcript)
+    )
 
 
 @pytest.mark.parametrize(("exit_code", "allowed"), [(0, True), (2, True), (1, False)])
 def test_a_listed_tool_hook_may_allow_or_block(exit_code: int, allowed: bool) -> None:
-    events, receipt = _captured("treated")
+    events, receipt, transcript = _captured("treated")
     receipt["hooks"]["hooks"].append({"event": "PreToolUse", "matcher": "Bash"})
     hook = {"type": "system", "hook_id": "tool", "hook_name": "PreToolUse:Bash",
             "hook_event": "PreToolUse"}
@@ -774,16 +819,51 @@ def test_a_listed_tool_hook_may_allow_or_block(exit_code: int, allowed: bool) ->
         {**hook, "subtype": "hook_started"},
         {**hook, "subtype": "hook_response", "exit_code": exit_code, "outcome": "error"},
     ]
-    assert (_errors(events, receipt) == []) is allowed
+    assert (_errors(events, receipt, transcript) == []) is allowed
 
 
 def test_an_unqualified_version_is_held_only_to_the_disallowed_tools() -> None:
-    events, receipt = _captured("vanilla")
+    events, receipt, transcript = _captured("vanilla")
     receipt["cli_version"] = "2.1.400"
     _init(events).update(claude_code_version="2.1.400", tools=["Read"])
-    assert _errors(events, receipt) == []
+    assert _errors(events, receipt, transcript) == []
     _init(events)["tools"].append("RemoteTrigger")
-    assert _errors(events, receipt) == ["system/init offers a disallowed tool"]
+    assert _errors(events, receipt, transcript) == ["system/init offers a disallowed tool"]
+
+
+def test_discovery_must_have_run_with_the_pinned_permission_rules() -> None:
+    events, receipt, transcript = _captured("vanilla")
+    del receipt["settings"]["permissions"]
+    assert _errors(events, receipt, transcript) == [
+        "discovery's effective settings lack the pinned permission rules"
+    ]
+
+
+def _run_twice(transcript: list[dict[str, Any]]) -> None:
+    """Hook A runs twice and hook B never: the stream still shows two startup hooks."""
+    transcript[1]["attachment"]["command"] = transcript[0]["attachment"]["command"]
+
+
+TRANSCRIPT_CHANGES: dict[str, tuple[Callable[[list[dict[str, Any]]], object], str]] = {
+    "one hook twice, another never": (_run_twice, "are not each listed hook once"),
+    "hook missing": (lambda t: t.pop(), "are not each listed hook once"),
+    "hook failed": (
+        lambda t: t[1]["attachment"].update(type="hook_non_blocking_error", exitCode=1),
+        "failed or ran after the first reply",
+    ),
+    "hook after the first reply": (
+        lambda t: t.insert(1, {"type": "assistant", "message": {"content": []}}),
+        "failed or ran after the first reply",
+    ),
+}
+
+
+@pytest.mark.parametrize("change", sorted(TRANSCRIPT_CHANGES))
+def test_each_listed_startup_hook_runs_once_by_its_command(change: str) -> None:
+    events, receipt, transcript = _captured("two-hooks")
+    edit, reason = TRANSCRIPT_CHANGES[change]
+    edit(transcript)
+    assert any(reason in error for error in _errors(events, receipt, transcript))
 
 
 def test_a_failed_usage_check_leaves_the_attempt_usage_unvalidated(
@@ -827,13 +907,12 @@ def test_treatment_files_changed_during_the_run_fail_the_attempt(
     reason="Explicit check against the host's real Claude Code CLI 2.1.322",
 )
 @pytest.mark.parametrize("subagents", [False, True])
-def test_the_real_cli_drops_its_subagent_tool_for_disallowed_agent(
-    tmp_path: Path, subagents: bool
-) -> None:
-    """`system/init` names the subagent tool Task; `--disallowed-tools Agent` removes it.
+def test_the_real_cli_starts_the_pinned_launch_as_pinned(tmp_path: Path, subagents: bool) -> None:
+    """The pinned launch starts in `default` mode without the scrub's forced-mode warning,
+    offering the captured tools; `--disallowed-tools Agent` removes the subagent tool, Task.
 
-    A fake token: the CLI reports init before its first model request, and the test stops it
-    there.
+    A fake token and a dead proxy: the CLI reports init before its first model request, and
+    the test stops it there.
     """
     import subprocess
 
@@ -843,11 +922,13 @@ def test_the_real_cli_drops_its_subagent_tool_for_disallowed_agent(
         (tmp_path / name).mkdir()
     env = {
         "PATH": os.environ["PATH"], "HOME": str(tmp_path / "home"),
-        "CLAUDE_CONFIG_DIR": str(tmp_path / "config"), "CLAUDE_CODE_OAUTH_TOKEN": TOKEN, **pinned,
+        "CLAUDE_CONFIG_DIR": str(tmp_path / "config"), "CLAUDE_CODE_OAUTH_TOKEN": TOKEN,
+        "HTTPS_PROXY": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1:9", **pinned,
     }
+    stderr = tmp_path / "stderr.log"
     process = subprocess.Popen(
         argv, cwd=tmp_path, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, text=True,
+        stderr=stderr.open("w"), text=True,
     )
     assert process.stdin is not None and process.stdout is not None
     process.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}}))
@@ -861,5 +942,7 @@ def test_the_real_cli_drops_its_subagent_tool_for_disallowed_agent(
         process.kill()
         process.wait()
     assert init["claude_code_version"] == VERSION
-    assert ("Task" in init["tools"]) is subagents
-    assert not set(claude.DISALLOWED_TOOLS) & set(init["tools"])
+    assert init["permissionMode"] == claude.PERMISSION_MODE
+    assert "Permission mode forced" not in stderr.read_text()
+    offered = set(INIT_TOOLS["offline"]) - (set() if subagents else {"Task"})
+    assert sorted(init["tools"]) == sorted(offered)
