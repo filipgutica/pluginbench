@@ -1031,7 +1031,7 @@ def chart_data(report: dict[str, object]) -> dict[str, object]:
     for row in observations:
         if row.compatibility and not groups.get((row.role, row.compatibility, "baseline")):
             row.status = "not comparable"
-            row.reason += "; no matching explicit baseline observation"
+            row.reason += "; no matching explicit vanilla observation"
     medians = []
     for (role, identity, arm), rows in groups.items():
         baseline = groups.get((role, identity, "baseline"), [])

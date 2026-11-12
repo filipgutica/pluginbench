@@ -7,6 +7,8 @@ Unknown fields are rejected. `<name>` denotes a mapping key; `[]` denotes a list
 Required applies within the containing object, including optional objects when supplied.
 Defaults are JSON values; `—` means no default. Validators also enforce combinations of fields.
 See [running evaluations](running-evaluations.md) for valid combinations and execution requirements.
+The no-guidance arm is `vanilla` in configuration, gates, and public report files.
+See [report format](metrics.md#report-files) for schema versions and legacy report compatibility.
 
 ## Evaluation file
 

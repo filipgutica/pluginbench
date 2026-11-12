@@ -18,10 +18,9 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from pluginbench.arms import normalize_arm_name
 from pluginbench.evaluation_report import MEASUREMENT_METRICS, correctness_state
 
-# Older runs call the package without guidance "baseline".
-ARM_NAMES = {"baseline": "vanilla"}
 PASS_STATES = {"pass"}
 # Any other correctness, such as unknown, could be a pass or a fail.
 GRADED_STATES = {"pass", "fail", "overlap_pass"}
@@ -310,7 +309,7 @@ def load_evidence(specs: list[str]) -> Evidence:
     owners: dict[tuple[str, str], int] = {}
     for index, spec in enumerate(specs):
         directory, _, selection = spec.partition("=")
-        wanted = {ARM_NAMES.get(arm, arm) for arm in selection.split(",") if arm}
+        wanted = {normalize_arm_name(arm) for arm in selection.split(",") if arm}
         results = Path(directory) / "report" / "results.json"
         if not results.is_file():
             raise ValueError(f"{directory} has no report/results.json; run `pluginbench report`")
@@ -352,7 +351,7 @@ def load_evidence(specs: list[str]) -> Evidence:
                 )
         found: set[str] = set()
         for row in data["attempts"]:
-            arm = ARM_NAMES.get(row["guidance"], row["guidance"])
+            arm = normalize_arm_name(row["guidance"])
             found.add(arm)
             if wanted and arm not in wanted:
                 continue

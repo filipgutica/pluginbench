@@ -49,6 +49,33 @@ def _gates_file(tmp_path: Path, **changes: object) -> Path:
     return path
 
 
+@pytest.mark.parametrize(("version", "arm"), [(1, "baseline"), (2, "vanilla")])
+def test_compare_reads_both_report_arm_names(tmp_path: Path, version: int, arm: str) -> None:
+    root = tmp_path / "run"
+    report = root / "report/results.json"
+    report.parent.mkdir(parents=True)
+    report.write_text(json.dumps({
+        "schema_version": version,
+        "attempts": [{"id": "stored-id", "task": "task", "guidance": arm, "correctness": "pass"}],
+        "observations": [{
+            # Not a token metric: unvalidated token figures read as unknown (PR #59).
+            "attempt_id": "stored-id", "arm": arm, "metric": "Source lines added",
+            "value": 42, "status": "measured",
+        }],
+    }))
+    gates = tmp_path / "gates.yaml"
+    gates.write_text("count_overlap_passes: false\ngates: []\n")
+    before = report.read_bytes()
+    result = CliRunner().invoke(cli.app, ["compare", f"{root}=vanilla", "--gates", str(gates)])
+    assert result.exit_code == 0, result.output
+    assert "vanilla" in result.stdout and "baseline" not in result.stdout
+    [attempt] = load_evidence([f"{root}=baseline"]).attempts
+    assert (attempt.id, attempt.arm, attempt.values) == (
+        "stored-id", "vanilla", {"Source lines added": 42}
+    )
+    assert report.read_bytes() == before
+
+
 def test_pilot_climb_measures_match_the_study_analysis() -> None:
     # analyze.py's numbers for the pilot's climb split, from the same saved reports.
     evidence = load_evidence(PILOT)

@@ -243,7 +243,8 @@ Cache keys bind the launcher's declared version, not the source of the modules t
 
 Each vanilla repeat is its own cache entry, `<key>/<repeat>`, published as soon as that attempt finishes. A run that stops midway still caches the repeats it finished. A cached cohort includes failures and unknowns. Missing isolation receipts, corrupt entries, or a concurrent reservation stop reuse. Imported submissions retain original receipts and timing; token usage is re-validated from saved evidence. A separate `execution-current.json` holds the current usage projection and native regrade result. Current native verification, selected measurements, and reviews run again. Re-validation does not change cache identity or keys. Reports disclose reuse. Reused runs are not fresh independent samples.
 
-Open `report/report.html`. `results.json` contains raw observations, capabilities, grading evidence, baseline deltas, reference values and ratios, and cost rows. `results.csv` contains individual measurements. Rebuild with `pluginbench report runs/<run>` without model calls.
+Open `report/report.html`. `results.json` contains raw observations, capabilities, grading evidence, vanilla deltas, reference values and ratios, and cost rows. `results.csv` contains individual measurements. Rebuild with `pluginbench report runs/<run>` without model calls.
+Public reports use `vanilla` for the no-guidance arm. See the [report format](metrics.md#report-files) for schema version 2 and compatibility with older reports.
 
 The overview gives each task equal weight by averaging its median. Complexity and unused candidates are grouped by language and analyzer; unlike scores are not pooled. Fractional finding counts are averages; individual reviews have whole-number counts. Drill into a task to see repetitions. A package's delta is its value minus vanilla. Separate evaluations need matching task, runtime, measurement, and review identities before comparing deltas.
 

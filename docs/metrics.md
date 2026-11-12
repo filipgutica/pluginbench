@@ -54,3 +54,27 @@ See [running evaluations](running-evaluations.md#compare-runs) for gate statisti
 | Scope findings | Unnecessary changes beyond the task, as reported by the independent reviewer. Each issue has one category; fewer means fewer reported issues of this kind. | findings | `Scope review findings` | Gate chooses |
 | Maintainability findings | Complexity, duplication, or unclear responsibilities, as reported by the independent reviewer. Each issue has one category; fewer means fewer reported issues of this kind. | findings | `Maintainability review findings` | Gate chooses |
 | Tests findings | Missing, misleading, or low-value tests, as reported by the independent reviewer. Each issue has one category; fewer means fewer reported issues of this kind. | findings | `Tests review findings` | Gate chooses |
+
+## Report files
+
+`report/results.json`, `report/results.csv`, and `report/report.html` name the no-guidance arm `vanilla`.
+CSV column names are unchanged; the `arm` column now contains `vanilla` instead of `baseline`.
+The JSON format is `schema_version: 2`. Version 1 called this arm `baseline`.
+`compare`, `status`, and `judge prepare` accept both report versions without rewriting them.
+
+| Version 1 | Version 2 | Location |
+| --- | --- | --- |
+| `baseline` | `vanilla` | `arm` and `guidance` values; `completeness_matrix[].cells` keys |
+| `baseline_median` | `vanilla_median` | `comparisons[]` |
+| `baseline_assigned` | `vanilla_assigned` | `comparisons[]` |
+| `baseline_measured` | `vanilla_measured` | `medians[]`, `raw_medians[]`, `comparisons[]` |
+| `baseline_value` | `vanilla_value` | `aggregates[]` |
+| `baseline_origin` | `vanilla_origin` | `attempts[]` |
+| `reused_baseline_attempts` | `reused_vanilla_attempts` | Top-level field |
+
+Arm values change in attempts, observations, medians, comparisons, aggregates, reference comparisons and aggregates,
+passing medians and aggregates, review findings, cost rows, and measurement completeness rows.
+HTML uses the same public data, labels, and vanilla-first ordering.
+Opaque attempt IDs, evidence paths, provenance, and comparison identities keep their stored values.
+Evidence files, `inputs/study.json`, run identities, and cache keys still use `baseline` internally.
+Existing runs and vanilla caches can resume and reuse without migration.

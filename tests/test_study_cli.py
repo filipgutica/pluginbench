@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import fcntl
 import inspect
+import csv
+import io
 import json
 import hashlib
 import os
@@ -928,7 +930,7 @@ def test_integrated_evaluation_and_report_regeneration(
         assert json.loads((measurement / "revision.json").read_text())["jobs"] == config.jobs
     assert json.loads((review / "protocol.json").read_text())["jobs"] == config.jobs
     assert len(calls) == data["assigned"] == 9
-    assert {row["guidance"] for row in data["attempts"]} == {"baseline", "workflow", "superpowers"}
+    assert {row["guidance"] for row in data["attempts"]} == {"vanilla", "workflow", "superpowers"}
     assert sum(row["correctness"] == "fail" for row in data["attempts"]) == (
         0 if unavailable else 1
     )
@@ -2911,7 +2913,7 @@ def test_an_earlier_build_refuses_the_report_of_a_run_with_listed_pairs(
     }
 
 
-def test_an_earlier_build_writes_the_same_non_token_report_without_listed_pairs(
+def test_an_earlier_build_reports_the_same_measurements_with_legacy_arm_names(
     checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     export = _exported(_BEFORE_LIST, tmp_path)
@@ -2924,22 +2926,30 @@ def test_an_earlier_build_writes_the_same_non_token_report_without_listed_pairs(
     assert evaluation._load_selection(root)["not_measured"] == []
     revision = root / "evidence/observer-revisions/measurements/revision.json"
     assert json.loads(revision.read_text())["schema_version"] == 2
-    ours = json.loads((root / "report/results.json").read_text())
-    csv = (root / "report/results.csv").read_bytes()
+    names = ("results.json", "results.csv", "report.html")
+    ours = {name: (root / "report" / name).read_bytes() for name in names}
+    evidence = load_evidence([str(root)])
+    csv_rows = list(csv.DictReader(io.StringIO(ours["results.csv"].decode())))
+    assert json.loads(ours["results.json"])["schema_version"] == 2
 
     assert _old_report(export, root, tmp_path).startswith("exit: 0")
 
-    earlier = json.loads((root / "report/results.json").read_text())
-    for current, old in zip(ours["attempts"], earlier["attempts"], strict=True):
-        assert current["execution"].pop("usage_accounting") == {
-            "status": "incomplete",
-            "reasons": ["legacy usage has no saved session evidence to validate"],
-        }
-        assert current["execution"].pop("partial_usage") == []
-        assert old["execution"].pop("usage_accounting") is None
-        assert old["execution"].pop("partial_usage") is None
-    assert ours == earlier
-    assert (root / "report/results.csv").read_bytes() == csv
+    legacy = json.loads((root / "report/results.json").read_text())
+    assert legacy["schema_version"] == 1
+    assert {row["guidance"] for row in legacy["attempts"]} == {
+        "baseline", "workflow", "superpowers"
+    }
+    # The old writer still reads the same saved run. Only public naming and the
+    # versioned JSON/HTML format changed; its comparison inputs and CSV measures agree.
+    assert load_evidence([str(root)]) == evidence
+    old_csv = list(csv.DictReader(io.StringIO((root / "report/results.csv").read_text())))
+    for row in old_csv:
+        if row["arm"] == "baseline":
+            row["arm"] = "vanilla"
+    assert old_csv == csv_rows
+    rebuilt = CliRunner().invoke(cli.app, ["report", str(root)])
+    assert rebuilt.exit_code == 0, rebuilt.stderr
+    assert {name: (root / "report" / name).read_bytes() for name in names} == ours
 
 
 def test_report_on_a_run_stopped_during_coding_covers_the_finished_attempts_and_says_so(

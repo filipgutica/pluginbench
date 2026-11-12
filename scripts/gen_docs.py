@@ -76,6 +76,8 @@ def config_reference() -> str:
         "Required applies within the containing object, including optional objects when supplied.",
         "Defaults are JSON values; `—` means no default. Validators also enforce combinations of fields.",
         "See [running evaluations](running-evaluations.md) for valid combinations and execution requirements.",
+        "The no-guidance arm is `vanilla` in configuration, gates, and public report files.",
+        "See [report format](metrics.md#report-files) for schema versions and legacy report compatibility.",
         "",
     ]
     for heading, model in (("Evaluation file", Evaluation), ("Gates file", Gates)):
@@ -135,6 +137,32 @@ def metrics_reference() -> str:
         direction = "Lower for paired token bounds" if name in TOKEN_METRICS else "Gate chooses"
         values = (title, explanation, unit, f"`{name}`", direction)
         lines.append("| " + " | ".join(cell(value) for value in values) + " |")
+    lines += [
+        "",
+        "## Report files",
+        "",
+        "`report/results.json`, `report/results.csv`, and `report/report.html` name the no-guidance arm `vanilla`.",
+        "CSV column names are unchanged; the `arm` column now contains `vanilla` instead of `baseline`.",
+        "The JSON format is `schema_version: 2`. Version 1 called this arm `baseline`.",
+        "`compare`, `status`, and `judge prepare` accept both report versions without rewriting them.",
+        "",
+        "| Version 1 | Version 2 | Location |",
+        "| --- | --- | --- |",
+        "| `baseline` | `vanilla` | `arm` and `guidance` values; `completeness_matrix[].cells` keys |",
+        "| `baseline_median` | `vanilla_median` | `comparisons[]` |",
+        "| `baseline_assigned` | `vanilla_assigned` | `comparisons[]` |",
+        "| `baseline_measured` | `vanilla_measured` | `medians[]`, `raw_medians[]`, `comparisons[]` |",
+        "| `baseline_value` | `vanilla_value` | `aggregates[]` |",
+        "| `baseline_origin` | `vanilla_origin` | `attempts[]` |",
+        "| `reused_baseline_attempts` | `reused_vanilla_attempts` | Top-level field |",
+        "",
+        "Arm values change in attempts, observations, medians, comparisons, aggregates, reference comparisons and aggregates,",
+        "passing medians and aggregates, review findings, cost rows, and measurement completeness rows.",
+        "HTML uses the same public data, labels, and vanilla-first ordering.",
+        "Opaque attempt IDs, evidence paths, provenance, and comparison identities keep their stored values.",
+        "Evidence files, `inputs/study.json`, run identities, and cache keys still use `baseline` internally.",
+        "Existing runs and vanilla caches can resume and reuse without migration.",
+    ]
     return "\n".join(lines) + "\n"
 
 

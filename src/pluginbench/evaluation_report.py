@@ -6,6 +6,7 @@ import json
 import statistics
 from pathlib import Path
 
+from pluginbench.arms import normalize_arm_name
 from pluginbench.measurement_profiles import REMOVED_TEST_OVERLAP, readiness_state
 from pluginbench.assessment_charts import (
     DIAGNOSTIC_PANELS,
@@ -889,7 +890,7 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
             }
         )
     limitations = [
-        "Each guidance set is compared with the same vanilla cohort. Compare separate evaluations through compatible baseline deltas.",
+        "Each guidance set is compared with the same vanilla cohort. Compare separate evaluations through compatible vanilla deltas.",
         "Deltas are differences in observed medians, not a winner or composite quality score. A negative delta is not automatically better.",
     ]
     environments = _map(_map(config.get("comparison_identity")).get("task_environment"))
@@ -929,7 +930,7 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
             "This report selects a separate review revision. Judge charts show that revision's usage; bound prior review receipts retain earlier calls, failures, and usage."
         )
     data = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "evaluation",
         "name": report.get("name"),
         "comparison_identity": config.get("comparison_identity"),
@@ -944,7 +945,7 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         "measurement_readiness": config.get("measurement_readiness", {}),
         "assigned": len(attempts),
         "coding_invocations": _map(report.get("study_progress")).get("native_invocations"),
-        "reused_baseline_attempts": len(origins),
+        "reused_vanilla_attempts": len(origins),
         "attempts": attempts,
         "observations": observations,
         "observation_fields": list(OBSERVATION_FIELDS),
@@ -977,11 +978,34 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
     prices = _map(config.get("prices"))
     data["prices"] = prices or None
     data["cost"] = _cost_rows(observations, prices) if "tokens" in selected else []
+    # Translate only report-owned fields after calculations. Never rewrite opaque IDs,
+    # evidence paths, provenance, comparison identities, or the canonical input report.
+    renamed_fields = {
+        "baseline_origin": "vanilla_origin",
+        "baseline_median": "vanilla_median",
+        "baseline_assigned": "vanilla_assigned",
+        "baseline_measured": "vanilla_measured",
+        "baseline_value": "vanilla_value",
+    }
+    for section in (
+        "attempts", "observations", "medians", "raw_medians", "comparisons", "aggregates",
+        "passing_medians", "passing_aggregates", "reference_comparisons", "reference_aggregates",
+        "review_findings", "cost",
+    ):
+        rows = _rows(data[section])
+        for row in rows:
+            for field in ("arm", "guidance"):
+                if isinstance(name := row.get(field), str):
+                    row[field] = normalize_arm_name(name)
+            for old, new in renamed_fields.items():
+                if old in row:
+                    row[new] = row.pop(old)
+        data[section] = rows
     data["measurement_completeness"] = _selected_completeness(
         data=data, projection=projection, selected=selected, skipped=skipped
     )
     data["completeness_matrix"] = _completeness_matrix(
-        observations, _map(config.get("measurement_capabilities"))
+        _rows(data["observations"]), _map(config.get("measurement_capabilities"))
     )
     if config.get("review_projection") is not None:
         data["review_projection"] = config["review_projection"]
