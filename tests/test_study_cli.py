@@ -2917,6 +2917,10 @@ def test_an_earlier_build_reports_the_same_measurements_with_legacy_arm_names(
     checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     export = _exported(_BEFORE_LIST, tmp_path)
+    # Token reports now revalidate saved evidence; other measures keep their old projection.
+    raw = yaml.safe_load(checkable["path"].read_text())
+    raw["measurements"].remove("tokens")
+    checkable["path"].write_text(yaml.safe_dump(raw))
     root, result, _, _ = _run_checkable(checkable, monkeypatch)
     assert result.exit_code == 0, result.stderr
     assert evaluation._load_selection(root)["not_measured"] == []

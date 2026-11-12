@@ -623,6 +623,9 @@ def _observation(
         eligible = isinstance(work.get("token_format"), str) and bool(work["token_format"])
         identity.update(provenance)
         reason = "native tokens at handoff; cached input and reasoning output subsets are not added"
+        validation = _map(work.get("usage_validation"))
+        if validation:
+            provenance["usage_validation"] = validation
     elif kind == "loc_change":
         classification = "source" if key.startswith("source_") else "test"
         code_size = _map(stage.get("code_size" if classification == "source" else "test_code_size"))
@@ -897,6 +900,10 @@ def _observation(
                 if evidence.get("reason")
                 else "measurement unavailable; unknown is not zero",
             )
+        if kind == "work":
+            validation_reasons = _map(work.get("usage_validation")).get("reasons")
+            if isinstance(validation_reasons, list) and validation_reasons:
+                reason += "; " + "; ".join(str(item) for item in validation_reasons)
     else:
         status = "measured" if compatibility else "not comparable"
     change = _map(stage.get("change"))

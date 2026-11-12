@@ -765,7 +765,10 @@ def test_a_worker_that_overruns_its_budget_is_kept_ungraded_and_the_run_goes_on(
     report = _json(root / "report/assessment-report.json")
     stage = next(row for row in report["attempts"] if row["id"] == failed)["stages"][0]
     assert stage["snapshot_digest"] is None and stage["correctness"]["status"] == "unknown"
-    assert stage["work"]["tokens"] == _USAGE
+    assert stage["work"]["tokens"] is None
+    validation = stage["work"]["usage_validation"]
+    assert validation["recorded_usage"] == _USAGE
+    assert "legacy usage has no saved session evidence to validate" in validation["reasons"]
     assert stage["execution_provenance"]["timed_out"] is True
     assert stage["execution_provenance"]["error"] == reason
     assert len(list(cache.glob("*/*/manifest.json"))) == 5  # Not a vanilla baseline.

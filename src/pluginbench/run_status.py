@@ -20,8 +20,9 @@ from pluginbench.arms import normalize_arm_name
 from pluginbench.evaluation_report import correctness_state
 from pluginbench.ledger import LEDGER_NAME, Ledger
 
-# Bump on any change that removes or renames a field; adding a field keeps the version.
-SCHEMA_VERSION = 1
+# Bump on any change that removes or renames a field, or adds a value to an existing enum;
+# adding a field keeps the version. 2: `tokens_status` gained `unvalidated`.
+SCHEMA_VERSION = 2
 
 TOKEN_FIELDS = (
     "input_tokens",
@@ -40,11 +41,19 @@ def _read(path: Path) -> Any:
     return json.loads(path.read_text()) if path.is_file() else None
 
 
-def _usage(execution: dict[str, Any] | None) -> tuple[dict[str, int] | None, str]:
-    """Token usage and how far to trust it: exact, lower_bound, or unknown."""
+def _usage(
+    execution: dict[str, Any] | None, *, host: str = "codex"
+) -> tuple[dict[str, int] | None, str]:
+    """Token usage and trust: exact, unvalidated, lower_bound, or unknown."""
     if execution is None:
         return None, "unknown"
     usage, status = execution.get("usage"), "exact"
+    if (
+        host != "claude"
+        and (execution.get("launch") or {}).get("harness") != "claude-cli"
+        and (execution.get("usage_validation") or {}).get("status") != "validated"
+    ):
+        status = "unvalidated"
     if not isinstance(usage, dict):
         usage = (execution.get("usage_accounting") or {}).get("observed_usage_lower_bound")
         status = "lower_bound"
@@ -74,7 +83,12 @@ def _tokens(rows: list[dict[str, Any]]) -> dict[str, Any]:
         _add(total, row["tokens"])
     return {
         **{field: total.get(field, 0) for field in TOKEN_FIELDS},
-        "lower_bound": any(row["tokens_status"] in ("lower_bound", "unknown") for row in rows),
+        "lower_bound": any(
+            row["tokens_status"] in ("lower_bound", "unknown")
+            or row.get("state") in ("running", "interrupted")
+            for row in rows
+        ),
+        "unvalidated": any(row["tokens_status"] == "unvalidated" for row in rows),
     }
 
 
@@ -277,6 +291,11 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
     pending = _pending(root, selection, run)
     slots, source = _slots(evidence, run)
     plan = _read(evidence / "plan.json") or {}
+    host = plan.get("host", "codex")
+    rebuild = (
+        f"rebuild with `{shlex.join(['pluginbench', 'report', str(root)])}` "
+        "to re-validate token usage"
+    )
     decisions = plan.get("baseline_cache") or {}
     origins = (run or {}).get("baseline_origin", {})
     report = _read(root / "report/results.json")
@@ -285,8 +304,9 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
     attempts = []
     for row in slots:
         handoff = evidence / "attempts" / row["id"] / _STAGE
-        execution = _read(handoff / "execution.json")
-        tokens, tokens_status = _usage(execution)
+        current = handoff / "execution-current.json"
+        execution = _read(current if current.is_file() else handoff / "execution.json")
+        tokens, tokens_status = _usage(execution, host=host)
         if row["state"] == "pending":
             tokens_status = "not_started"
         elif row["state"] in ("running", "interrupted") and tokens_status == "exact":
@@ -306,6 +326,11 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
                 "reused": (origins.get(row["id"]) or {}).get("status") == "hit",
                 "tokens": tokens,
                 "tokens_status": tokens_status,
+                "tokens_reason": rebuild
+                if tokens_status == "unvalidated"
+                else "; ".join(
+                    ((execution or {}).get("usage_validation") or {}).get("reasons", [])
+                ) or None,
                 "minutes": round(elapsed / 60, 1) if isinstance(elapsed, int | float) else None,
                 "measures": measured.get(row["id"], {}),
             }
@@ -317,7 +342,7 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
         stage = (receipt.get("stages") or {}).get(_STAGE) or {}
         reference = stage.get("execution")
         execution = _read(evidence / reference["path"]) if isinstance(reference, dict) else None
-        tokens, tokens_status = _usage(execution)
+        tokens, tokens_status = _usage(execution, host=host)
         discarded.append(
             {
                 "id": receipt["id"],
@@ -473,6 +498,15 @@ def format_status(status: dict[str, Any]) -> str:
             else ""
         )
     )
+    if any(
+        row["tokens_status"] == "unvalidated"
+        for row in [*status["attempts"], *status["discarded"]]
+    ):
+        lines.append(
+            "Recorded Codex usage is unvalidated; "
+            f"rebuild with `{shlex.join(['pluginbench', 'report', status['run']])}` "
+            "to re-validate token usage"
+        )
     if status["attempts"]:
         width = max(len("arm"), *(len(arm) for arm in status["arms"]))
         columns = (*_RESULTS, "tokens")

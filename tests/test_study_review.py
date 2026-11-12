@@ -491,7 +491,8 @@ def test_interrupted_judge_binds_reportable_usage_and_pending_assignments(
     assert cost["execution"]["partial_usage"] == captured["partial_usage"]
     assert all(item["work"] is None for item in review["records"] if item["status"] == "pending")
     assert all(
-        attempt["stages"][0]["work"]["tokens"]["input_tokens"] == 10
+        attempt["stages"][0]["work"]["tokens"] is None
+        and attempt["stages"][0]["work"]["usage_validation"]["recorded_usage"]["input_tokens"] == 10
         for attempt in report["attempts"]
     )
     with pytest.raises(ValueError, match="already|replayed"):

@@ -247,6 +247,8 @@ def test_cli_cross_run_pairs_match_a_single_run(tmp_path: Path) -> None:
                             "metric": metric,
                             "value": value,
                             "status": "measured",
+                            # Synthetic receipts: this test isolates pairing across runs.
+                            "provenance": {"usage_validation": {"status": "validated"}},
                         }
                         for row in attempts
                         for metric, value in row.values.items()

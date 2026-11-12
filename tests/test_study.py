@@ -365,7 +365,8 @@ def test_native_failure_is_retained_even_if_workspace_checks_pass(
     assert failed["work"]["tokens"] is None
     execution = failed["execution_provenance"]
     assert execution["stream_errors"] == stream_errors
-    assert execution["partial_usage"] == partial_usage
+    assert execution["partial_usage"] == []
+    assert execution["usage_validation"]["recorded_partial_usage"] == partial_usage
     assert execution["successful_native_completion"] is False
     assert execution["timed_out"] is (cause == "timeout")
     provenance = report["attempts"][0]["provenance"]
@@ -681,7 +682,8 @@ def test_interrupted_study_is_reportable_and_retains_every_assignment(
     }
     assert [row["correctness"] for row in observations].count("pass") == 1
     assert [row["correctness"] for row in observations].count("unknown") == 11
-    assert observations[0]["value"] == 10
+    assert observations[0]["value"] is None
+    assert observations[0]["provenance"]["usage_validation"]["recorded_usage"]["input_tokens"] == 10
     assert all(row["value"] is None and row["status"] == "unknown" for row in observations[1:])
     for task_id in ("first", "second"):
         for arm in ("baseline", "candidate"):
