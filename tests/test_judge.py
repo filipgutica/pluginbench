@@ -296,7 +296,12 @@ def test_evidence_that_contradicts_the_report_is_refused_not_left_out(
 
 
 def _fake_judge(
-    monkeypatch: pytest.MonkeyPatch, answers: dict[str, str], *, root: Path
+    monkeypatch: pytest.MonkeyPatch,
+    answers: dict[str, str],
+    *,
+    root: Path,
+    tool_failure: bool = False,
+    expect_unable_contract: bool = False,
 ) -> list[Path]:
     """Answer every pair with answers[model]; check what the judge's workspace holds."""
     calls: list[Path] = []
@@ -313,6 +318,10 @@ def _fake_judge(
         calls.append(area)
         workspace = area / "workspace"
         assert output_schema == workspace / "response-schema.json"
+        if expect_unable_contract:
+            schema = json.loads(output_schema.read_text())
+            assert "unable" in schema["$defs"]["PairVerdict"]["properties"]["preferred"]["enum"]
+            assert "unable" in prompt
         assert not workspace.is_relative_to(root)
         source = workspace / "source"
         assert source.is_dir() and not source.is_symlink()
@@ -329,7 +338,25 @@ def _fake_judge(
         }
         (area / "artifacts").mkdir()
         (area / "artifacts" / "stdout.jsonl").write_text(json.dumps(response) + "\n")
+        trace = (
+            json.dumps(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "read-inputs",
+                        "output": "Error: failed to start codex-code-mode-host: No such file or directory (os error 2)",
+                    },
+                }
+            )
+            if tool_failure
+            else ""
+        )
+        if trace:
+            (area / "artifacts/host-trace-0.jsonl").write_text(trace + "\n")
+        parsed = codex.parse_events("", [trace], "codex")
         return {
+            **parsed,
             "successful_native_completion": True,
             "actual_primary_models": [model],
             "runtime_effort_evidence": [protocol["reasoning"]],
@@ -494,3 +521,107 @@ def test_cli_prepare_and_tally(tmp_path: Path) -> None:
     assert tallied.exit_code == 0, tallied.output
     assert "Weighted wins over 6 pairs: vanilla 3, workflow-r9 3" in tallied.output
     assert json.loads((output / "tally.json").read_text())["pairs"] == 6
+
+
+def test_prepared_judge_schema_and_brief_distinguish_unable_from_tie(tmp_path: Path) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    schema = json.loads((directory / "task-1/response-schema.json").read_text())
+    assert "unable" in schema["$defs"]["PairVerdict"]["properties"]["preferred"]["enum"]
+    assert "unable" in (directory / "task-1.brief.md").read_text()
+
+
+def test_unable_answers_fail_by_pair_and_retry_without_losing_raw_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    calls = _fake_judge(monkeypatch, {"m1": "unable"}, root=tmp_path)
+    messages: list[str] = []
+    assert (
+        judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=messages.append)
+        == 2
+    )
+    assert any(
+        "codex-m1-high task-1: failed:" in line and "unable" in line and "1, 2, 3" in line
+        for line in messages
+    )
+    with pytest.raises(ValueError, match="judge results missing"):
+        tally(directory)
+    _fake_judge(monkeypatch, {"m1": "tie"}, root=tmp_path)
+    assert judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 0
+    assert len(calls) == 2
+    assert (directory / "results/codex-m1-high/task-1/call-2").is_dir()
+    assert tally(directory)["weighted_wins"] == {"vanilla": 3.0, "workflow-r9": 3.0}
+
+
+def test_saved_unable_blocks_tally_and_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _fake_judge(monkeypatch, {"m1": "tie"}, root=tmp_path)
+    assert judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 0
+    path = directory / "results/codex-m1-high/task-1.json"
+    verdicts = json.loads(path.read_text())
+    verdicts["pairs"][0]["preferred"] = "unable"
+    path.write_text(json.dumps(verdicts))
+    with pytest.raises(ValueError, match="codex-m1-high task-1.*pair.*1.*unable"):
+        tally(directory)
+    calls = _fake_judge(monkeypatch, {"m1": "A"}, root=tmp_path)
+    assert judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 0
+    assert len(calls) == 1  # The complete task stays cached.
+    assert json.loads(path.read_text())["pairs"][0]["preferred"] == "A"
+
+
+def test_tool_startup_failure_cannot_be_accepted_as_a_tie(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _fake_judge(monkeypatch, {"m1": "tie"}, root=tmp_path, tool_failure=True)
+    assert judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 2
+    assert not list((directory / "results/codex-m1-high").glob("*.json"))
+    with pytest.raises(ValueError, match="judge results missing"):
+        tally(directory)
+
+
+def test_previously_saved_tie_with_failed_tool_trace_blocks_tally_and_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _votes(directory, {"codex-m1-high": {}})
+    raw = directory / "results/codex-m1-high/task-1/call-1"
+    raw.mkdir(parents=True)
+    (raw / "host-trace-0.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "read-inputs",
+                    "output": "Error: failed to start codex-code-mode-host: No such file or directory (os error 2)",
+                },
+            }
+        )
+        + "\n"
+    )
+    with pytest.raises(ValueError, match="codex-m1-high task-1.*unable"):
+        tally(directory)
+    calls = _fake_judge(monkeypatch, {"m1": "tie"}, root=tmp_path)
+    assert judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 0
+    assert len(calls) == 1
+    assert (raw.parent / "call-2").is_dir()
+    assert tally(directory)["weighted_wins"] == {"vanilla": 3.0, "workflow-r9": 3.0}
+
+
+def test_retry_of_old_prepared_folder_uses_the_unable_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    for folder in directory.glob("task-*"):
+        if not folder.is_dir():
+            continue
+        path = folder / "response-schema.json"
+        schema = json.loads(path.read_text())
+        schema["$defs"]["PairVerdict"]["properties"]["preferred"]["enum"] = ["A", "B", "tie"]
+        path.write_text(json.dumps(schema))
+        (directory / f"{folder.name}.brief.md").write_text("Read the inputs and return A, B, or tie.")
+    _fake_judge(monkeypatch, {"m1": "unable"}, root=tmp_path, expect_unable_contract=True)
+    assert judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 2

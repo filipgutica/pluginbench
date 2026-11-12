@@ -208,6 +208,32 @@ def _judge(
             execution["final"] = "not JSON"
         if behavior == "runtime_unknown":
             execution["actual_primary_models"] = []
+        if behavior == "tool_startup_failure":
+            execution.update(
+                codex.parse_events(
+                    "",
+                    [
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "function_call_output",
+                                    "call_id": "read-packet",
+                                    "output": "Error: failed to start codex-code-mode-host: No such file or directory (os error 2)",
+                                },
+                            }
+                        )
+                    ],
+                    "codex",
+                )
+            )
+            execution.update(
+                successful_native_completion=True,
+                actual_primary_models=["gpt-6-astra"],
+                runtime_effort_evidence=["high"],
+                usage={"input_tokens": 30, "output_tokens": 7},
+                final=json.dumps(response),
+            )
         if behavior == "trace_leak":
             execution["command_items"] = [{"command": f"cat {root}/review/mapping.json"}]
         if behavior in {"aggregate", "aggregate_issues"} or citation_evidence is not None:
@@ -296,6 +322,7 @@ def test_unsupported_review_artifacts_cannot_leak_host_data_or_count_findings(
         "outside_disclosed",
         "runtime_unknown",
         "trace_leak",
+        "tool_startup_failure",
         "packet_mutation",
         "raised",
         "unsupported",
