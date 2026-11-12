@@ -824,8 +824,8 @@ def test_saved_claude_usage_is_revalidated_on_report_and_cache_reuse(
         }
         invocation = json.loads((artifacts / "invocation.json").read_text())
         (artifacts / "invocation.json").write_text(json.dumps({**invocation, **launch}))
-        # Cache admission still binds the Codex delivery receipt until Claude launches are
-        # wired; shape it for this model so the second run reaches the reuse boundary.
+        # Cache admission binds the Codex delivery receipt, which a real Claude attempt never
+        # has; shape it for this model so the second run reaches the reuse boundary.
         treatment = execution["native_treatment"]
         assert isinstance(treatment, dict)
         treatment["effective_config"] = treatment["effective_config"].replace(
@@ -836,7 +836,7 @@ def test_saved_claude_usage_is_revalidated_on_report_and_cache_reuse(
         return execution
 
     monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
-    # Claude coding launches are admitted in a later change; this test needs only saved runs.
+    # The treatment is shaped as Codex packages; this test needs only saved runs.
     monkeypatch.setattr(study, "admit", lambda treatment, harness: native_treatments.admit(
         treatment, "codex"
     ))

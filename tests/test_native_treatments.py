@@ -119,8 +119,11 @@ def test_guidance_limits_prevent_native_truncation_and_other_harness_is_not_emul
     guidance.write_bytes(b"x" * 32769)
     with pytest.raises(ValueError, match="silent truncation"):
         admit(Treatment(guidance=[guidance]), "codex")
-    with pytest.raises(ValueError, match="Codex only"):
-        admit(Treatment(), "claude")
+    # Claude admits under its own rules and the same cap; no other harness is emulated.
+    with pytest.raises(ValueError, match="silent truncation"):
+        admit(Treatment(guidance=[guidance]), "claude")
+    with pytest.raises(ValueError, match="unsupported native treatment harness"):
+        admit(Treatment(), "gemini")
 
 
 @pytest.mark.parametrize("subagents", [False, True])

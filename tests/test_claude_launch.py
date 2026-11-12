@@ -1,0 +1,506 @@
+"""Claude coding attempts through Harbor's real ClaudeCode agent and a fake container.
+
+No Docker, credentials or model call: the container runs commands on the host, and the
+`claude` it finds on its PATH replays a calibrated 2.1.322 coding fixture.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib
+import json
+import os
+import shlex
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from pluginbench import claude, claude_launch, claude_treatments, evaluation, saved_usage
+from pluginbench import harbor_backend as harbor
+from pluginbench.native_treatments import NativeCapabilities, admit
+from pluginbench.processes import run_command
+from pluginbench.treatments import Treatment
+from test_claude_treatments import HOOK, skill
+from test_native_harbor import native_task
+
+FIXTURES = Path(__file__).parent / "fixtures/claude-2.1.322"
+VERSION = "2.1.322"
+MODEL = "claude-opus-5-5"
+TOKEN = "sk-ant-oat01-fake-subscription-token"
+DIAGNOSTIC = "claude diagnostic on stderr"
+
+
+def treatment(root: Path) -> Treatment:
+    """A guidance file, a loose skill and a plugin with a skill and a SessionStart hook."""
+    guide = root / "guide.md"
+    guide.write_text("Keep the implementation in the existing module.\n")
+    plugin = root / "demo"
+    skill(plugin / "skills/demo-skill", "demo-skill")
+    (plugin / ".claude-plugin").mkdir()
+    (plugin / ".claude-plugin/plugin.json").write_text(json.dumps({"name": "demo"}))
+    (plugin / "hooks").mkdir()
+    (plugin / "hooks/hooks.json").write_text(json.dumps({"hooks": {"SessionStart": [
+        {"matcher": "startup", "hooks": [{"type": "command", "command": HOOK}]},
+    ]}}))
+    return Treatment(
+        guidance=[guide], skills=[skill(root / "loose-folder", "loose-skill")], plugins=[plugin]
+    )
+
+
+@dataclass
+class Container:
+    """The attempt's fake container: it records each command with the env it would run with."""
+
+    root: Path
+    case: str
+    persistent: dict[str, str] = field(default_factory=dict)
+    harbor_config: dict[str, Any] = field(default_factory=dict)
+    commands: list[tuple[str, dict[str, str]]] = field(default_factory=list)
+    installs: list[dict[str, Any]] = field(default_factory=list)
+    # Shell run after the sessions are written, to damage them.
+    after_sessions: str = ""
+
+    @property
+    def home(self) -> Path:
+        return self.root / "home"
+
+    @property
+    def argv_log(self) -> Path:
+        return self.root / "claude-argv.txt"
+
+    def agent_dir(self, config: dict[str, Any]) -> Path:
+        return Path(str(config["trials_dir"])) / str(config["trial_name"]) / "agent"
+
+    def install_cli(self) -> None:
+        """The CLI Harbor's PATH export finds first: it replays one coding fixture."""
+        fixture = FIXTURES / "coding" / self.case
+        binary = self.home / ".local/bin/claude"
+        binary.parent.mkdir(parents=True)
+        binary.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "--version" ]; then echo "2.1.322 (Claude Code)"; exit 0; fi\n'
+            f'printf "%s\\n" "$@" > {shlex.quote(str(self.argv_log))}\n'
+            f"cat > {shlex.quote(str(self.root / 'prompt.txt'))}\n"
+            f'cp -R {shlex.quote(str(fixture / "sessions"))}/. "$CLAUDE_CONFIG_DIR/"\n'
+            f"{self.after_sessions}\n"
+            f"cat {shlex.quote(str(fixture / 'stream.jsonl'))}\n"
+            f"echo {shlex.quote(DIAGNOSTIC)} >&2\n"
+        )
+        binary.chmod(0o755)
+        # The version guard also requires the image's base tools.
+        for tool in ("curl", "node", "npm", "ps"):
+            stub = binary.with_name(tool)
+            stub.write_text("#!/bin/sh\nexit 0\n")
+            stub.chmod(0o755)
+
+    def run_trial(self, config: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> object:
+        """Harbor's trial, with its real ClaudeCode agent, against this container."""
+        container = self
+        agent_dir = self.agent_dir(config)
+        agent_dir.mkdir(parents=True)
+        result_type = importlib.import_module("harbor.environments.base").ExecResult
+        context = importlib.import_module("harbor.models.agent.context").AgentContext
+        agent_type = importlib.import_module("harbor.agents.installed.claude_code").ClaudeCode
+
+        class Environment:
+            session_id = config["trial_name"] + "__env"
+            default_user = None
+            scoped: dict[str, str] = {}
+
+            def _merge_env(self, env: dict[str, str] | None) -> dict[str, str] | None:
+                # Harbor's precedence: persistent < per-command < the trial's scoped agent env.
+                return {**container.persistent, **(env or {}), **self.scoped} or None
+
+            async def upload_file(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            async def exec(
+                self,
+                command: str,
+                user: str | int | None = None,
+                env: dict[str, str] | None = None,
+                cwd: str | None = None,
+                timeout_sec: int | None = None,
+            ) -> object:
+                merged = self._merge_env(env) or {}
+                container.commands.append((command, env if env is not None else {}))
+                local = f"{agent_dir}/"
+                result = run_command(
+                    ["bash", "-c", command.replace("/logs/agent/", local)],
+                    cwd=container.root,
+                    timeout=30,
+                    env={
+                        "PATH": os.environ["PATH"],
+                        "HOME": str(container.home),
+                        **{key: value.replace("/logs/agent/", local) for key, value in merged.items()},
+                    },
+                )
+                return result_type(
+                    stdout=result.stdout, stderr=result.stderr, return_code=result.returncode
+                )
+
+        class Trial:
+            agent_environment = Environment()
+
+            def __init__(self) -> None:
+                agent = config["agent"]
+                self.agent = agent_type(
+                    logs_dir=agent_dir,
+                    model_name=agent["model_name"],
+                    extra_env=agent.get("env"),
+                    **{**agent["kwargs"], **container.harbor_config},
+                )
+                # Trial scopes the agent's own env over each of its commands.
+                Environment.scoped = dict(self.agent.extra_env)
+
+            @classmethod
+            async def create(cls, trial_config: object) -> Trial:
+                return cls()
+
+            async def run(self) -> object:
+                await self.agent.exec_as_agent(
+                    self.agent_environment, harbor._native_cli_qualification("claude", VERSION)
+                )
+                await self.agent.run("Fix the bug.", self.agent_environment, context())
+                return SimpleNamespace(
+                    model_dump=lambda mode: {"exception_info": None, "verifier_result": None}
+                )
+
+        monkeypatch.setattr(importlib.import_module("harbor.trial.trial"), "Trial", Trial)
+        monkeypatch.setattr(
+            importlib.import_module("harbor.models.trial.config"),
+            "TrialConfig",
+            SimpleNamespace(model_validate=lambda value: value),
+        )
+        # Source export and the frozen-image guard are proven elsewhere.
+        monkeypatch.setattr(harbor, "install_native_hooks", lambda *args: None)
+        return asyncio.run(harbor.run_trial(config))
+
+
+@dataclass
+class Attempt:
+    area: Path
+    task_dir: Path
+    container: Container
+    treatment: Treatment
+    subagents: bool
+
+    def invoke(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+        identity: dict[str, object] = {
+            "task_assets_sha256": harbor.native_task_assets(self.task_dir),
+            "source_digest": "prepared-source",
+            "workdir": "/app",
+            "image_identity": {"image": "coding", "image_id": "coding", "workdir": "/app"},
+            "grader_image_identity": {"image": "grader", "image_id": "grader"},
+            "toolchain_identity": {"harness": "claude", "harness_version": VERSION},
+            "transport_policy": {
+                "name": harbor.NATIVE_TRANSPORT_POLICY,
+                "provider_hosts": harbor.NATIVE_PROVIDER_HOSTS["claude"],
+            },
+        }
+        protocol: dict[str, object] = {
+            "native_task_identity": identity,
+            "isolation": {"resources": {"cpus": 1, "memory_mb": 256}},
+            "harness_version": VERSION,
+            "reasoning": "high",
+            "models": {"claude": MODEL},
+            "treatment": self.treatment.model_dump(mode="json"),
+            "capabilities": {"subagents": self.subagents},
+        }
+        monkeypatch.setattr(harbor, "assert_runtime", lambda expected, **kwargs: expected)
+        monkeypatch.setattr(harbor, "_assert_native_image", lambda image, expected: None)
+        monkeypatch.setattr(
+            harbor,
+            "_native_process",
+            lambda **kwargs: self.container.run_trial(kwargs["config"], monkeypatch),
+        )
+        monkeypatch.setattr(
+            harbor,
+            "_native_submission",
+            lambda **kwargs: {"status": "complete", "snapshot_digest": "frozen-submission"},
+        )
+        monkeypatch.setattr(harbor, "_native_cleanup_projects", lambda **kwargs: {"status": "complete"})
+        return harbor.invoke_native(
+            area=self.area,
+            task_dir=self.task_dir,
+            entry={"host": "claude"},
+            protocol=protocol,
+            prompt="",
+            timeout=1800,
+        )
+
+
+@pytest.fixture
+def attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[..., Attempt]:
+    for name in claude.REFUSED_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN)
+
+    def make(
+        *, treated: bool, case: str = "plain", subagents: bool = True, after_sessions: str = ""
+    ) -> Attempt:
+        root = tmp_path / ("treated" if treated else "vanilla")
+        root.mkdir()
+        container = Container(root, case, after_sessions=after_sessions)
+        container.install_cli()
+        area = root / "area"
+        area.mkdir()
+        made = Attempt(
+            area=area,
+            task_dir=native_task(root),
+            container=container,
+            treatment=treatment(root) if treated else Treatment(),
+            subagents=subagents,
+        )
+
+        async def install(**kwargs: Any) -> dict[str, Any]:
+            # Discovery runs before the coding command, with the env the coding command gets.
+            assert not container.argv_log.exists()
+            container.installs.append(kwargs)
+            inventory = admit(made.treatment, "claude")
+            hooks = [
+                {"event": "SessionStart", "matcher": "startup", "commandText": HOOK}
+            ] if treated else []
+            receipt = {
+                "status": "verified", "delivery": claude_treatments.DELIVERY_POLICY,
+                "inventory": inventory, "hooks": {"hooks": hooks, "policy": {"allDisabled": True}},
+            }
+            (kwargs["artifacts"] / "native-treatment.json").write_text(json.dumps(receipt))
+            return receipt
+
+        monkeypatch.setattr(claude_treatments, "install", install)
+        return made
+
+    return make
+
+
+def coding_command(container: Container) -> tuple[str, dict[str, str]]:
+    (coding,) = [
+        (command, env) for command, env in container.commands if "--output-format" in command
+    ]
+    return coding
+
+
+@pytest.mark.parametrize(
+    ("treated", "case", "subagents"),
+    [(False, "plain", False), (True, "one-subagent", True)],
+)
+def test_a_claude_attempt_runs_the_pinned_command_with_the_pinned_subscription_env(
+    attempt: Callable[..., Attempt],
+    monkeypatch: pytest.MonkeyPatch,
+    treated: bool,
+    case: str,
+    subagents: bool,
+) -> None:
+    made = attempt(treated=treated, case=case, subagents=subagents)
+    execution = made.invoke(monkeypatch)
+    run = claude.CodingRun(MODEL, "high", subagents, 1800)
+    argv, pinned = claude.coding_launch(run)
+    command, env = coding_command(made.container)
+    # Harbor's prompt plumbing, then exactly the pinned argv, stderr apart from the stream.
+    assert command.startswith('set -o pipefail; export PATH="$HOME/.local/bin:$PATH"; ')
+    assert command.endswith(
+        f"| {shlex.join(argv)} 2>/logs/agent/claude-code.stderr.log "
+        "| tee /logs/agent/claude-code.txt"
+    )
+    assert made.container.argv_log.read_text().splitlines() == argv[1:]
+    assert (made.container.root / "prompt.txt").read_text() == "Fix the bug."
+    assert {name: env[name] for name in pinned} == pinned
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == TOKEN
+    assert env["CLAUDE_CONFIG_DIR"] == claude_treatments.CONFIG_DIR
+    assert not set(env) & set(claude.REFUSED_ENV)
+    # Discovery got the very dict the coding command ran with.
+    (install,) = made.container.installs
+    assert install["env"] is env
+    assert install["run"] == run and install["cli_version"] == VERSION
+
+    artifacts = made.area / "artifacts"
+    assert DIAGNOSTIC not in (artifacts / "stdout.jsonl").read_text()
+    assert (artifacts / "claude-code.stderr.log").read_text() == DIAGNOSTIC + "\n"
+    saved = json.loads((artifacts / "execution.json").read_text())
+    assert saved == json.loads(json.dumps(execution))
+    assert saved["successful_native_completion"] is True
+    assert saved["launch"]["delivery"] == claude_treatments.DELIVERY_POLICY
+    assert saved["launch"]["argv"] == argv
+    assert saved["launch"]["capabilities"] == {
+        "subagents": subagents, "max_threads": "not_enforced", "max_depth": "not_enforced",
+    }
+    # The fresh attempt's usage is what reuse and reports revalidate to. A study keeps the
+    # receipt beside the attempt's artifacts.
+    (made.area / "execution.json").write_text(json.dumps(saved))
+    revalidated = saved_usage.revalidate_usage(saved, made.area / "execution.json")
+    if treated:
+        # A command hook's subprocess is not metered: usage stays incomplete.
+        assert saved["usage"] is None and saved["usage_accounting"]["status"] == "incomplete"
+        assert saved["native_session_usage"] == revalidated["usage_validation"]["validated_usage"]
+        assert saved["native_session_usage"] is not None
+        assert revalidated["usage"] is None
+    else:
+        assert saved["usage"] is not None
+        assert saved["usage_accounting"]["status"] == "complete"
+        assert saved["usage_accounting"]["rule"] == "equal"
+        assert revalidated["usage"] == saved["usage"]
+        assert revalidated["usage_validation"]["status"] == "validated"
+
+
+def test_a_fresh_attempt_with_unreconciled_usage_is_unvalidated_at_launch(
+    attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The subagent transcript answers a call the stream never made.
+    made = attempt(
+        treated=False,
+        case="one-subagent",
+        after_sessions='for meta in "$CLAUDE_CONFIG_DIR"/projects/*/*/subagents/*.meta.json; '
+        "do echo '{\"toolUseId\": \"toolu_orphan\"}' > \"$meta\"; done",
+    )
+    made.invoke(monkeypatch)
+    saved = json.loads((made.area / "artifacts/execution.json").read_text())
+    assert saved["successful_native_completion"] is True
+    assert saved["usage"] is None and saved["usage_accounting"]["status"] == "incomplete"
+    assert "a subagent transcript has no matching Agent tool call" in (
+        saved["usage_accounting"]["reasons"]
+    )
+
+
+def test_an_api_key_in_the_container_env_stops_the_attempt_before_any_command(
+    attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made = attempt(treated=False)
+    # A task's own environment can name a key; Harbor would pass it to every command.
+    made.container.persistent = {"ANTHROPIC_API_KEY": "sk-ant-api-key"}
+    with pytest.raises(ValueError, match="refuses ANTHROPIC_API_KEY"):
+        made.invoke(monkeypatch)
+    assert made.container.commands == [] and not made.container.installs
+    assert not made.container.argv_log.exists()
+
+
+@pytest.mark.parametrize("name", ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"])
+def test_a_refused_variable_in_the_operator_env_stops_the_run_before_any_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", TOKEN)
+    monkeypatch.setenv(name, "operator-value")
+    monkeypatch.setattr(
+        harbor, "run_command", lambda *args, **kwargs: pytest.fail("worker started")
+    )
+    with pytest.raises(ValueError, match=f"CLAUDE_CODE_OAUTH_TOKEN only; unset {name}"):
+        harbor._native_process(
+            area=tmp_path, config={}, expected={}, harness="claude", timeout=60,
+            install_only=False,
+        )
+    assert not (tmp_path / "private").exists()
+    # The evaluation's own check refuses it too, before Docker or task preparation.
+    monkeypatch.setattr(claude, "preflight", lambda: {"harness_version": "2.1.322 (Claude Code)"})
+    with pytest.raises(ValueError, match=f"unset {name}"):
+        evaluation._harness_version("claude", VERSION, coding=True)
+
+
+@pytest.mark.parametrize(
+    "harbor_config",
+    [
+        # PluginBench's old Claude kwargs: Harbor turns any config into its own --settings.
+        {"config": {}},
+        {"max_turns": 5},
+        {"disable_web_search": True},
+        {"permission_mode": "acceptEdits"},
+    ],
+)
+def test_a_command_off_the_contract_is_refused_before_the_cli_starts(
+    attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch, harbor_config: dict[str, Any]
+) -> None:
+    made = attempt(treated=False)
+    made.container.harbor_config = harbor_config
+    with pytest.raises(ValueError, match="pinned launch contract"):
+        made.invoke(monkeypatch)
+    saved = json.loads((made.area / "artifacts/execution.json").read_text())
+    assert saved["successful_native_completion"] is False
+    assert "differs from the pinned launch contract" in json.dumps(saved["error"])
+    assert not made.container.installs and not made.container.argv_log.exists()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda command: command.replace(" 2>&1 | tee", " | tee"),
+        lambda command: command.replace("claude-code.txt", "other.txt"),
+        lambda command: command.replace("--print", "--print --settings /tmp/s.json"),
+        lambda command: command.replace("unset HARBOR", "unset OTHER"),
+        lambda command: command + "; curl example.com",
+    ],
+)
+def test_the_contract_accepts_only_the_exact_harbor_command(
+    mutation: Callable[[str], str],
+) -> None:
+    run = claude.CodingRun(MODEL, "high", True, 1800)
+    variable = "harbor_claude_code_instruction_" + "ab" * 16
+    harbor_command = (
+        'export PATH="$HOME/.local/bin:$PATH"; '
+        f'{variable}="${variable.upper()}"; unset {variable.upper()}; '
+        f'printf "%s" "${variable}" | claude --verbose --output-format=stream-json '
+        "--effort high --permission-mode=bypassPermissions --print 2>&1 "
+        "| tee /logs/agent/claude-code.txt"
+    )
+    assert claude.contract_command(harbor_command, run).endswith(
+        f"{shlex.join(claude.coding_launch(run)[0])} 2>{claude.STDERR_LOG} | tee {claude.STDOUT_LOG}"
+    )
+    with pytest.raises(ValueError, match="pinned launch contract"):
+        claude.contract_command(mutation(harbor_command), run)
+
+
+def test_a_second_coding_command_in_one_attempt_is_refused(
+    attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made = attempt(treated=False)
+    original = made.container.run_trial
+
+    def twice(config: dict[str, Any], patch: pytest.MonkeyPatch) -> object:
+        agent_type = importlib.import_module("harbor.agents.installed.claude_code").ClaudeCode
+        first = agent_type.run
+
+        async def run_twice(self: Any, *args: Any) -> None:
+            await first(self, *args)
+            await first(self, *args)
+
+        patch.setattr(agent_type, "run", run_twice)
+        return original(config, patch)
+
+    monkeypatch.setattr(made.container, "run_trial", twice)
+    monkeypatch.setattr(claude_launch, "transport", lambda: {})
+    with pytest.raises(ValueError, match="runs one coding command"):
+        made.invoke(monkeypatch)
+    saved = json.loads((made.area / "artifacts/execution.json").read_text())
+    assert "runs one coding command" in json.dumps(saved["error"])
+    assert len(made.container.installs) == 1
+
+
+def test_the_version_guard_runs_the_cli_the_coding_command_runs() -> None:
+    guard = harbor._native_cli_qualification("claude", VERSION)
+    assert guard.startswith('export PATH="$HOME/.local/bin:$PATH"; set -eu; ')
+
+
+def test_claude_harbor_config_passes_no_settings_and_pins_the_agent_env(tmp_path: Path) -> None:
+    config = harbor._native_config(
+        task_dir=tmp_path, area=tmp_path, owner="o", harness="claude", version=VERSION,
+        limits={"cpus": 1, "memory_mb": 256}, timeout=1800, model=MODEL, effort="high",
+        treatment=Treatment(), capabilities=NativeCapabilities(subagents=False),
+        agent_env={"GIT_AUTHOR_NAME": "PluginBench"},
+    )
+    agent = config["agent"]
+    assert isinstance(agent, dict)
+    assert agent["kwargs"] == {"version": VERSION, "reasoning_effort": "high"}
+    pinned = claude.coding_launch(claude.CodingRun(MODEL, "high", False, 1800))[1]
+    assert agent["env"] == {**pinned, "GIT_AUTHOR_NAME": "PluginBench"}
+
+
+def test_the_claude_transport_pins_harbors_run_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert claude_launch.transport() == {
+        "version": "claude-pinned-launch-v1",
+        "harbor_run_sha256": claude_launch._HARBOR_RUN_SHA256,
+    }
+    monkeypatch.setattr(claude_launch, "_HARBOR_RUN_SHA256", "0" * 64)
+    with pytest.raises(ValueError, match="ClaudeCode.run changed"):
+        claude_launch.transport()

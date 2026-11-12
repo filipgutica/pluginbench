@@ -30,6 +30,7 @@ const REQUESTS = [
 // Offline, CLI 2.1.322 took 19 s to answer initialize and 18 s per plugin command.
 const REQUEST_TIMEOUT_MS = 90000;
 const CLI_TIMEOUT_MS = 90000;
+const MANAGED_SETTINGS = "/etc/claude-code";
 // The agents CLI 2.1.322 ships. The pinned launch lists all but claude-code-guide.
 const BUILTIN_AGENTS = new Set([
   "Explore", "Plan", "claude", "claude-code-guide", "general-purpose", "statusline-setup",
@@ -294,6 +295,8 @@ async function main() {
   const unpinned = Object.keys(payload.pinned_env).filter(name => process.env[name] !== payload.pinned_env[name]);
   check(!unpinned.length, "Claude treatment installation requires the pinned launch environment: "
     + unpinned.join(", "));
+  // Managed settings outrank every pinned setting; preparation removes them.
+  check(!fs.existsSync(MANAGED_SETTINGS), "Claude managed settings exist: " + MANAGED_SETTINGS);
   // User agents load from here and can replace a built-in agent of the same name.
   const agentsDir = path.join(configDir, "agents");
   check(!fs.existsSync(agentsDir) || !fs.readdirSync(agentsDir).length, "Undeclared Claude user agents exist");

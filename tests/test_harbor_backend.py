@@ -840,7 +840,7 @@ def test_measurement_capacity_counts_the_largest_limits_run_at_once(
     # The 80% budget of 20 GiB is 16384 MB: room for the larger container, not for both.
     current["docker_engine"]["capacity"]["memory_bytes"] = 20 * 1024**3
 
-    def reported(*, cpus: int, memory_mb: int) -> dict[str, Any]:
+    def reported(*, cpus: int, memory_mb: int, harness: str = "codex") -> dict[str, Any]:
         return {**current, "resources": {**current["resources"], "memory_mb": memory_mb}}
 
     monkeypatch.setattr(harbor, "runtime_identity", reported)

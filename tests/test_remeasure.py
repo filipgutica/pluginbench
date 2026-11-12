@@ -1048,7 +1048,7 @@ def test_measurement_checks_capacity_for_the_containers_it_runs_at_once(
     monkeypatch.setattr(
         harbor_backend,
         "runtime_identity",
-        lambda *, cpus, memory_mb: {**current, "resources": {"cpus": cpus, "memory_mb": memory_mb}},
+        lambda *, cpus, memory_mb, harness="codex": {**current, "resources": {"cpus": cpus, "memory_mb": memory_mb}},
     )
     started: list[Path] = []
 
@@ -1097,7 +1097,7 @@ def test_measurement_capacity_counts_each_inputs_largest_container(
     monkeypatch.setattr(
         harbor_backend,
         "runtime_identity",
-        lambda *, cpus, memory_mb: {**current, "resources": {"cpus": cpus, "memory_mb": memory_mb}},
+        lambda *, cpus, memory_mb, harness="codex": {**current, "resources": {"cpus": cpus, "memory_mb": memory_mb}},
     )
     monkeypatch.setattr(
         remeasure,

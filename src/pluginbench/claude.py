@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
+import shlex
 import subprocess
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
@@ -179,6 +182,52 @@ def coding_launch(run: CodingRun) -> tuple[list[str], dict[str, str]]:
     return argv, env
 
 
+STDOUT_LOG = "/logs/agent/claude-code.txt"
+STDERR_LOG = "/logs/agent/claude-code.stderr.log"
+# The coding command Harbor 0.24.0's ClaudeCode.run builds when PluginBench passes it only
+# `version` and `reasoning_effort`: no settings file, no other flag. The prompt travels in a
+# one-use environment variable whose name Harbor draws at random.
+_HARBOR_CODING = re.compile(
+    r'export PATH="\$HOME/\.local/bin:\$PATH"; '
+    r'(?P<var>harbor_claude_code_instruction_[0-9a-f]{32})="\$(?P<env>[0-9A-Z_]+)"; '
+    r'unset (?P=env); printf "%s" "\$(?P=var)" \| '
+    r"(?P<cli>.*) 2>&1 \| tee " + re.escape(STDOUT_LOG)
+)
+
+
+def contract_command(command: str, run: CodingRun) -> str:
+    """Harbor's coding command with the pinned argv in place of Harbor's own flags.
+
+    Only the exact command Harbor builds for this run is accepted. The pinned command keeps
+    stderr out of the stream-json stdout, and Harbor's `set -o pipefail` keeps the CLI's exit.
+    """
+    match = _HARBOR_CODING.fullmatch(command)
+    harbor = (
+        "claude --verbose --output-format=stream-json "
+        f"--effort {run.effort} --permission-mode=bypassPermissions --print"
+    )
+    if match is None or match["env"] != match["var"].upper() or match["cli"] != harbor:
+        raise ValueError("Harbor's Claude coding command differs from the pinned launch contract")
+    argv = coding_launch(run)[0]
+    return command[: match.start("cli")] + f"{shlex.join(argv)} 2>{STDERR_LOG} | tee {STDOUT_LOG}"
+
+
+def refuse_env(env: Mapping[str, str]) -> None:
+    refused = sorted(set(env) & set(REFUSED_ENV))
+    if refused:
+        raise ValueError(f"Claude coding refuses {', '.join(refused)}; model call refused")
+
+
+def check_coding_env(env: Mapping[str, str], run: CodingRun) -> None:
+    """The environment a coding command runs with: pinned, subscription-authenticated."""
+    refuse_env(env)
+    unpinned = sorted(name for name, value in coding_launch(run)[1].items() if env.get(name) != value)
+    if unpinned:
+        raise ValueError(f"Claude coding requires the pinned {', '.join(unpinned)}")
+    if not env.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip():
+        raise ValueError("Claude coding requires the subscription token CLAUDE_CODE_OAUTH_TOKEN")
+
+
 def discovery_launch(run: CodingRun) -> tuple[list[str], dict[str, str]]:
     """The coding launch with only the discovery delta, so both load the same treatment.
 
@@ -259,6 +308,25 @@ def runtime_environment(
     )
     env.update(selected)
     return env, tuple(selected.values())
+
+
+def coding_environment(
+    private: Path, *, auth_file: Path | None = None
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    """The worker environment of a coding run: the operator's subscription token only.
+
+    Harbor forwards an API key over the token and never drops one, so a refused variable in
+    the operator's environment stops the run before any container starts.
+    """
+    present = sorted(name for name in REFUSED_ENV if name in os.environ)
+    if present:
+        raise ValueError(
+            "Claude coding authenticates with CLAUDE_CODE_OAUTH_TOKEN only; unset "
+            + ", ".join(present)
+        )
+    if auth_file is not None:
+        raise ValueError("Claude coding takes CLAUDE_CODE_OAUTH_TOKEN, not an auth file")
+    return runtime_environment(private)
 
 
 def _count(value: object) -> bool:
@@ -353,9 +421,18 @@ def _builtin_plugin(plugin: object) -> bool:
 
 
 def parse_events(
-    stdout: str, traces: list[str], host: str = "claude", *, requested_effort: str = "medium"
+    stdout: str,
+    traces: list[str],
+    host: str = "claude",
+    *,
+    requested_effort: str = "medium",
+    coding: bool = False,
 ) -> dict[str, Any]:
-    """Normalize native receipts; never infer effective effort from the launch flag."""
+    """Normalize native receipts; never infer effective effort from the launch flag.
+
+    An isolated review refuses plugins, hooks and subagents. A coding attempt may run its
+    treatment's plugins and hooks, and subagents; its receipt checks those instead.
+    """
     if host != "claude":
         raise ValueError(f"unsupported Claude host: {host}")
     errors: list[Any] = []
@@ -383,19 +460,23 @@ def parse_events(
             plugins = event.get("plugins") or []
             if (
                 not isinstance(plugins, list)
-                or not all(_builtin_plugin(plugin) for plugin in plugins)
+                or not (coding or all(_builtin_plugin(plugin) for plugin in plugins))
                 or any(
                     event.get(key) for key in ("mcp_servers", "plugin_errors", "mcp_server_errors")
                 )
             ):
                 errors.append("custom plugin or MCP configuration present in native startup")
-        if event.get("type") == "system" and str(event.get("subtype", "")).startswith("hook_"):
+        if (
+            not coding
+            and event.get("type") == "system"
+            and str(event.get("subtype", "")).startswith("hook_")
+        ):
             errors.append("native hook ran during isolated invocation")
         if event.get("type") == "result":
             result = event
         if event.get("type") not in {"assistant", "user"}:
             continue
-        if event.get("parent_tool_use_id") is not None:
+        if not coding and event.get("parent_tool_use_id") is not None:
             errors.append("delegated work appeared in isolated native invocation")
         message = event.get("message")
         if (
