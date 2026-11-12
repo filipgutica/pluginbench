@@ -534,8 +534,10 @@ def _check_binding(
     if saved.get("binding_version") == BINDING_VERSION:
         current["binding_version"] = BINDING_VERSION
         observed = _judge_cli_version(_latest_call(path), _judge_host(judge))
-        if observed is not None:
-            current["judge_cli_version"] = observed
+        # Without the call's evidence nothing proves the saved version, even when both are absent.
+        if observed is None:
+            raise ValueError(f"{path}: binding mismatch: judge_cli_version")
+        current["judge_cli_version"] = observed
     fields = saved.keys() | current.keys()
     for field in ["prepare_seed", *sorted(fields - {"prepare_seed"})]:
         if saved.get(field) != current.get(field):
@@ -686,7 +688,9 @@ def _judge_task(
         )
         binding["brief"] = "sha256:" + hashlib.sha256(prompt.encode()).hexdigest()
         # mkdir is the reservation: even SIGKILL leaves an attempt with unknown usage.
-        number = 1
+        # Number past the highest call so _latest_call rereads this call's evidence.
+        latest = _latest_call(verdict)
+        number = int(latest.name.removeprefix("call-")) + 1 if latest is not None else 1
         while True:
             attempt = raw / f"call-{number}"
             try:

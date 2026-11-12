@@ -440,6 +440,7 @@ pluginbench judge tally judging/r3
 - Tally refuses a changed binding and names the verdict file and mismatching field. This includes key replacement after re-preparing the same inputs.
 - Tally reads each key and verdict file once. Binding checks and scoring use those same snapshots.
 - Legacy verdicts without bindings remain accepted. Each prints `unbound verdict (written before binding)`. JSON counts those files in `unbound` and lists their paths in `unbound_verdicts`. Use `pluginbench judge tally judging/r3 --require-bound` to refuse them. A legacy verdict cannot prove which inputs were judged; rerun in a new prepared directory to obtain bound verdicts.
+- A binding also records the judge CLI version, read from the producing call's saved native evidence. A verdict bound before this was recorded prints `needs rebind`; JSON counts those files in `needs_rebind` and lists their paths in `needs_rebind_verdicts`. `--require-bound` refuses them too. Delete the verdict and run `pluginbench judge run` to judge it again. A bound verdict whose call evidence is missing or reports a different version is a binding mismatch.
 - It refuses to tally while any judge lacks a verdict for any task. That includes every judge `run` was asked for, even one that never started.
 
 ## Development

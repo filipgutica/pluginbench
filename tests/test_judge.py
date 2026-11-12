@@ -821,10 +821,36 @@ def test_unknown_binding_version_is_a_mismatch(
     judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print)
     verdict = directory / "results/codex-m1-high/task-1.json"
     saved = json.loads(verdict.read_text())
-    saved["binding"]["binding_version"] = "1"
+    saved["binding"]["binding_version"] = "3"
     verdict.write_text(json.dumps(saved))
     with pytest.raises(ValueError, match="task-1.json.*binding mismatch: binding_version"):
         tally(directory)
+
+
+def test_bound_verdict_without_version_evidence_is_a_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _fake_judge(monkeypatch, {"m1": "A"}, root=tmp_path)
+    judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print)
+    verdict = directory / "results/codex-m1-high/task-1.json"
+    saved = json.loads(verdict.read_text())
+    del saved["binding"]["judge_cli_version"]
+    verdict.write_text(json.dumps(saved))
+    shutil.rmtree(verdict.with_suffix(""))
+    with pytest.raises(ValueError, match="task-1.json.*binding mismatch: judge_cli_version"):
+        tally(directory, require_bound=True)
+
+
+def test_judge_call_numbers_past_a_gap_in_earlier_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _fake_judge(monkeypatch, {"m1": "A"}, root=tmp_path)
+    (directory / "results/codex-m1-high/task-1/call-2").mkdir(parents=True)
+    assert judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 0
+    assert (directory / "results/codex-m1-high/task-1/call-3").is_dir()
+    tally(directory, require_bound=True)
 
 
 def test_judge_call_without_an_observed_cli_version_writes_no_verdict(
