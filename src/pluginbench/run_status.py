@@ -318,7 +318,10 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
             execution = {
                 **execution,
                 "usage_validation": validation,
-                "usage": validation.get("validated_usage"),
+                # A rejection keeps its re-parsed usage for the record; it is not a usable figure.
+                "usage": validation.get("validated_usage")
+                if validation.get("status") == "validated"
+                else None,
                 "usage_accounting": None,
             }
         tokens, tokens_status = _usage(execution, host=host)

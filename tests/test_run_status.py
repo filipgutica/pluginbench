@@ -641,25 +641,40 @@ def test_a_run_saved_before_the_not_measured_list_shows_no_such_warning(tmp_path
 
 @pytest.mark.parametrize(
     "projection",
-    ["validated", "unavailable", "historical", "claude", "report-validated", "report-rejected"],
+    [
+        "validated",
+        "unavailable",
+        "historical",
+        "claude",
+        "report-validated",
+        "report-rejected",
+        "current-over-report",
+    ],
 )
 def test_status_uses_current_usage_and_labels_historical_receipts(
     tmp_path: Path, projection: str
 ) -> None:
     root = _run(tmp_path / "run", states={**STATES, "a3": "pending"}, ledger=True)
     handoff = root / "evidence/attempts/a1/handoff"
-    if projection in {"validated", "unavailable"}:
+    if projection in {"validated", "unavailable", "current-over-report"}:
         _write(handoff / "execution-current.json", {
-            "usage": USAGE if projection == "validated" else None,
-            "usage_validation": {"status": projection, "reasons":
-                                 ["rejected saved rollout"] if projection == "unavailable" else []},
+            "usage": USAGE if projection != "unavailable" else None,
+            "usage_validation": {
+                "status": "unavailable" if projection == "unavailable" else "validated",
+                "reasons": ["rejected saved rollout"] if projection == "unavailable" else [],
+            },
         })
-    elif projection.startswith("report-"):
-        # A report rebuilt after the upgrade re-validated this attempt's saved usage.
+    if projection.startswith("report-") or projection == "current-over-report":
+        # A report rebuilt after the upgrade re-validated this attempt's saved usage. A rejection
+        # still carries the re-parsed usage, and the receipt an observed floor; neither counts.
         validated = projection == "report-validated"
+        if projection == "report-rejected":
+            execution = json.loads((handoff / "execution.json").read_text())
+            execution["usage_accounting"] = {"observed_usage_lower_bound": USAGE}
+            _write(handoff / "execution.json", execution)
         validation = {
             "status": "validated" if validated else "unavailable",
-            "validated_usage": USAGE if validated else None,
+            "validated_usage": USAGE,
             "reasons": [] if validated else ["rejected saved rollout"],
         }
         _write(root / "report/results.json", {"observations": [{
@@ -675,7 +690,8 @@ def test_status_uses_current_usage_and_labels_historical_receipts(
     row = next(row for row in status["attempts"] if row["id"] == "a1")
     expected = {"validated": "exact", "unavailable": "unknown",
                 "historical": "unvalidated", "claude": "exact",
-                "report-validated": "exact", "report-rejected": "unknown"}
+                "report-validated": "exact", "report-rejected": "unknown",
+                "current-over-report": "exact"}
     assert row["tokens_status"] == expected[projection]
     if projection in {"unavailable", "report-rejected"}:
         assert row["tokens"] is None
