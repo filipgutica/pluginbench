@@ -272,7 +272,11 @@ def test_a_stream_line_that_hides_an_event_is_refused(tmp_path: Path) -> None:
     run = _copy("plain", tmp_path / "run")
     stream = run / "stream.jsonl"
     (result,) = [line for line in stream.read_text().splitlines() if '"type": "result"' in line]
-    stream.write_text(stream.read_text() + "warning: " + result + "\n")
+    # As the real CLI writes it: compact, with "type" not the first key.
+    event = json.loads(result)
+    event = {"is_error": event.pop("is_error"), **event}
+    hidden = json.dumps(event, separators=(",", ":"))
+    stream.write_text(stream.read_text() + "warning: " + hidden + "\n")
     parsed = _validate(run)
     assert parsed["usage"] is None
     assert parsed["usage_accounting"]["reasons"] == [

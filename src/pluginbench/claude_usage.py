@@ -133,7 +133,8 @@ def _stream_events(stream: str, reasons: list[str]) -> list[dict[str, Any]]:
     for line in stream.splitlines():
         # Harbor tees stderr into the same file; its warning lines are not stream events.
         if not line.startswith("{"):
-            if '{"type"' in line:
+            # The CLI does not write "type" first in every event, so any embedded object counts.
+            if '{"' in line:
                 reasons.append("a stream line hides an event behind other output")
             continue
         try:
