@@ -6,6 +6,8 @@ import json
 import math
 import os
 import subprocess
+import warnings
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -226,6 +228,24 @@ def observed_cli_version(startup: object) -> str | None:
     ):
         return None
     return versions[0] if len(set(versions)) == 1 else None
+
+
+# Claude Code versions that coding evidence (discovery control requests, session transcripts,
+# and token reconciliation) is qualified against. Other versions run with a warning.
+QUALIFIED_VERSIONS = frozenset({"2.1.322"})
+
+
+@cache
+def admit_version(version: str) -> None:
+    """Accept every version; warn once per unqualified version in this process."""
+    if version not in QUALIFIED_VERSIONS:
+        warnings.warn(
+            f"Claude Code CLI {version} is not qualified for PluginBench: its discovery control "
+            "requests, session transcript format, and token reconciliation have not been "
+            "checked against this version. Qualified versions: "
+            + ", ".join(sorted(QUALIFIED_VERSIONS)),
+            stacklevel=2,
+        )
 
 
 def _builtin_plugin(plugin: object) -> bool:
