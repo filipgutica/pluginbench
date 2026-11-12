@@ -646,6 +646,7 @@ def test_a_run_saved_before_the_not_measured_list_shows_no_such_warning(tmp_path
         "unavailable",
         "historical",
         "claude",
+        "claude-validated",
         "report-validated",
         "report-rejected",
         "current-over-report",
@@ -656,7 +657,12 @@ def test_status_uses_current_usage_and_labels_historical_receipts(
 ) -> None:
     root = _run(tmp_path / "run", states={**STATES, "a3": "pending"}, ledger=True)
     handoff = root / "evidence/attempts/a1/handoff"
-    if projection in {"validated", "unavailable", "current-over-report"}:
+    if projection.startswith("claude"):
+        # Claude usage is trusted only once its saved transcripts are revalidated, as Codex's is.
+        execution = json.loads((handoff / "execution.json").read_text())
+        execution["launch"] = {"harness": "claude-cli"}
+        _write(handoff / "execution.json", execution)
+    if projection in {"validated", "unavailable", "current-over-report", "claude-validated"}:
         _write(handoff / "execution-current.json", {
             "usage": USAGE if projection != "unavailable" else None,
             "usage_validation": {
@@ -681,15 +687,11 @@ def test_status_uses_current_usage_and_labels_historical_receipts(
             "attempt_id": "a1", "metric": "Input tokens", "status": "measured",
             "value": USAGE["input_tokens"], "provenance": {"usage_validation": validation},
         }]})
-    elif projection == "claude":
-        execution = json.loads((handoff / "execution.json").read_text())
-        execution["launch"] = {"harness": "claude-cli"}
-        _write(handoff / "execution.json", execution)
     before = _tree(root)
     status = run_status.run_status(root)
     row = next(row for row in status["attempts"] if row["id"] == "a1")
     expected = {"validated": "exact", "unavailable": "unknown",
-                "historical": "unvalidated", "claude": "exact",
+                "historical": "unvalidated", "claude": "unvalidated", "claude-validated": "exact",
                 "report-validated": "exact", "report-rejected": "unknown",
                 "current-over-report": "exact"}
     assert row["tokens_status"] == expected[projection]
@@ -698,7 +700,7 @@ def test_status_uses_current_usage_and_labels_historical_receipts(
         assert "rejected saved rollout" in row["tokens_reason"]
     else:
         assert row["tokens"] == USAGE
-    if projection == "historical":
+    if projection in {"historical", "claude"}:
         assert status["arms"]["vanilla"]["tokens"]["unvalidated"] is True
         note = f"rebuild with `pluginbench report {root}` to re-validate token usage"
         assert note in row["tokens_reason"]

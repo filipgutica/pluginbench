@@ -1379,8 +1379,7 @@ def _run_attempts(
                     for stage in record["stages"]:
                         target = attempt_dir / stage["id"]
                         execution = json.loads((target / "execution.json").read_text())
-                        if frozen.recipe.harness == "codex":
-                            execution = revalidate_usage(execution, target / "execution.json")
+                        execution = revalidate_usage(execution, target / "execution.json")
                         stage["work"] = _work(execution)
                         if stage["snapshot"] is not None:
                             regraded = harbor_backend.regrade_native(
@@ -1762,12 +1761,11 @@ def report_study(
         for stage in attempt["stages"]:
             reference = run["executions"][attempt["id"]][stage["id"]]
             execution = _bound_document(root, reference)
-            if plan.get("host", "codex") == "codex":
-                execution = revalidate_usage(execution, _bound_path(root, reference))
-                stage["work"] = {
-                    **_work(execution),
-                    "usage_validation": execution["usage_validation"],
-                }
+            execution = revalidate_usage(execution, _bound_path(root, reference))
+            stage["work"] = {
+                **_work(execution),
+                "usage_validation": execution["usage_validation"],
+            }
             executions.append(execution)
             verifier_result = (
                 run.get("verifier_results", {}).get(attempt["id"], {}).get(stage["id"])
