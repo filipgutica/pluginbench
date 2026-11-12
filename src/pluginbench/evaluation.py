@@ -377,7 +377,10 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
         "coding_calls": coding,
         "review_calls": coding if config.reviewer else 0,
         "runner": config.runner.model_dump(mode="json"),
-        "treatments": {name: treatment_inventory(item) for name, item in config.treatments.items()},
+        "treatments": {
+            name: treatment_inventory(item, config.runner.harness)
+            for name, item in config.treatments.items()
+        },
         "delivery": DELIVERY_POLICY,
         "capabilities": config.capabilities.model_dump(mode="json"),
         "tasks": config.tasks.task_ids,
@@ -1549,7 +1552,8 @@ def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path
             name: treatment_inventory(
                 resolve_treatment(
                     Treatment.model_validate(item), evidence / "frozen", recipe["harness"]
-                )
+                ),
+                recipe["harness"],
             )
             for name, item in recipe["treatments"].items()
         }

@@ -89,7 +89,16 @@ def _guidance(path: Path, base: Path) -> Path:
     return path
 
 
-def _skill_name(root: Path) -> str:
+# Claude Code skill frontmatter that describes the skill or who may invoke it. Keys
+# that change the model, effort, context, subagent, hooks, or activation are refused.
+# `allowed-tools` only pre-approves tools, which is a no-op under bypassPermissions.
+_CLAUDE_SKILL_KEYS = {
+    "name", "description", "dependencies", "license", "metadata", "allowed-tools",
+    "disable-model-invocation", "user-invocable", "argument-hint",
+}
+
+
+def _skill_name(root: Path, harness: str | None = None) -> str:
     skill = root / "SKILL.md"
     try:
         text = skill.read_text(encoding="utf-8")
@@ -111,6 +120,9 @@ def _skill_name(root: Path) -> str:
     if not isinstance(description, str) or not description.strip():
         raise ValueError(f"skill requires a description: {skill}")
     _skill_dependencies(metadata, skill)
+    if harness == "claude" and set(metadata) - _CLAUDE_SKILL_KEYS:
+        unsupported = sorted(set(metadata) - _CLAUDE_SKILL_KEYS)
+        raise ValueError(f"unsupported Claude skill frontmatter {unsupported}: {skill}")
     agent_file = root / "agents/openai.yaml"
     if agent_file.exists():
         try:
@@ -132,7 +144,7 @@ def _skill_dependencies(metadata: dict[str, Any], source: Path) -> None:
         raise ValueError(f"unsupported declared skill dependencies: {source}")
 
 
-def _skill_roots(path: Path) -> list[Path]:
+def _skill_roots(path: Path, harness: str | None = None) -> list[Path]:
     _tree(path)
     roots = [path] if (path / "SKILL.md").exists() else [
         child for child in sorted(path.iterdir())
@@ -140,7 +152,7 @@ def _skill_roots(path: Path) -> list[Path]:
     ]
     if not roots:
         raise ValueError(f"skill directory contains no direct SKILL.md roots: {path}")
-    names = [_skill_name(root) for root in roots]
+    names = [_skill_name(root, harness) for root in roots]
     if len(set(names)) != len(names):
         raise ValueError(f"duplicate skill names in collection: {path}")
     return roots
@@ -168,7 +180,7 @@ def _component(root: Path, value: object) -> Path:
     return path
 
 
-def _hooks(root: Path, value: object) -> list[dict[str, Any]]:
+def _hooks(root: Path, value: object, harness: str) -> list[dict[str, Any]]:
     values = value if isinstance(value, list) else [value]
     configs = []
     for entry in values:
@@ -177,6 +189,10 @@ def _hooks(root: Path, value: object) -> list[dict[str, Any]]:
             raise ValueError(f"plugin hooks must be JSON paths or objects: {root}")
         if config and "hooks" not in config:
             raise ValueError(f"plugin hooks require the full hook-file object with hooks: {root}")
+        # Claude Code also loads keys such as `modules` (in-process hook code) from hook files.
+        if harness == "claude" and set(config) - {"hooks", "description"}:
+            unsupported = sorted(set(config) - {"hooks", "description"})
+            raise ValueError(f"unsupported Claude hook-file keys {unsupported}: {root}")
         events = config.get("hooks", {})
         if not isinstance(events, dict):
             raise ValueError(f"plugin hook events must be an object: {root}")
@@ -203,23 +219,34 @@ _METADATA = {
     "license", "keywords", "interface", "extensions", "onboardingSkill",
 }
 _COMPONENTS = {"skills", "hooks", "mcpServers", "apps", "agents", "commands", "dependencies"}
+# Plugin-root paths Claude Code loads without a manifest declaration.
+# A root SKILL.md is loaded as a skill when the plugin declares no skills.
+_CLAUDE_REFUSED_DEFAULTS = (
+    "agents", "commands", "workflows", "output-styles", "monitors", ".mcp.json", ".lsp.json",
+    "settings.json", "SKILL.md",
+)
+_CLAUDE_ADMITTED_DEFAULTS = ("bin", "themes")
 
 
-def _plugin(root: Path, harness: str | None = None) -> dict[str, Any]:
+def _plugin(root: Path, harness: str) -> dict[str, Any]:
     _tree(root)
     portable = root / "plugin.json"
     codex = root / ".codex-plugin/plugin.json"
     claude = root / ".claude-plugin/plugin.json"
-    manifest_path = portable if portable.exists() else (
-        claude if harness == "claude" else codex
-    )
-    if harness is None and not manifest_path.exists() and claude.exists():
+    if harness == "claude":
+        # Claude Code reads only .claude-plugin/plugin.json; a receipt must not describe this one.
+        if portable.exists():
+            raise ValueError(f"Claude Code ignores a portable plugin.json: {portable}")
         manifest_path = claude
+    else:
+        manifest_path = portable if portable.exists() else codex
     manifest = _json_object(manifest_path)
+    # Claude Code documents displayName as UI-only metadata, not used for lookup.
+    metadata = _METADATA | {"displayName"} if harness == "claude" else _METADATA
     name = manifest.get("name")
     if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name):
         raise ValueError(f"plugin requires a kebab-case name: {manifest_path}")
-    unknown = set(manifest) - _METADATA - _COMPONENTS
+    unknown = set(manifest) - metadata - _COMPONENTS
     if unknown:
         raise ValueError(f"unsupported plugin manifest fields: {sorted(unknown)}")
     settings = manifest
@@ -234,9 +261,9 @@ def _plugin(root: Path, harness: str | None = None) -> dict[str, Any]:
             settings = extensions["com.openai"]
             if not isinstance(settings, dict):
                 raise ValueError(f"plugin com.openai extension must be an object: {manifest_path}")
-        elif codex.exists() and harness != "claude":
+        elif codex.exists():
             settings = _json_object(codex)
-    unknown = set(settings) - _METADATA - _COMPONENTS
+    unknown = set(settings) - metadata - _COMPONENTS
     if unknown:
         raise ValueError(f"unsupported plugin settings: {sorted(unknown)}")
     onboarding = [settings["onboardingSkill"]] if "onboardingSkill" in settings else []
@@ -259,19 +286,35 @@ def _plugin(root: Path, harness: str | None = None) -> dict[str, Any]:
             config = _json_object(root / filename)
             if config.get("mcpServers") or config.get("apps"):
                 raise ValueError(f"unsupported plugin MCP/app configuration: {root / filename}")
+    if harness == "claude":
+        refused = [path for path in _CLAUDE_REFUSED_DEFAULTS if (root / path).exists()]
+        if refused:
+            raise ValueError(f"unsupported Claude plugin default components {refused}: {root}")
     skill_paths = settings.get("skills")
-    if skill_paths is None:
-        roots = _skill_roots(root / "skills") if (root / "skills").exists() else []
-    else:
+    # Claude Code scans skills/ even when the manifest declares other skill paths.
+    default_skills = skill_paths is None or harness == "claude"
+    roots = (_skill_roots(root / "skills", harness)
+             if default_skills and (root / "skills").exists() else [])
+    if skill_paths is not None:
         paths = skill_paths if isinstance(skill_paths, list) else [skill_paths]
-        roots = [skill for value in paths for skill in _skill_roots(_component(root, value))]
+        declared = [skill for value in paths
+                    for skill in _skill_roots(_component(root, value), harness)]
+        roots += [skill for skill in declared if skill not in roots]
     names = [_skill_name(skill) for skill in roots]
     if len(set(names)) != len(names):
         raise ValueError(f"duplicate plugin skill names: {root}")
     if "hooks" in settings:
-        hooks = _hooks(root, settings["hooks"])
+        declared_hooks = settings["hooks"]
+        if harness == "claude" and (root / "hooks/hooks.json").exists():
+            # Check the default hook file too, in case Claude Code loads both.
+            entries = declared_hooks if isinstance(declared_hooks, list) else [declared_hooks]
+            default_hooks = _component(root, "./hooks/hooks.json")
+            if not any(isinstance(entry, str) and _component(root, entry) == default_hooks
+                       for entry in entries):
+                declared_hooks = ["./hooks/hooks.json", *entries]
+        hooks = _hooks(root, declared_hooks, harness)
     elif (root / "hooks/hooks.json").exists():
-        hooks = _hooks(root, "./hooks/hooks.json")
+        hooks = _hooks(root, "./hooks/hooks.json", harness)
     else:
         hooks = []
     for value in onboarding:
@@ -287,7 +330,7 @@ def _plugin(root: Path, harness: str | None = None) -> dict[str, Any]:
             for value in values:
                 if not _component(root, value).is_file():
                     raise ValueError(f"plugin interface asset must be a file: {value}")
-    return {
+    plugin: dict[str, Any] = {
         "name": name,
         "manifest_path": manifest_path.relative_to(root).as_posix(),
         "manifest": manifest,
@@ -296,19 +339,22 @@ def _plugin(root: Path, harness: str | None = None) -> dict[str, Any]:
                    for skill in roots],
         "hooks": hooks,
     }
+    if harness == "claude":
+        plugin["default_components"] = [
+            path for path in _CLAUDE_ADMITTED_DEFAULTS if (root / path).exists()
+        ]
+    return plugin
 
 
 def resolve_treatment(treatment: Treatment, base: Path, harness: str) -> Treatment:
     """Validate selected inputs and return absolute files and actual skill roots."""
     if harness not in {"codex", "claude"}:
         raise ValueError(f"unsupported treatment harness: {harness}")
-    if harness == "claude" and treatment.plugins:
-        raise ValueError("native plugin qualification currently supports only Codex")
     guidance = [_guidance(path, base) for path in treatment.guidance]
     if len(set(guidance)) != len(guidance):
         raise ValueError("duplicate guidance files in treatment")
     skills = [root for path in treatment.skills
-              for root in _skill_roots(_checked_path(path, base))]
+              for root in _skill_roots(_checked_path(path, base), harness)]
     names = [_skill_name(root) for root in skills]
     if len(set(names)) != len(names):
         raise ValueError("duplicate skill names in treatment")
@@ -342,23 +388,24 @@ def _package_inventory(root: Path) -> dict[str, Any]:
     return {"directory": root.name, "sha256": digest, "entries": entries}
 
 
-def treatment_inventory(treatment: Treatment) -> dict[str, Any]:
+def treatment_inventory(treatment: Treatment, harness: str) -> dict[str, Any]:
     """Portable content/mode identities, independent of installation paths."""
     guidance = [_guidance(path, Path.cwd()) for path in treatment.guidance]
     return {
         "guidance": [{"name": path.name, "mode": stat.S_IMODE(path.stat().st_mode),
                       "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                       "size": path.stat().st_size} for path in guidance],
-        "skills": [{**_package_inventory(root), "name": _skill_name(root)}
+        "skills": [{**_package_inventory(root), "name": _skill_name(root, harness)}
                    for root in treatment.skills],
-        "plugins": [{**_package_inventory(root), **_plugin(root)} for root in treatment.plugins],
+        "plugins": [{**_package_inventory(root), **_plugin(root, harness)}
+                    for root in treatment.plugins],
     }
 
 
-def freeze_treatment(treatment: Treatment, destination: Path) -> Treatment:
+def freeze_treatment(treatment: Treatment, destination: Path, harness: str) -> Treatment:
     """Copy complete packages into deterministic locations without Git internals."""
     # Inventory first: reject invalid packages before writing a partial snapshot.
-    before = treatment_inventory(treatment)
+    before = treatment_inventory(treatment, harness)
     for path in [destination, *destination.parents]:
         if path.exists() or path.is_symlink():
             _checked_path(path, Path.cwd())
@@ -383,6 +430,6 @@ def freeze_treatment(treatment: Treatment, destination: Path) -> Treatment:
                 shutil.copytree(source, target, ignore=shutil.ignore_patterns(".git"))
             frozen[kind].append(target.absolute())
     result = Treatment(**frozen)
-    if treatment_inventory(result) != before:
+    if treatment_inventory(result, harness) != before:
         raise ValueError("treatment changed while its snapshot was being frozen")
     return result

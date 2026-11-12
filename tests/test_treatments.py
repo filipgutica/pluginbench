@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -65,8 +66,8 @@ def test_freeze_retains_resources_modes_and_package_identity(tmp_path: Path) -> 
     (plugin / ".git/config").write_text("do not snapshot local git credentials")
     (plugin / ".gitignore").write_text("cache/\n")
     resolved = _resolve(Treatment(skills=[skill], plugins=[plugin]), tmp_path)
-    before = treatment_inventory(resolved)
-    frozen = freeze_treatment(resolved, tmp_path / "frozen")
+    before = treatment_inventory(resolved, "codex")
+    frozen = freeze_treatment(resolved, tmp_path / "frozen", "codex")
     assert frozen.skills[0] != skill
     assert (frozen.skills[0] / "scripts/check.sh").stat().st_mode & 0o777 == 0o755
     assert (frozen.skills[0] / "references/context.md").read_text() == (
@@ -75,9 +76,9 @@ def test_freeze_retains_resources_modes_and_package_identity(tmp_path: Path) -> 
     assert (frozen.plugins[0] / "assets/example.bin").read_bytes() == b"\x00\xff\x01"
     assert not (frozen.plugins[0] / ".git").exists()
     assert (frozen.plugins[0] / ".gitignore").exists()
-    assert treatment_inventory(frozen) == before
+    assert treatment_inventory(frozen, "codex") == before
     script.chmod(0o644)
-    assert treatment_inventory(resolved) != before
+    assert treatment_inventory(resolved, "codex") != before
 
 
 @pytest.mark.parametrize("selection", ["guidance", "skills", "plugins"])
@@ -173,7 +174,7 @@ def test_empty_hooks_disable_fallback_and_portable_overlay_replaces_compatibilit
         "extensions": {"com.openai": {"hooks": {}}},
     }))
     resolved = _resolve(Treatment(plugins=[plugin]), tmp_path)
-    info = treatment_inventory(resolved)["plugins"][0]
+    info = treatment_inventory(resolved, "codex")["plugins"][0]
     assert info["name"] == "portable"
     assert info["manifest_path"] == "plugin.json"
     assert info["hooks"] == []
@@ -189,7 +190,7 @@ def test_hook_configuration_is_preserved_and_model_hooks_are_ineligible(tmp_path
     hooks = {"hooks": {"SessionStart": [{"hooks": [command_hook]}]}}
     (plugin / "hooks/start.json").write_text(json.dumps(hooks))
     resolved = _resolve(Treatment(plugins=[plugin]), tmp_path)
-    assert treatment_inventory(resolved)["plugins"][0]["hooks"] == [hooks]
+    assert treatment_inventory(resolved, "codex")["plugins"][0]["hooks"] == [hooks]
     hooks["hooks"]["SessionStart"][0]["hooks"][0]["type"] = "prompt"
     (plugin / "hooks/start.json").write_text(json.dumps(hooks))
     with pytest.raises(ValueError, match="only command"):
@@ -220,13 +221,188 @@ def test_inline_hooks_use_the_native_hook_file_wrapper(tmp_path: Path) -> None:
     }]}]}}
     plugin = _plugin(tmp_path / "plugin", hooks=hooks)
     resolved = _resolve(Treatment(plugins=[plugin]), tmp_path)
-    assert treatment_inventory(resolved)["plugins"][0]["hooks"] == [hooks]
+    assert treatment_inventory(resolved, "codex")["plugins"][0]["hooks"] == [hooks]
 
 
-def test_claude_plugin_cannot_be_admitted_without_native_qualification(tmp_path: Path) -> None:
+def _claude_plugin(root: Path, **fields: object) -> Path:
+    (root / ".claude-plugin").mkdir(parents=True)
+    (root / ".claude-plugin/plugin.json").write_text(json.dumps({"name": "repairs", **fields}))
+    _skill(root / "skills/repair")
+    return root
+
+
+def _claude(treatment: Treatment, base: Path) -> Treatment:
+    return resolve_treatment(treatment, base, "claude")
+
+
+def test_codex_only_plugin_is_refused_for_claude(tmp_path: Path) -> None:
     plugin = _plugin(tmp_path / "plugin")
-    with pytest.raises(ValueError, match="only Codex"):
-        resolve_treatment(Treatment(plugins=[plugin]), tmp_path, "claude")
+    with pytest.raises(ValueError, match="plugin JSON"):
+        _claude(Treatment(plugins=[plugin]), tmp_path)
+
+
+def test_superpowers_shaped_claude_plugin_admits_and_freezes(tmp_path: Path) -> None:
+    plugin = _claude_plugin(
+        tmp_path / "plugin", version="7.0.2", description="Skills.",
+        author={"name": "Author"}, homepage="https://example.com",
+        repository="https://example.com/repo", license="MIT", keywords=["skills"],
+    )
+    (plugin / "hooks").mkdir()
+    hooks = {"description": "Session start.", "hooks": {"SessionStart": [{
+        "matcher": "startup|resume", "hooks": [{
+            "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session-start",
+            "shell": "bash", "powershell": "hooks/session-start.ps1", "async": False,
+        }],
+    }]}}
+    (plugin / "hooks/hooks.json").write_text(json.dumps(hooks))
+    (plugin / "bin").mkdir()
+    (plugin / "bin/tool").write_text("#!/bin/sh\n")
+    resolved = _claude(Treatment(plugins=[plugin]), tmp_path)
+    info = treatment_inventory(resolved, "claude")["plugins"][0]
+    assert info["manifest_path"] == ".claude-plugin/plugin.json"
+    assert info["skills"] == [{"name": "repair", "path": "skills/repair"}]
+    assert info["hooks"] == [hooks]
+    assert info["default_components"] == ["bin"]
+    frozen = freeze_treatment(resolved, tmp_path / "frozen", "claude")
+    assert treatment_inventory(frozen, "claude")["plugins"][0]["sha256"] == info["sha256"]
+
+
+def test_workflow_shaped_dual_manifest_plugin_reads_the_manifest_of_its_harness(
+    tmp_path: Path,
+) -> None:
+    plugin = _claude_plugin(tmp_path / "plugin", skills="./skills", displayName="Repairs")
+    (plugin / "skills/repair/SKILL.md").write_text(
+        "---\nname: repair\ndescription: Repair it.\ndisable-model-invocation: true\n"
+        "metadata:\n  short-description: Repair\n---\nBody.\n"
+    )
+    (plugin / ".codex-plugin").mkdir()
+    (plugin / ".codex-plugin/plugin.json").write_text(json.dumps({"name": "repairs-codex"}))
+    resolved = _claude(Treatment(plugins=[plugin]), tmp_path)
+    claude = treatment_inventory(resolved, "claude")["plugins"][0]
+    assert claude["manifest_path"] == ".claude-plugin/plugin.json"
+    assert claude["skills"] == [{"name": "repair", "path": "skills/repair"}]
+    codex = treatment_inventory(_resolve(Treatment(plugins=[plugin]), tmp_path), "codex")
+    assert codex["plugins"][0]["manifest_path"] == ".codex-plugin/plugin.json"
+    assert "default_components" not in codex["plugins"][0]
+
+
+def test_claude_refuses_a_portable_manifest_it_would_not_read(tmp_path: Path) -> None:
+    plugin = _claude_plugin(tmp_path / "plugin", agents=["./x/reviewer.md"])
+    (plugin / "x").mkdir()
+    (plugin / "x/reviewer.md").write_text("Review.")
+    (plugin / "plugin.json").write_text(json.dumps({"name": "repairs"}))
+    with pytest.raises(ValueError, match="portable plugin.json"):
+        _claude(Treatment(plugins=[plugin]), tmp_path)
+    (plugin / ".claude-plugin/plugin.json").unlink()
+    with pytest.raises(ValueError, match="portable plugin.json"):
+        _claude(Treatment(plugins=[plugin]), tmp_path)
+
+
+def test_claude_refuses_hook_file_modules(tmp_path: Path) -> None:
+    plugin = _claude_plugin(tmp_path / "plugin")
+    (plugin / "hooks").mkdir()
+    (plugin / "hooks/hooks.json").write_text(json.dumps({"hooks": {}, "modules": ["./mod.ts"]}))
+    with pytest.raises(ValueError, match="hook-file keys"):
+        _claude(Treatment(plugins=[plugin]), tmp_path)
+
+
+def test_claude_refuses_a_root_skill(tmp_path: Path) -> None:
+    plugin = _claude_plugin(tmp_path / "plugin")
+    shutil.rmtree(plugin / "skills")
+    (plugin / "SKILL.md").write_text("---\nname: repairs\ndescription: R.\nmodel: haiku\n---\n")
+    with pytest.raises(ValueError, match="default components"):
+        _claude(Treatment(plugins=[plugin]), tmp_path)
+
+
+def test_claude_explicit_default_hook_file_is_checked_once(tmp_path: Path) -> None:
+    plugin = _claude_plugin(tmp_path / "plugin", hooks="./hooks/hooks.json")
+    (plugin / "hooks").mkdir()
+    hooks = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "true"}]}]}}
+    (plugin / "hooks/hooks.json").write_text(json.dumps(hooks))
+    resolved = _claude(Treatment(plugins=[plugin]), tmp_path)
+    assert treatment_inventory(resolved, "claude")["plugins"][0]["hooks"] == [hooks]
+
+
+@pytest.mark.parametrize("path", [
+    "agents/reviewer.md", "commands/review.md", "workflows/ship.md", "output-styles/terse.md",
+    "monitors/monitors.json", ".lsp.json", "settings.json", ".mcp.json",
+])
+def test_claude_default_components_are_refused(tmp_path: Path, path: str) -> None:
+    plugin = _claude_plugin(tmp_path / "plugin")
+    (plugin / path).parent.mkdir(exist_ok=True)
+    # Flat .mcp.json servers have no mcpServers key; presence alone must refuse.
+    (plugin / path).write_text(json.dumps({"server": {"command": "serve"}}))
+    with pytest.raises(ValueError, match="default components"):
+        _claude(Treatment(plugins=[plugin]), tmp_path)
+
+
+@pytest.mark.parametrize("field", ["userConfig", "lspServers", "outputStyles", "monitors"])
+def test_claude_only_manifest_fields_are_refused(tmp_path: Path, field: str) -> None:
+    plugin = _claude_plugin(tmp_path / "plugin", **{field: {"key": {}}})
+    with pytest.raises(ValueError, match="manifest fields"):
+        _claude(Treatment(plugins=[plugin]), tmp_path)
+
+
+@pytest.mark.parametrize("line", ["hooks: {}", "model: haiku", "context: fork", "effort: low"])
+def test_claude_skill_frontmatter_outside_the_allowlist_is_refused(
+    tmp_path: Path, line: str,
+) -> None:
+    skill = _skill(tmp_path / "skill")
+    (skill / "SKILL.md").write_text(f"---\nname: repair\ndescription: Repair.\n{line}\n---\n")
+    _resolve(Treatment(skills=[skill]), tmp_path)
+    with pytest.raises(ValueError, match="Claude skill frontmatter"):
+        _claude(Treatment(skills=[skill]), tmp_path)
+    plugin = _claude_plugin(tmp_path / "plugin")
+    (plugin / "skills/repair/SKILL.md").write_text((skill / "SKILL.md").read_text())
+    with pytest.raises(ValueError, match="Claude skill frontmatter"):
+        _claude(Treatment(plugins=[plugin]), tmp_path)
+
+
+def test_claude_checks_default_skills_and_hooks_beside_declared_ones(tmp_path: Path) -> None:
+    plugin = _claude_plugin(tmp_path / "plugin", skills="./extra", hooks={})
+    _skill(plugin / "extra/other", "other")
+    resolved = _claude(Treatment(plugins=[plugin]), tmp_path)
+    assert [skill["name"] for skill in treatment_inventory(resolved, "claude")["plugins"][0][
+        "skills"
+    ]] == ["repair", "other"]
+    (plugin / "skills/repair/SKILL.md").write_text(
+        "---\nname: repair\ndescription: Repair.\nmodel: haiku\n---\n"
+    )
+    with pytest.raises(ValueError, match="Claude skill frontmatter"):
+        _claude(Treatment(plugins=[plugin]), tmp_path)
+    _skill(tmp_path / "clean/repair")
+    (plugin / "skills/repair/SKILL.md").write_text(
+        (tmp_path / "clean/repair/SKILL.md").read_text()
+    )
+    (plugin / "hooks").mkdir()
+    (plugin / "hooks/hooks.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{
+        "type": "prompt", "prompt": "Check the work.",
+    }]}]}}))
+    with pytest.raises(ValueError, match="only command"):
+        _claude(Treatment(plugins=[plugin]), tmp_path)
+
+
+def test_codex_admission_ignores_claude_default_components(tmp_path: Path) -> None:
+    plugin = _plugin(tmp_path / "plugin", displayName="Repairs")
+    with pytest.raises(ValueError, match="manifest fields"):
+        _resolve(Treatment(plugins=[plugin]), tmp_path)
+    plugin = _plugin(tmp_path / "other")
+    for path in [
+        "agents/reviewer.md", "commands/review.md", "workflows/ship.md", "bin/tool",
+        "themes/dark.json",
+    ]:
+        (plugin / path).parent.mkdir(exist_ok=True)
+        (plugin / path).write_text("x")
+    (plugin / "settings.json").write_text("{}")
+    (plugin / "plugin.json").write_text(json.dumps({"name": "repairs"}))
+    (plugin / "hooks").mkdir()
+    (plugin / "hooks/hooks.json").write_text(json.dumps({"hooks": {}, "modules": ["./m.ts"]}))
+    resolved = _resolve(Treatment(plugins=[plugin]), tmp_path)
+    info = treatment_inventory(resolved, "codex")["plugins"][0]
+    assert {key: info[key] for key in info if key not in {"directory", "sha256", "entries"}} == {
+        "name": "repairs", "manifest_path": "plugin.json", "manifest": {"name": "repairs"},
+        "settings": {"name": "repairs"}, "skills": [], "hooks": [],
+    }
 
 
 def test_freeze_rechecks_inputs_and_destination_links(tmp_path: Path) -> None:
@@ -236,18 +412,20 @@ def test_freeze_rechecks_inputs_and_destination_links(tmp_path: Path) -> None:
     path.unlink()
     path.symlink_to(tmp_path / "other.md")
     with pytest.raises(ValueError, match="symlink"):
-        freeze_treatment(resolved, tmp_path / "frozen")
+        freeze_treatment(resolved, tmp_path / "frozen", "codex")
     assert not (tmp_path / "frozen").exists()
     path.unlink()
     path.write_text("Instructions.")
     (tmp_path / "real").mkdir()
     (tmp_path / "alias").symlink_to(tmp_path / "real", target_is_directory=True)
     with pytest.raises(ValueError, match="symlink"):
-        freeze_treatment(resolved, tmp_path / "alias/snapshot")
+        freeze_treatment(resolved, tmp_path / "alias/snapshot", "codex")
     assert not (tmp_path / "real/snapshot").exists()
     skill = _skill(tmp_path / "skill")
     with pytest.raises(ValueError, match="outside its input"):
-        freeze_treatment(_resolve(Treatment(skills=[skill]), tmp_path), skill / "frozen")
+        freeze_treatment(
+            _resolve(Treatment(skills=[skill]), tmp_path), skill / "frozen", "codex"
+        )
 
 
 def test_dotenv_is_rejected_but_examples_are_preserved(tmp_path: Path) -> None:
