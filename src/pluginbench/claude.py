@@ -110,11 +110,13 @@ PINNED_SETTINGS: dict[str, object] = {}
 # Discovery adds only this: it lists hooks without running them.
 DISCOVERY_SETTINGS: dict[str, object] = {"disableAllHooks": True}
 DISALLOWED_TOOLS = ("RemoteTrigger", "CronCreate", "ScheduleWakeup", "SendMessage", "Workflow")
-# Routes and limits that would change which model serves the run or how it is metered.
+# Routes, credentials and limits that would change which model serves the run, whose
+# account pays for it, or how it is metered. Coding authenticates with the operator's
+# subscription token only; an API key would silently outrank it in print mode.
 REFUSED_ENV = (
+    "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",

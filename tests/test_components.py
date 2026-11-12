@@ -31,10 +31,10 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # Claude plugin admission rules; Codex admission and every admitted launch stay v1.
             "treatments.py": "441498fa24855b0ed5e8b713be2bdf1eb8d06bc29b9d01cdbdb762f838bcc81c",
             # Claude version admission and coding launch builder; Claude-only, so Codex stays v1.
-            "claude.py": "d4dc66cb46713b976db98e5eae5c84ae58f19e075e29c2ead02b30fd038e8d31",
+            "claude.py": "780dda033e3b20e4a911f6d562ea407588fe76b9b8886a0f5f541c4f4d878b51",
             "claude_treatments.py": "15d5d5de89f34e2b1b6982bb0f1eb1fbbcf28be2b08586500e489d2db55e2aa5",
             "claude_treatment_runtime.js": (
-                "af893dc284d079df0e9785aac03e257a96884d60d6bf4a5558196fa39affc882"
+                "42c3d364df88c9ff66bece4bd7f8ae6780aa56942109be962f6c686a891a10c6"
             ),
         },
     ),
