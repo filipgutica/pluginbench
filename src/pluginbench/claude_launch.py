@@ -12,13 +12,15 @@ import hashlib
 import importlib
 import importlib.metadata
 import inspect
+import json
 import re
+import shlex
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from pluginbench import claude, claude_treatments
-from pluginbench.native_treatments import NativeCapabilities
+from pluginbench.native_treatments import REMOTE_ROOT, NativeCapabilities
 from pluginbench.treatments import Treatment
 
 TRANSPORT_VERSION = "claude-pinned-launch-v1"
@@ -92,7 +94,7 @@ def pin_exec(agent: object, boundary: dict[str, Any], *, qualification: str) -> 
         pinned = claude.contract_command(command, run)
         claude.check_coding_env(merged, run)
         # Discovery and coding get this same dict, so discovery sees what coding will.
-        await claude_treatments.install(
+        receipt = await claude_treatments.install(
             environment=environment,
             treatment=Treatment.model_validate(boundary["treatment"]),
             env=merged,
@@ -101,6 +103,164 @@ def pin_exec(agent: object, boundary: dict[str, Any], *, qualification: str) -> 
             run=run,
             cli_version=str(boundary["version"]),
         )
-        return await original(environment, pinned, env=merged, cwd=cwd, timeout_sec=timeout_sec)
+        result = await original(environment, pinned, env=merged, cwd=cwd, timeout_sec=timeout_sec)
+        trees = _treatment_trees(receipt)
+        if trees:
+            # Skills and plugins load their files on use, so they must last the whole run.
+            report = await original(
+                environment,
+                "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
+                f"node {REMOTE_ROOT}/install.cjs {REMOTE_ROOT} "
+                f"{shlex.quote(str(boundary['image']['workdir']))} --trees "
+                + shlex.join(path for path, _ in trees),
+                env=merged,
+                cwd=cwd,
+                timeout_sec=120,
+            )
+            observed = json.loads(str(getattr(report, "stdout", "")))
+            for (path, entries), now in zip(trees, observed, strict=True):
+                if _by_path(now) != _by_path(entries):
+                    raise ValueError(f"Claude treatment files changed during the coding run: {path}")
+        return result
 
     setattr(agent, "exec_as_agent", pinned_exec)
+
+
+def _treatment_trees(receipt: dict[str, Any]) -> list[tuple[str, list[dict[str, Any]]]]:
+    """Each delivered tree the CLI reads during coding, with its frozen inventory entries."""
+    inventory = receipt["inventory"]
+    plugins = {plugin["name"]: plugin["entries"] for plugin in inventory["plugins"]}
+    return [
+        *(
+            (install["loaded_from"], plugins[install["id"].partition("@")[0]])
+            for install in receipt["plugin_installs"]
+        ),
+        *(
+            (f"{claude_treatments.CONFIG_DIR}/skills/{skill['directory']}", skill["entries"])
+            for skill in inventory["skills"]
+        ),
+    ]
+
+
+def _by_path(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(entries, key=lambda entry: str(entry["path"]))
+
+
+def session_errors(
+    stream: str, receipt: dict[str, Any], *, model: str, subagents: bool
+) -> list[str]:
+    """How a coding session differs from the discovery receipt it was launched after (D2).
+
+    Its `system/init` must report what discovery found, and its hook events must be the
+    listed hooks: each SessionStart hook that matches `startup` starts once and exits 0
+    before the first assistant message, and no other hook event appears.
+    """
+    events = [
+        event
+        for line in stream.splitlines()
+        if line.startswith("{") and isinstance(event := _json(line), dict)
+    ]
+    inits = [e for e in events if e.get("type") == "system" and e.get("subtype") == "init"]
+    if len(inits) != 1:
+        return ["the coding stream needs exactly one system/init"]
+    init = inits[0]
+    try:
+        builtin = set(receipt["builtins"]["commands"])
+        skills = {skill["name"] for skill in receipt["skills"]}
+        plugins = sorted((item["id"], item["loaded_from"]) for item in receipt["plugin_installs"])
+        listing = [(hook["event"], hook.get("matcher") or "") for hook in receipt["hooks"]["hooks"]]
+        expected = {
+            "claude_code_version": receipt["cli_version"],
+            "model": model,
+            # Discovery saw a subscription token and no API key.
+            "apiKeySource": "none" if "apiKeySource" not in receipt["account"] else None,
+            "mcp_servers": [],
+            "agents": receipt["builtins"]["agents"],
+            "slash_commands": sorted(builtin | skills),
+            "skills": sorted(skills),
+            "plugins": plugins,
+        }
+    except (KeyError, TypeError) as error:
+        return [f"the discovery receipt lacks {error}"]
+    observed = {
+        **{key: init.get(key) for key in ("claude_code_version", "model", "apiKeySource")},
+        "mcp_servers": init.get("mcp_servers"),
+        "agents": _sorted(init.get("agents")),
+        "slash_commands": _sorted(init.get("slash_commands")),
+        # Built-in skills are built-in commands too; the rest must be the declared skills.
+        "skills": sorted(set(_sorted(init.get("skills"))) - builtin),
+        "plugins": sorted(
+            (plugin.get("source"), plugin.get("path"))
+            for plugin in init.get("plugins") or []
+            if isinstance(plugin, dict) and plugin.get("path") != "builtin"
+        ),
+    }
+    errors = [
+        f"system/init {key} differs from discovery"
+        for key in expected
+        if observed[key] != expected[key]
+    ]
+    refused = set(claude.DISALLOWED_TOOLS) | (set() if subagents else {"Agent", "Task"})
+    if not isinstance(init.get("tools"), list) or refused & set(init["tools"]):
+        errors.append("system/init offers a disallowed tool")
+    return errors + _hook_errors(events, listing)
+
+
+def _hook_errors(events: list[dict[str, Any]], listing: list[tuple[str, str]]) -> list[str]:
+    errors = []
+    first_reply = next(
+        (index for index, event in enumerate(events) if event.get("type") == "assistant"),
+        len(events),
+    )
+    hooks = [
+        (index, event)
+        for index, event in enumerate(events)
+        if event.get("type") == "system" and str(event.get("subtype", "")).startswith("hook_")
+    ]
+    started: list[tuple[int, dict[str, Any]]] = []
+    responses: dict[object, list[dict[str, Any]]] = {}
+    for index, event in hooks:
+        name, _, trigger = str(event.get("hook_name", "")).partition(":")
+        if name != event.get("hook_event") or not any(
+            listed == name and _matches(matcher, trigger) for listed, matcher in listing
+        ):
+            errors.append(f"hook event {event.get('hook_name')} is not in the listing")
+        if event["subtype"] == "hook_started":
+            started.append((index, event))
+        elif event["subtype"] == "hook_response":
+            responses.setdefault(event.get("hook_id"), []).append(event)
+    for _, event in started:
+        answer = responses.pop(event.get("hook_id"), [])
+        if len(answer) != 1 or answer[0].get("exit_code") != 0 or answer[0].get("outcome") != "success":
+            errors.append(f"hook {event.get('hook_name')} did not exit 0 exactly once")
+    if responses:
+        errors.append("a hook responded without starting")
+    at_startup = sum(
+        1 for name, matcher in listing if name == "SessionStart" and _matches(matcher, "startup")
+    )
+    ran = sum(
+        1
+        for index, event in started
+        if event.get("hook_name") == "SessionStart:startup" and index < first_reply
+    )
+    if ran != at_startup:
+        errors.append(
+            f"{ran} SessionStart startup hooks ran before the first reply; {at_startup} are listed"
+        )
+    return errors
+
+
+def _matches(matcher: str, trigger: str) -> bool:
+    """Claude's matcher: empty or `*` matches all; otherwise `|`-separated exact names."""
+    return matcher in ("", "*") or trigger in matcher.split("|")
+
+
+def _sorted(value: object) -> list[str]:
+    return sorted(str(item) for item in value) if isinstance(value, list) else []
+
+
+def _json(line: str) -> object:
+    try:
+        return json.loads(line)
+    except ValueError:
+        return None

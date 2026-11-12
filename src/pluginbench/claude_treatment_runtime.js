@@ -346,7 +346,13 @@ async function main() {
   process.stdout.write(JSON.stringify(receipt) + "\n");
 }
 
-main().catch(error => {
+// After coding, `--trees <dir>...` reports each tree as it is now, changing nothing; the
+// caller compares them with the frozen inventory.
+const [mode, ...trees] = process.argv.slice(4);
+const run = mode === "--trees"
+  ? async () => process.stdout.write(JSON.stringify(trees.map(tree => treeEntries(tree))) + "\n")
+  : main;
+run().catch(error => {
   process.stderr.write(String(error.stack || error) + "\n");
   process.exitCode = 1;
 });

@@ -1,0 +1,351 @@
+{
+ "account": {
+  "apiProvider": "firstParty",
+  "tokenSource": "CLAUDE_CODE_OAUTH_TOKEN"
+ },
+ "auto_memory": {
+  "enabled": false,
+  "status": "off",
+  "toggleable": true
+ },
+ "builtins": {
+  "agents": [
+   "Explore",
+   "Plan",
+   "claude",
+   "general-purpose",
+   "statusline-setup"
+  ],
+  "commands": [
+   "__remote-workflow",
+   "agents",
+   "auto-mode-setup",
+   "autocompact",
+   "batch",
+   "claude-api",
+   "clear",
+   "code-review",
+   "color",
+   "compact",
+   "config",
+   "context",
+   "dataviz",
+   "debug",
+   "deep-research",
+   "doctor",
+   "effort",
+   "fast",
+   "fewer-permission-prompts",
+   "focus",
+   "goal",
+   "init",
+   "insights",
+   "list-agents",
+   "loop",
+   "mcp",
+   "model",
+   "output-style",
+   "plugin-authoring",
+   "recap",
+   "reload-plugins",
+   "reload-skills",
+   "rename",
+   "run",
+   "run-skill-generator",
+   "security-review",
+   "simplify",
+   "update-config",
+   "usage",
+   "verify",
+   "workflow-authoring",
+   "workflow-launch-exec"
+  ]
+ },
+ "cli_version": "2.1.322",
+ "commands": [
+  "demo:demo-skill",
+  "loose-skill"
+ ],
+ "delivery": "claude-native-v1",
+ "discovery": {
+  "argv": [
+   "claude",
+   "--verbose",
+   "--output-format=stream-json",
+   "--settings",
+   "{\"disableAllHooks\":true}",
+   "--model",
+   "claude-opus-5-5",
+   "--effort",
+   "high",
+   "--permission-mode=bypassPermissions",
+   "--setting-sources",
+   "user",
+   "--strict-mcp-config",
+   "--mcp-config",
+   "{\"mcpServers\":{}}",
+   "--include-hook-events",
+   "--no-chrome",
+   "--disallowed-tools",
+   "RemoteTrigger,CronCreate,ScheduleWakeup,SendMessage,Workflow",
+   "--input-format",
+   "stream-json",
+   "--no-session-persistence",
+   "--print"
+  ],
+  "exit_code": 0,
+  "requests": [
+   "initialize",
+   "get_context_usage",
+   "get_hooks_listing",
+   "get_settings",
+   "get_memory_dialog",
+   "get_skills_dialog",
+   "get_session_cost"
+  ],
+  "signal": null
+ },
+ "guidance": {
+  "bytes": 48,
+  "memory_files_tokens": 16,
+  "path": "/logs/agent/sessions/CLAUDE.md",
+  "scope": "Claude user instructions",
+  "sha256": "b3f12da81e289356d321f0f626a050e487c768baef6327543db89768be5cdb03"
+ },
+ "hook_execution": "suppressed in discovery by disableAllHooks; the coding stream must show it",
+ "hooks": {
+  "hooks": [
+   {
+    "commandText": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\"}}'",
+    "contentLabel": "Command",
+    "disabled": true,
+    "displayText": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\"}}'",
+    "event": "SessionStart",
+    "matcher": "startup",
+    "pluginName": "demo@pluginbench-frozen",
+    "source": "pluginHook",
+    "sourceLabel": "Plugin hooks (~/.claude/plugins/*/hooks/hooks.json)",
+    "type": "command"
+   }
+  ],
+  "policy": {
+   "allDisabled": true,
+   "disabledByPolicy": false,
+   "managedOnly": false,
+   "pluginOnly": false,
+   "policyHookCount": 0
+  }
+ },
+ "inventory": {
+  "guidance": [
+   {
+    "mode": 436,
+    "name": "guide.md",
+    "sha256": "b3f12da81e289356d321f0f626a050e487c768baef6327543db89768be5cdb03",
+    "size": 48
+   }
+  ],
+  "plugins": [
+   {
+    "default_components": [],
+    "directory": "demo",
+    "entries": [
+     {
+      "kind": "directory",
+      "mode": 509,
+      "path": "."
+     },
+     {
+      "kind": "directory",
+      "mode": 509,
+      "path": ".claude-plugin"
+     },
+     {
+      "kind": "file",
+      "mode": 436,
+      "path": ".claude-plugin/plugin.json",
+      "sha256": "675ea2a1527c7ead62bdbaaf8741a38bc20c53bab1b47ba9c15ab7a87ba2d5e0",
+      "size": 16
+     },
+     {
+      "kind": "directory",
+      "mode": 509,
+      "path": "hooks"
+     },
+     {
+      "kind": "file",
+      "mode": 436,
+      "path": "hooks/hooks.json",
+      "sha256": "ca6be663e147da2b5eadc08a32dade035bd6e0bc310e8f36c3a1f4fc556a5053",
+      "size": 168
+     },
+     {
+      "kind": "directory",
+      "mode": 509,
+      "path": "skills"
+     },
+     {
+      "kind": "directory",
+      "mode": 509,
+      "path": "skills/demo-skill"
+     },
+     {
+      "kind": "file",
+      "mode": 436,
+      "path": "skills/demo-skill/SKILL.md",
+      "sha256": "62b1773a1fe8ef85c42c6296f2eb9b5794dc9912e72933ef7ce7867ba0b675b3",
+      "size": 60
+     },
+     {
+      "kind": "file",
+      "mode": 493,
+      "path": "skills/demo-skill/check.sh",
+      "sha256": "1b0c5a94b076f16e41e5a9fb121101c38c24eeb05e47a127e6693c1ddd3d3c19",
+      "size": 23
+     }
+    ],
+    "hooks": [
+     {
+      "hooks": {
+       "SessionStart": [
+        {
+         "hooks": [
+          {
+           "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\"}}'",
+           "type": "command"
+          }
+         ],
+         "matcher": "startup"
+        }
+       ]
+      }
+     }
+    ],
+    "manifest": {
+     "name": "demo"
+    },
+    "manifest_path": ".claude-plugin/plugin.json",
+    "name": "demo",
+    "settings": {
+     "name": "demo"
+    },
+    "sha256": "5bbe70924771b43766f74e7eb4c2ffcee84a67f6ed1163a732dd734e6c78bbf2",
+    "skills": [
+     {
+      "name": "demo-skill",
+      "path": "skills/demo-skill"
+     }
+    ]
+   }
+  ],
+  "skills": [
+   {
+    "directory": "loose-folder",
+    "entries": [
+     {
+      "kind": "directory",
+      "mode": 509,
+      "path": "."
+     },
+     {
+      "kind": "file",
+      "mode": 436,
+      "path": "SKILL.md",
+      "sha256": "ffe4be05561be903de022d02bd549ea610bd1c6e46d384db7ea4671e9b5d6e05",
+      "size": 61
+     },
+     {
+      "kind": "file",
+      "mode": 493,
+      "path": "check.sh",
+      "sha256": "1b0c5a94b076f16e41e5a9fb121101c38c24eeb05e47a127e6693c1ddd3d3c19",
+      "size": 23
+     }
+    ],
+    "name": "loose-skill",
+    "sha256": "dcc3c3dfda6478c4487039e9244b990b45789c088937e8f639e496e6c7c29a77"
+   }
+  ]
+ },
+ "marketplace": {
+  "add": {
+   "command": "marketplace-add",
+   "marketplace": "pluginbench-frozen",
+   "message": "Successfully added marketplace: pluginbench-frozen (declared in user settings)",
+   "outcome": "ok"
+  },
+  "path": "/tmp/pluginbench-treatments/marketplace"
+ },
+ "plugin_installs": [
+  {
+   "cache_path": "/logs/agent/sessions/plugins/cache/pluginbench-frozen/demo/unknown",
+   "id": "demo@pluginbench-frozen",
+   "loaded_from": "/tmp/pluginbench-treatments/marketplace/plugins/demo",
+   "output": {
+    "command": "install",
+    "message": "Successfully installed plugin: demo@pluginbench-frozen (scope: user)",
+    "outcome": "ok",
+    "plugin": "demo@pluginbench-frozen",
+    "pluginId": "demo@pluginbench-frozen",
+    "scope": "user"
+   }
+  }
+ ],
+ "plugins": [
+  {
+   "enabled": true,
+   "id": "demo@pluginbench-frozen",
+   "installPath": "/logs/agent/sessions/plugins/cache/pluginbench-frozen/demo/unknown",
+   "installedAt": "2026-11-12T21:55:04.555Z",
+   "lastUpdated": "2026-11-12T21:55:04.555Z",
+   "projectEnabled": false,
+   "readFromFolder": "/tmp/pluginbench-treatments/marketplace/plugins/demo",
+   "scope": "user",
+   "version": "unknown"
+  }
+ ],
+ "session_cost": "Total cost:            $0.0000\nTotal duration (API):  0s\nTotal duration (wall): 21s\nTotal code changes:    0 lines added, 0 lines removed\nUsage:                 0 input, 0 output, 0 cache read, 0 cache write",
+ "settings": {
+  "disableAllHooks": true,
+  "enabledPlugins": {
+   "demo@pluginbench-frozen": true
+  },
+  "extraKnownMarketplaces": {
+   "pluginbench-frozen": {
+    "source": {
+     "path": "/tmp/pluginbench-treatments/marketplace",
+     "source": "directory"
+    }
+   }
+  }
+ },
+ "skill_activation": "not observed by discovery; native availability is verified",
+ "skills": [
+  {
+   "advertised": true,
+   "description": "Claude fixture skill.",
+   "display_name": "demo:demo-skill",
+   "handles": {
+    "aliases": [
+     "demo-skill"
+    ]
+   },
+   "locked_by": "plugin",
+   "name": "demo:demo-skill",
+   "source": "plugin",
+   "state": "on",
+   "tokens": 12
+  },
+  {
+   "advertised": true,
+   "description": "Claude fixture skill.",
+   "display_name": "loose-skill",
+   "handles": {},
+   "name": "loose-folder",
+   "source": "user",
+   "state": "on",
+   "tokens": 11
+  }
+ ],
+ "status": "verified"
+}

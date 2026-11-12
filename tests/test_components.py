@@ -22,7 +22,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # The optional artifact destination is judge-only; coding launch behavior stays v1.
             "codex.py": "185d0c33e1389051ddfb97a85c08978a6f65773c2378d601cdf608f4b0c17ccf",
             # The Claude launch contract; tests/test_codex_identity.py proves Codex launches equal.
-            "harbor_backend.py": "e05bda9202565cd8b0a023540976f973692691ca9a9e6bfe6677d83eda5bf6b9",
+            "harbor_backend.py": "9b49b3205324a68de2332e717a48e5f70e91ae16dea839a8249360b75e164c28",
             "processes.py": "0170e0a4902fc610d19b50ed5656c601474adad97b9b8d6fb5b08c6ab6ad00d1",
             # Claude admission dispatch only; Codex admission is unchanged.
             "native_treatments.py": "cfe17310a7f43de42af556e98fe63380493aeaf6a419ad612d51e01d671f0f19",
@@ -35,9 +35,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             "claude.py": "0387f14438368ed964f678202fcadf6c3ac8a18f30adae037676c01e42becfda",
             "claude_treatments.py": "15d5d5de89f34e2b1b6982bb0f1eb1fbbcf28be2b08586500e489d2db55e2aa5",
             "claude_treatment_runtime.js": (
-                "0202b8856e637aa81b2ccfd80684539fd35e45e5184dd0c9098908f4d7ec2a29"
+                "61ac207ea357796c3ed935cac8b3d1574e0c562a7651cade586aad7e5cc5731b"
             ),
-            "claude_launch.py": "84ae4641af302d1d44c6a378ab7de783afd61be029f45ccb7527c149621a8648",
+            "claude_launch.py": "7d663da4c084714e3b09cabed5507588fb7cfddd710bb14797819b329ad82f19",
         },
     ),
     "analysis_observer": (

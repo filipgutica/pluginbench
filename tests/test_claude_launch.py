@@ -11,6 +11,7 @@ import importlib
 import json
 import os
 import shlex
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,7 +22,7 @@ import pytest
 
 from pluginbench import claude, claude_launch, claude_treatments, evaluation, saved_usage
 from pluginbench import harbor_backend as harbor
-from pluginbench.native_treatments import NativeCapabilities, admit
+from pluginbench.native_treatments import REMOTE_ROOT, NativeCapabilities, admit
 from pluginbench.processes import run_command
 from pluginbench.treatments import Treatment
 from test_claude_treatments import HOOK, skill
@@ -57,12 +58,22 @@ class Container:
 
     root: Path
     case: str
+    arm: str
+    subagents: bool
     persistent: dict[str, str] = field(default_factory=dict)
     harbor_config: dict[str, Any] = field(default_factory=dict)
     commands: list[tuple[str, dict[str, str]]] = field(default_factory=list)
     installs: list[dict[str, Any]] = field(default_factory=list)
     # Shell run after the sessions are written, to damage them.
     after_sessions: str = ""
+    # Changes to the captured events the CLI streams before its first model request.
+    edit_start: Callable[[list[dict[str, Any]]], None] = lambda events: None
+    agent_root: Path | None = None
+
+    @property
+    def remote(self) -> Path:
+        """Where the container's staged treatment directory lives on the host."""
+        return self.root / "remote"
 
     @property
     def home(self) -> Path:
@@ -75,9 +86,31 @@ class Container:
     def agent_dir(self, config: dict[str, Any]) -> Path:
         return Path(str(config["trials_dir"])) / str(config["trial_name"]) / "agent"
 
+    def stream(self) -> str:
+        """The captured start of a real session for this arm, then a calibrated coding run."""
+        start = [
+            json.loads(line)
+            for line in (FIXTURES / "session-start" / self.arm / "session-start.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        coding = [
+            json.loads(line)
+            for line in (FIXTURES / "coding" / self.case / "stream.jsonl").read_text().splitlines()
+        ]
+        (init,) = [event for event in coding if event.get("subtype") == "init"]
+        for event in start:
+            event["session_id"] = init["session_id"]
+            if event.get("subtype") == "init" and not self.subagents:
+                # The real CLI drops its subagent tool, Task, for `--disallowed-tools Agent`.
+                event["tools"].remove("Task")
+        self.edit_start(start)
+        return "".join(json.dumps(event) + "\n" for event in start + coding if event is not init)
+
     def install_cli(self) -> None:
         """The CLI Harbor's PATH export finds first: it replays one coding fixture."""
         fixture = FIXTURES / "coding" / self.case
+        (self.root / "stream.jsonl").write_text(self.stream())
         binary = self.home / ".local/bin/claude"
         binary.parent.mkdir(parents=True)
         binary.write_text(
@@ -87,7 +120,7 @@ class Container:
             f"cat > {shlex.quote(str(self.root / 'prompt.txt'))}\n"
             f'cp -R {shlex.quote(str(fixture / "sessions"))}/. "$CLAUDE_CONFIG_DIR/"\n'
             f"{self.after_sessions}\n"
-            f"cat {shlex.quote(str(fixture / 'stream.jsonl'))}\n"
+            f"cat {shlex.quote(str(self.root / 'stream.jsonl'))}\n"
             f"echo {shlex.quote(DIAGNOSTIC)} >&2\n"
         )
         binary.chmod(0o755)
@@ -97,11 +130,19 @@ class Container:
             stub.write_text("#!/bin/sh\nexit 0\n")
             stub.chmod(0o755)
 
+    def local(self, text: str) -> str:
+        """Container paths in a command or env value, as their host directories."""
+        assert self.agent_root is not None
+        return text.replace("/logs/agent/", f"{self.agent_root}/").replace(
+            REMOTE_ROOT, str(self.remote)
+        )
+
     def run_trial(self, config: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> object:
         """Harbor's trial, with its real ClaudeCode agent, against this container."""
         container = self
         agent_dir = self.agent_dir(config)
         agent_dir.mkdir(parents=True)
+        self.agent_root = agent_dir
         result_type = importlib.import_module("harbor.environments.base").ExecResult
         context = importlib.import_module("harbor.models.agent.context").AgentContext
         agent_type = importlib.import_module("harbor.agents.installed.claude_code").ClaudeCode
@@ -128,15 +169,14 @@ class Container:
             ) -> object:
                 merged = self._merge_env(env) or {}
                 container.commands.append((command, env if env is not None else {}))
-                local = f"{agent_dir}/"
                 result = run_command(
-                    ["bash", "-c", command.replace("/logs/agent/", local)],
+                    ["bash", "-c", container.local(command)],
                     cwd=container.root,
                     timeout=30,
                     env={
                         "PATH": os.environ["PATH"],
                         "HOME": str(container.home),
-                        **{key: value.replace("/logs/agent/", local) for key, value in merged.items()},
+                        **{key: container.local(value) for key, value in merged.items()},
                     },
                 )
                 return result_type(
@@ -190,6 +230,7 @@ class Attempt:
     subagents: bool
 
     def invoke(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+        self.container.install_cli()
         identity: dict[str, object] = {
             "task_assets_sha256": harbor.native_task_assets(self.task_dir),
             "source_digest": "prepared-source",
@@ -243,10 +284,10 @@ def attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[..., At
     def make(
         *, treated: bool, case: str = "plain", subagents: bool = True, after_sessions: str = ""
     ) -> Attempt:
-        root = tmp_path / ("treated" if treated else "vanilla")
+        arm = "treated" if treated else "vanilla"
+        root = tmp_path / arm
         root.mkdir()
-        container = Container(root, case, after_sessions=after_sessions)
-        container.install_cli()
+        container = Container(root, case, arm, subagents, after_sessions=after_sessions)
         area = root / "area"
         area.mkdir()
         made = Attempt(
@@ -261,14 +302,19 @@ def attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[..., At
             # Discovery runs before the coding command, with the env the coding command gets.
             assert not container.argv_log.exists()
             container.installs.append(kwargs)
-            inventory = admit(made.treatment, "claude")
-            hooks = [
-                {"event": "SessionStart", "matcher": "startup", "commandText": HOOK}
-            ] if treated else []
-            receipt = {
-                "status": "verified", "delivery": claude_treatments.DELIVERY_POLICY,
-                "inventory": inventory, "hooks": {"hooks": hooks, "policy": {"allDisabled": True}},
-            }
+            # What the real runtime leaves in the container: the staged treatment, and the
+            # loose skills Harbor copies into the private configuration.
+            claude_treatments.stage(
+                made.treatment, container.remote, run=kwargs["run"], cli_version=VERSION
+            )
+            for source in made.treatment.skills:
+                shutil.copytree(
+                    source,
+                    Path(container.local(claude_treatments.CONFIG_DIR)) / "skills" / source.name,
+                    copy_function=shutil.copy2,
+                )
+            receipt: dict[str, Any] = json.loads((FIXTURES / "session-start" / arm / "receipt.json").read_text())
+            receipt["inventory"] = admit(made.treatment, "claude")
             (kwargs["artifacts"] / "native-treatment.json").write_text(json.dumps(receipt))
             return receipt
 
@@ -318,12 +364,20 @@ def test_a_claude_attempt_runs_the_pinned_command_with_the_pinned_subscription_e
     assert install["env"] is env
     assert install["run"] == run and install["cli_version"] == VERSION
 
+    # The session matched its receipt, and the delivered files outlasted the run.
+    trees = [command for command, _ in made.container.commands if " --trees " in command]
+    assert len(trees) == (1 if treated else 0)
+    if treated:
+        assert made.container.commands.index((trees[0], env)) > made.container.commands.index(
+            (command, env)
+        )
     artifacts = made.area / "artifacts"
     assert DIAGNOSTIC not in (artifacts / "stdout.jsonl").read_text()
     assert (artifacts / "claude-code.stderr.log").read_text() == DIAGNOSTIC + "\n"
     saved = json.loads((artifacts / "execution.json").read_text())
     assert saved == json.loads(json.dumps(execution))
     assert saved["successful_native_completion"] is True
+    assert "treatment_error" not in saved and saved["native_treatment"]["status"] == "verified"
     assert saved["launch"]["delivery"] == claude_treatments.DELIVERY_POLICY
     assert saved["launch"]["argv"] == argv
     assert saved["launch"]["capabilities"] == {
@@ -504,3 +558,141 @@ def test_the_claude_transport_pins_harbors_run_source(monkeypatch: pytest.Monkey
     monkeypatch.setattr(claude_launch, "_HARBOR_RUN_SHA256", "0" * 64)
     with pytest.raises(ValueError, match="ClaudeCode.run changed"):
         claude_launch.transport()
+
+
+def _init(events: list[dict[str, Any]]) -> dict[str, Any]:
+    (init,) = [event for event in events if event.get("subtype") == "init"]
+    return init
+
+
+def _hook(events: list[dict[str, Any]], subtype: str) -> dict[str, Any]:
+    (hook,) = [event for event in events if event.get("subtype") == subtype]
+    return hook
+
+
+def _drop_hooks(events: list[dict[str, Any]]) -> None:
+    events[:] = [event for event in events if not event["subtype"].startswith("hook_")]
+
+
+SESSION_CHANGES: dict[str, tuple[bool, Callable[[list[dict[str, Any]]], None], str]] = {
+    "model": (False, lambda e: _init(e).update(model="claude-sonnet-5-5"), "model differs"),
+    "version": (
+        False, lambda e: _init(e).update(claude_code_version="2.1.323"),
+        "claude_code_version differs",
+    ),
+    "api key": (
+        False, lambda e: _init(e).update(apiKeySource="ANTHROPIC_API_KEY"), "apiKeySource differs",
+    ),
+    "agent": (False, lambda e: _init(e)["agents"].append("claude-code-guide"), "agents differs"),
+    "skill": (True, lambda e: _init(e)["skills"].append("undeclared"), "skills differs"),
+    "command": (
+        True, lambda e: _init(e)["slash_commands"].append("undeclared"), "slash_commands differs",
+    ),
+    "plugin": (
+        True,
+        lambda e: _init(e)["plugins"].append({"name": "x", "path": "/x", "source": "x@other"}),
+        "plugins differs",
+    ),
+    "plugin folder": (
+        True,
+        lambda e: _init(e)["plugins"][0].update(path="/logs/agent/sessions/plugins/cache/demo"),
+        "plugins differs",
+    ),
+    "mcp": (False, lambda e: _init(e).update(mcp_servers=[{"name": "m"}]), "mcp_servers differs"),
+    "subagent tool": (False, lambda e: _init(e)["tools"].append("Task"), "disallowed tool"),
+    "remote tool": (False, lambda e: _init(e)["tools"].append("RemoteTrigger"), "disallowed tool"),
+    "hook did not run": (True, lambda e: _drop_hooks(e), "0 SessionStart startup hooks ran"),
+    "hook failed": (
+        True, lambda e: _hook(e, "hook_response").update(exit_code=1, outcome="error"),
+        "did not exit 0 exactly once",
+    ),
+    "unlisted hook": (
+        True,
+        lambda e: e.insert(0, {**_hook(e, "hook_started"), "hook_name": "PreToolUse:Bash",
+                               "hook_event": "PreToolUse", "hook_id": "other"}),
+        "hook event PreToolUse:Bash is not in the listing",
+    ),
+    "hook in a vanilla arm": (
+        False,
+        lambda e: e.insert(0, {"type": "system", "subtype": "hook_started", "hook_id": "h",
+                               "hook_name": "SessionStart:startup", "hook_event": "SessionStart"}),
+        "hook event SessionStart:startup is not in the listing",
+    ),
+}
+
+
+@pytest.mark.parametrize("change", sorted(SESSION_CHANGES))
+def test_a_session_that_differs_from_its_discovery_receipt_fails_the_attempt(
+    attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    treated, edit, reason = SESSION_CHANGES[change]
+    made = attempt(treated=treated, subagents=change != "subagent tool")
+    made.container.edit_start = edit
+    made.invoke(monkeypatch)
+    saved = json.loads((made.area / "artifacts/execution.json").read_text())
+    assert saved["successful_native_completion"] is False
+    assert "differs from its discovery receipt" in saved["treatment_error"]
+    assert reason in saved["treatment_error"]
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "echo changed >> {remote}/marketplace/plugins/demo/skills/demo-skill/SKILL.md",
+        "chmod 600 {remote}/marketplace/plugins/demo/.claude-plugin/plugin.json",
+        "mkdir {remote}/marketplace/plugins/demo/agents",
+        'echo changed >> "$CLAUDE_CONFIG_DIR/skills/loose-folder/SKILL.md"',
+    ],
+)
+def test_treatment_files_changed_during_the_run_fail_the_attempt(
+    attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch, damage: str
+) -> None:
+    made = attempt(treated=True)
+    made.container.after_sessions = damage.format(remote=shlex.quote(str(made.container.remote)))
+    with pytest.raises(ValueError, match="files changed during the coding run"):
+        made.invoke(monkeypatch)
+    saved = json.loads((made.area / "artifacts/execution.json").read_text())
+    assert saved["successful_native_completion"] is False
+
+
+@pytest.mark.skipif(
+    os.environ.get("PLUGINBENCH_REAL_CLAUDE_TESTS") != "1",
+    reason="Explicit check against the host's real Claude Code CLI 2.1.322",
+)
+@pytest.mark.parametrize("subagents", [False, True])
+def test_the_real_cli_drops_its_subagent_tool_for_disallowed_agent(
+    tmp_path: Path, subagents: bool
+) -> None:
+    """`system/init` names the subagent tool Task; `--disallowed-tools Agent` removes it.
+
+    A fake token: the CLI reports init before its first model request, and the test stops it
+    there.
+    """
+    import subprocess
+
+    argv, pinned = claude.coding_launch(claude.CodingRun(MODEL, "low", subagents, 60))
+    argv[argv.index("--print") : argv.index("--print")] = ["--input-format", "stream-json"]
+    for name in ("home", "config"):
+        (tmp_path / name).mkdir()
+    env = {
+        "PATH": os.environ["PATH"], "HOME": str(tmp_path / "home"),
+        "CLAUDE_CONFIG_DIR": str(tmp_path / "config"), "CLAUDE_CODE_OAUTH_TOKEN": TOKEN, **pinned,
+    }
+    process = subprocess.Popen(
+        argv, cwd=tmp_path, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, text=True,
+    )
+    assert process.stdin is not None and process.stdout is not None
+    process.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}}))
+    process.stdin.write("\n")
+    process.stdin.flush()
+    try:
+        init = next(
+            event for event in map(json.loads, process.stdout) if event.get("subtype") == "init"
+        )
+    finally:
+        process.kill()
+        process.wait()
+    assert init["claude_code_version"] == VERSION
+    assert ("Task" in init["tools"]) is subagents
+    assert not set(claude.DISALLOWED_TOOLS) & set(init["tools"])

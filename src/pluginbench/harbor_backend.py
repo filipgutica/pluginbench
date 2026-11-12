@@ -2398,6 +2398,20 @@ def _native_completion(
             if (treatment_receipt.get("status") != "verified"
                     or treatment_receipt.get("inventory") != launch.get("treatment_inventory")):
                 raise ValueError("native treatment installation was not verified for this attempt")
+            if launch.get("delivery") == claude_treatments.DELIVERY_POLICY:
+                mismatches = claude_launch.session_errors(
+                    (artifacts / "stdout.jsonl").read_text(errors="replace"),
+                    treatment_receipt,
+                    model=str(launch["requested_model"]),
+                    subagents=bool(
+                        _native_object(launch["capabilities"], "coding capabilities")["subagents"]
+                    ),
+                )
+                if mismatches:
+                    raise ValueError(
+                        "the Claude coding session differs from its discovery receipt: "
+                        + "; ".join(mismatches)
+                    )
             execution["native_treatment"] = treatment_receipt
             # Command hooks may execute subprocesses outside native session logging.
             # Preserve native observed usage, but never present it as complete total cost.
