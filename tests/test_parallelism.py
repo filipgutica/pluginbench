@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, wait as wait_for_futures
 from threading import Barrier, Event, Lock, get_ident
@@ -164,3 +165,39 @@ def test_every_interrupt_while_draining_says_what_it_waits_for(
         "Stopping: no new work starts. Waiting for 2 running call(s) to finish, "
         "so the work already paid for is kept."
     ] * 2
+
+
+def test_a_broken_stderr_does_not_stop_the_drain_from_saving_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = Barrier(2)
+    saved: list[int] = []
+    interrupted = False
+
+    class BrokenStream:
+        def write(self, text: str) -> int:
+            raise BrokenPipeError
+
+        def flush(self) -> None:
+            raise BrokenPipeError
+
+    def wait(*args: object, **kwargs: object) -> object:
+        nonlocal interrupted
+        if not interrupted:
+            gate.wait(timeout=5)
+            interrupted = True
+            raise KeyboardInterrupt("stop")
+        active = args[0]
+        assert isinstance(active, set)
+        return wait_for_futures(active, timeout=0.05, return_when=FIRST_COMPLETED)
+
+    def operation(item: int, cancelled: Event, emit: Callable[[Callable[[], None]], None]) -> None:
+        gate.wait(timeout=5)
+        assert cancelled.wait(timeout=5)
+        emit(lambda: saved.append(item))
+
+    monkeypatch.setattr(parallel, "wait", wait)
+    monkeypatch.setattr(sys, "stderr", BrokenStream())
+    with pytest.raises(KeyboardInterrupt, match="stop"):
+        parallel.run_jobs(list(range(3)), jobs=1, operation=operation)
+    assert saved == [0]

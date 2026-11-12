@@ -96,10 +96,14 @@ def run_jobs[T](
 
 def _report_stop(running: int) -> None:
     """Answer each Ctrl-C while draining, so a repeated press is not met with silence."""
-    if running:
+    if not running:
+        return
+    try:
         print(
             f"Stopping: no new work starts. Waiting for {running} running call(s) to finish, "
             "so the work already paid for is kept.",
             file=sys.stderr,
             flush=True,
         )
+    except (OSError, ValueError):
+        pass  # A closed or broken stderr must not stop the drain that saves finished work.

@@ -18,6 +18,7 @@ from threading import Event, Lock
 from typing import Any
 
 import pytest
+import typer
 import yaml
 from typer.testing import CliRunner
 from typer.main import get_group
@@ -149,18 +150,33 @@ def test_config_dry_run_includes_fresh_vanilla_and_every_package(
     assert not summary.stdout.lstrip().startswith("{")
 
 
-def test_run_without_a_terminal_says_to_pass_yes(
-    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("answer", "started", "exit_code", "hint"),
+    [("y\n", True, 3, False), ("n\n", False, 0, False), ("", False, 1, True)],
+)
+def test_run_confirms_from_piped_input_and_explains_a_missing_answer(
+    config: evaluation.Evaluation,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    answer: str,
+    started: bool,
+    exit_code: int,
+    hint: bool,
 ) -> None:
     path = tmp_path / "eval.yaml"
     path.write_text(yaml.safe_dump(config.model_dump(mode="json")))
-    monkeypatch.setattr(
-        cli, "prepare_evaluation", lambda *args, **kwargs: pytest.fail("unconfirmed run started")
-    )
-    # CliRunner's stdin is not a terminal, like a script or an agent shell.
-    result = CliRunner().invoke(cli.app, ["run", str(path)], input="")
-    assert result.exit_code == 1
-    assert "Pass --yes to start without confirmation." in result.stderr
+    calls: list[object] = []
+
+    def prepare(*args: object, **kwargs: object) -> None:
+        calls.append(args)
+        raise typer.Exit(3)
+
+    monkeypatch.setattr(cli, "prepare_evaluation", prepare)
+    # CliRunner's stdin is a pipe, like a script or an agent shell.
+    result = CliRunner().invoke(cli.app, ["run", str(path), "--foreground"], input=answer)
+    assert result.exit_code == exit_code, result.output
+    assert bool(calls) == started
+    assert ("Pass --yes to start without confirmation." in result.stderr) == hint
     assert "Aborted" not in result.output
 
 

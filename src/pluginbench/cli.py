@@ -72,11 +72,14 @@ def pick(
 
 
 def _confirm(question: str) -> bool:
-    """Ask before paid work; without a terminal, explain how to start instead of aborting."""
-    if not sys.stdin.isatty():
-        typer.echo("No terminal to confirm in. Pass --yes to start without confirmation.", err=True)
-        raise typer.Exit(1)
-    return typer.confirm(question)
+    """Ask before paid work; when no answer can be read, explain how to start instead."""
+    try:
+        return typer.confirm(question)
+    except typer.Abort:
+        if sys.stdin.isatty():
+            raise  # Ctrl-C at the prompt.
+        typer.echo("No answer to confirm with. Pass --yes to start without confirmation.", err=True)
+        raise typer.Exit(1) from None
 
 
 def _error(exc: Exception) -> None:
