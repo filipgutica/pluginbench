@@ -322,6 +322,7 @@ def _fake_judge(
     expect_unable_contract: bool = False,
     usage: dict[str, int] | None = None,
     on_call: Callable[[], None] | None = None,
+    cli_version: str = "0.130.0",
 ) -> list[Path]:
     """Answer every pair with answers[model]; check what the judge's workspace holds."""
     calls: list[Path] = []
@@ -359,25 +360,44 @@ def _fake_judge(
         }
         artifacts = area / "artifacts" if artifacts is None else artifacts
         artifacts.mkdir(exist_ok=True)
-        (artifacts / "stdout.jsonl").write_text(json.dumps(response) + "\n")
         (artifacts / "host-evidence.json").write_text(json.dumps({"usage": usage}))
-        trace = (
-            json.dumps(
-                {
-                    "type": "response_item",
-                    "payload": {
-                        "type": "function_call_output",
-                        "call_id": "read-inputs",
-                        "output": "Error: failed to start codex-code-mode-host: No such file or directory (os error 2)",
-                    },
-                }
-            )
-            if tool_failure
-            else ""
-        )
-        if trace:
-            (artifacts / "host-trace-0.jsonl").write_text(trace + "\n")
-        parsed = codex.parse_events("", [trace], "codex")
+        if entry["host"] == "claude":
+            # Claude reports its version in stdout's init event; the launch stands in for argv.
+            events = [
+                {"type": "system", "subtype": "init", "claude_code_version": cli_version},
+                {"type": "result", "subtype": "success", "is_error": False},
+            ]
+            stdout = "".join(json.dumps(event) + "\n" for event in events)
+            (artifacts / "stdout.jsonl").write_text(stdout)
+            effort = str(protocol["reasoning"])
+            parsed = {
+                **codex.parse_events(stdout, [], "claude"),
+                "launch": {
+                    "harness": "claude-cli",
+                    "requested_model": model,
+                    "requested_effort": effort,
+                    "harness_version": cli_version,
+                    "argv": ["claude", "--model", model, "--effort", effort, "--safe-mode"],
+                },
+            }
+        else:
+            (artifacts / "stdout.jsonl").write_text(json.dumps(response) + "\n")
+            # Codex reports its version in the rollout trace's session_meta.
+            lines = [{"type": "session_meta", "payload": {"cli_version": cli_version}}]
+            if tool_failure:
+                lines.append(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "call_id": "read-inputs",
+                            "output": "Error: failed to start codex-code-mode-host: No such file or directory (os error 2)",
+                        },
+                    }
+                )
+            trace = "".join(json.dumps(line) + "\n" for line in lines)
+            (artifacts / "host-trace-0.jsonl").write_text(trace)
+            parsed = codex.parse_events("", [trace], "codex")
         if on_call is not None:
             on_call()
         return {
@@ -731,6 +751,89 @@ def test_legacy_binding_policy_is_visible_and_can_be_strict(tmp_path: Path) -> N
     strict = runner.invoke(cli.app, ["judge", "tally", str(directory), "--require-bound"])
     assert strict.exit_code != 0
     assert "task-1.json" in strict.output and "unbound verdict" in strict.output
+
+
+@pytest.mark.parametrize(("harness", "version"), [("codex", "0.130.0"), ("claude", "2.1.322")])
+def test_verdict_binds_the_cli_version_its_own_call_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str, version: str
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _fake_judge(monkeypatch, {"m1": "A"}, root=tmp_path, cli_version=version)
+    assert (
+        judge.run(directory, judges=[f"{harness}:m1:high"], timeout=60, jobs=1, progress=print) == 0
+    )
+    binding = json.loads((directory / f"results/{harness}-m1-high/task-1.json").read_text())[
+        "binding"
+    ]
+    assert binding["binding_version"] == "2"
+    assert binding["judge_cli_version"] == version
+    assert tally(directory, require_bound=True)["needs_rebind"] == 0
+
+
+def test_tally_refuses_a_changed_judge_cli_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _fake_judge(monkeypatch, {"m1": "A"}, root=tmp_path)
+    judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print)
+    # The recheck reads the call's own evidence, not only the stored field.
+    trace = directory / "results/codex-m1-high/task-1/call-1/host-trace-0.jsonl"
+    trace.write_text(trace.read_text().replace("0.130.0", "0.131.0"))
+    with pytest.raises(ValueError, match="task-1.json.*binding mismatch: judge_cli_version"):
+        tally(directory)
+
+
+def test_verdict_bound_before_the_judge_cli_version_needs_rebind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _fake_judge(monkeypatch, {"m1": "A"}, root=tmp_path)
+    judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print)
+    verdict = directory / "results/codex-m1-high/task-1.json"
+    saved = json.loads(verdict.read_text())
+    del saved["binding"]["binding_version"], saved["binding"]["judge_cli_version"]
+    verdict.write_text(json.dumps(saved))
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["judge", "tally", str(directory)])
+    assert result.exit_code == 0, result.output
+    assert "binding mismatch" not in result.output
+    assert f"{verdict}: needs rebind" in result.output
+    assert json.loads((directory / "tally.json").read_text())["needs_rebind_verdicts"] == [
+        str(verdict)
+    ]
+    strict = runner.invoke(cli.app, ["judge", "tally", str(directory), "--require-bound"])
+    assert strict.exit_code != 0
+    assert "task-1.json" in strict.output and "needs rebind" in strict.output
+    # Resume keeps the verdict; only deleting it, as the message says, makes a new call.
+    assert judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 0
+    assert json.loads(verdict.read_text()) == saved
+    # The older binding's own fields are still checked.
+    (directory / "task-1/pair-1-A.diff").write_text("changed")
+    with pytest.raises(ValueError, match="task-1.json.*binding mismatch: files/pair-1-A.diff"):
+        tally(directory)
+
+
+def test_unknown_binding_version_is_a_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _fake_judge(monkeypatch, {"m1": "A"}, root=tmp_path)
+    judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print)
+    verdict = directory / "results/codex-m1-high/task-1.json"
+    saved = json.loads(verdict.read_text())
+    saved["binding"]["binding_version"] = "1"
+    verdict.write_text(json.dumps(saved))
+    with pytest.raises(ValueError, match="task-1.json.*binding mismatch: binding_version"):
+        tally(directory)
+
+
+def test_judge_call_without_an_observed_cli_version_writes_no_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _fake_judge(monkeypatch, {"m1": "A"}, root=tmp_path, cli_version="")
+    assert judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 2
+    assert not (directory / "results/codex-m1-high/task-1.json").exists()
 
 
 @pytest.mark.parametrize(
