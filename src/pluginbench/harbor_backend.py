@@ -2414,6 +2414,7 @@ def _native_completion(
                 # Kept for every version: an unqualified one is checked only against the
                 # disallowed tools.
                 execution["claude_init_tools"] = claude_launch.init_tools(stream)
+                execution["claude_permission_denials"] = claude_launch.permission_denials(stream)
                 mismatches = claude_launch.session_errors(
                     stream,
                     treatment_receipt,

@@ -738,15 +738,17 @@ def test_a_session_that_differs_from_its_discovery_receipt_fails_the_attempt(
     assert reason in saved["treatment_error"]
 
 
-def test_a_run_with_a_permission_denial_fails_the_attempt(
+def test_a_permission_denial_is_recorded_not_refused(
     attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The paid probe's one-subagent run: the subagent's Bash call was denied.
+    # The paid probe's one-subagent run: the CLI asked to approve the subagent's Bash call
+    # under bypassPermissions and denied it. Every arm meets the same CLI behaviour.
     made = attempt(treated=False, case="one-subagent")
     made.invoke(monkeypatch)
     saved = json.loads((made.area / "artifacts/execution.json").read_text())
-    assert saved["successful_native_completion"] is False
-    assert "the run records permission denials" in saved["treatment_error"]
+    assert saved["successful_native_completion"] is True
+    assert saved.get("treatment_error") is None
+    assert saved["claude_permission_denials"] == ["Bash"]
 
 
 def _captured(arm: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:

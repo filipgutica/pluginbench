@@ -203,8 +203,8 @@ def session_errors(
 ) -> list[str]:
     """How a coding session differs from the discovery receipt it was launched after (D2).
 
-    Its `system/init` must report what discovery found and offer the pinned tools, its
-    result must record no permission denial, and its hook events must be the listed hooks:
+    Its `system/init` must report what discovery found and offer the pinned tools, and its
+    hook events must be the listed hooks:
     the SessionStart hooks that match `startup` start once each and exit 0 before the first
     assistant message, other listed hooks exit 0 or 2 (a deliberate block), and no other hook
     event appears.
@@ -259,9 +259,6 @@ def session_errors(
         qualified - (set() if subagents else {claude.SUBAGENT_TOOL})
     ):
         errors.append("system/init tools differ from the pinned tool set")
-    for result in (e for e in events if e.get("type") == "result"):
-        if result.get("permission_denials") != []:
-            errors.append("the run records permission denials")
     return errors + _hook_errors(events, listing)
 
 
@@ -327,6 +324,21 @@ def init_tools(stream: str) -> list[str] | None:
     """The tools a coding session's one `system/init` offered, for the attempt's record."""
     inits = _inits(_events(stream))
     return _sorted(inits[0].get("tools")) if len(inits) == 1 else None
+
+
+def permission_denials(stream: str) -> list[str]:
+    """The tools the CLI denied during the run, for the attempt's record.
+
+    Recorded, not refused: in 2.1.322 a subagent can be asked to approve a Bash command even
+    under bypassPermissions (the paid probe's one-subagent run), the same in every arm.
+    """
+    return [
+        str(denial.get("tool_name"))
+        for event in _events(stream)
+        if event.get("type") == "result" and isinstance(event.get("permission_denials"), list)
+        for denial in event["permission_denials"]
+        if isinstance(denial, dict)
+    ]
 
 
 def _events(stream: str) -> list[dict[str, Any]]:
