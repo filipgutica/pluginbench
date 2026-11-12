@@ -207,8 +207,12 @@ function verifyDiscovery({ responses, events }, { marketplace, installs }, guida
   shape(init && Array.isArray(init.commands) && Array.isArray(init.agents), "initialize");
   check(init.claude_code_version === payload.cli_version,
     "Claude CLI version " + init.claude_code_version + " differs from the pinned " + payload.cli_version);
-  check(init.account && init.account.apiKeySource === "ANTHROPIC_API_KEY" && init.account.tokenSource === "none",
-    "Claude discovery is not authenticated by ANTHROPIC_API_KEY alone");
+  // CLI 2.1.322 reports a subscription token as tokenSource and omits apiKeySource. It
+  // reports the same when an API key is also set, so the refused environment, checked
+  // first, is what rules a key out.
+  check(init.account && init.account.tokenSource === "CLAUDE_CODE_OAUTH_TOKEN"
+    && !("apiKeySource" in init.account) && init.account.apiProvider === "firstParty",
+    "Claude discovery is not authenticated by the subscription token alone");
 
   const expectedSkills = new Map(payload.inventory.skills.map(skill => [skill.name, "user"]));
   for (const install of installs) {
