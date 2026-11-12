@@ -32,9 +32,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             "treatments.py": "441498fa24855b0ed5e8b713be2bdf1eb8d06bc29b9d01cdbdb762f838bcc81c",
             # Claude version admission and coding launch builder; Claude-only, so Codex stays v1.
             "claude.py": "d4dc66cb46713b976db98e5eae5c84ae58f19e075e29c2ead02b30fd038e8d31",
-            "claude_treatments.py": "1c6a943ce506a5b4984a4698b693d1edd3b9f6a780ae97feb818c1e4f99f1f15",
+            "claude_treatments.py": "15d5d5de89f34e2b1b6982bb0f1eb1fbbcf28be2b08586500e489d2db55e2aa5",
             "claude_treatment_runtime.js": (
-                "ee32cd309f5de9c17a868f645c01fe781ec553c60642a60129743fbe9873ee02"
+                "af893dc284d079df0e9785aac03e257a96884d60d6bf4a5558196fa39affc882"
             ),
         },
     ),

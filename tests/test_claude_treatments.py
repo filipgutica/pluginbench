@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -35,6 +35,8 @@ class Attempt:
     root: Path
     treatment: Treatment
     scenario: dict[str, Any]
+    # Merged over the launch environment, as a misconfigured runtime would pass it.
+    extra_env: dict[str, str] = field(default_factory=dict)
 
     @property
     def config(self) -> Path:
@@ -52,6 +54,7 @@ class Attempt:
             "FAKE_CLAUDE_SCENARIO": str(self.root / "scenario.json"),
             "FAKE_CLAUDE_LOG": str(self.root / "claude-calls.jsonl"),
             **claude.discovery_launch(RUN)[1],
+            **self.extra_env,
         }
 
     def run(self) -> subprocess.CompletedProcess[str]:
@@ -209,7 +212,14 @@ def test_vanilla_receipt_proves_nothing_loaded_without_a_model_call(tmp_path: Pa
     assert receipt["guidance"]["path"] is None and receipt["guidance"]["memory_files_tokens"] == 0
     assert receipt["builtins"] == {
         "commands": ["code-review", "debug"],
-        "agents": ["claude", "claude-code-guide"],
+        "agents": [
+            "Explore",
+            "Plan",
+            "claude",
+            "claude-code-guide",
+            "general-purpose",
+            "statusline-setup",
+        ],
     }
     assert not (vanilla.config / "CLAUDE.md").exists()
     # No marketplace or install; discovery ran with exactly the shared builder's argv.
@@ -228,9 +238,12 @@ def test_treatment_receipt_proves_guidance_skills_plugin_and_hook_loaded(tmp_pat
         ("loose-skill", "user"),
     }
     assert [item["id"] for item in receipt["plugins"]] == ["demo@pluginbench-frozen"]
-    install_path = Path(receipt["plugin_installs"][0]["install_path"])
-    assert install_path.is_relative_to((treated.config / "plugins/cache").resolve())
-    assert (install_path / "skills/demo-skill/check.sh").stat().st_mode & 0o777 == 0o755
+    [installed] = receipt["plugin_installs"]
+    # The CLI loads a directory marketplace's plugin from the staged folder, not the cache.
+    loaded_from = Path(installed["loaded_from"])
+    assert loaded_from == (treated.staged / "marketplace/plugins/demo").resolve()
+    assert (loaded_from / "skills/demo-skill/check.sh").stat().st_mode & 0o777 == 0o755
+    assert Path(installed["cache_path"]).is_relative_to((treated.config / "plugins/cache").resolve())
     # The key the hook-incomplete usage rule reads.
     [hook] = receipt["hooks"]["hooks"]
     assert (hook["event"], hook["matcher"], hook["commandText"]) == (
@@ -272,14 +285,87 @@ def _memory_tokens(responses: dict[str, Any]) -> None:
             category["tokens"] = 0
 
 
+def _extra_install_record(attempt: Attempt) -> None:
+    records = attempt.config / "plugins/installed_plugins.json"
+    records.parent.mkdir(parents=True)
+    entry = {"scope": "user", "installPath": str(attempt.config / "plugins/cache/x/rogue/1.0.0")}
+    records.write_text(json.dumps({"version": 2, "plugins": {"rogue@x": [entry]}}))
+
+
+def _user_agent(attempt: Attempt) -> None:
+    # CLI 2.1.322 loads this and lists it as Explore, in place of the built-in agent.
+    (attempt.config / "agents").mkdir()
+    (attempt.config / "agents/Explore.md").write_text("---\nname: Explore\ndescription: Other.\n---\n")
+
+
+STAGED_PLUGIN = "{staged}/marketplace/plugins/demo"
+
+# Each defect and the refusal it must cause; {staged} is the attempt's canonical staged root.
 REFUSALS: dict[str, tuple[Callable[[Attempt], object], str]] = {
     "undeclared non-builtin skill": (
         lambda attempt: _commands(attempt).append({"name": "rogue", "description": ""}),
         "Undeclared Claude command or skill discovered: rogue",
     ),
+    "duplicate command": (
+        lambda attempt: _commands(attempt).append({"name": "loose-skill", "description": ""}),
+        "Claude discovered duplicate commands",
+    ),
     "missing declared skill": (
-        lambda attempt: _commands(attempt).pop(0),
-        "Declared Claude skill was not discovered: loose-skill",
+        _responses(lambda r: r["get_skills_dialog"]["skills"].pop()),
+        "Claude skills dialog differs from the declared skills",
+    ),
+    "skill off": (
+        _responses(lambda r: r["get_skills_dialog"]["skills"][0].update(state="off")),
+        "Claude skill is not on from its declared source: demo:demo-skill",
+    ),
+    "skill from another source": (
+        _responses(lambda r: r["get_skills_dialog"]["skills"][0].update(source="user")),
+        "Claude skill is not on from its declared source: demo:demo-skill",
+    ),
+    "undeclared agent": (
+        _responses(lambda r: r["initialize"]["agents"].append({"name": "rogue", "description": ""})),
+        "Undeclared Claude agent discovered: rogue",
+    ),
+    "user agent in the private configuration": (_user_agent, "Undeclared Claude user agents exist"),
+    "unexpected discovery event": (
+        lambda attempt: attempt.scenario.update(stream=[{"type": "system", "subtype": "init"}]),
+        "Unexpected Claude discovery event: system/init",
+    ),
+    "refused environment": (
+        lambda attempt: attempt.extra_env.update(ANTHROPIC_BASE_URL="https://proxy.invalid"),
+        "Claude treatment installation refuses ANTHROPIC_BASE_URL",
+    ),
+    "unpinned environment": (
+        lambda attempt: attempt.extra_env.update(CLAUDE_CODE_DISABLE_AUTO_MEMORY="0"),
+        "requires the pinned launch environment: CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+    ),
+    "marketplace add failed": (
+        lambda attempt: attempt.scenario.update(outcomes={"marketplace-add": "error"}),
+        "Claude plugin marketplace-add did not succeed",
+    ),
+    "plugin install failed": (
+        lambda attempt: attempt.scenario.update(outcomes={"install": "error"}),
+        "Claude plugin install did not succeed",
+    ),
+    "undeclared install record": (
+        _extra_install_record,
+        "Claude plugin install record lists missing or undeclared plugins",
+    ),
+    "undeclared listed plugin": (
+        lambda attempt: attempt.scenario.update(
+            list_extra=[{"id": "rogue@x", "scope": "user", "enabled": True}]
+        ),
+        "Claude plugin list contains missing or undeclared plugins",
+    ),
+    "plugin loaded from another folder": (
+        lambda attempt: attempt.scenario.update(list_overrides={"readFromFolder": str(attempt.root)}),
+        "Claude plugin is not loaded from its staged folder: demo@pluginbench-frozen",
+    ),
+    "staged plugin bytes differ": (
+        lambda attempt: (
+            attempt.staged / "marketplace/plugins/demo/skills/demo-skill/check.sh"
+        ).write_text("changed\n"),
+        f"Installed treatment bytes differ: {STAGED_PLUGIN}/skills/demo-skill/check.sh",
     ),
     "extra memory file": (
         _extra_memory_file,
@@ -352,8 +438,28 @@ def test_discovery_refuses_each_receipt_rule(tmp_path: Path, defect: str) -> Non
     change(treated)
     result = treated.run()
     assert result.returncode != 0
-    assert message in result.stderr
+    assert message.format(staged=treated.staged.resolve()) in result.stderr
     assert result.stdout == ""
+
+
+def test_a_skill_hidden_from_commands_is_verified_from_the_skills_dialog(tmp_path: Path) -> None:
+    # CLI 2.1.322 shows a `user-invocable: false` skill on in the dialog, unadvertised, and
+    # leaves it out of initialize.commands.
+    treated = attempt(tmp_path)
+    responses = treated.scenario["responses"]
+    responses["initialize"]["commands"] = [
+        command for command in _commands(treated) if command["name"] != "loose-skill"
+    ]
+    for item in responses["get_skills_dialog"]["skills"]:
+        item["advertised"] = item["display_name"] != "loose-skill"
+    result = treated.run()
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(result.stdout)
+    assert receipt["commands"] == ["demo:demo-skill"]
+    assert {item["display_name"]: item["advertised"] for item in receipt["skills"]} == {
+        "demo:demo-skill": True,
+        "loose-skill": False,
+    }
 
 
 class Environment:

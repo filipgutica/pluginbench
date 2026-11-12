@@ -5,7 +5,9 @@ FAKE_CLAUDE_SCENARIO names a JSON file with:
 - stream: events written before the first response, such as hook events;
 - omit: request subtypes it answers by exiting instead;
 - install_root: where plugin installs go, instead of $CLAUDE_CONFIG_DIR/plugins/cache;
-- list_overrides: fields merged into every `plugin list --json` entry.
+- list_overrides: fields merged into every `plugin list --json` entry;
+- list_extra: entries appended to `plugin list --json`;
+- outcomes: the `outcome` a `--json` command reports, by its `command`, instead of "ok".
 Each invocation's arguments are appended to FAKE_CLAUDE_LOG; `plugin` commands warn on stderr.
 """
 
@@ -32,6 +34,17 @@ def records() -> dict[str, list[dict[str, object]]]:
     return json.loads(records_file.read_text())["plugins"] if records_file.exists() else {}
 
 
+def folder(plugin_id: str) -> Path:
+    """The marketplace folder CLI 2.1.322 loads a directory-marketplace plugin from."""
+    name, market = plugin_id.split("@")
+    return Path(json.loads(markets_file.read_text())[market]["source"]["path"]) / "plugins" / name
+
+
+def result(command: str, **fields: str) -> None:
+    outcome = scenario.get("outcomes", {}).get(command, "ok")
+    print(json.dumps({"command": command, "outcome": outcome, **fields}))
+
+
 if args[:3] == ["plugin", "marketplace", "add"]:
     source = Path(args[3])
     name = json.loads((source / ".claude-plugin/marketplace.json").read_text())["name"]
@@ -39,14 +52,16 @@ if args[:3] == ["plugin", "marketplace", "add"]:
     markets_file.write_text(
         json.dumps({name: {"source": {"source": "directory", "path": str(source)}}})
     )
-    print(f"Adding marketplace {name}")
-    print(json.dumps({"ok": True, "marketplace": name}))
+    result(
+        "marketplace-add",
+        marketplace=name,
+        message=f"Successfully added marketplace: {name} (declared in user settings)",
+    )
 elif args[:2] == ["plugin", "install"]:
     plugin_id = args[2]
     name, market = plugin_id.split("@")
-    source = Path(json.loads(markets_file.read_text())[market]["source"]["path"]) / "plugins" / name
     target = Path(scenario.get("install_root", plugins / "cache")) / market / name / "1.0.0"
-    shutil.copytree(source, target)
+    shutil.copytree(folder(plugin_id), target)
     entry = {
         "scope": "user",
         "installPath": str(target),
@@ -57,7 +72,13 @@ elif args[:2] == ["plugin", "install"]:
     records_file.write_text(
         json.dumps({"version": 2, "plugins": {**records(), plugin_id: [entry]}})
     )
-    print(json.dumps({"ok": True, "plugin": plugin_id}))
+    result(
+        "install",
+        plugin=plugin_id,
+        pluginId=plugin_id,
+        scope="user",
+        message=f"Successfully installed plugin: {plugin_id} (scope: user)",
+    )
 elif args[:2] == ["plugin", "list"]:
     print(
         json.dumps(
@@ -68,11 +89,13 @@ elif args[:2] == ["plugin", "list"]:
                     "scope": entry["scope"],
                     "enabled": True,
                     "installPath": entry["installPath"],
+                    "readFromFolder": str(folder(plugin_id)),
                     **scenario.get("list_overrides", {}),
                 }
                 for plugin_id, entries in records().items()
                 for entry in entries
-            ],
+            ]
+            + scenario.get("list_extra", []),
             indent=2,
         )
     )

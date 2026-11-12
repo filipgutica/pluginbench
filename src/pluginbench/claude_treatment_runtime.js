@@ -27,17 +27,26 @@ const REQUESTS = [
   "initialize", "get_context_usage", "get_hooks_listing", "get_settings",
   "get_memory_dialog", "get_skills_dialog", "get_session_cost",
 ];
+// Offline, CLI 2.1.322 took 19 s to answer initialize and 18 s per plugin command.
+const REQUEST_TIMEOUT_MS = 90000;
+const CLI_TIMEOUT_MS = 90000;
+// The agents CLI 2.1.322 ships. The pinned launch lists all but claude-code-guide.
+const BUILTIN_AGENTS = new Set([
+  "Explore", "Plan", "claude", "claude-code-guide", "general-purpose", "statusline-setup",
+]);
 
 function cli(args) {
   return execFileSync("claude", args, {
-    cwd, env: process.env, encoding: "utf8", timeout: 60000, maxBuffer: 8 * 1024 * 1024,
+    cwd, env: process.env, encoding: "utf8", timeout: CLI_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024,
   });
 }
 
-// `--json` on install and marketplace add prints its result as the last stdout line.
-function cliResult(args) {
-  const lines = cli(args).trim().split("\n");
-  return JSON.parse(lines[lines.length - 1]);
+// `--json` on install and marketplace add prints one result object with an outcome.
+function cliResult(args, command) {
+  const result = JSON.parse(cli(args));
+  check(result.command === command && result.outcome === "ok",
+    "Claude plugin " + command + " did not succeed: " + JSON.stringify(result));
+  return result;
 }
 
 function treeEntries(directory, relative = ".") {
@@ -79,10 +88,10 @@ function installPlugins() {
   const installs = [];
   let marketplaceAdd = null;
   if (payload.inventory.plugins.length) {
-    marketplaceAdd = cliResult(["plugin", "marketplace", "add", marketplace, "--json"]);
+    marketplaceAdd = cliResult(["plugin", "marketplace", "add", marketplace, "--json"], "marketplace-add");
     for (const plugin of payload.inventory.plugins) {
       const id = plugin.name + "@" + payload.marketplace;
-      installs.push({ id, output: cliResult(["plugin", "install", id, "--json"]), expected: plugin });
+      installs.push({ id, output: cliResult(["plugin", "install", id, "--json"], "install"), expected: plugin });
     }
   }
   const recordFile = path.join(configDir, "plugins/installed_plugins.json");
@@ -94,19 +103,25 @@ function installPlugins() {
     const entries = records[install.id];
     check(Array.isArray(entries) && entries.length === 1 && entries[0].scope === "user"
       && typeof entries[0].installPath === "string", "Claude plugin install record differs: " + install.id);
-    install.installPath = canonical(entries[0].installPath);
-    check(inside(install.installPath, cache), "Claude plugin installed outside the private cache: " + install.id);
-    verifyTree(install.installPath, install.expected);
+    install.cachePath = canonical(entries[0].installPath);
+    check(inside(install.cachePath, cache), "Claude plugin installed outside the private cache: " + install.id);
   }
   const listed = JSON.parse(cli(["plugin", "list", "--json"]));
-  check(Array.isArray(listed) && listed.length === installs.length
-    && sameSet(listed.map(item => item.id), installs.map(item => item.id)),
-  "Claude plugin list contains missing or undeclared plugins");
+  // sameSet compares sorted lists, so a repeated entry differs too.
+  check(Array.isArray(listed) && sameSet(listed.map(item => item.id), installs.map(item => item.id)),
+    "Claude plugin list contains missing or undeclared plugins");
   for (const item of listed) {
     const install = installs.find(candidate => candidate.id === item.id);
     check(item.enabled === true && item.scope === "user" && !item.errors
-      && canonical(item.installPath) === install.installPath,
+      && canonical(item.installPath) === install.cachePath,
     "Claude plugin is not enabled in user scope: " + item.id);
+    // A directory marketplace's plugin loads from its marketplace folder, not the cache copy.
+    const staged = canonical(path.join(marketplace, "plugins", install.expected.name));
+    check(typeof item.readFromFolder === "string" && canonical(item.readFromFolder) === staged,
+      "Claude plugin is not loaded from its staged folder: " + item.id);
+    install.loadedFrom = staged;
+    verifyTree(install.loadedFrom, install.expected);
+    verifyTree(install.cachePath, install.expected);
   }
   return { marketplace, marketplaceAdd, installs, listed };
 }
@@ -144,7 +159,8 @@ async function discover() {
   });
   const request = subtype => new Promise((resolve, reject) => {
     if (gone) { reject(new Error(gone.message.replace("every request", subtype))); return; }
-    const timer = setTimeout(() => pending.reject(new Error("Claude discovery timed out: " + subtype)), 20000);
+    const timer = setTimeout(() => pending.reject(new Error("Claude discovery timed out: " + subtype)),
+      REQUEST_TIMEOUT_MS);
     const settle = action => value => { clearTimeout(timer); pending = null; action(value); };
     pending = { id: subtype, resolve: settle(resolve), reject: settle(reject) };
     child.stdin.write(JSON.stringify({ type: "control_request", request_id: subtype, request: { subtype } }) + "\n");
@@ -198,16 +214,19 @@ function verifyDiscovery({ responses, events }, { marketplace, installs }, guida
   for (const install of installs) {
     for (const skill of install.expected.skills) expectedSkills.set(install.expected.name + ":" + skill.name, "plugin");
   }
+  // A treatment declares no agents, and admission refuses plugin agents.
+  const agents = init.agents.map(item => item.name);
+  const undeclaredAgents = agents.filter(name => !BUILTIN_AGENTS.has(name));
+  check(!undeclaredAgents.length, "Undeclared Claude agent discovered: " + undeclaredAgents.join(", "));
   const commands = init.commands.filter(item => item.builtin !== true).map(item => item.name);
   check(new Set(commands).size === commands.length, "Claude discovered duplicate commands");
   const undeclared = commands.filter(name => !expectedSkills.has(name));
   check(!undeclared.length, "Undeclared Claude command or skill discovered: " + undeclared.join(", "));
-  const missing = [...expectedSkills.keys()].filter(name => !commands.includes(name));
-  check(!missing.length, "Declared Claude skill was not discovered: " + missing.join(", "));
   const dialog = responses.get_skills_dialog;
   shape(dialog && Array.isArray(dialog.skills), "get_skills_dialog");
-  // The dialog names a loose skill by its folder and shows its frontmatter name as
-  // display_name, which is the name commands use (CLI 2.1.322).
+  // The dialog, not commands, proves presence: a `user-invocable: false` skill is on in the
+  // dialog but absent from commands. The dialog names a loose skill by its folder and shows
+  // its frontmatter name as display_name, which is the name commands use (CLI 2.1.322).
   check(sameSet(dialog.skills.map(skill => skill.display_name), expectedSkills.keys()),
     "Claude skills dialog differs from the declared skills");
   for (const skill of dialog.skills) {
@@ -265,6 +284,15 @@ function verifyDiscovery({ responses, events }, { marketplace, installs }, guida
 }
 
 async function main() {
+  // The CLI runs with this process's environment, so check it and not the requested one.
+  const refused = payload.refused_env.filter(name => name in process.env);
+  check(!refused.length, "Claude treatment installation refuses " + refused.join(", "));
+  const unpinned = Object.keys(payload.pinned_env).filter(name => process.env[name] !== payload.pinned_env[name]);
+  check(!unpinned.length, "Claude treatment installation requires the pinned launch environment: "
+    + unpinned.join(", "));
+  // User agents load from here and can replace a built-in agent of the same name.
+  const agentsDir = path.join(configDir, "agents");
+  check(!fs.existsSync(agentsDir) || !fs.readdirSync(agentsDir).length, "Undeclared Claude user agents exist");
   const guidancePath = path.join(configDir, "CLAUDE.md");
   check(!fs.existsSync(guidancePath), "Undeclared Claude user instructions already exist");
   // Guidance goes to the private user scope, never into the task source.
@@ -295,7 +323,9 @@ async function main() {
       agents: responses.initialize.agents.map(item => item.name).sort(),
     },
     marketplace: { path: plugins.marketplace, add: plugins.marketplaceAdd },
-    plugin_installs: plugins.installs.map(item => ({ id: item.id, install_path: item.installPath, output: item.output })),
+    plugin_installs: plugins.installs.map(item => ({
+      id: item.id, loaded_from: item.loadedFrom, cache_path: item.cachePath, output: item.output,
+    })),
     plugins: plugins.listed,
     hooks: { hooks: responses.get_hooks_listing.hooks, policy: responses.get_hooks_listing.policy },
     settings: responses.get_settings.effective,

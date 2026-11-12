@@ -24,6 +24,9 @@ from pluginbench.treatments import Treatment, resolve_treatment, treatment_inven
 DELIVERY_POLICY = "claude-native-v1"
 # Harbor's claude-code agent keeps its private configuration in its logs directory.
 CONFIG_DIR = "/logs/agent/sessions"
+# Offline, each plugin command took about 18 s and discovery about 20 s, so this admits
+# about 25 plugins. The runtime keeps its own per-command limits.
+INSTALL_TIMEOUT_SECONDS = 600
 
 
 def admit(treatment: Treatment) -> dict[str, Any]:
@@ -57,6 +60,7 @@ def stage(
     (manifest_dir / "marketplace.json").write_text(json.dumps({
         "name": MARKETPLACE, "owner": {"name": "pluginbench"}, "plugins": packages,
     }) + "\n")
+    discovery_argv, pinned_env = claude.discovery_launch(run)
     payload = {
         "delivery": DELIVERY_POLICY,
         "inventory": inventory,
@@ -64,7 +68,10 @@ def stage(
         "guidance_bytes": len(guidance),
         "marketplace": MARKETPLACE,
         "cli_version": cli_version,
-        "discovery_argv": claude.discovery_launch(run)[0],
+        "discovery_argv": discovery_argv,
+        # The runtime checks its own environment against these, since the CLI inherits it.
+        "pinned_env": pinned_env,
+        "refused_env": list(claude.REFUSED_ENV),
     }
     (directory / "treatment.json").write_text(json.dumps(payload, sort_keys=True) + "\n")
     shutil.copy2(Path(__file__).with_name("claude_treatment_runtime.js"), directory / "install.cjs")
@@ -100,7 +107,7 @@ async def install(
             ),
             env=env,
             cwd=cwd,
-            timeout_sec=180,
+            timeout_sec=INSTALL_TIMEOUT_SECONDS,
         )
         receipt_file = artifacts / "native-treatment.json"
         stdout = str(getattr(result, "stdout", ""))

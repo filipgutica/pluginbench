@@ -66,6 +66,25 @@
           "name": "claude-code-guide",
           "model": "haiku",
           "description": "Use this agent when the user asks questions (\"Can Claude...\""
+        },
+        {
+          "name": "Explore",
+          "model": "inherit",
+          "description": "Fast read-only search agent for locating code. Use it to fin"
+        },
+        {
+          "name": "general-purpose",
+          "description": "General-purpose agent for researching complex questions, sea"
+        },
+        {
+          "name": "Plan",
+          "model": "inherit",
+          "description": "Software architect agent for designing implementation plans."
+        },
+        {
+          "name": "statusline-setup",
+          "model": "sonnet",
+          "description": "Use this agent to configure the user's Claude Code status li"
         }
       ],
       "output_style": "default",
