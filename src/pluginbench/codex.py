@@ -299,9 +299,10 @@ def invoke(
     prompt: str,
     timeout: int,
     output_schema: Path | None = None,
+    artifacts: Path | None = None,
 ) -> dict[str, Any]:
     """Invoke a local reviewer with an OS-enforced read-only source packet."""
-    artifacts = area / "artifacts"
+    artifacts = area / "artifacts" if artifacts is None else artifacts
     artifacts.mkdir(exist_ok=True)
     if any((artifacts / name).exists() for name in ("invocation.json", "execution.json")):
         raise ValueError("native invocation artifacts already exist; use a fresh trial area")

@@ -441,12 +441,11 @@ def parse_judge(spec: str) -> Judge:
     return Judge(harness, model, effort)
 
 
-def _read_key(directory: Path) -> dict[str, Any]:
+def _read_key(directory: Path) -> bytes:
     path = directory / KEY
     if not path.is_file():
         raise ValueError(f"{directory} has no {KEY}; run `pluginbench judge prepare` first")
-    key: dict[str, Any] = json.loads(path.read_text())
-    return key
+    return path.read_bytes()
 
 
 def _panel(directory: Path) -> list[str]:
@@ -459,41 +458,69 @@ def _verdict_path(directory: Path, judge: str, task: str) -> Path:
 
 
 def _binding(
-    directory: Path, judge: str, task: str, *, folder: Path | None = None
+    directory: Path,
+    judge: str,
+    task: str,
+    *,
+    key_bytes: bytes,
+    folder: Path | None = None,
+    launch_judge: Judge | None = None,
 ) -> dict[str, str]:
     """Hash the presented files, with the key and judge identity kept outside the workspace."""
     folder = directory / task if folder is None else folder
     paths = {
-        "key": directory / KEY,
-        "judge_spec": directory / "judge-specs" / f"{judge}.json",
         "brief": directory / f"{task}.brief.md",
-        "instruction.md": folder / "instruction.md",
-        "review-standard.md": folder / "review-standard.md",
-        SCHEMA: folder / SCHEMA,
+        "files/instruction.md": folder / "instruction.md",
+        "files/review-standard.md": folder / "review-standard.md",
+        f"files/{SCHEMA}": folder / SCHEMA,
     }
     # rglob does not traverse prepare's source symlink; traverse its target explicitly.
     for root, prefix in ((folder, ""), ((folder / "source").resolve(), "source/")):
-        paths.update(
-            (prefix + path.relative_to(root).as_posix(), path)
-            for path in sorted(root.rglob("*"))
-            if path.is_file()
-        )
+        for path in sorted(root.rglob("*")):
+            # Only prepare's source-directory link is followed, above.
+            if path == folder / "source" and path.is_dir():
+                continue
+            field = "files/" + prefix + path.relative_to(root).as_posix()
+            if path.is_symlink():
+                raise ValueError(f"binding mismatch: symlink in bound tree: {field}")
+            if path.is_file():
+                paths[field] = path
     digests = {}
     for field, path in paths.items():
         try:
             digests[field] = study._digest(path)
         except OSError as error:
             raise ValueError(f"binding mismatch: {field}: {error}") from error
+    digests["key"] = "sha256:" + hashlib.sha256(key_bytes).hexdigest()
     digests["prepare_seed"] = (
-        "sha256:" + hashlib.sha256(json.dumps(_read_key(directory)["seed"]).encode()).hexdigest()
+        "sha256:" + hashlib.sha256(json.dumps(json.loads(key_bytes)["seed"]).encode()).hexdigest()
+    )
+    spec_path = directory / "judge-specs" / f"{judge}.json"
+    try:
+        spec = json.loads(spec_path.read_bytes())
+    except (OSError, ValueError) as error:
+        raise ValueError(f"binding mismatch: judge_spec: {spec_path}: {error}") from error
+    if launch_judge is not None:
+        if spec != asdict(launch_judge):
+            raise ValueError(f"binding mismatch: judge_spec: {spec_path}: launch identity changed")
+        spec = asdict(launch_judge)
+    digests["judge_spec"] = (
+        "sha256:" + hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
     )
     return digests
 
 
-def _check_binding(directory: Path, judge: str, task: str, saved: dict[str, str]) -> None:
+def _check_binding(
+    directory: Path, judge: str, task: str, saved: dict[str, str], *, key_bytes: bytes | None = None
+) -> None:
     path = _verdict_path(directory, judge, task)
     try:
-        current = _binding(directory, judge, task)
+        current = _binding(
+            directory,
+            judge,
+            task,
+            key_bytes=_read_key(directory) if key_bytes is None else key_bytes,
+        )
     except ValueError as error:
         raise ValueError(f"{path}: {error}") from error
     fields = saved.keys() | current.keys()
@@ -502,14 +529,22 @@ def _check_binding(directory: Path, judge: str, task: str, saved: dict[str, str]
             raise ValueError(f"{path}: binding mismatch: {field}")
 
 
-def _verdict_problem(directory: Path, judge: str, task: str) -> str | None:
+def _verdict_problem(
+    directory: Path,
+    judge: str,
+    task: str,
+    *,
+    verdicts: SavedVerdicts | None = None,
+    key_bytes: bytes | None = None,
+) -> str | None:
     """Recheck saved verdicts, including ties written before tool failures were rejected."""
     path = _verdict_path(directory, judge, task)
-    if not path.is_file():
-        return "missing"
-    verdicts = SavedVerdicts.model_validate_json(path.read_text())
+    if verdicts is None:
+        if not path.is_file():
+            return "missing"
+        verdicts = SavedVerdicts.model_validate_json(path.read_bytes())
     if verdicts.binding is not None:
-        _check_binding(directory, judge, task, verdicts.binding)
+        _check_binding(directory, judge, task, verdicts.binding, key_bytes=key_bytes)
     unable = [str(row.pair) for row in verdicts.pairs if row.preferred == "unable"]
     if unable:
         return "pairs " + ", ".join(unable) + ": unable"
@@ -542,7 +577,8 @@ def run(
     panel = [parse_judge(spec) for spec in judges]
     if not panel or len({judge.label for judge in panel}) != len(panel):
         raise ValueError("give at least one --judge, each once")
-    tasks = _read_key(directory)["tasks"]
+    key_bytes = _read_key(directory)
+    tasks = json.loads(key_bytes)["tasks"]
     for judge in panel:
         path = directory / "judge-specs" / f"{judge.label}.json"
         if path.is_file() and json.loads(path.read_text()) != asdict(judge):
@@ -555,7 +591,7 @@ def run(
         (judge, task)
         for judge in panel
         for task in tasks
-        if _verdict_problem(directory, judge.label, task) is not None
+        if _verdict_problem(directory, judge.label, task, key_bytes=key_bytes) is not None
     ]
     # Upgrade old prepared inputs once, before parallel calls copy them. Cached bound
     # verdicts have already been checked, so this cannot hide a changed response schema.
@@ -595,7 +631,6 @@ def _judge_task(
     verdict.unlink(missing_ok=True)
     raw = verdict.with_suffix("")
     raw.mkdir(parents=True, exist_ok=True)
-    attempt = raw / f"call-{len(list(raw.glob('call-*'))) + 1}"
     folder = directory / task
     with tempfile.TemporaryDirectory(prefix="pluginbench-judge-") as temporary:
         area = Path(temporary)
@@ -604,21 +639,34 @@ def _judge_task(
         shutil.copytree(folder, workspace, symlinks=True, ignore=shutil.ignore_patterns("source"))
         shutil.copytree((folder / "source").resolve(), workspace / "source", symlinks=True)
         prompt = (directory / f"{task}.brief.md").read_bytes().decode()
-        binding = _binding(directory, judge.label, task, folder=workspace)
+        binding = _binding(
+            directory,
+            judge.label,
+            task,
+            folder=workspace,
+            key_bytes=_read_key(directory),
+            launch_judge=judge,
+        )
         binding["brief"] = "sha256:" + hashlib.sha256(prompt.encode()).hexdigest()
-        try:
-            execution = codex.invoke(
-                area=area,
-                entry={"host": judge.harness},
-                protocol={"models": {judge.harness: judge.model}, "reasoning": judge.effort},
-                prompt=prompt,
-                timeout=timeout,
-                output_schema=workspace / SCHEMA,
-            )
-        finally:
-            artifacts = area / "artifacts"
-            if artifacts.exists():
-                codex.copy_artifacts(artifacts, attempt)
+        # mkdir is the reservation: even SIGKILL leaves an attempt with unknown usage.
+        number = 1
+        while True:
+            attempt = raw / f"call-{number}"
+            try:
+                attempt.mkdir()
+            except FileExistsError:
+                number += 1
+            else:
+                break
+        execution = codex.invoke(
+            area=area,
+            artifacts=attempt,
+            entry={"host": judge.harness},
+            protocol={"models": {judge.harness: judge.model}, "reasoning": judge.effort},
+            prompt=prompt,
+            timeout=timeout,
+            output_schema=workspace / SCHEMA,
+        )
     final = verified_final(execution, model=judge.model, effort=judge.effort, harness=judge.harness)
     check_read_only_trace(
         execution, harness=judge.harness, forbidden=(str(directory.resolve()), "../", KEY)
@@ -692,7 +740,8 @@ def _judge_usage(directory: Path, judge: str, tasks: Sequence[str]) -> dict[str,
 
 def tally(directory: Path, *, require_bound: bool = False) -> dict[str, Any]:
     """Unblind and score every pair: correctness first, then a strict majority of judges."""
-    key = _read_key(directory)
+    key_bytes = _read_key(directory)
+    key = json.loads(key_bytes)
     tasks: dict[str, Any] = key["tasks"]
     results = directory / "results"
     started = (
@@ -709,11 +758,23 @@ def tally(directory: Path, *, require_bound: bool = False) -> dict[str, Any]:
     ]
     if missing:
         raise ValueError("judge results missing: " + ", ".join(missing))
+    verdicts = {
+        (judge, task): SavedVerdicts.model_validate_json(
+            _verdict_path(directory, judge, task).read_bytes()
+        )
+        for judge in judges
+        for task in tasks
+    }
     failed = [
         f"{judge} {task} {problem}"
         for judge in judges
         for task in tasks
-        if (problem := _verdict_problem(directory, judge, task)) is not None
+        if (
+            problem := _verdict_problem(
+                directory, judge, task, verdicts=verdicts[judge, task], key_bytes=key_bytes
+            )
+        )
+        is not None
     ]
     if failed:
         raise ValueError("judge results incomplete: " + ", ".join(failed))
@@ -721,18 +782,12 @@ def tally(directory: Path, *, require_bound: bool = False) -> dict[str, Any]:
         str(_verdict_path(directory, judge, task))
         for judge in judges
         for task in tasks
-        if SavedVerdicts.model_validate_json(
-            _verdict_path(directory, judge, task).read_text()
-        ).binding
-        is None
+        if verdicts[judge, task].binding is None
     ]
     if require_bound and unbound:
         raise ValueError(f"{unbound[0]}: unbound verdict (written before binding); --require-bound")
     votes = {
-        (judge, task): {
-            str(row["pair"]): str(row["preferred"])
-            for row in json.loads(_verdict_path(directory, judge, task).read_text())["pairs"]
-        }
+        (judge, task): {str(row.pair): row.preferred for row in verdicts[judge, task].pairs}
         for judge in judges
         for task in tasks
     }
