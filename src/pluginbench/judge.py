@@ -555,9 +555,12 @@ def _verdict_problem(
         if call.is_dir() and call.name.removeprefix("call-").isdigit()
     ]
     if calls:
+        # Labels start with the harness; an unlabeled legacy judge keeps the Codex check.
+        harness = judge.split("-", 1)[0]
+        host = harness if harness in HARNESSES else "codex"
         latest = max(calls, key=lambda call: int(call.name.removeprefix("call-")))
         traces = [trace.read_text() for trace in sorted(latest.glob("host-trace-*.jsonl"))]
-        if codex.parse_events("", traces, "codex").get("tool_startup_failures"):
+        if codex.parse_events("", traces, host).get("tool_startup_failures"):
             return "unable: tool startup failed in saved trace"
     return None
 
