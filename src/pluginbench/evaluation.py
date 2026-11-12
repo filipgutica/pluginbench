@@ -79,6 +79,11 @@ class Runner(BaseModel):
     reasoning: Literal["minimal", "low", "medium", "high", "xhigh", "max", "ultra"] = Field(
         description="Selects reasoning effort, subject to harness and evaluation validation."
     )
+    cli_version: str | None = Field(
+        default=None,
+        pattern=rf"^{harbor_backend.CLI_VERSION_PATTERN}$",
+        description="Pins the coding CLI version installed in the task container; defaults to the host CLI's version at prepare time.",
+    )
 
     @model_validator(mode="after")
     def supported_effort(self) -> Runner:
@@ -98,6 +103,10 @@ class Runner(BaseModel):
 
 
 class Reviewer(Runner):
+    cli_version: None = Field(
+        default=None,
+        description="Reviews use the host CLI; only runner.cli_version can pin a container CLI.",
+    )
     timeout_seconds: int | None = Field(
         default=None,
         strict=True,
@@ -333,7 +342,7 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
     )
     comparison: dict[str, object] = {
         "tasks": identities,
-        "runner": config.runner.model_dump(mode="json"),
+        "runner": config.runner.model_dump(mode="json", exclude={"cli_version"}),
         "delivery": DELIVERY_POLICY,
         "capabilities": config.capabilities.model_dump(mode="json"),
         "measurement_settings": config.measurement_settings.model_dump(mode="json"),
@@ -343,7 +352,7 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
         if config.measurement_settings.fallow_config is not None
         else None,
         "measurements": sorted(config.measurements),
-        "reviewer": config.reviewer.model_dump(mode="json", exclude={"guidance"})
+        "reviewer": config.reviewer.model_dump(mode="json", exclude={"guidance", "cli_version"})
         if config.reviewer
         else None,
         "review_criteria_sha256": _criteria_digest(criteria) if criteria else None,
@@ -545,17 +554,19 @@ class _Checked:
     report: dict[str, object]
 
 
-def _harness_version(harness: str) -> str:
-    native = (claude.preflight if harness == "claude" else codex.preflight)()
-    version = str(native.get("harness_version", ""))
-    match = re.search(r"(?<![\w.+-])\d+\.\d+\.\d+(?![\w.+-])", version)
-    if match is None:
-        raise ValueError(f"cannot pin {harness} CLI version: {version}")
+def _harness_version(harness: str, cli_version: str | None = None) -> str:
+    if cli_version is None:
+        native = (claude.preflight if harness == "claude" else codex.preflight)()
+        version = str(native.get("harness_version", ""))
+        match = re.search(r"(?<![\w.+-])\d+\.\d+\.\d+(?![\w.+-])", version)
+        if match is None:
+            raise ValueError(f"cannot pin {harness} CLI version: {version}")
+        cli_version = match.group()
     if harness == "codex":
-        codex.admit_version(match.group())
+        codex.admit_version(cli_version)
     with tempfile.TemporaryDirectory(prefix="pluginbench-auth-check-") as temporary:
         codex.runtime_environment(Path(temporary) / "private", harness)
-    return match.group()
+    return cli_version
 
 
 def _coding_environment_row(
@@ -623,14 +634,16 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
     caches = _caches(root)
     harbor_backend.preflight(jobs=config.jobs, **limits)
     harness_versions: dict[str, str] = {
-        harness: _harness_version(harness)
-        for harness in {
-            config.runner.harness,
-            *([config.reviewer.harness] if config.reviewer else []),
-        }
+        config.runner.harness: _harness_version(config.runner.harness, config.runner.cli_version)
     }
-    if config.reviewer and config.reviewer.harness == "codex":
-        isolation.codex_code_mode_host()
+    # Reviews run the host binary, including when coding pins another version of that harness.
+    if config.reviewer:
+        if config.reviewer.harness == config.runner.harness:
+            _review_preflight(config.model_dump(mode="json"))
+        else:
+            harness_versions[config.reviewer.harness] = _harness_version(config.reviewer.harness)
+            if config.reviewer.harness == "codex":
+                isolation.codex_code_mode_host()
     coding_images = _object(plan["coding_images"])
     warnings = [
         f"{task}: runs the prebuilt image {image['image']}; {image['ignored_dockerfile']} is "
@@ -884,8 +897,13 @@ def prepare_evaluation(
         harness_version=harness_versions[config.runner.harness],
         measurement_capabilities=capabilities,
     )
+    # Keep default configs readable by older builds that reject unknown runner fields.
+    excluded = {"reviewer": {"cli_version"}}
+    if config.runner.cli_version is None:
+        excluded["runner"] = {"cli_version"}
     selection = {
-        **config.model_dump(mode="json"),
+        **config.model_dump(mode="json", exclude=excluded),
+        "cli_version_source": "runner.cli_version" if config.runner.cli_version else "host",
         "comparison_identity": comparison,
         "task_scopes": scopes,
         "measurement_capabilities": capabilities,
@@ -964,12 +982,7 @@ def _code(
 
     def same_coder() -> None:
         # Checked only once reconciliation has found a slot left to code.
-        version = _harness_version(config.runner.harness)
-        if version != recipe["harness_version"]:
-            raise ValueError(
-                f"{config.runner.harness} CLI is {version}, but this run codes with "
-                f"{recipe['harness_version']}; install that version to resume it"
-            )
+        _harness_version(config.runner.harness, str(recipe["harness_version"]))
         # One comparison must not hold attempts coded by two launchers.
         _assert_launcher(selection, identity, config.runner.harness)
 

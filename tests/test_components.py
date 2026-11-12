@@ -20,7 +20,8 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         1,
         {
             "codex.py": "6b1d892b37ea5e33337a469923762fe71130e22c840859771367cf34fa66b21f",
-            "harbor_backend.py": "4c8cc597aca59c1c27f162ea7c707b1c146a5d7d38e86b8b45044a552df84a4e",
+            # Credential readability checks preserve successful coding commands and cache identity.
+            "harbor_backend.py": "19cfcade250c1df3b54a45aec621f53a78d489523d23db3873c5173763d8542f",
             "processes.py": "0170e0a4902fc610d19b50ed5656c601474adad97b9b8d6fb5b08c6ab6ad00d1",
             "native_treatments.py": "dcb11553bc9bd2ea7a15ff3293d3ec74617565f89c3c2d156f714acade8b73a8",
             "native_treatment_runtime.js": (
