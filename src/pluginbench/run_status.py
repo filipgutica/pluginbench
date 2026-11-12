@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from pluginbench import run_lock, trial_containers
+from pluginbench.arms import normalize_arm_name
 from pluginbench.evaluation_report import correctness_state
 from pluginbench.ledger import LEDGER_NAME, Ledger
 
@@ -33,11 +34,6 @@ TOKEN_FIELDS = (
 _STAGE = "handoff"
 # sha256 of no bytes: the verifier graded an empty patch.
 _EMPTY_PATCH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-
-
-def _arm(name: str) -> str:
-    """Runs before the rename call the vanilla arm `baseline`."""
-    return "vanilla" if name == "baseline" else name
 
 
 def _read(path: Path) -> Any:
@@ -302,7 +298,7 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
                 "id": row["id"],
                 "slot": row["slot"],
                 "task": row["task_id"],
-                "arm": _arm(row["arm"]),
+                "arm": normalize_arm_name(row["arm"]),
                 "repeat": row["attempt"],
                 "state": row["state"],
                 "outcome": outcome,
@@ -327,7 +323,7 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
                 "id": receipt["id"],
                 "slot": receipt.get("slot"),
                 "task": receipt["task_id"],
-                "arm": _arm(receipt["arm"]),
+                "arm": normalize_arm_name(receipt["arm"]),
                 "repeat": receipt["attempt"],
                 "replaced_by": receipt.get("replaced_by"),
                 "tokens": tokens,

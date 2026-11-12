@@ -273,7 +273,8 @@ const formatTick = value => new Intl.NumberFormat(undefined, { notation: Math.ab
 // Values below one keep two significant digits so a small real difference never reads as zero.
 const formatCompact = value => value === null || value === undefined ? "Unknown" : new Intl.NumberFormat(undefined, Math.abs(value) >= 10000 ? { notation: "compact", maximumFractionDigits: 2 } : value !== 0 && Math.abs(value) < 1 ? { maximumSignificantDigits: 2 } : { maximumFractionDigits: 2 }).format(value);
 const formatSigned = value => (value > 0 ? "+" : "") + formatCompact(value);
-const armLabel = (arm) => arm === "baseline" ? "Vanilla" : arm === "unknown" ? "Unlabelled skill set" : arm;
+const vanillaArm = data.kind === "evaluation" ? "vanilla" : "baseline";
+const armLabel = (arm) => arm === vanillaArm ? "Vanilla" : arm === "unknown" ? "Unlabelled skill set" : arm;
 const choices = (select, values) => {
   for (const value of values) create("option", value, select).value = value;
 };
@@ -283,10 +284,10 @@ const knownTasks = unique(observations.map(row => row.task).filter(task => task 
 choices(taskSelect, knownTasks);
 taskSelect.value = "";
 // One package order and color per package everywhere: Vanilla first, then packages by name.
-const packageNames = unique([...observations.map(row => row.arm), ...data.attempts.map(row => row.guidance)]).filter(arm => arm !== "baseline").sort();
-const armRank = arm => arm === "baseline" ? -1 : packageNames.indexOf(arm);
+const packageNames = unique([...observations.map(row => row.arm), ...data.attempts.map(row => row.guidance)]).filter(arm => arm !== vanillaArm).sort();
+const armRank = arm => arm === vanillaArm ? -1 : packageNames.indexOf(arm);
 const byArm = (a, b) => armRank(a) - armRank(b);
-const seriesVariable = arm => arm !== "baseline" && armRank(arm) >= 0 ? "--series-" + (armRank(arm) % 8 + 1) : "--pb-muted";
+const seriesVariable = arm => arm !== vanillaArm && armRank(arm) >= 0 ? "--series-" + (armRank(arm) % 8 + 1) : "--pb-muted";
 const viewLabel = create("label", "Chart values", document.querySelector(".controls"));
 const comparisonView = create("select", undefined, viewLabel);
 for (const [value, label] of [["delta", "Delta vs vanilla"], ["raw", "Raw values"]]) create("option", label, comparisonView).value = value;
@@ -414,7 +415,7 @@ function showPackageSummary() {
           const text = result?.value !== undefined && result.value !== null ? formatCompact(result.value) : "Unknown";
           create("div", text + (groups.length > 1 && result?.analysis_group ? " · " + result.analysis_group : ""), cell);
           if (!taskSelect.value && result) create("small", result.measured_tasks + "/" + result.assigned_tasks + " tasks", cell);
-          if (arm !== "baseline") {
+          if (arm !== vanillaArm) {
             const deltaRows = taskSelect.value ? (data.comparisons || []).filter(row => row.task === taskSelect.value && row.metric === metric && row.guidance === arm) : [result];
             const delta = deltaRows.length === 1 ? deltaRows[0] : null;
             const value = delta?.absolute_delta_vs_vanilla ?? null;
@@ -626,10 +627,10 @@ function evaluationPlotRows({ rows, metric }) {
   const raw = comparisonView.value === "raw", overview = !taskSelect.value;
   if (overview && chartBreakdown.value === "tasks") {
     const medians = raw ? (data.raw_medians || []) : (data.comparisons || []);
-    return medians.filter(row => row.metric === metric).map(row => ({ ...row, guidance: row.guidance || row.arm, label: row.task.replaceAll("-", " "), plotted: raw ? row.value : row.absolute_delta_vs_vanilla, status: raw ? "measured" : row.status, reason: raw ? "Raw task median for one measurement profile. Comparison eligibility is separate." : row.reason, population: raw ? row.measured + " runs" : "Vanilla " + row.baseline_measured + "/" + row.baseline_assigned + " · guidance " + row.guidance_measured + "/" + row.guidance_assigned + " runs", rawRuns: [] })).sort((a, b) => a.task.localeCompare(b.task) || Number(b.guidance === "baseline") - Number(a.guidance === "baseline") || a.guidance.localeCompare(b.guidance));
+    return medians.filter(row => row.metric === metric).map(row => ({ ...row, guidance: row.guidance || row.arm, label: row.task.replaceAll("-", " "), plotted: raw ? row.value : row.absolute_delta_vs_vanilla, status: raw ? "measured" : row.status, reason: raw ? "Raw task median for one measurement profile. Comparison eligibility is separate." : row.reason, population: raw ? row.measured + " runs" : "Vanilla " + row.vanilla_measured + "/" + row.vanilla_assigned + " · guidance " + row.guidance_measured + "/" + row.guidance_assigned + " runs", rawRuns: [] })).sort((a, b) => a.task.localeCompare(b.task) || Number(b.guidance === "vanilla") - Number(a.guidance === "vanilla") || a.guidance.localeCompare(b.guidance));
   }
   if (overview) return (data.aggregates || []).filter(row => row.metric === metric).map(row => ({ ...row, status: raw ? row.status : row.comparison_status, label: armLabel(row.guidance) + (row.analysis_group ? " · " + row.analysis_group : ""), plotted: raw ? row.value : row.absolute_delta_vs_vanilla, population: row.measured_tasks + "/" + row.assigned_tasks + " tasks", rawRuns: [] }));
-  if (!raw) return (data.comparisons || []).filter(row => row.metric === metric && row.task === taskSelect.value).map(row => ({ ...row, label: row.guidance, plotted: row.absolute_delta_vs_vanilla, population: "Vanilla " + row.baseline_measured + "/" + row.baseline_assigned + " · guidance " + row.guidance_measured + "/" + row.guidance_assigned + " runs", rawRuns: [] }));
+  if (!raw) return (data.comparisons || []).filter(row => row.metric === metric && row.task === taskSelect.value).map(row => ({ ...row, label: row.guidance, plotted: row.absolute_delta_vs_vanilla, population: "Vanilla " + row.vanilla_measured + "/" + row.vanilla_assigned + " · guidance " + row.guidance_measured + "/" + row.guidance_assigned + " runs", rawRuns: [] }));
   const medians = (data.raw_medians || []).filter(row => row.role === "handoff" && row.metric === metric && row.task === taskSelect.value);
   const arms = unique(rows.map(row => row.arm));
   return arms.flatMap(arm => {
@@ -652,9 +653,9 @@ function drawEvaluationPlot({ parent, rows, metric }) {
   for (const label of ["Set", raw ? "Value" : "Delta vs vanilla", ...(!raw ? ["Vanilla reference", "% vs vanilla"] : []), "Status", "Measured / assigned"]) create("th", label, head);
   for (const row of plotRows) {
     const tr = create("tr", undefined, table);
-    for (const value of [byTask ? row.label + " · " + armLabel(row.guidance) : row.label, format(row.plotted), ...(!raw ? [format(row.baseline_value ?? row.baseline_median ?? null), format(row.percentage_delta_vs_vanilla)] : []), row.status, row.population]) create("td", value, tr);
+    for (const value of [byTask ? row.label + " · " + armLabel(row.guidance) : row.label, format(row.plotted), ...(!raw ? [format(row.vanilla_value ?? row.vanilla_median ?? null), format(row.percentage_delta_vs_vanilla)] : []), row.status, row.population]) create("td", value, tr);
   }
-  if (!plotRows.some(row => row.plotted !== null || row.rawRuns.length)) { create("p", raw ? "No defined values to plot. Complete empty scans and missing measurements are listed separately." : "No matching baseline values for a delta. Switch to Raw values to see the available measurements.", parent); return 0; }
+  if (!plotRows.some(row => row.plotted !== null || row.rawRuns.length)) { create("p", raw ? "No defined values to plot. Complete empty scans and missing measurements are listed separately." : "No matching vanilla values for a delta. Switch to Raw values to see the available measurements.", parent); return 0; }
   const container = create("div", undefined, parent); container.className = "chart";
   const arms = unique(plotRows.map(row => row.guidance));
   const categories = grouped ? unique(plotRows.map(row => row.group)) : plotRows.map(row => byTask ? row.label + " · " + armLabel(row.guidance) : row.label);

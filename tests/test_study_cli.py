@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import fcntl
 import inspect
+import csv
+import io
 import json
 import hashlib
 import os
@@ -897,7 +899,7 @@ def test_integrated_evaluation_and_report_regeneration(
         assert json.loads((measurement / "revision.json").read_text())["jobs"] == config.jobs
     assert json.loads((review / "protocol.json").read_text())["jobs"] == config.jobs
     assert len(calls) == data["assigned"] == 9
-    assert {row["guidance"] for row in data["attempts"]} == {"baseline", "workflow", "superpowers"}
+    assert {row["guidance"] for row in data["attempts"]} == {"vanilla", "workflow", "superpowers"}
     assert sum(row["correctness"] == "fail" for row in data["attempts"]) == (
         0 if unavailable else 1
     )
@@ -2880,7 +2882,7 @@ def test_an_earlier_build_refuses_the_report_of_a_run_with_listed_pairs(
     }
 
 
-def test_an_earlier_build_writes_the_same_report_for_a_run_without_listed_pairs(
+def test_an_earlier_build_reports_the_same_measurements_with_legacy_arm_names(
     checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     export = _exported(_BEFORE_LIST, tmp_path)
@@ -2891,9 +2893,27 @@ def test_an_earlier_build_writes_the_same_report_for_a_run_without_listed_pairs(
     assert json.loads(revision.read_text())["schema_version"] == 2
     names = ("results.json", "results.csv", "report.html")
     ours = {name: (root / "report" / name).read_bytes() for name in names}
+    evidence = load_evidence([str(root)])
+    csv_rows = list(csv.DictReader(io.StringIO(ours["results.csv"].decode())))
+    assert json.loads(ours["results.json"])["schema_version"] == 2
 
     assert _old_report(export, root, tmp_path).startswith("exit: 0")
 
+    legacy = json.loads((root / "report/results.json").read_text())
+    assert legacy["schema_version"] == 1
+    assert {row["guidance"] for row in legacy["attempts"]} == {
+        "baseline", "workflow", "superpowers"
+    }
+    # The old writer still reads the same saved run. Only public naming and the
+    # versioned JSON/HTML format changed; its comparison inputs and CSV measures agree.
+    assert load_evidence([str(root)]) == evidence
+    old_csv = list(csv.DictReader(io.StringIO((root / "report/results.csv").read_text())))
+    for row in old_csv:
+        if row["arm"] == "baseline":
+            row["arm"] = "vanilla"
+    assert old_csv == csv_rows
+    rebuilt = CliRunner().invoke(cli.app, ["report", str(root)])
+    assert rebuilt.exit_code == 0, rebuilt.stderr
     assert {name: (root / "report" / name).read_bytes() for name in names} == ours
 
 

@@ -28,9 +28,9 @@ import yaml
 from pydantic import StrictInt, StrictStr
 
 from pluginbench import codex, study
+from pluginbench.arms import normalize_arm_name
 from pluginbench.assessment import _load_manifest
 from pluginbench.assessment_models import Attempt, InputModel, Snapshot
-from pluginbench.compare import ARM_NAMES
 from pluginbench.evaluation_report import correctness_state
 from pluginbench.parallel import run_jobs, validate_jobs
 from pluginbench.datasets import TaskCatalog
@@ -179,7 +179,7 @@ def parse_arm(spec: str) -> tuple[Path, str]:
     directory, _, arm = spec.partition("=")
     if not directory or not arm:
         raise ValueError(f"{spec!r}: give RUN_DIR=ARM")
-    return Path(directory), ARM_NAMES.get(arm, arm)
+    return Path(directory), normalize_arm_name(arm)
 
 
 def _packets(run: Path, base: str, wanted: set[str]) -> dict[str, tuple[str, Path]]:
@@ -258,7 +258,7 @@ def load_submissions(
     rows = [
         row
         for row in data["attempts"]
-        if ARM_NAMES.get(row["guidance"], row["guidance"]) == arm and row["task"] in tasks
+        if normalize_arm_name(row["guidance"]) == arm and row["task"] in tasks
     ]
     if not rows:
         raise ValueError(f"{run} has no {arm} attempts on the given tasks")
