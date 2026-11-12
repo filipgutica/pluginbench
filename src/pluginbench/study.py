@@ -189,7 +189,8 @@ def load_study(path: Path) -> ResolvedStudy:
         for name, item in recipe.treatments.items()
     }
     selection = {
-        name: treatment_inventory(item) for name, item in recipe.treatments.items()
+        name: treatment_inventory(item, recipe.harness)
+        for name, item in recipe.treatments.items()
     }
     for collector in recipe.collectors:
         collector.config = _resolve(base, collector.config)
@@ -282,7 +283,7 @@ def _assert_frozen(root: Path) -> None:
         actual = {
             name: treatment_inventory(resolve_treatment(
                 Treatment.model_validate(value), root / "frozen", recipe["harness"],
-            ))
+            ), recipe["harness"])
             for name, value in recipe["treatments"].items()
         }
         if actual != json.loads(selection.read_text()):
@@ -300,7 +301,7 @@ def _freeze(study: ResolvedStudy, root: Path) -> ResolvedStudy:
         shutil.copyfile(source_file, runner / source_file.name)
     _write(frozen / "treatment-selection.json", study.treatment_selection)
     treatments = {
-        name: freeze_treatment(item, frozen / "treatments" / str(index))
+        name: freeze_treatment(item, frozen / "treatments" / str(index), study.recipe.harness)
         for index, (name, item) in enumerate(study.treatments.items())
     }
     recipe = study.recipe.model_copy(deep=True)

@@ -65,7 +65,7 @@ def admit(treatment: Treatment, harness: str) -> dict[str, Any]:
     if harness != "codex":
         raise ValueError("native treatment execution is currently qualified for Codex only")
     resolved = resolve_treatment(treatment, Path.cwd(), harness)
-    inventory = treatment_inventory(resolved)
+    inventory = treatment_inventory(resolved, harness)
     guidance = b"\n\n".join(path.read_bytes() for path in resolved.guidance)
     if len(guidance) > MAX_GUIDANCE_BYTES:
         raise ValueError(

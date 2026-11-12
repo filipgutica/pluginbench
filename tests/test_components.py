@@ -24,11 +24,12 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # Credential readability checks preserve successful coding commands and cache identity.
             "harbor_backend.py": "19cfcade250c1df3b54a45aec621f53a78d489523d23db3873c5173763d8542f",
             "processes.py": "0170e0a4902fc610d19b50ed5656c601474adad97b9b8d6fb5b08c6ab6ad00d1",
-            "native_treatments.py": "dcb11553bc9bd2ea7a15ff3293d3ec74617565f89c3c2d156f714acade8b73a8",
+            "native_treatments.py": "9660867a3fd8148864b48e75406a11a6c999f0445f4878d6cad924dc0167f78b",
             "native_treatment_runtime.js": (
                 "229d01b78fd893b8e502139507b74d18f0147079c58f15f90b0548b5520e67c5"
             ),
-            "treatments.py": "e807503ac1809dd1030a6805702fe23da0d4cd07eb2d9f52d12069ae85f1926f",
+            # Claude plugin admission rules; Codex admission and every admitted launch stay v1.
+            "treatments.py": "441498fa24855b0ed5e8b713be2bdf1eb8d06bc29b9d01cdbdb762f838bcc81c",
             # Version admission only warns; it launches every CLI version as before.
             "claude.py": "26b4d1344d187d080159c6e7ad128c1614d057bc20498840738a7b5d7c905a73",
         },
