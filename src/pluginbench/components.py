@@ -24,8 +24,8 @@ VERSIONS: dict[str, int] = {
 # The source files each component's version stands for. These are the only hashed files.
 FILES: dict[str, tuple[str, ...]] = {
     # How a coding attempt is launched. Session parsing lives in codex_events.py, outside
-    # this list, so a parser-only change keeps every vanilla cache entry. claude.py counts
-    # only when Claude is the harness.
+    # this list, so a parser-only change keeps every vanilla cache entry. CLAUDE_ONLY files
+    # count only when Claude is the harness.
     "launcher": (
         "codex.py",
         "harbor_backend.py",
@@ -34,6 +34,8 @@ FILES: dict[str, tuple[str, ...]] = {
         "native_treatment_runtime.js",
         "treatments.py",
         "claude.py",
+        "claude_treatments.py",
+        "claude_treatment_runtime.js",
     ),
     "analysis_observer": ("language_analysis.py",),
     "coverage_observer": ("coverage_report.py",),
@@ -86,14 +88,27 @@ def source_sha256(name: str) -> str:
     return hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
 
 
+# Launcher files only a Claude launch runs. A Codex launcher neither hashes nor depends on
+# them, so adding or changing one leaves every Codex run and cache identity as it was.
+CLAUDE_ONLY = frozenset({"claude.py", "claude_treatments.py", "claude_treatment_runtime.js"})
+
+
 def launcher_files(harness: str) -> tuple[str, ...]:
-    """The launcher files a coding run hashes: claude.py only when Claude is the harness."""
-    return tuple(name for name in FILES["launcher"] if name != "claude.py" or harness == "claude")
+    """The launcher files a coding run hashes: CLAUDE_ONLY files only when Claude is the harness."""
+    return tuple(
+        name for name in FILES["launcher"] if name not in CLAUDE_ONLY or harness == "claude"
+    )
 
 
 def saved_launcher_version(harness: object, hashes: object) -> int:
-    """The version of a saved launcher hash set, which must name every file of its harness."""
-    expected = launcher_files(harness) if harness in ("codex", "claude") else ()
+    """The version of a saved launcher hash set, which must name every file of its harness.
+
+    Only runs from before versions were saved record hashes without a version, so a file
+    added to the launcher since then is not expected in their set.
+    """
+    expected = tuple(
+        name for name in launcher_files(harness) if name in _SAVED_HASHES
+    ) if harness in ("codex", "claude") else ()
     saved = sorted(hashes) if isinstance(hashes, Mapping) else []
     if not expected or saved != sorted(expected):
         raise UnknownSourceError(

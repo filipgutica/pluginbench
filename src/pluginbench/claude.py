@@ -1,4 +1,4 @@
-"""Claude Code capabilities and evidence for isolated read-only reviews."""
+"""Claude Code capabilities and evidence for isolated read-only reviews and coding launches."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import math
 import os
 import subprocess
 import warnings
+from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 from typing import Any
@@ -101,6 +102,93 @@ def command(
         "--no-session-persistence",
         "--no-chrome",
     ]
+
+
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# Settings every Claude coding launch passes, identical in vanilla and treatment arms.
+PINNED_SETTINGS: dict[str, object] = {}
+# Discovery adds only this: it lists hooks without running them.
+DISCOVERY_SETTINGS: dict[str, object] = {"disableAllHooks": True}
+DISALLOWED_TOOLS = ("RemoteTrigger", "CronCreate", "ScheduleWakeup", "SendMessage", "Workflow")
+# Routes and limits that would change which model serves the run or how it is metered.
+REFUSED_ENV = (
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "DISABLE_PROMPT_CACHING",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+)
+
+
+@dataclass(frozen=True)
+class CodingRun:
+    """The run settings a Claude coding launch, and its discovery, are built from."""
+
+    model: str
+    effort: str
+    subagents: bool
+    timeout_seconds: int
+
+
+def _settings(settings: dict[str, object]) -> str:
+    return json.dumps(settings, sort_keys=True, separators=(",", ":"))
+
+
+def coding_launch(run: CodingRun) -> tuple[list[str], dict[str, str]]:
+    """The argv and pinned environment of a coding attempt; the prompt arrives on stdin."""
+    if run.effort not in EFFORTS:
+        raise ValueError(f"unsupported Claude effort: {run.effort}")
+    disallowed = [*DISALLOWED_TOOLS, *([] if run.subagents else ["Agent"])]
+    argv = [
+        "claude",
+        "--verbose",
+        "--output-format=stream-json",
+        "--settings",
+        _settings(PINNED_SETTINGS),
+        "--model",
+        run.model,
+        "--effort",
+        run.effort,
+        "--permission-mode=bypassPermissions",
+        "--setting-sources",
+        "user",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--include-hook-events",
+        "--no-chrome",
+        "--disallowed-tools",
+        ",".join(disallowed),
+        "--print",
+    ]
+    env = {
+        "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+        "DISABLE_UPDATES": "1",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+        "CLAUDE_CODE_SUBAGENT_MODEL": run.model,
+        "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": str(run.timeout_seconds * 1000),
+    }
+    return argv, env
+
+
+def discovery_launch(run: CodingRun) -> tuple[list[str], dict[str, str]]:
+    """The coding launch with only the discovery delta, so both load the same treatment.
+
+    Discovery sends control requests on stdin instead of the prompt, keeps no session, and
+    lists hooks without running them. The environment is unchanged.
+    """
+    argv, env = coding_launch(run)
+    argv[argv.index("--settings") + 1] = _settings({**PINNED_SETTINGS, **DISCOVERY_SETTINGS})
+    argv[argv.index("--print") : argv.index("--print")] = [
+        "--input-format", "stream-json", "--no-session-persistence",
+    ]
+    return argv, env
 
 
 def runtime_environment(
