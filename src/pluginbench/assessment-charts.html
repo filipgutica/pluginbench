@@ -497,7 +497,7 @@ function showCompleteness() {
   // Task × measure × package: measured, unknown with its reason, or not configured for the task.
   const matrix = (data.completeness_matrix || []).filter(row => !taskSelect.value || row.task === taskSelect.value);
   if (!matrix.length) return;
-  const arms = unique(matrix.flatMap(row => Object.keys(row.cells)));
+  const arms = unique(matrix.flatMap(row => Object.keys(row.cells))).sort(byArm);
   const grid = create("table", undefined, body);
   const head = create("tr", undefined, grid);
   for (const label of ["Task", "Measure", ...arms.map(armLabel)]) create("th", label, head);

@@ -1304,16 +1304,16 @@ def test_completeness_matrix_shows_each_task_measure_and_arm(tmp_path: Path) -> 
     assert visible[header : header + 5] == [
         "Task",
         "Measure",
+        "Vanilla",
         "superpowers",
-        "vanilla",
         "workflow",
     ]
     row = visible.index("Output tokens", visible.index("fixture-task", header)) - 1
     assert visible[row : row + 5] == [
         "fixture-task",
         "Output tokens",
-        "",
         "measured",
+        "",
         missing["text"],
     ]
 
@@ -1321,14 +1321,21 @@ def test_completeness_matrix_shows_each_task_measure_and_arm(tmp_path: Path) -> 
 def _completeness_text(data: dict[str, object], tmp_path: Path) -> list[str]:
     controller = Path("src/pluginbench/assessment-charts.html").read_text().rsplit("<script>", 1)[1]
     function = re.search(r"function showCompleteness\(\) \{.*?\n\}", controller, re.S)
-    assert function is not None
+    # The template's own arm naming and order, so the rendered columns are what users see.
+    helpers = [
+        re.search(rf"^const {name} = .*$", controller, re.M)
+        for name in ("vanillaArm", "armLabel", "packageNames", "armRank", "byArm")
+    ]
+    assert function is not None and all(helpers)
     script = tmp_path / "completeness.js"
     script.write_text(
         "const data=" + json.dumps(data) + ";\n"
         "const texts=[];const element=()=>({replaceChildren(){},querySelector(){return element()}});\n"
         "const document={getElementById:element},taskSelect={value:''};\n"
-        "const unique=items=>[...new Set(items)],armLabel=arm=>arm;\n"
+        "const unique=items=>[...new Set(items)],observations=data.observations;\n"
         "const create=(tag,text,parent)=>{if(text!==undefined)texts.push(String(text));return element();};\n"
+        + "\n".join(helper.group(0) for helper in helpers if helper)
+        + "\n"
         + function.group(0)
         + "\nshowCompleteness();console.log(JSON.stringify(texts));\n"
     )
