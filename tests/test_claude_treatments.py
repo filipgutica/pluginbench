@@ -400,13 +400,33 @@ REFUSALS: dict[str, tuple[Callable[[Attempt], object], str]] = {
         _responses(lambda r: r["initialize"].update(claude_code_version="2.1.321")),
         "Claude CLI version 2.1.321 differs from the pinned 2.1.322",
     ),
-    "OAuth token source": (
+    "API key source": (
         _responses(
             lambda r: r["initialize"].update(
-                account={"tokenSource": "CLAUDE_CODE_OAUTH_TOKEN", "apiKeySource": "none"}
+                account={
+                    "tokenSource": "none",
+                    "apiKeySource": "ANTHROPIC_API_KEY",
+                    "apiProvider": "firstParty",
+                }
             )
         ),
-        "Claude discovery is not authenticated by ANTHROPIC_API_KEY alone",
+        "Claude discovery is not authenticated by the subscription token alone",
+    ),
+    "API key beside the subscription token": (
+        _responses(
+            lambda r: r["initialize"].update(
+                account={
+                    "tokenSource": "CLAUDE_CODE_OAUTH_TOKEN",
+                    "apiKeySource": "ANTHROPIC_API_KEY",
+                    "apiProvider": "firstParty",
+                }
+            )
+        ),
+        "Claude discovery is not authenticated by the subscription token alone",
+    ),
+    "API key in the environment": (
+        lambda attempt: attempt.extra_env.update(ANTHROPIC_API_KEY="sk-ant-unwanted"),
+        "Claude treatment installation refuses ANTHROPIC_API_KEY",
     ),
     "missing get_hooks_listing response": (
         lambda attempt: attempt.scenario.update(omit=["get_hooks_listing"]),
