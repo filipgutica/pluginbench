@@ -94,7 +94,12 @@ def responses(attempt: Attempt) -> dict[str, Any]:
         .replace("/SCRATCH/work", str(attempt.root / "workspace"))
     )
     treatment = attempt.treatment
-    loose = [path.name for path in treatment.skills]
+    # Commands and the dialog's display_name use the frontmatter name; the dialog's name is
+    # the folder (CLI 2.1.322).
+    loose = {
+        path.name: (path / "SKILL.md").read_text().split("name: ", 1)[1].split("\n", 1)[0]
+        for path in treatment.skills
+    }
     packaged = [
         f"{plugin.name}:{name}"
         for plugin in treatment.plugins
@@ -102,18 +107,22 @@ def responses(attempt: Attempt) -> dict[str, Any]:
     ]
     initialize = captured["initialize"]
     initialize["commands"] = [
-        *[{"name": name, "description": "", "argumentHint": ""} for name in [*loose, *packaged]],
+        *[
+            {"name": name, "description": "", "argumentHint": ""}
+            for name in [*loose.values(), *packaged]
+        ],
         *[command for command in initialize["commands"] if command.get("builtin")],
     ]
     dialog_entry = captured["get_skills_dialog"]["skills"][1]
     captured["get_skills_dialog"]["skills"] = [
-        {
-            **dialog_entry,
-            "name": name,
-            "display_name": name,
-            "source": "plugin" if ":" in name else "user",
-        }
-        for name in [*packaged, *loose]
+        *[
+            {**dialog_entry, "name": name, "display_name": name, "source": "plugin"}
+            for name in packaged
+        ],
+        *[
+            {**dialog_entry, "name": folder, "display_name": name, "source": "user"}
+            for folder, name in loose.items()
+        ],
     ]
     listing = captured["get_hooks_listing"]
     listing["policy"]["allDisabled"] = True
@@ -174,11 +183,12 @@ def attempt(tmp_path: Path, *, vanilla: bool = False) -> Attempt:
         )
         treatment = Treatment(
             guidance=[guide],
-            skills=[skill(tmp_path / "loose-skill", "loose-skill")],
+            # A folder name that differs from the skill name, as Claude reports both.
+            skills=[skill(tmp_path / "loose-folder", "loose-skill")],
             plugins=[plugin],
         )
         # Harbor's setup copies loose skills into the private configuration.
-        shutil.copytree(treatment.skills[0], tmp_path / "config/skills/loose-skill")
+        shutil.copytree(treatment.skills[0], tmp_path / "config/skills/loose-folder")
     stage(treatment, tmp_path / "staged", run=RUN, cli_version=VERSION)
     result = Attempt(tmp_path, treatment, {})
     result.scenario["responses"] = responses(result)
@@ -213,7 +223,7 @@ def test_treatment_receipt_proves_guidance_skills_plugin_and_hook_loaded(tmp_pat
     receipt = json.loads(result.stdout)
     assert receipt["status"] == "verified"
     assert receipt["commands"] == ["demo:demo-skill", "loose-skill"]
-    assert {(item["name"], item["source"]) for item in receipt["skills"]} == {
+    assert {(item["display_name"], item["source"]) for item in receipt["skills"]} == {
         ("demo:demo-skill", "plugin"),
         ("loose-skill", "user"),
     }
@@ -329,7 +339,7 @@ REFUSALS: dict[str, tuple[Callable[[Attempt], object], str]] = {
         "Claude plugin installed outside the private cache: demo@pluginbench-frozen",
     ),
     "tree byte mismatch": (
-        lambda attempt: (attempt.config / "skills/loose-skill/check.sh").write_text("changed\n"),
+        lambda attempt: (attempt.config / "skills/loose-folder/check.sh").write_text("changed\n"),
         "Installed treatment bytes differ",
     ),
 }

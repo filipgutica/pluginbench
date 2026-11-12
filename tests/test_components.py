@@ -34,7 +34,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             "claude.py": "d4dc66cb46713b976db98e5eae5c84ae58f19e075e29c2ead02b30fd038e8d31",
             "claude_treatments.py": "1c6a943ce506a5b4984a4698b693d1edd3b9f6a780ae97feb818c1e4f99f1f15",
             "claude_treatment_runtime.js": (
-                "7b7a88b1662069b9d0d4784c23e6fbfe2481bb32d96f2f1323808ff7c1547d32"
+                "ee32cd309f5de9c17a868f645c01fe781ec553c60642a60129743fbe9873ee02"
             ),
         },
     ),

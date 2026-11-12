@@ -206,18 +206,22 @@ function verifyDiscovery({ responses, events }, { marketplace, installs }, guida
   check(!missing.length, "Declared Claude skill was not discovered: " + missing.join(", "));
   const dialog = responses.get_skills_dialog;
   shape(dialog && Array.isArray(dialog.skills), "get_skills_dialog");
-  check(sameSet(dialog.skills.map(skill => skill.name), expectedSkills.keys()),
+  // The dialog names a loose skill by its folder and shows its frontmatter name as
+  // display_name, which is the name commands use (CLI 2.1.322).
+  check(sameSet(dialog.skills.map(skill => skill.display_name), expectedSkills.keys()),
     "Claude skills dialog differs from the declared skills");
   for (const skill of dialog.skills) {
-    check(skill.state === "on" && skill.source === expectedSkills.get(skill.name),
-      "Claude skill is not on from its declared source: " + skill.name);
+    check(skill.state === "on" && skill.source === expectedSkills.get(skill.display_name),
+      "Claude skill is not on from its declared source: " + skill.display_name);
   }
 
   const memory = responses.get_memory_dialog;
-  shape(memory && Array.isArray(memory.files) && Array.isArray(memory.memories) && memory.auto_memory, "get_memory_dialog");
+  // CLI 2.1.322 omits `memories` while auto-memory is off; when present it must be empty.
+  const memories = memory && memory.memories === undefined ? [] : memory && memory.memories;
+  shape(memory && Array.isArray(memory.files) && Array.isArray(memories) && memory.auto_memory, "get_memory_dialog");
   const resolved = file => (fs.existsSync(file) ? canonical(file) : file);
   const loaded = memory.files.filter(file => file.exists === true).map(file => resolved(file.path));
-  check(stable(loaded) === stable(payload.inventory.guidance.length ? [guidancePath] : []) && !memory.memories.length,
+  check(stable(loaded) === stable(payload.inventory.guidance.length ? [guidancePath] : []) && !memories.length,
     "Claude memory files differ from the declared guidance: " + loaded.join(", "));
   check(memory.auto_memory.enabled === false, "Claude auto-memory is on");
   const context = responses.get_context_usage;

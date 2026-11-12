@@ -220,24 +220,18 @@
           "exists": false
         }
       ],
-      "folders": [
-        {
-          "kind": "auto",
-          "path": "/SCRATCH/cfg/projects/-SCRATCH-work/memory/",
-          "label": "Open auto-memory folder",
-          "description": ""
-        }
-      ],
-      "memories": [],
+      "folders": [],
       "auto_memory": {
-        "enabled": false
+        "enabled": false,
+        "toggleable": true,
+        "status": "off"
       },
       "auto_dream": {
         "shown": false,
         "enabled": false,
         "toggleable": false,
-        "status": "off",
-        "detail": "can't be turned on here; use a session started outside Claude Code"
+        "status": "off while auto-memory is off",
+        "detail": ""
       }
     },
     "get_skills_dialog": {
