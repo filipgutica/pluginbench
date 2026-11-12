@@ -29,7 +29,8 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
                 "229d01b78fd893b8e502139507b74d18f0147079c58f15f90b0548b5520e67c5"
             ),
             "treatments.py": "e807503ac1809dd1030a6805702fe23da0d4cd07eb2d9f52d12069ae85f1926f",
-            "claude.py": "d769c7343dc7bd00a06baffb5282e67feca5580d7627b61d7648f23edb4cf4e9",
+            # Version admission only warns; it launches every CLI version as before.
+            "claude.py": "26b4d1344d187d080159c6e7ad128c1614d057bc20498840738a7b5d7c905a73",
         },
     ),
     "analysis_observer": (

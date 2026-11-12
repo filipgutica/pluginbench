@@ -554,7 +554,7 @@ class _Checked:
     report: dict[str, object]
 
 
-def _harness_version(harness: str, cli_version: str | None = None) -> str:
+def _harness_version(harness: str, cli_version: str | None = None, *, coding: bool = False) -> str:
     if cli_version is None:
         native = (claude.preflight if harness == "claude" else codex.preflight)()
         version = str(native.get("harness_version", ""))
@@ -564,6 +564,9 @@ def _harness_version(harness: str, cli_version: str | None = None) -> str:
         cli_version = match.group()
     if harness == "codex":
         codex.admit_version(cli_version)
+    elif coding:
+        # Claude's qualification covers coding evidence; reviews keep their host behaviour.
+        claude.admit_version(cli_version)
     with tempfile.TemporaryDirectory(prefix="pluginbench-auth-check-") as temporary:
         codex.runtime_environment(Path(temporary) / "private", harness)
     return cli_version
@@ -634,7 +637,9 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
     caches = _caches(root)
     harbor_backend.preflight(jobs=config.jobs, **limits)
     harness_versions: dict[str, str] = {
-        config.runner.harness: _harness_version(config.runner.harness, config.runner.cli_version)
+        config.runner.harness: _harness_version(
+            config.runner.harness, config.runner.cli_version, coding=True
+        )
     }
     # Reviews run the host binary, including when coding pins another version of that harness.
     if config.reviewer:
@@ -982,7 +987,7 @@ def _code(
 
     def same_coder() -> None:
         # Checked only once reconciliation has found a slot left to code.
-        _harness_version(config.runner.harness, str(recipe["harness_version"]))
+        _harness_version(config.runner.harness, str(recipe["harness_version"]), coding=True)
         # One comparison must not hold attempts coded by two launchers.
         _assert_launcher(selection, identity, config.runner.harness)
 

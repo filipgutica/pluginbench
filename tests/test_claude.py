@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 from typing import IO, Any, Literal, TypedDict, Unpack
 
@@ -81,6 +82,28 @@ def test_preflight_checks_local_capabilities_without_authentication(
     )
     with pytest.raises(ValueError, match="lacks required isolation flags"):
         claude.preflight()
+
+
+def test_unqualified_version_is_admitted_and_warns_once() -> None:
+    claude.admit_version.cache_clear()
+    with pytest.warns(UserWarning, match="Claude Code CLI 2.1.9001 is not qualified") as caught:
+        assert claude.admit_version("2.1.9001") is None
+        assert claude.admit_version("2.1.9001") is None
+    assert len(caught) == 1
+    message = str(caught[0].message)
+    for unqualified in (
+        "discovery control requests",
+        "session transcript format",
+        "token reconciliation",
+    ):
+        assert unqualified in message
+    assert "Qualified versions: 2.1.322" in message
+
+
+def test_qualified_version_is_admitted_silently() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        claude.admit_version("2.1.322")
 
 
 def test_review_command_removes_shell_writes_and_delegation() -> None:

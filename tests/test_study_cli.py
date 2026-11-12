@@ -1207,6 +1207,33 @@ def test_check_accepts_an_unverified_codex_version_and_warns_once(
     assert checkable["calls"] == []
 
 
+@pytest.mark.parametrize("cli_version", ["2.1.400", None])
+def test_claude_runner_version_goes_through_claude_admission(
+    monkeypatch: pytest.MonkeyPatch, cli_version: str | None
+) -> None:
+    # Called directly: native treatments still refuse Claude runners before `check` finishes.
+    monkeypatch.setattr(claude, "preflight", lambda: {"harness_version": "2.1.400 (Claude Code)"})
+    monkeypatch.setattr(codex, "runtime_environment", lambda *args, **kwargs: ({}, ()))
+    admitted: list[str] = []
+    monkeypatch.setattr(claude, "admit_version", admitted.append)
+    monkeypatch.setattr(
+        codex, "admit_version", lambda version: pytest.fail("Claude runner used Codex admission")
+    )
+    assert evaluation._harness_version("claude", cli_version, coding=True) == "2.1.400"
+    assert admitted == ["2.1.400"]
+
+
+def test_claude_reviewer_version_is_not_admitted_as_coding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(claude, "preflight", lambda: {"harness_version": "2.1.400 (Claude Code)"})
+    monkeypatch.setattr(codex, "runtime_environment", lambda *args, **kwargs: ({}, ()))
+    monkeypatch.setattr(
+        claude, "admit_version", lambda version: pytest.fail("reviewer used coding admission")
+    )
+    assert evaluation._harness_version("claude") == "2.1.400"
+
+
 @pytest.mark.parametrize("cli_version", ["0.167.0", None])
 def test_prepare_pins_the_selected_coding_cli_and_records_its_source(
     checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch, cli_version: str | None
