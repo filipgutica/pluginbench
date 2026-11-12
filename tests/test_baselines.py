@@ -28,7 +28,8 @@ def _study(
     directory: Path, *, guidance: str = "candidate", runner: dict[str, str] | None = None
 ) -> study.ResolvedStudy:
     directory.mkdir()
-    entry = task_entry(directory, "answer", answer_path="answer.py", version="0.143.0")
+    version = (runner or {}).get("harness_version", "0.143.0")
+    entry = task_entry(directory, "answer", answer_path="answer.py", version=version)
     if runner:
         provenance = entry["provenance"]
         assert isinstance(provenance, dict)
@@ -62,9 +63,12 @@ def _coding(
         "delivery": "native-instructions-skills-plugins-v1",
         "capabilities": {"subagents": True, "max_threads": 4, "max_depth": 1},
         "isolation": runtime_identity(),
-        "harness_version": "0.143.0",
+        "harness_version": (runner or {}).get("harness_version", "0.143.0"),
         "timeout_seconds": 1800,
-        "study": {"harness": "codex", "model": "gpt-6.1-sol", "reasoning": "medium", **(runner or {})},
+        "study": {
+            "harness": "codex", "model": "gpt-6.1-sol", "reasoning": "medium",
+            **{key: value for key, value in (runner or {}).items() if key != "harness_version"},
+        },
         "task_environment": {
             task.task_id: portable_native_identity(native_identity(task)) for task in tasks
         },
@@ -780,7 +784,7 @@ def test_saved_usage_is_revalidated_on_report_and_cache_reuse(
         assert json.loads(path.with_name("execution.json").read_text())["usage"] == recorded
 
 
-CLAUDE_RUNNER = {"harness": "claude", "model": "claude-opus-5-5"}
+CLAUDE_RUNNER = {"harness": "claude", "model": "claude-opus-5-5", "harness_version": "2.1.322"}
 
 
 @pytest.mark.parametrize("evidence", ["valid", "orphan"])
@@ -805,7 +809,7 @@ def test_saved_claude_usage_is_revalidated_on_report_and_cache_reuse(
         (area / "workspace/answer.py").write_text("answer = 1\n")
         execution = native_execution(
             area, kwargs["protocol"]["native_task_identity"],
-            answer_path="answer.py", timeout=1800, version="0.143.0",
+            answer_path="answer.py", timeout=1800, version=CLAUDE_RUNNER["harness_version"],
         )
         artifacts = area / "artifacts"
         (artifacts / "stdout.jsonl").write_text(stream)
@@ -814,7 +818,10 @@ def test_saved_claude_usage_is_revalidated_on_report_and_cache_reuse(
         if evidence == "orphan":
             (subagent,) = sessions.rglob("agent-*.meta.json")
             subagent.write_text(json.dumps({"toolUseId": "toolu_orphan"}))
-        launch = {"harness": "claude-cli", "requested_model": "claude-opus-5-5"}
+        launch = {
+            "harness": "claude-cli", "requested_model": "claude-opus-5-5",
+            "harness_version": CLAUDE_RUNNER["harness_version"],
+        }
         invocation = json.loads((artifacts / "invocation.json").read_text())
         (artifacts / "invocation.json").write_text(json.dumps({**invocation, **launch}))
         # Cache admission still binds the Codex delivery receipt until Claude launches are

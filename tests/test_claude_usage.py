@@ -1,14 +1,14 @@
-"""Claude coding token accounting (design D4) on calibrated 2.1.322 shapes.
+"""Claude coding token accounting (design D4) on 2.1.322 shapes.
 
-The fixtures keep the event structure, ids, models and usage numbers of the 2026-11-12 probe on
-CLI 2.1.322; every prompt, response and tool text is a placeholder. The probe compacted with a
-second `/compact` turn, so the `compaction` fixture drops that turn's init and the first result to
-take a coding attempt's one-prompt shape. That auto-compaction keeps one result is unverified.
+See fixtures/claude-2.1.322/coding/README.md: `plain`, `one-subagent` and `two-parallel` are
+calibrated probe runs; `compaction` is derived from a two-turn probe, since no single-prompt
+auto-compaction has been observed.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -22,6 +22,7 @@ from pluginbench.saved_usage import revalidate_usage
 FIXTURES = Path(__file__).parent / "fixtures/claude-2.1.322/coding"
 RUNNER = "claude-opus-5-5"
 MODEL = "claude-opus-5-5"
+VERSION = "2.1.322"
 
 
 def _copy(case: str, directory: Path) -> Path:
@@ -29,9 +30,10 @@ def _copy(case: str, directory: Path) -> Path:
     return directory
 
 
-def _validate(run: Path, runner: str = RUNNER) -> dict[str, Any]:
+def _validate(run: Path, runner: str = RUNNER, version: str = VERSION) -> dict[str, Any]:
     return claude_usage.coding_usage(
-        (run / "stream.jsonl").read_text(), run / "sessions", runner_model=runner
+        (run / "stream.jsonl").read_text(), run / "sessions", runner_model=runner,
+        cli_version=version,
     )
 
 
@@ -206,32 +208,52 @@ def test_the_primary_model_must_be_the_runner_model(tmp_path: Path) -> None:
     ]
 
 
-def _unqualified(run: Path) -> None:
-    def apply(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        events[0]["claude_code_version"] = "2.1.400"
-        return events
+def _init_version(version: str | None) -> Callable[[Path], None]:
+    def mutate(run: Path) -> None:
+        def apply(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            events[0].pop("claude_code_version")
+            if version is not None:
+                events[0]["claude_code_version"] = version
+            return events
 
-    _rewrite(run / "stream.jsonl", apply)
+        _rewrite(run / "stream.jsonl", apply)
+
+    return mutate
+
+
+@pytest.mark.parametrize("version", ["2.1.400", None])
+def test_the_launched_version_picks_the_rule_and_the_stream_must_agree(
+    tmp_path: Path, version: str | None
+) -> None:
+    # A stream claiming another version, or none, would otherwise get the one-sided rule.
+    run = _copy("plain", tmp_path / "run")
+    _init_version(version)(run)
+    _result(lambda result: result["modelUsage"][MODEL].update(inputTokens=500002))(run)
+    parsed = _validate(run)
+    assert parsed["usage"] is None and parsed["usage_accounting"]["rule"] == "equal"
+    assert "the init CLI version is missing or differs from the launched version" in (
+        parsed["usage_accounting"]["reasons"]
+    )
 
 
 def test_an_unqualified_version_compares_input_only_and_never_more_than_model_usage(
     tmp_path: Path,
 ) -> None:
     run = _copy("plain", tmp_path / "run")
-    _unqualified(run)
+    _init_version("2.1.400")(run)
     # Output counts are not compared, and transcribed input below modelUsage is reported.
     _assistant(_root, lambda message: message["usage"].update(output_tokens=1))(run)
     _assistant(_root, lambda message: message["usage"].update(cache_creation_input_tokens=15000))(
         run
     )
-    parsed = _validate(run)
+    parsed = _validate(run, version="2.1.400")
     accounting = parsed["usage_accounting"]
     assert accounting["reasons"] == [] and accounting["rule"] == "one-sided"
     assert accounting["cli_version"] == "2.1.400"
     assert accounting["untranscribed"] == {MODEL: {"input_tokens": 338}}
 
     _assistant(_root, _exceed)(run)
-    refused = _validate(run)
+    refused = _validate(run, version="2.1.400")
     assert refused["usage"] is None
     assert refused["usage_accounting"]["reasons"] == [f"transcripts exceed modelUsage for {MODEL}"]
 
@@ -245,6 +267,99 @@ def test_stderr_lines_in_the_harbor_capture_are_not_stream_events(tmp_path: Path
     assert "the stream has a malformed JSON event" in _validate(run)["usage_accounting"]["reasons"]
 
 
+def test_a_stream_line_that_hides_an_event_is_refused(tmp_path: Path) -> None:
+    # Prefixing a second result would otherwise drop it from the one-result rule.
+    run = _copy("plain", tmp_path / "run")
+    stream = run / "stream.jsonl"
+    (result,) = [line for line in stream.read_text().splitlines() if '"type": "result"' in line]
+    stream.write_text(stream.read_text() + "warning: " + result + "\n")
+    parsed = _validate(run)
+    assert parsed["usage"] is None
+    assert parsed["usage_accounting"]["reasons"] == [
+        "a stream line hides an event behind other output"
+    ]
+
+
+def _stream_compaction(run: Path) -> None:
+    def apply(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        boundary = {"type": "system", "subtype": "compact_boundary",
+                    "session_id": events[0]["session_id"]}
+        return [*events[:-1], boundary, events[-1]]
+
+    _rewrite(run / "stream.jsonl", apply)
+
+
+def _root_compaction_only(run: Path) -> None:
+    _rewrite(run / "stream.jsonl", lambda events: [
+        e for e in events if e.get("subtype") != "compact_boundary"
+    ])
+
+
+def test_compaction_counts_only_when_the_root_transcript_records_it(tmp_path: Path) -> None:
+    run = _copy("plain", tmp_path / "stream-only")
+    _stream_compaction(run)
+    _result(lambda result: result["modelUsage"][MODEL].update(inputTokens=500002))(run)
+    parsed = _validate(run)
+    assert parsed["usage"] is None and parsed["usage_accounting"]["rule"] == "equal"
+    assert parsed["usage_accounting"]["reasons"] == [
+        "the stream and the root transcript disagree on compaction",
+        f"transcripts differ from modelUsage for {MODEL}",
+    ]
+    run = _copy("compaction", tmp_path / "root-only")
+    _root_compaction_only(run)
+    parsed = _validate(run)
+    assert "the stream and the root transcript disagree on compaction" in (
+        parsed["usage_accounting"]["reasons"]
+    )
+
+
+def test_only_the_runner_model_may_have_untranscribed_usage(tmp_path: Path) -> None:
+    run = _copy("compaction", tmp_path / "run")
+    _result(lambda result: result["modelUsage"].update({"claude-haiku-5-5": {
+        "inputTokens": 50000, "outputTokens": 0,
+        "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0,
+    }}))(run)
+    parsed = _validate(run)
+    assert parsed["usage"] is None
+    assert parsed["usage_accounting"]["reasons"] == [
+        "transcripts differ from modelUsage for claude-haiku-5-5"
+    ]
+
+
+def test_the_stream_agent_calls_must_match_the_transcripts(tmp_path: Path) -> None:
+    # Deleting a subagent and its call from the transcripts leaves the stream's call behind.
+    run = _copy("one-subagent", tmp_path / "run")
+    _no_subagent(run)
+    _rewrite(_root(run), lambda events: [
+        e for e in events
+        if not any(block.get("name") == "Agent" for block in _content(e))
+    ])
+    parsed = _validate(run)
+    assert parsed["usage"] is None
+    assert "the stream's Agent calls differ from the transcripts'" in (
+        parsed["usage_accounting"]["reasons"]
+    )
+
+
+def _content(event: dict[str, Any]) -> list[dict[str, Any]]:
+    content = event.get("message", {}).get("content")
+    return content if isinstance(content, list) else []
+
+
+def test_a_transcript_message_without_usage_is_not_a_model_call(tmp_path: Path) -> None:
+    run = _copy("plain", tmp_path / "run")
+    synthetic = {"type": "assistant", "sessionId": _root(run).stem, "message": {
+        "id": "msg_synthetic", "model": "<synthetic>", "role": "assistant",
+        "content": [{"type": "text", "text": "<text>"}],
+        "usage": dict.fromkeys(
+            ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+             "output_tokens"), 0,
+        ),
+    }}
+    _rewrite(_root(run), lambda events: [*events, synthetic])
+    assert _validate(run)["usage_accounting"]["reasons"] == []
+
+
 def _saved(case: str, directory: Path, **execution: Any) -> Path:
     """A saved Claude attempt in the layout Harbor and `_native_evidence` leave behind."""
     agent = directory / "artifacts/harbor/trial/agent"
@@ -254,7 +369,7 @@ def _saved(case: str, directory: Path, **execution: Any) -> Path:
     stream = (FIXTURES / case / "stream.jsonl").read_text()
     receipt = directory / "execution.json"
     receipt.write_text(json.dumps({
-        "launch": {"harness": "claude-cli", "requested_model": RUNNER},
+        "launch": {"harness": "claude-cli", "requested_model": RUNNER, "harness_version": VERSION},
         "usage": claude.parse_events(stream, [])["usage"],
         **execution,
     }))
@@ -291,8 +406,14 @@ def test_a_saved_claude_run_falls_back_to_the_harbor_capture(tmp_path: Path) -> 
             "revalidated usage disagrees with recorded usage",
         ),
         (
-            {"launch": {"harness": "claude-cli", "requested_model": "claude-sonnet-5-5"}},
+            {"launch": {"harness": "claude-cli", "requested_model": "claude-sonnet-5-5",
+                        "harness_version": VERSION}},
             "the primary model differs from the runner model",
+        ),
+        (
+            {"launch": {"harness": "claude-cli", "requested_model": RUNNER,
+                        "harness_version": "2.1.400"}},
+            "the init CLI version is missing or differs from the launched version",
         ),
         (
             {"native_treatment": {"hooks": {"hooks": [{"event": "SessionStart"}]}}},
@@ -318,3 +439,15 @@ def test_a_saved_claude_run_with_a_broken_transcript_set_is_refused(tmp_path: Pa
     assert "an Agent tool call has no subagent transcript" in (
         revalidated["usage_validation"]["reasons"]
     )
+
+
+def test_the_fixtures_carry_only_synthetic_ids_and_no_cost() -> None:
+    real = re.compile(
+        r"msg_[A-Za-z0-9]{20,}|toolu_[A-Za-z0-9]{20,}|total_cost_usd"
+        r"|(?!00000000-)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+        r"|a(?!0{8})[0-9a-f]{16}"
+    )
+    for path in FIXTURES.rglob("*"):
+        assert not real.search(str(path.relative_to(FIXTURES))), path
+        if path.is_file():
+            assert not real.search(path.read_text()), path

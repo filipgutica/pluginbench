@@ -4,6 +4,10 @@ The headline is `result.modelUsage`, which counts subagents. The cross-check is 
 transcript Claude writes under `projects/`: one root transcript, `<session>.jsonl`, and one
 `<session>/subagents/agent-<id>.jsonl` per subagent. A subagent's `agent-<id>.meta.json` names
 the `Agent` tool call that started it (`toolUseId`). Any failed rule leaves usage unvalidated.
+
+The stream is the least durable record: a rule never relaxes on the stream's word alone. The
+launched CLI version picks the rule, and compaction counts only when the root transcript
+records it too.
 """
 
 from __future__ import annotations
@@ -21,10 +25,13 @@ _MESSAGE_USAGE = (
 )
 
 
-def coding_usage(stream: str, sessions: Path, *, runner_model: str) -> dict[str, Any]:
+def coding_usage(
+    stream: str, sessions: Path, *, runner_model: str, cli_version: str
+) -> dict[str, Any]:
     """Usage and its accounting; usage is None when any accounting rule fails.
 
-    `stream` is the CLI's stream-json output, `sessions` its `CLAUDE_CONFIG_DIR`.
+    `stream` is the CLI's stream-json output, `sessions` its `CLAUDE_CONFIG_DIR`, and
+    `cli_version` the version the attempt was launched and checked with.
     """
     reasons: list[str] = []
     events = _stream_events(stream, reasons)
@@ -46,15 +53,22 @@ def coding_usage(stream: str, sessions: Path, *, runner_model: str) -> dict[str,
     if init.get("model") != runner_model:
         reasons.append("the primary model differs from the runner model")
     version = claude.observed_cli_version(inits)
+    if version != cli_version:
+        reasons.append("the init CLI version is missing or differs from the launched version")
+    transcripts = _transcript_usage(sessions / "projects", session, reasons)
+    transcribed = transcripts["models"]
+    if _agent_calls(events) != transcripts["calls"]:
+        reasons.append("the stream's Agent calls differ from the transcripts'")
     compacted = any(
         e.get("type") == "system" and e.get("subtype") == "compact_boundary" for e in events
     )
-    if version not in claude.QUALIFIED_VERSIONS:
+    if compacted != transcripts["compacted"]:
+        reasons.append("the stream and the root transcript disagree on compaction")
+    if cli_version not in claude.QUALIFIED_VERSIONS:
         rule = "one-sided"
     else:
-        rule = "compaction" if compacted else "equal"
+        rule = "compaction" if compacted and transcripts["compacted"] else "equal"
 
-    transcribed, depth = _transcript_usage(sessions / "projects", session, reasons)
     per_model: dict[str, dict[str, int]] = {}
     untranscribed: dict[str, dict[str, int]] = {}
     for model in sorted(set(model_usage or {}) | set(transcribed)):
@@ -87,6 +101,11 @@ def coding_usage(stream: str, sessions: Path, *, runner_model: str) -> dict[str,
             continue
         # Per-step output counts are placeholders on unqualified versions; compare input only.
         compared = excess if rule == "compaction" else {"input_tokens": excess["input_tokens"]}
+        if model != runner_model:
+            # Only the main loop compacts; any other model is transcribed in full.
+            if any(compared.values()):
+                reasons.append(f"transcripts differ from modelUsage for {model}")
+            continue
         if any(value < 0 for value in compared.values()):
             reasons.append(f"transcripts exceed modelUsage for {model}")
         if any(value > 0 for value in compared.values()):
@@ -104,7 +123,7 @@ def coding_usage(stream: str, sessions: Path, *, runner_model: str) -> dict[str,
             "per_model": per_model,
             "untranscribed": untranscribed,
             # Report only: nesting is neither limited nor refused here.
-            "observed_subagent_depth": depth,
+            "observed_subagent_depth": transcripts["depth"],
         },
     }
 
@@ -114,6 +133,8 @@ def _stream_events(stream: str, reasons: list[str]) -> list[dict[str, Any]]:
     for line in stream.splitlines():
         # Harbor tees stderr into the same file; its warning lines are not stream events.
         if not line.startswith("{"):
+            if '{"type"' in line:
+                reasons.append("a stream line hides an event behind other output")
             continue
         try:
             event = json.loads(line)
@@ -123,6 +144,25 @@ def _stream_events(stream: str, reasons: list[str]) -> list[dict[str, Any]]:
         if isinstance(event, dict):
             events.append(event)
     return events
+
+
+def _agent_calls(events: list[dict[str, Any]]) -> set[str]:
+    """The ids of the Agent tool calls in assistant messages."""
+    calls: set[str] = set()
+    for event in events:
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if event.get("type") != "assistant" or not isinstance(content, list):
+            continue
+        calls.update(
+            block["id"]
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "tool_use"
+            and block.get("name") == SUBAGENT_TOOL
+            and isinstance(block.get("id"), str)
+        )
+    return calls
 
 
 def _count(value: object) -> bool:
@@ -140,31 +180,36 @@ def _model_usage(value: object) -> dict[str, dict[str, int]] | None:
     return counts
 
 
-def _transcript_usage(
-    projects: Path, session: object, reasons: list[str]
-) -> tuple[dict[str, dict[str, int]], int | None]:
-    """Per-model usage of one session's transcripts and the deepest subagent's depth."""
+def _transcript_usage(projects: Path, session: object, reasons: list[str]) -> dict[str, Any]:
+    """Per-model usage of one session's transcripts, their Agent calls, whether the root
+    transcript records a compaction, and the deepest subagent's depth."""
+    found: dict[str, Any] = {"models": {}, "calls": set(), "compacted": False, "depth": None}
     files = sorted(projects.rglob("*.jsonl")) if projects.is_dir() else []
     roots = [path for path in files if len(path.relative_to(projects).parts) == 2]
     subagents = [path for path in files if path not in roots]
     if len(roots) != 1:
         reasons.append("the sessions need exactly one root transcript")
-        return {}, None
+        return found
     root = roots[0]
     if root.stem != session:
         reasons.append("the root transcript is not the stream's session")
-        return {}, None
+        return found
     expected = root.with_suffix("") / "subagents"
     if any(path.parent != expected or not path.name.startswith("agent-") for path in subagents):
         reasons.append("a transcript lies outside its session's subagents directory")
-        return {}, None
+        return found
     # Each transcript's Agent calls, and the transcript that answers each call.
     calls: dict[Path, set[str]] = {}
     answers: dict[str, Path] = {}
     messages: dict[str, tuple[str, dict[str, int]]] = {}
     for path in [root, *subagents]:
-        calls[path] = _read_transcript(path, session, messages, reasons)
+        events = _read_transcript(path, session, messages, reasons)
+        calls[path] = _agent_calls(events)
         if path == root:
+            found["compacted"] = any(
+                e.get("type") == "system" and e.get("subtype") == "compact_boundary"
+                for e in events
+            )
             continue
         try:
             meta = json.loads(path.with_suffix(".meta.json").read_text())
@@ -175,14 +220,13 @@ def _transcript_usage(
             reasons.append("a subagent transcript has no matching Agent tool call")
             continue
         answers[call] = path
-    made = set[str]().union(*calls.values())
-    if made - set(answers):
+    found["calls"] = set[str]().union(*calls.values())
+    if found["calls"] - set(answers):
         reasons.append("an Agent tool call has no subagent transcript")
-    if set(answers) - made:
+    if set(answers) - found["calls"]:
         reasons.append("a subagent transcript has no matching Agent tool call")
-    models: dict[str, dict[str, int]] = {}
     for model, usage in messages.values():
-        totals = models.setdefault(model, dict.fromkeys(_MESSAGE_USAGE, 0))
+        totals = found["models"].setdefault(model, dict.fromkeys(_MESSAGE_USAGE, 0))
         for key in _MESSAGE_USAGE:
             totals[key] += usage[key]
     parent = {
@@ -198,7 +242,8 @@ def _transcript_usage(
         if caller in depths and path not in depths
     }:
         depths.update(ready)
-    return models, max(depths.values())
+    found["depth"] = max(depths.values())
+    return found
 
 
 def _read_transcript(
@@ -206,9 +251,9 @@ def _read_transcript(
     session: object,
     messages: dict[str, tuple[str, dict[str, int]]],
     reasons: list[str],
-) -> set[str]:
-    """Record each assistant message's usage once; return the Agent calls the file makes."""
-    calls = set()
+) -> list[dict[str, Any]]:
+    """Record each assistant message's usage once; return the file's events."""
+    events = []
     for line in path.read_text(errors="replace").splitlines():
         if not line.strip():
             continue
@@ -219,31 +264,25 @@ def _read_transcript(
             continue
         if not isinstance(event, dict):
             continue
+        events.append(event)
         if "sessionId" in event and event["sessionId"] != session:
             reasons.append(f"transcript {path.name} belongs to another session")
         message = event.get("message")
         if event.get("type") != "assistant" or not isinstance(message, dict):
             continue
         usage, model, key = message.get("usage"), message.get("model"), message.get("id")
-        if (
-            not isinstance(key, str)
-            or not isinstance(model, str)
-            or not isinstance(usage, dict)
-            or not all(_count(usage.get(k)) for k in _MESSAGE_USAGE)
-        ):
+        if not isinstance(usage, dict) or not all(_count(usage.get(k)) for k in _MESSAGE_USAGE):
             reasons.append(f"transcript {path.name} has a message without well-typed usage")
+            continue
+        if not any(usage[k] for k in _MESSAGE_USAGE):
+            # A message the CLI writes itself, such as `<synthetic>` after an API error,
+            # made no model call.
+            continue
+        if not isinstance(key, str) or not isinstance(model, str):
+            reasons.append(f"transcript {path.name} has a message without an id or model")
             continue
         entry = (model, {k: usage[k] for k in _MESSAGE_USAGE})
         # One API call may span several lines (one per content block), or several files.
         if messages.setdefault(key, entry) != entry:
             reasons.append("a message id repeats with different usage")
-        content = message.get("content")
-        for block in content if isinstance(content, list) else []:
-            if (
-                isinstance(block, dict)
-                and block.get("type") == "tool_use"
-                and block.get("name") == SUBAGENT_TOOL
-                and isinstance(block.get("id"), str)
-            ):
-                calls.add(block["id"])
-    return calls
+    return events

@@ -82,4 +82,5 @@ def _claude_usage(artifacts: Path, launch: dict[str, Any]) -> dict[str, Any]:
         stdout.read_text(errors="replace") if stdout.is_file() else "",
         agent / "sessions",
         runner_model=str(launch.get("requested_model")),
+        cli_version=str(launch.get("harness_version")),
     )
