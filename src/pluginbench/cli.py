@@ -658,12 +658,15 @@ def judge_run(
 @judge_app.command("tally")
 def judge_tally(
     directory: Path = typer.Argument(..., help="A directory whose judge calls are complete."),
+    require_bound: bool = typer.Option(
+        False, help="Refuse legacy verdicts without input bindings."
+    ),
 ) -> None:
     """Unblind with the key and score each pair; writes tally.json; no model calls."""
     from pluginbench.judge import format_tally, tally
 
     try:
-        result = tally(directory)
+        result = tally(directory, require_bound=require_bound)
         (directory / "tally.json").write_text(json.dumps(result, indent=2) + "\n")
     except (OSError, ValueError, KeyError) as exc:
         _error(exc)

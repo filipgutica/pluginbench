@@ -401,19 +401,28 @@ pluginbench judge tally judging/r3
 - `task-N.brief.md` is the prompt, and `key.json` maps each side to its arm, attempt, and correctness. Both stay outside the task folders.
 
 `run` makes one read-only call per judge and task. It uses the same Codex or Claude launch and identity checks as reviews.
+
 - Each call's sandbox can read only a fresh copy of `task-N/`, with the source copied in. The key, arm names, traces, final messages, and verifier results are never inside it.
 - Raw evidence goes to `results/<judge>/task-N/call-K/`.
 - The verdict is saved to `results/<judge>/task-N.json` only after the model, the effort, the read-only trace, and the pair numbers check out.
+- Each saved verdict has a `binding` of SHA-256 digests: the presented A/B diffs, starting source, brief, instruction, review standard, response schema, judge spec, prepare seed, and key. Judge specs (harness, model, effort) stay outside the workspace in `judge-specs/<judge>.json`. Inputs changed during a call prevent its verdict from being saved.
+- `run` checks saved bindings before reusing a verdict. A mismatch requires a new prepared directory; it cannot silently reuse a stale verdict.
 - A failed call leaves no verdict. `run` exits 2, and running it again retries only the missing calls.
 - Every pair goes to the judges, including pairs that correctness will decide, so the brief reveals nothing about correctness.
 - The brief asks for JSON in the final message. A hand-run prompt that asks judges to write a file needs that one change.
 
 `tally` unblinds the verdicts with the key and writes `tally.json` and a text table.
+
 - If exactly one side passed, that side wins without a vote. A pass is `pass` or an overlap pass. Unknown correctness does not count as a pass.
 - Otherwise, the side that more than half of the judges prefer wins. Anything else, including ties, scores half to each side.
 - It reports weighted wins, correctness-decided pairs, judged pairs, and per-task results.
 - For each judge, it reports the side-A rate and its agreement. Agreement is the share of pairs where the judge's vote equals the verdict that more than half of the other judges gave.
-- Both judge measures cover every pair, including correctness-decided ones.
+- Side-A rate is A votes divided by all pairs. Ties enter the denominator and add zero A votes. Both measures include correctness-decided pairs. An `unable` verdict blocks tally, so it never enters either measure.
+- With at least 10 pairs, a side-A rate outside 0.2–0.8 prints `FLAG: position bias`. The endpoints are inside the band. Below 10 pairs, it prints `sample too small to tell`. JSON records `judge_stats.<judge>.position_bias` as `flagged`, `within_band`, or `too_small`.
+- Per-judge token usage sums all recorded calls, including failed attempts before a successful retry. It reads each call's `host-evidence.json`, or parses saved `stdout.jsonl` and native traces for older calls. The text total adds input and output tokens; cached input and reasoning output are subsets and are not added again.
+- JSON records `judge_stats.<judge>.usage`: `tokens`, `known_tokens`, `calls`, and `unknown_calls`. If any call lacks complete input/output usage, `tokens` is `null` and the text says `unknown`. `known_tokens` retains available usage, or is `null` when none is known. Optional token counters are summed only when every known call records them. A verdict without any call evidence counts as one unknown call.
+- Tally refuses a changed binding and names the verdict file and mismatching field. This includes key replacement after re-preparing the same inputs.
+- Legacy verdicts without bindings remain accepted. Each prints `unbound verdict (written before binding)`. JSON counts those files in `unbound` and lists their paths in `unbound_verdicts`. Use `pluginbench judge tally judging/r3 --require-bound` to refuse them. A legacy verdict cannot prove which inputs were judged; rerun in a new prepared directory to obtain bound verdicts.
 - It refuses to tally while any judge lacks a verdict for any task. That includes every judge `run` was asked for, even one that never started.
 
 ## Development
