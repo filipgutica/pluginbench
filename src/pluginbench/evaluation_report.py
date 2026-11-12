@@ -99,6 +99,7 @@ OBSERVATION_FIELDS = (
     "provenance",
 )
 PROVENANCE_FIELDS = (
+    "usage_validation",
     "language",
     "analyzers",
     "metric_settings",
@@ -909,7 +910,7 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         )
     if origins:
         limitations.append(
-            f"{len(origins)} vanilla attempts were reused from earlier evaluations. Their tokens and time are original observations, not fresh independent samples. Grading, measurements, and reviews run again."
+            f"{len(origins)} vanilla attempts were reused from earlier evaluations. Their time and raw token evidence are original observations, not fresh independent samples. Codex tokens are re-validated from saved evidence; unavailable usage stays unknown. Grading, measurements, and reviews run again."
         )
     if {"cyclomatic", "cognitive"}.intersection(selected):
         limitations.append(

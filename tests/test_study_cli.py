@@ -2880,21 +2880,35 @@ def test_an_earlier_build_refuses_the_report_of_a_run_with_listed_pairs(
     }
 
 
-def test_an_earlier_build_writes_the_same_report_for_a_run_without_listed_pairs(
+def test_an_earlier_build_writes_the_same_non_token_report_without_listed_pairs(
     checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     export = _exported(_BEFORE_LIST, tmp_path)
+    # Token reports now revalidate saved evidence; other measures keep their old projection.
+    raw = yaml.safe_load(checkable["path"].read_text())
+    raw["measurements"].remove("tokens")
+    checkable["path"].write_text(yaml.safe_dump(raw))
     root, result, _, _ = _run_checkable(checkable, monkeypatch)
     assert result.exit_code == 0, result.stderr
     assert evaluation._load_selection(root)["not_measured"] == []
     revision = root / "evidence/observer-revisions/measurements/revision.json"
     assert json.loads(revision.read_text())["schema_version"] == 2
-    names = ("results.json", "results.csv", "report.html")
-    ours = {name: (root / "report" / name).read_bytes() for name in names}
+    ours = json.loads((root / "report/results.json").read_text())
+    csv = (root / "report/results.csv").read_bytes()
 
     assert _old_report(export, root, tmp_path).startswith("exit: 0")
 
-    assert {name: (root / "report" / name).read_bytes() for name in names} == ours
+    earlier = json.loads((root / "report/results.json").read_text())
+    for current, old in zip(ours["attempts"], earlier["attempts"], strict=True):
+        assert current["execution"].pop("usage_accounting") == {
+            "status": "incomplete",
+            "reasons": ["legacy usage has no saved session evidence to validate"],
+        }
+        assert current["execution"].pop("partial_usage") == []
+        assert old["execution"].pop("usage_accounting") is None
+        assert old["execution"].pop("partial_usage") is None
+    assert ours == earlier
+    assert (root / "report/results.csv").read_bytes() == csv
 
 
 def test_report_on_a_run_stopped_during_coding_covers_the_finished_attempts_and_says_so(

@@ -6,6 +6,9 @@ Metric names below are the exact strings accepted in a gate's `metrics` list.
 Definitions and units come from `METRIC_GUIDE` in `src/pluginbench/assessment_charts.py`.
 Point gates choose their direction; the code defines no universal better direction for each metric.
 Paired token bounds require both Input tokens and Output tokens, with `direction: lower`.
+Saved Codex usage is re-validated on cache reuse and report generation. Invalid, disagreeing,
+or legacy stdout-only evidence makes tokens unavailable; token gates treat it as unknown.
+Token provenance retains original figures and recording time in `usage_validation`.
 Higher coverage or lower cost alone does not establish a better solution.
 Correctness gates use `correctness: passes` or `correctness: unknown` instead of metric names.
 See [running evaluations](running-evaluations.md#compare-runs) for gate statistics and bounds.

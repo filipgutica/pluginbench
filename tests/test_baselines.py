@@ -545,7 +545,12 @@ def test_reuse_regrades_without_replaying_models_and_retains_failures(
         (row for row in records if row["arm"] == "baseline"), key=lambda row: row["attempt"]
     )
     assert baseline[0]["stages"][0]["work"]["tokens"] is None
-    assert baseline[1]["stages"][0]["work"]["tokens"] == {"input_tokens": 13}
+    assert baseline[1]["stages"][0]["work"]["tokens"] is None
+    validation = json.loads(
+        (second / "attempts" / baseline[1]["id"] / "handoff/execution-current.json").read_text()
+    )["usage_validation"]
+    assert validation["recorded_usage"] == {"input_tokens": 13}
+    assert validation["status"] == "unavailable"
     correctness = second / baseline[0]["stages"][0]["correctness"]["path"]
     assert json.loads(correctness.read_text())["checks"]["native_completion"] is False
     # Origins name their cohort relative to the cache root, never the origin run's path.
@@ -647,3 +652,113 @@ def test_an_attempt_that_ran_with_an_updated_docker_cli_is_still_cached(tmp_path
     _publish(first, records)
     second, _, _ = _cohort(tmp_path / "second", path)
     assert _hits(second) == ["hit", "hit"]
+
+
+@pytest.mark.parametrize("evidence", ["valid", "sessions", "ordinal", "subset", "disagrees", "legacy"])
+@pytest.mark.parametrize("boundary", ["report", "reuse"])
+def test_saved_usage_is_revalidated_on_report_and_cache_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, evidence: str, boundary: str
+) -> None:
+    from test_codex import native_session, stream
+
+    calls = []
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: runtime_identity())
+    monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
+    monkeypatch.setattr(
+        harbor_backend, "regrade_native",
+        lambda **kwargs: {"verifier_result": {"rewards": {"reward": 1}}, "exception_info": None},
+    )
+    recorded = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+    def invoke(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        area = kwargs["area"]
+        (area / "workspace/answer.py").write_text("answer = 1\n")
+        execution = native_execution(
+            area, kwargs["protocol"]["native_task_identity"],
+            answer_path="answer.py", timeout=1800, version="0.143.0",
+        )
+        artifacts = area / "artifacts"
+        counts = dict(recorded)
+        if evidence == "subset":
+            counts["cached_input_tokens"] = 11
+        if evidence == "disagrees":
+            counts.update(input_tokens=11, total_tokens=16)
+        (artifacts / "stdout.jsonl").write_text(
+            stream({"type": "turn.completed", "usage": counts})
+        )
+        if evidence != "legacy":
+            events = [json.loads(line) for line in native_session("root", [counts]).splitlines()]
+            if evidence == "ordinal":
+                for index, event in enumerate(events):
+                    event["ordinal"] = index + (1 if index > 1 else 0)
+            trace = artifacts / "host-trace-0.jsonl"
+            if evidence == "sessions":
+                trace = artifacts / "harbor/trial/agent/sessions/rollout.jsonl"
+                trace.parent.mkdir(parents=True)
+                (trace.parent.parent / "codex.txt").write_text(
+                    (artifacts / "stdout.jsonl").read_text()
+                )
+                (artifacts / "stdout.jsonl").unlink()
+            trace.write_text(stream(*events))
+        return execution
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
+    one = _study(tmp_path / "one")
+    cache = tmp_path / "cache"
+    first = study.run_study(one, tmp_path / "first", baseline_cache=cache,
+                            baseline_identity=_coding(one.tasks))
+    originals = {
+        path: path.read_bytes()
+        for path in first.glob("attempts/*/handoff/execution.json")
+    }
+    # Rebuilding a report must project the same result without changing its evidence.
+    study.report_study(first)
+    root = first
+    if boundary == "reuse":
+        two = _study(tmp_path / "two", guidance="another")
+        root = study.run_study(two, tmp_path / "second", baseline_cache=cache,
+                               baseline_identity=_coding(two.tasks))
+        assert len(calls) == 6  # Two cached baselines, no model replay.
+        manifest = json.loads((root / "assessment-input.json").read_text())
+        for row in manifest["records"]:
+            if row["arm"] == "baseline":
+                assert row["stages"][0]["work"]["tokens"] == (
+                    recorded if evidence in {"valid", "sessions"} else None
+                )
+    expected_reason = {
+        "ordinal": "noncontiguous rollout ordinals",
+        "subset": "invalid cumulative usage",
+        "disagrees": "disagrees with recorded usage",
+        "legacy": "no saved session evidence",
+    }
+    report = json.loads((root / "report/assessment-report.json").read_text())
+    for row in report["attempts"]:
+        work = row["stages"][0]["work"]
+        assert work["tokens"] == (recorded if evidence in {"valid", "sessions"} else None)
+        validation = work["usage_validation"]
+        assert validation["recorded_usage"] == recorded
+        assert validation["recorded_at"]
+        if evidence in {"valid", "sessions"}:
+            assert work["tokens"] == recorded
+            assert validation["status"] == "validated"
+        else:
+            assert work["tokens"] is None
+            assert validation["status"] == "unavailable"
+            assert any(expected_reason[evidence] in reason for reason in validation["reasons"])
+    from pluginbench.evaluation_report import evaluation_data
+
+    results = evaluation_data(report, {"measurements": ["tokens"]})
+    observations = results["observations"]
+    assert isinstance(observations, list)
+    token_rows = [row for row in observations if row["metric"] == "Input tokens"]
+    assert all(row["value"] == (10 if evidence in {"valid", "sessions"} else None)
+               for row in token_rows)
+    assert all(row["provenance"]["usage_validation"]["recorded_usage"] == recorded
+               for row in token_rows)
+    if evidence in expected_reason:
+        assert all(expected_reason[evidence] in row["reason"] for row in token_rows)
+    assert all(path.read_bytes() == content for path, content in originals.items())
+    # Imported execution receipts remain the original, even after regrading.
+    for path in root.glob("attempts/*/handoff/execution-current.json"):
+        assert json.loads(path.with_name("execution.json").read_text())["usage"] == recorded

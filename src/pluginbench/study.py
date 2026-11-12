@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from pluginbench import codex, harbor_backend, submissions, trial_containers
 from pluginbench.codex_events import failed_before_first_turn
+from pluginbench.saved_usage import revalidate_usage
 from pluginbench.harbor_backend import binary_native_reward as _binary_native_reward
 from pluginbench.treatments import (
     Treatment, resolve_treatment, freeze_treatment, treatment_inventory,
@@ -767,6 +768,8 @@ def _checkpoint(
     for record in manifest["records"]:
         for stage in record["stages"]:
             execution = root / "attempts" / record["id"] / stage["id"] / "execution.json"
+            if execution.with_name("execution-current.json").is_file():
+                execution = execution.with_name("execution-current.json")
             if stage["snapshot"] is None and execution.is_file():
                 stage["work"] = _work(json.loads(execution.read_text()))
     AssessmentInput.model_validate(manifest)
@@ -786,6 +789,8 @@ def _checkpoint(
             target = root / "attempts" / record["id"] / stage["id"]
             progress = root / "progress" / record["id"] / stage["id"]
             execution = target / "execution.json"
+            if (target / "execution-current.json").is_file():
+                execution = target / "execution-current.json"
             if not execution.is_file():
                 execution = progress / f"execution.{states[record['id']]}.json"
                 _write(execution, {"attempt_status": states[record["id"]], "usage": None})
@@ -1373,6 +1378,9 @@ def _run_attempts(
                     for stage in record["stages"]:
                         target = attempt_dir / stage["id"]
                         execution = json.loads((target / "execution.json").read_text())
+                        if frozen.recipe.harness == "codex":
+                            execution = revalidate_usage(execution, target / "execution.json")
+                        stage["work"] = _work(execution)
                         if stage["snapshot"] is not None:
                             regraded = harbor_backend.regrade_native(
                                 artifacts=target / "artifacts",
@@ -1388,7 +1396,6 @@ def _run_attempts(
                                 else None,
                             )
                             unmoved()
-                            _write(target / "execution.json", execution)
                             verified = _verify_snapshot(
                                 root=root,
                                 snapshot=root / stage["snapshot"]["path"],
@@ -1399,6 +1406,8 @@ def _run_attempts(
                                 execution=execution,
                             )
                             stage.update(verified)
+                        unmoved()
+                        _write(target / "execution-current.json", execution)
                     completed = True
                     return
                 if cancelled.is_set():
@@ -1750,7 +1759,14 @@ def report_study(
         )
         executions = []
         for stage in attempt["stages"]:
-            execution = _bound_document(root, run["executions"][attempt["id"]][stage["id"]])
+            reference = run["executions"][attempt["id"]][stage["id"]]
+            execution = _bound_document(root, reference)
+            if plan.get("host", "codex") == "codex":
+                execution = revalidate_usage(execution, _bound_path(root, reference))
+                stage["work"] = {
+                    **_work(execution),
+                    "usage_validation": execution["usage_validation"],
+                }
             executions.append(execution)
             verifier_result = (
                 run.get("verifier_results", {}).get(attempt["id"], {}).get(stage["id"])
@@ -1805,6 +1821,7 @@ def report_study(
                         "exit_code",
                         "partial_usage",
                         "usage_accounting",
+                        "usage_validation",
                         "actual_descendant_models",
                         "native_treatment",
                         "native_session_usage",
