@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 import yaml
 
-from pluginbench import baselines, harbor_backend, study, submissions
+from pluginbench import baselines, harbor_backend, native_treatments, study, submissions
 from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.datasets import TaskSpec, native_identity, portable_native_identity
 from native_support import (
@@ -24,9 +24,17 @@ def synthetic_admission(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(submissions, "reviewed_contract", synthetic_contract)
 
 
-def _study(directory: Path, *, guidance: str = "candidate") -> study.ResolvedStudy:
+def _study(
+    directory: Path, *, guidance: str = "candidate", runner: dict[str, str] | None = None
+) -> study.ResolvedStudy:
     directory.mkdir()
     entry = task_entry(directory, "answer", answer_path="answer.py", version="0.143.0")
+    if runner:
+        provenance = entry["provenance"]
+        assert isinstance(provenance, dict)
+        identity = json.loads(provenance["native_task_identity"])
+        identity["toolchain_identity"]["harness"] = runner["harness"]
+        provenance["native_task_identity"] = json.dumps(identity)
     (directory / "tasks.yaml").write_text(yaml.safe_dump({"schema_version": 1, "tasks": [entry]}))
     (directory / "guidance.md").write_text(f"Follow {guidance}.\n")
     recipe = directory / "recipe.yaml"
@@ -40,20 +48,23 @@ def _study(directory: Path, *, guidance: str = "candidate") -> study.ResolvedStu
                 "harness_version": "0.143.0",
                 "timeout_seconds": 1800,
                 "guidance": {guidance: ["guidance.md"]},
+                **(runner or {}),
             }
         )
     )
     return study.load_study(recipe)
 
 
-def _coding(tasks: tuple[TaskSpec, ...]) -> dict[str, object]:
+def _coding(
+    tasks: tuple[TaskSpec, ...], runner: dict[str, str] | None = None
+) -> dict[str, object]:
     return {
         "delivery": "native-instructions-skills-plugins-v1",
         "capabilities": {"subagents": True, "max_threads": 4, "max_depth": 1},
         "isolation": runtime_identity(),
         "harness_version": "0.143.0",
         "timeout_seconds": 1800,
-        "study": {"harness": "codex", "model": "gpt-6.1-sol", "reasoning": "medium"},
+        "study": {"harness": "codex", "model": "gpt-6.1-sol", "reasoning": "medium", **(runner or {})},
         "task_environment": {
             task.task_id: portable_native_identity(native_identity(task)) for task in tasks
         },
@@ -767,3 +778,84 @@ def test_saved_usage_is_revalidated_on_report_and_cache_reuse(
     # Imported execution receipts remain the original, even after regrading.
     for path in root.glob("attempts/*/handoff/execution-current.json"):
         assert json.loads(path.with_name("execution.json").read_text())["usage"] == recorded
+
+
+CLAUDE_RUNNER = {"harness": "claude", "model": "claude-opus-5-5"}
+
+
+@pytest.mark.parametrize("evidence", ["valid", "orphan"])
+@pytest.mark.parametrize("boundary", ["report", "reuse"])
+def test_saved_claude_usage_is_revalidated_on_report_and_cache_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, evidence: str, boundary: str
+) -> None:
+    from pluginbench import claude
+
+    fixture = Path(__file__).parent / "fixtures/claude-2.1.322/coding/one-subagent"
+    stream = (fixture / "stream.jsonl").read_text()
+    recorded = claude.parse_events(stream, [])["usage"]
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: runtime_identity())
+    monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
+    monkeypatch.setattr(
+        harbor_backend, "regrade_native",
+        lambda **kwargs: {"verifier_result": {"rewards": {"reward": 1}}, "exception_info": None},
+    )
+
+    def invoke(**kwargs: Any) -> dict[str, Any]:
+        area = kwargs["area"]
+        (area / "workspace/answer.py").write_text("answer = 1\n")
+        execution = native_execution(
+            area, kwargs["protocol"]["native_task_identity"],
+            answer_path="answer.py", timeout=1800, version="0.143.0",
+        )
+        artifacts = area / "artifacts"
+        (artifacts / "stdout.jsonl").write_text(stream)
+        sessions = artifacts / "harbor/trial/agent/sessions"
+        shutil.copytree(fixture / "sessions", sessions)
+        if evidence == "orphan":
+            (subagent,) = sessions.rglob("agent-*.meta.json")
+            subagent.write_text(json.dumps({"toolUseId": "toolu_orphan"}))
+        launch = {"harness": "claude-cli", "requested_model": "claude-opus-5-5"}
+        invocation = json.loads((artifacts / "invocation.json").read_text())
+        (artifacts / "invocation.json").write_text(json.dumps({**invocation, **launch}))
+        # Cache admission still binds the Codex delivery receipt until Claude launches are
+        # wired; shape it for this model so the second run reaches the reuse boundary.
+        treatment = execution["native_treatment"]
+        assert isinstance(treatment, dict)
+        treatment["effective_config"] = treatment["effective_config"].replace(
+            "gpt-6.1-sol", "claude-opus-5-5"
+        )
+        (artifacts / "native-treatment.json").write_text(json.dumps(treatment))
+        execution.update(usage=recorded, launch=launch, actual_primary_models=["claude-opus-5-5"])
+        return execution
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
+    # Claude coding launches are admitted in a later change; this test needs only saved runs.
+    monkeypatch.setattr(study, "admit", lambda treatment, harness: native_treatments.admit(
+        treatment, "codex"
+    ))
+    one = _study(tmp_path / "one", runner=CLAUDE_RUNNER)
+    cache = tmp_path / "cache"
+    root = study.run_study(one, tmp_path / "first", baseline_cache=cache,
+                           baseline_identity=_coding(one.tasks, CLAUDE_RUNNER))
+    study.report_study(root)
+    if boundary == "reuse":
+        two = _study(tmp_path / "two", guidance="another", runner=CLAUDE_RUNNER)
+        root = study.run_study(two, tmp_path / "second", baseline_cache=cache,
+                               baseline_identity=_coding(two.tasks, CLAUDE_RUNNER))
+        run = json.loads((root / "run.json").read_text())
+        assert len(run["baseline_origin"]) == 2
+        manifest = json.loads((root / "assessment-input.json").read_text())
+        baseline = [row for row in manifest["records"] if row["arm"] == "baseline"]
+        assert [row["stages"][0]["work"]["tokens"] for row in baseline] == [
+            recorded if evidence == "valid" else None
+        ] * 2
+    report = json.loads((root / "report/assessment-report.json").read_text())
+    for row in report["attempts"]:
+        work = row["stages"][0]["work"]
+        validation = work["usage_validation"]
+        assert validation["recorded_usage"] == recorded
+        if evidence == "valid":
+            assert work["tokens"] == recorded and validation["status"] == "validated"
+        else:
+            assert work["tokens"] is None and validation["status"] == "unavailable"
+            assert "a subagent transcript has no matching Agent tool call" in validation["reasons"]

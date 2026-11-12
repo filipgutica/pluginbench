@@ -41,18 +41,12 @@ def _read(path: Path) -> Any:
     return json.loads(path.read_text()) if path.is_file() else None
 
 
-def _usage(
-    execution: dict[str, Any] | None, *, host: str = "codex"
-) -> tuple[dict[str, int] | None, str]:
+def _usage(execution: dict[str, Any] | None) -> tuple[dict[str, int] | None, str]:
     """Token usage and trust: exact, unvalidated, lower_bound, or unknown."""
     if execution is None:
         return None, "unknown"
     usage, status = execution.get("usage"), "exact"
-    if (
-        host != "claude"
-        and (execution.get("launch") or {}).get("harness") != "claude-cli"
-        and (execution.get("usage_validation") or {}).get("status") != "validated"
-    ):
+    if (execution.get("usage_validation") or {}).get("status") != "validated":
         status = "unvalidated"
     if not isinstance(usage, dict):
         usage = (execution.get("usage_accounting") or {}).get("observed_usage_lower_bound")
@@ -291,7 +285,6 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
     pending = _pending(root, selection, run)
     slots, source = _slots(evidence, run)
     plan = _read(evidence / "plan.json") or {}
-    host = plan.get("host", "codex")
     rebuild = (
         f"rebuild with `{shlex.join(['pluginbench', 'report', str(root)])}` "
         "to re-validate token usage"
@@ -324,7 +317,7 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
                 else None,
                 "usage_accounting": None,
             }
-        tokens, tokens_status = _usage(execution, host=host)
+        tokens, tokens_status = _usage(execution)
         if row["state"] == "pending":
             tokens_status = "not_started"
         elif row["state"] in ("running", "interrupted") and tokens_status == "exact":
@@ -360,7 +353,7 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
         stage = (receipt.get("stages") or {}).get(_STAGE) or {}
         reference = stage.get("execution")
         execution = _read(evidence / reference["path"]) if isinstance(reference, dict) else None
-        tokens, tokens_status = _usage(execution, host=host)
+        tokens, tokens_status = _usage(execution)
         discarded.append(
             {
                 "id": receipt["id"],

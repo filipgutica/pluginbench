@@ -1,4 +1,4 @@
-"""Project current Codex token validation without changing saved raw evidence."""
+"""Project current token validation without changing saved raw evidence."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from pluginbench import codex
+from pluginbench import claude_usage, codex
 
 
 def revalidate_usage(execution: dict[str, Any], receipt: Path) -> dict[str, Any]:
@@ -22,13 +22,16 @@ def revalidate_usage(execution: dict[str, Any], receipt: Path) -> dict[str, Any]
     artifacts = receipt.parent / "artifacts"
     parsed: dict[str, Any] = {}
     reasons = []
+    launch = execution.get("launch") or {}
     try:
         codex.validate_artifacts(artifacts)
         traces = sorted(artifacts.glob("host-trace-*.jsonl"))
         if not traces:
             # Older Harbor layouts may retain sessions without the flattened copies.
             traces = sorted((artifacts / "harbor/trial/agent/sessions").rglob("*.jsonl"))
-        if not traces:
+        if launch.get("harness") == "claude-cli":
+            parsed = _claude_usage(artifacts, launch)
+        elif not traces:
             reasons.append("legacy usage has no saved session evidence to validate")
         else:
             stdout = artifacts / "stdout.jsonl"
@@ -40,6 +43,7 @@ def revalidate_usage(execution: dict[str, Any], receipt: Path) -> dict[str, Any]
                 "codex",
                 include_descendants=True,
             )
+        if parsed:
             reasons.extend(parsed["usage_accounting"]["reasons"])
             if parsed["usage"] != original["recorded_usage"]:
                 reasons.append("revalidated usage disagrees with recorded usage")
@@ -66,3 +70,16 @@ def revalidate_usage(execution: dict[str, Any], receipt: Path) -> dict[str, Any]
             "reasons": reasons,
         },
     }
+
+
+def _claude_usage(artifacts: Path, launch: dict[str, Any]) -> dict[str, Any]:
+    """Re-parse a Claude attempt's saved stream and transcripts with the attempt's own rules."""
+    agent = artifacts / "harbor/trial/agent"
+    stdout = artifacts / "stdout.jsonl"
+    if not stdout.is_file():
+        stdout = agent / "claude-code.txt"
+    return claude_usage.coding_usage(
+        stdout.read_text(errors="replace") if stdout.is_file() else "",
+        agent / "sessions",
+        runner_model=str(launch.get("requested_model")),
+    )

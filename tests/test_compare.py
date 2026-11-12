@@ -566,9 +566,10 @@ def test_compare_refuses_runs_whose_saved_identities_differ(tmp_path: Path) -> N
 @pytest.mark.parametrize(
     "host,validation,expected",
     [("codex", None, "undetermined"), ("codex", "unavailable", "undetermined"),
-     ("codex", "validated", "pass"), ("claude", None, "pass")],
+     ("codex", "validated", "pass"), ("claude", None, "undetermined"),
+     ("claude", "unavailable", "undetermined"), ("claude", "validated", "pass")],
 )
-def test_saved_codex_token_gates_require_validation_provenance(
+def test_saved_token_gates_require_validation_provenance(
     tmp_path: Path, schema: int, host: str, validation: str | None, expected: str
 ) -> None:
     attempts = [

@@ -317,24 +317,12 @@ def load_evidence(specs: list[str]) -> Evidence:
         evidence.identities[directory] = data.get("comparison_identity")
         values: dict[str, dict[str, float | None]] = {}
         reasons: dict[str, dict[str, str]] = {}
-        runtimes = {row["id"]: row.get("runtime") or {} for row in data["attempts"]}
-        run_host = ((data.get("comparison_identity") or {}).get("runner") or {}).get("harness")
         for row in data["observations"]:
             measured = row.get("status") == "measured" and isinstance(row.get("value"), int | float)
-            runtime = runtimes.get(row["attempt_id"], {})
-            host = (
-                row.get("host")
-                or row.get("harness")
-                or runtime.get("host")
-                or runtime.get("harness")
-                or run_host
-            )
             validation = (row.get("provenance") or {}).get("usage_validation")
             unvalidated = (
                 row["metric"] in MEASUREMENT_METRICS["tokens"]
                 and row["metric"] != "Coding time"
-                # Historical reports omit host metadata; only explicit Claude is exempt.
-                and host not in {"claude", "claude-cli"}
                 and (not isinstance(validation, dict) or validation.get("status") != "validated")
             )
             if unvalidated:
@@ -345,7 +333,7 @@ def load_evidence(specs: list[str]) -> Evidence:
             )
             if not measured:
                 reasons.setdefault(row["attempt_id"], {})[row["metric"]] = str(
-                    "Codex token usage lacks validated provenance; rebuild the report"
+                    "Token usage lacks validated provenance; rebuild the report"
                     if unvalidated
                     else row.get("reason") or row.get("status") or "no value"
                 )
