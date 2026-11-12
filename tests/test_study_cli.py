@@ -2603,8 +2603,7 @@ def test_stopped_run_copied_to_a_new_path_resumes_there(
 # The launcher hashes a Codex run saved at 942f12c.
 _SAVED_CODEX_LAUNCHER = {
     name: next(iter(components._SAVED_HASHES[name]))
-    for name in components.FILES["launcher"]
-    if name != "claude.py"
+    for name in components.launcher_files("codex")
 }
 
 

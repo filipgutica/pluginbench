@@ -115,6 +115,45 @@ def test_review_command_removes_shell_writes_and_delegation() -> None:
     assert not any(flag in argv for flag in ("--plugin-dir", "--agents", "--system-prompt"))
 
 
+def test_coding_launch_is_the_pinned_contract() -> None:
+    run = claude.CodingRun(
+        model="claude-opus-5-5", effort="high", subagents=False, timeout_seconds=1800
+    )
+    assert claude.coding_launch(run) == (
+        [
+            "claude", "--verbose", "--output-format=stream-json", "--settings", "{}",
+            "--model", "claude-opus-5-5", "--effort", "high",
+            "--permission-mode=bypassPermissions", "--setting-sources", "user",
+            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+            "--include-hook-events", "--no-chrome", "--disallowed-tools",
+            "RemoteTrigger,CronCreate,ScheduleWakeup,SendMessage,Workflow,Agent", "--print",
+        ],
+        {
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+            "DISABLE_UPDATES": "1",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+            "CLAUDE_CODE_SUBAGENT_MODEL": "claude-opus-5-5",
+            "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "1800000",
+        },
+    )
+
+
+@pytest.mark.parametrize("subagents", [False, True])
+def test_discovery_differs_from_coding_by_exactly_the_discovery_delta(subagents: bool) -> None:
+    run = claude.CodingRun(
+        model="claude-opus-5-5", effort="medium", subagents=subagents, timeout_seconds=600
+    )
+    coding, coding_env = claude.coding_launch(run)
+    discovery, discovery_env = claude.discovery_launch(run)
+    expected = list(coding)
+    expected[coding.index("--settings") + 1] = '{"disableAllHooks":true}'
+    printing = coding.index("--print")
+    expected[printing:printing] = ["--input-format", "stream-json", "--no-session-persistence"]
+    assert discovery == expected
+    assert discovery_env == coding_env
+
+
 def test_selected_auth_file_ignores_inherited_auth_guidance_and_model_settings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

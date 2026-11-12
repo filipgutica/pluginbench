@@ -30,8 +30,12 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             ),
             # Claude plugin admission rules; Codex admission and every admitted launch stay v1.
             "treatments.py": "441498fa24855b0ed5e8b713be2bdf1eb8d06bc29b9d01cdbdb762f838bcc81c",
-            # Version admission only warns; it launches every CLI version as before.
-            "claude.py": "26b4d1344d187d080159c6e7ad128c1614d057bc20498840738a7b5d7c905a73",
+            # Claude version admission and coding launch builder; Claude-only, so Codex stays v1.
+            "claude.py": "d4dc66cb46713b976db98e5eae5c84ae58f19e075e29c2ead02b30fd038e8d31",
+            "claude_treatments.py": "1c6a943ce506a5b4984a4698b693d1edd3b9f6a780ae97feb818c1e4f99f1f15",
+            "claude_treatment_runtime.js": (
+                "7b7a88b1662069b9d0d4784c23e6fbfe2481bb32d96f2f1323808ff7c1547d32"
+            ),
         },
     ),
     "analysis_observer": (
@@ -81,6 +85,27 @@ def test_the_pinned_files_are_the_files_the_code_hashes() -> None:
     assert {name: set(files) for name, files in components.FILES.items()} == hashed
     assert Path(harbor_backend.__file__).name in hashed["launcher"]
     assert set(PINNED) == set(components.VERSIONS) == set(components.FILES)
+
+
+CODEX_LAUNCHER = (
+    "codex.py", "harbor_backend.py", "processes.py", "native_treatments.py",
+    "native_treatment_runtime.js", "treatments.py",
+)
+
+
+def test_claude_only_launcher_files_stay_out_of_the_codex_launcher() -> None:
+    # Codex runs and caches bind exactly these files, so a Claude-only change never moves them.
+    assert components.launcher_files("codex") == CODEX_LAUNCHER
+    assert set(evaluation._launcher_sha256("codex")) == set(CODEX_LAUNCHER)
+    assert components.launcher_files("claude") == components.FILES["launcher"]
+
+
+def test_a_launcher_saved_before_versions_keeps_its_version() -> None:
+    # Those runs predate the later Claude-only files, so their sets never name them.
+    legacy = {name: next(iter(components._SAVED_HASHES[name])) for name in CODEX_LAUNCHER}
+    assert components.saved_launcher_version("codex", legacy) == 1
+    claude = {**legacy, "claude.py": next(iter(components._SAVED_HASHES["claude.py"]))}
+    assert components.saved_launcher_version("claude", claude) == 1
 
 
 def test_an_unknown_saved_hash_is_refused_and_names_the_file() -> None:

@@ -1,0 +1,276 @@
+{
+  "_source": "Claude Code 2.1.322, captured offline 2026-11-12 with a fake API key and no route to api.anthropic.com; trimmed. /SCRATCH replaces private paths. A demo plugin (one skill, one SessionStart command hook) and a loose user skill were installed. auto_memory is the CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 shape; policy.allDisabled is as captured without disableAllHooks.",
+  "stream": [
+    {
+      "type": "system",
+      "subtype": "hook_started",
+      "hook_id": "9161a60d-8c80-4603-9bd5-4b9c710d0d1e",
+      "hook_name": "SessionStart:startup",
+      "hook_event": "SessionStart",
+      "uuid": "25702318-d844-4d95-aa2d-372e7f55f745",
+      "session_id": "a553da63-a01c-4187-a6af-0c0444651a6a"
+    },
+    {
+      "type": "system",
+      "subtype": "hook_response",
+      "hook_id": "9161a60d-8c80-4603-9bd5-4b9c710d0d1e",
+      "hook_name": "SessionStart:startup",
+      "hook_event": "SessionStart",
+      "output": "{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"DEMO_CONTEXT\"}}\n",
+      "stdout": "{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"DEMO_CONTEXT\"}}\n",
+      "stderr": "",
+      "exit_code": 0,
+      "outcome": "success",
+      "uuid": "43db6822-e7e3-4350-ac7d-ce291b6bf3b3",
+      "session_id": "a553da63-a01c-4187-a6af-0c0444651a6a"
+    }
+  ],
+  "responses": {
+    "initialize": {
+      "commands": [
+        {
+          "name": "loose-skill",
+          "description": "loose (user)",
+          "argumentHint": ""
+        },
+        {
+          "name": "demo:demo-skill",
+          "description": "(demo) A demo skill for discovery tests.",
+          "argumentHint": "",
+          "aliases": [
+            "demo-skill"
+          ]
+        },
+        {
+          "name": "debug",
+          "description": "Enable debug logging for this session and help diagnose issues",
+          "argumentHint": "[issue description]",
+          "builtin": true
+        },
+        {
+          "name": "code-review",
+          "description": "Review the current diff, or a PR number/branch/path target, for correctness bugs",
+          "argumentHint": "[low|medium|high|xhigh|max] [--fix] [--comment] [<pr#>|<branch>|<path>] [--max-findings <n>|all]",
+          "aliases": [
+            "review"
+          ],
+          "builtin": true
+        }
+      ],
+      "agents": [
+        {
+          "name": "claude",
+          "description": "Catch-all for any task that doesn't fit a more specific agen"
+        },
+        {
+          "name": "claude-code-guide",
+          "model": "haiku",
+          "description": "Use this agent when the user asks questions (\"Can Claude...\""
+        }
+      ],
+      "output_style": "default",
+      "account": {
+        "tokenSource": "none",
+        "apiKeySource": "ANTHROPIC_API_KEY",
+        "apiProvider": "firstParty"
+      },
+      "claude_code_version": "2.1.322",
+      "session_state": "idle"
+    },
+    "get_context_usage": {
+      "categories": [
+        {
+          "id": "system_prompt",
+          "name": "System prompt",
+          "tokens": 1997,
+          "color": "promptBorder",
+          "kind": "used"
+        },
+        {
+          "id": "system_tools",
+          "name": "System tools",
+          "tokens": 8140,
+          "color": "inactive",
+          "kind": "used"
+        },
+        {
+          "id": "system_tools_deferred",
+          "name": "System tools (deferred)",
+          "tokens": 9784,
+          "color": "inactive",
+          "isDeferred": true,
+          "kind": "deferred"
+        },
+        {
+          "id": "memory_files",
+          "name": "Memory files",
+          "tokens": 11,
+          "color": "claude",
+          "kind": "used"
+        },
+        {
+          "id": "skills",
+          "name": "Skills",
+          "tokens": 2085,
+          "color": "warning",
+          "kind": "used"
+        },
+        {
+          "id": "messages",
+          "name": "Messages",
+          "tokens": 29,
+          "color": "purple_FOR_SUBAGENTS_ONLY",
+          "kind": "used"
+        },
+        {
+          "id": "autocompact_buffer",
+          "name": "Autocompact buffer",
+          "tokens": 33000,
+          "color": "inactive",
+          "kind": "buffer"
+        },
+        {
+          "id": "free_space",
+          "name": "Free space",
+          "tokens": 954738,
+          "color": "promptBorder",
+          "kind": "free"
+        }
+      ],
+      "totalTokens": 12262,
+      "maxTokens": 1000000
+    },
+    "get_hooks_listing": {
+      "events": [
+        {
+          "name": "SessionStart",
+          "summary": "When a new session is started",
+          "supportsMatcher": true,
+          "hookCount": 1
+        }
+      ],
+      "hooks": [
+        {
+          "event": "SessionStart",
+          "matcher": "startup",
+          "source": "pluginHook",
+          "sourceLabel": "Plugin hooks (~/.claude/plugins/*/hooks/hooks.json)",
+          "pluginName": "demo@pluginbench-frozen",
+          "type": "command",
+          "displayText": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"DEMO_CONTEXT\"}}'",
+          "commandText": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"DEMO_CONTEXT\"}}'",
+          "contentLabel": "Command"
+        }
+      ],
+      "policy": {
+        "disabledByPolicy": false,
+        "managedOnly": false,
+        "pluginOnly": false,
+        "allDisabled": false,
+        "policyHookCount": 0
+      }
+    },
+    "get_settings": {
+      "effective": {
+        "enabledPlugins": {
+          "demo@pluginbench-frozen": true
+        },
+        "extraKnownMarketplaces": {
+          "pluginbench-frozen": {
+            "source": {
+              "source": "directory",
+              "path": "/SCRATCH/market"
+            }
+          }
+        }
+      },
+      "sources": [
+        {
+          "source": "userSettings",
+          "settings": {
+            "enabledPlugins": {
+              "demo@pluginbench-frozen": true
+            },
+            "extraKnownMarketplaces": {
+              "pluginbench-frozen": {
+                "source": {
+                  "source": "directory",
+                  "path": "/SCRATCH/market"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "get_memory_dialog": {
+      "files": [
+        {
+          "kind": "user",
+          "path": "/SCRATCH/cfg/CLAUDE.md",
+          "label": "User instructions",
+          "description": "Saved in ~/.claude/CLAUDE.md",
+          "exists": true
+        },
+        {
+          "kind": "project",
+          "path": "/SCRATCH/work/CLAUDE.md",
+          "label": "Project instructions",
+          "description": "Checked in at ./CLAUDE.md",
+          "exists": false
+        }
+      ],
+      "folders": [
+        {
+          "kind": "auto",
+          "path": "/SCRATCH/cfg/projects/-SCRATCH-work/memory/",
+          "label": "Open auto-memory folder",
+          "description": ""
+        }
+      ],
+      "memories": [],
+      "auto_memory": {
+        "enabled": false
+      },
+      "auto_dream": {
+        "shown": false,
+        "enabled": false,
+        "toggleable": false,
+        "status": "off",
+        "detail": "can't be turned on here; use a session started outside Claude Code"
+      }
+    },
+    "get_skills_dialog": {
+      "skills": [
+        {
+          "name": "demo:demo-skill",
+          "display_name": "demo:demo-skill",
+          "description": "A demo skill for discovery tests.",
+          "source": "plugin",
+          "tokens": 16,
+          "state": "on",
+          "locked_by": "plugin",
+          "advertised": true,
+          "handles": {
+            "aliases": [
+              "demo-skill"
+            ]
+          }
+        },
+        {
+          "name": "loose-skill",
+          "display_name": "loose-skill",
+          "description": "loose",
+          "source": "user",
+          "tokens": 6,
+          "state": "on",
+          "advertised": true,
+          "handles": {}
+        }
+      ]
+    },
+    "get_session_cost": {
+      "text": "Total cost:            $0.0000\nTotal duration (API):  0s\nTotal duration (wall): 18s\nTotal code changes:    0 lines added, 0 lines removed\nUsage:                 0 input, 0 output, 0 cache read, 0 cache write"
+    }
+  }
+}
