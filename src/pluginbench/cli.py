@@ -670,7 +670,8 @@ def judge_run(
 def judge_tally(
     directory: Path = typer.Argument(..., help="A directory whose judge calls are complete."),
     require_bound: bool = typer.Option(
-        False, help="Refuse legacy verdicts without input bindings."
+        False,
+        help="Refuse legacy verdicts without input bindings or that need a rebind.",
     ),
 ) -> None:
     """Unblind with the key and score each pair; writes tally.json; no model calls."""

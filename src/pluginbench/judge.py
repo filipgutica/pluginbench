@@ -47,6 +47,12 @@ SCHEMA = "response-schema.json"
 # An overlap pass counts as a pass: the verifier graded the production code with its own tests.
 PASSING = {"pass", "overlap_pass"}
 HARNESSES = {"codex", "claude"}
+# Version 2 added judge_cli_version. A binding without a version is version 1.
+BINDING_VERSION = "2"
+NEEDS_REBIND = (
+    "needs rebind (bound before verdicts recorded the judge CLI version); "
+    "delete it and run `pluginbench judge run` to judge it again"
+)
 
 UNABLE_INSTRUCTION = (
     'Use "preferred": "unable", never "tie", for each pair you could not evaluate because '
@@ -523,6 +529,15 @@ def _check_binding(
         )
     except ValueError as error:
         raise ValueError(f"{path}: {error}") from error
+    # A version 1 binding has neither version field, so only its own fields are compared and
+    # tally reports it as needing a rebind. Any other saved version mismatches below.
+    if saved.get("binding_version") == BINDING_VERSION:
+        current["binding_version"] = BINDING_VERSION
+        observed = _judge_cli_version(_latest_call(path), _judge_host(judge))
+        # Without the call's evidence nothing proves the saved version, even when both are absent.
+        if observed is None:
+            raise ValueError(f"{path}: binding mismatch: judge_cli_version")
+        current["judge_cli_version"] = observed
     fields = saved.keys() | current.keys()
     for field in ["prepare_seed", *sorted(fields - {"prepare_seed"})]:
         if saved.get(field) != current.get(field):
@@ -548,21 +563,42 @@ def _verdict_problem(
     unable = [str(row.pair) for row in verdicts.pairs if row.preferred == "unable"]
     if unable:
         return "pairs " + ", ".join(unable) + ": unable"
-    # Only the latest call produced this verdict; earlier failures may have been retried.
-    calls = [
-        call
-        for call in path.with_suffix("").glob("call-*")
-        if call.is_dir() and call.name.removeprefix("call-").isdigit()
-    ]
-    if calls:
-        # Labels start with the harness; an unlabeled legacy judge keeps the Codex check.
-        harness = judge.split("-", 1)[0]
-        host = harness if harness in HARNESSES else "codex"
-        latest = max(calls, key=lambda call: int(call.name.removeprefix("call-")))
+    latest = _latest_call(path)
+    if latest is not None:
         traces = [trace.read_text() for trace in sorted(latest.glob("host-trace-*.jsonl"))]
-        if codex.parse_events("", traces, host).get("tool_startup_failures"):
+        if codex.parse_events("", traces, _judge_host(judge)).get("tool_startup_failures"):
             return "unable: tool startup failed in saved trace"
     return None
+
+
+def _judge_host(judge: str) -> str:
+    # Labels start with the harness; an unlabeled legacy judge keeps the Codex parser.
+    harness = judge.split("-", 1)[0]
+    return harness if harness in HARNESSES else "codex"
+
+
+def _latest_call(verdict: Path) -> Path | None:
+    """The raw folder of the call that produced the verdict; earlier calls failed or retried."""
+    calls = [
+        call
+        for call in verdict.with_suffix("").glob("call-*")
+        if call.is_dir() and call.name.removeprefix("call-").isdigit()
+    ]
+    return max(calls, key=lambda call: int(call.name.removeprefix("call-"))) if calls else None
+
+
+def _judge_cli_version(call: Path | None, host: str) -> str | None:
+    """The CLI version a call's saved native evidence reports, or None when it reports none.
+
+    Codex reports it in the rollout trace (session_meta), Claude in stdout (system/init).
+    """
+    if call is None:
+        return None
+    stdout = call / "stdout.jsonl"
+    traces = [trace.read_text() for trace in sorted(call.glob("host-trace-*.jsonl"))]
+    events = codex.parse_events(stdout.read_text() if stdout.is_file() else "", traces, host)
+    version = events.get("observed_cli_version")
+    return version if isinstance(version, str) else None
 
 
 def run(
@@ -652,7 +688,9 @@ def _judge_task(
         )
         binding["brief"] = "sha256:" + hashlib.sha256(prompt.encode()).hexdigest()
         # mkdir is the reservation: even SIGKILL leaves an attempt with unknown usage.
-        number = 1
+        # Number past the highest call so _latest_call rereads this call's evidence.
+        latest = _latest_call(verdict)
+        number = int(latest.name.removeprefix("call-")) + 1 if latest is not None else 1
         while True:
             attempt = raw / f"call-{number}"
             try:
@@ -681,6 +719,10 @@ def _judge_task(
     unable = [str(row.pair) for row in verdicts.pairs if row.preferred == "unable"]
     if unable:
         raise ValueError("unable to judge pairs: " + ", ".join(unable))
+    version = _judge_cli_version(attempt, judge.harness)
+    if version is None:
+        raise ValueError("judge CLI version is missing from the call's native evidence")
+    binding |= {"binding_version": BINDING_VERSION, "judge_cli_version": version}
     _check_binding(directory, judge.label, task, binding)
     study._write(verdict, {**verdicts.model_dump(mode="json"), "binding": binding})
 
@@ -789,6 +831,16 @@ def tally(directory: Path, *, require_bound: bool = False) -> dict[str, Any]:
     ]
     if require_bound and unbound:
         raise ValueError(f"{unbound[0]}: unbound verdict (written before binding); --require-bound")
+    # _verdict_problem already refused any other binding version as a mismatch.
+    rebind = [
+        str(_verdict_path(directory, judge, task))
+        for judge in judges
+        for task in tasks
+        if (binding := verdicts[judge, task].binding) is not None
+        and binding.get("binding_version") != BINDING_VERSION
+    ]
+    if require_bound and rebind:
+        raise ValueError(f"{rebind[0]}: {NEEDS_REBIND}; --require-bound")
     votes = {
         (judge, task): {str(row.pair): row.preferred for row in verdicts[judge, task].pairs}
         for judge in judges
@@ -849,6 +901,8 @@ def tally(directory: Path, *, require_bound: bool = False) -> dict[str, Any]:
         "judges": judges,
         "unbound": len(unbound),
         "unbound_verdicts": unbound,
+        "needs_rebind": len(rebind),
+        "needs_rebind_verdicts": rebind,
         "pairs": pairs_total,
         "weighted_wins": wins,
         "correctness_decided": {"pairs": by_correctness, "wins": decided["correctness"]},
@@ -947,5 +1001,6 @@ def format_tally(result: dict[str, Any]) -> str:
                 f"{path}: unbound verdict (written before binding)"
                 for path in result["unbound_verdicts"]
             ),
+            *(f"{path}: {NEEDS_REBIND}" for path in result["needs_rebind_verdicts"]),
         ]
     )
