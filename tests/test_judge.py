@@ -637,6 +637,27 @@ def test_previously_saved_tie_with_failed_tool_trace_blocks_tally_and_is_retried
     assert tally(directory)["weighted_wins"] == {"vanilla": 3.0, "workflow-r9": 3.0}
 
 
+def test_claude_judge_saved_trace_is_not_judged_by_codex_rules(tmp_path: Path) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _votes(directory, {"claude-m1-high": {}})
+    raw = directory / "results/claude-m1-high/task-1/call-1"
+    raw.mkdir(parents=True)
+    # A Codex parser would read this line as a tool startup failure; Claude's does not.
+    (raw / "host-trace-0.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "output": "Error: failed to start codex-code-mode-host: No such file or directory",
+                },
+            }
+        )
+        + "\n"
+    )
+    assert tally(directory)["weighted_wins"] == {"vanilla": 3.0, "workflow-r9": 3.0}
+
+
 def test_retry_of_old_prepared_folder_uses_the_unable_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

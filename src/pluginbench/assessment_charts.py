@@ -540,14 +540,17 @@ def _observation(
         )
         work = review_work
         value = _number(_map(review_work.get("tokens")).get(key))
+        judge_host = str(review.get("harness", review.get("requested_harness", "codex")))
         provenance = {
             "token_format": review_work.get("token_format"),
             "judge_model": execution.get("actual_primary_models"),
             "judge_harness": {"codex": "codex-cli", "claude": "claude-cli"}.get(
-                str(review.get("harness", review.get("requested_harness", "codex"))), "unknown"
+                judge_host, "unknown"
             ),
             "judge_reasoning_effort": execution.get("runtime_effort_evidence"),
-            "judge_harness_version": codex.observed_cli_version(execution.get("startup")),
+            "judge_harness_version": codex.observed_cli_version(
+                execution.get("startup"), host=judge_host
+            ),
             "review_stage": review.get("stage"),
         }
         judge_effort = provenance["judge_reasoning_effort"]

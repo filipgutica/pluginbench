@@ -147,6 +147,32 @@ def test_judge_tokens_remain_separate_and_require_matching_observed_identity() -
     )
 
 
+def test_claude_judge_version_is_read_from_claude_startup() -> None:
+    report = _report()
+    report["independent_review"] = {"status": "complete"}
+    for index in (0, 1):
+        _attempt(report, index)["independent_review"] = {
+            "requested_harness": "claude",
+            "stage": "handoff",
+            "stage_id": "handoff",
+            "criteria_sha256": "a" * 64,
+            "work": {"tokens": {"input_tokens": 30}, "token_format": "native claude"},
+            "execution": {
+                "actual_primary_models": ["judge-A"],
+                "runtime_effort_evidence": ["high"],
+                "startup": [{"type": "system", "subtype": "init", "claude_code_version": "2.1.0"}],
+            },
+        }
+    rows = _observations(chart_data(report), "Judge input tokens")
+    assert [row["value"] for row in rows] == [30, 30]
+    assert all(row["compatibility"] for row in rows)
+    for row in rows:
+        provenance = row["provenance"]
+        assert isinstance(provenance, dict)
+        assert provenance["judge_harness"] == "claude-cli"
+        assert provenance["judge_harness_version"] == "2.1.0"
+
+
 def _stage(report: dict[str, object], index: int = 1) -> dict[str, object]:
     stages = _attempt(report, index)["stages"]
     assert isinstance(stages, list) and isinstance(stages[0], dict)
