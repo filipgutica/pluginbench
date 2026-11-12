@@ -53,7 +53,6 @@ def test_pilot_climb_measures_match_the_study_analysis() -> None:
     # analyze.py's numbers for the pilot's climb split, from the same saved reports.
     evidence = load_evidence(PILOT)
     expected: dict[str, dict[str, float]] = {
-        "tokens": {"vanilla": 1.67e6, "superpowers": 3.96e6, "workflow-main": 4.59e6},
         "cognitive ratio to reference": {
             "vanilla": 0.15,
             "superpowers": -0.09,
@@ -69,6 +68,10 @@ def test_pilot_climb_measures_match_the_study_analysis() -> None:
         for arm, value in arms.items():
             result = measure(evidence, _gate(name), arm, CLIMB).value
             assert result == pytest.approx(value, rel=0.01, abs=0.05), (name, arm)
+    # These archived reports have no validation receipts; their token totals stay unknown.
+    for arm in ("vanilla", "superpowers", "workflow-main"):
+        assert measure(evidence, _gate("tokens"), arm, CLIMB).value is None
+    assert evidence.unvalidated_runs == set(PILOT)
 
 
 def test_ratios_to_reference_are_taken_per_task_before_averaging() -> None:
@@ -181,7 +184,7 @@ def test_a_missing_value_stays_missing_and_leaves_a_total_undetermined(tmp_path:
     tokens = check_gate(evidence, gates, _gate("tokens"), "superpowers", CLIMB)
     assert tokens.result == "undetermined"
     assert tokens.detail == (
-        "missing Input tokens, Output tokens values: 11/12 and 12/12 attempts measured"
+        "missing Input tokens, Output tokens values: 0/12 and 0/12 attempts measured"
     )
     coverage = measure(evidence, _gate("changed-line coverage"), "vanilla", CLIMB)
     assert coverage.missing == {
@@ -197,7 +200,7 @@ def test_a_missing_value_stays_missing_and_leaves_a_total_undetermined(tmp_path:
     printed = CliRunner().invoke(
         cli.app, ["compare", *runs, "--gates", str(FIXTURE / "card-gates.yaml")]
     )
-    assert f"tokens, superpowers, {first['task']}: 1 of 3 attempts unmeasured" in printed.stdout
+    assert f"complexity hotspots, superpowers, {first['task']}: 1 of 3 attempts unmeasured" in printed.stdout
 
 
 @pytest.mark.parametrize(
@@ -312,13 +315,11 @@ def test_round_one_takes_the_incumbent_from_the_pilot_only_when_selected() -> No
     cells = [re.split(r"\s{2,}", line) for line in table.splitlines() if line]
     rows = {row[0]: [cell.split(" ")[0] for cell in row[1:]] for row in cells}
     assert rows["measure"] == ["vanilla", "workflow-r1", "workflow-main"]
-    assert rows["tokens"] == ["1.67M", "2.91M", "4.59M"]
+    assert rows["tokens"] == ["missing", "missing", "missing"]
     assert rows["cognitive ratio to reference"] == ["0.15", "2.42", "2.95"]
     assert rows["high and medium review findings"] == ["11", "10", "9"]
     gate_lines = [line.split() for line in verdicts.splitlines() if line.startswith("tokens ")]
-    assert ["workflow-r1", "vanilla", "2.91M", "1.67M", "≤", "2.17M", "fail"] in [
-        line[1:8] for line in gate_lines
-    ]
+    assert all("undetermined" in line for line in gate_lines)
 
 
 def _write_run(directory: Path, attempts: list[Attempt], references: dict[str, float]) -> str:
@@ -532,3 +533,50 @@ def test_compare_refuses_runs_whose_saved_identities_differ(tmp_path: Path) -> N
     assert accepted.exit_code == 0, accepted.stderr
     assert "saved by only one, not checked: review_criteria_sha256" in accepted.stdout
     assert "saved no comparison identity" not in accepted.stdout
+
+
+@pytest.mark.parametrize("schema", [1, 2])
+@pytest.mark.parametrize(
+    "host,validation,expected",
+    [("codex", None, "undetermined"), ("codex", "unavailable", "undetermined"),
+     ("codex", "validated", "pass"), ("claude", None, "pass")],
+)
+def test_saved_codex_token_gates_require_validation_provenance(
+    tmp_path: Path, schema: int, host: str, validation: str | None, expected: str
+) -> None:
+    attempts = [
+        Attempt(f"{arm}-{task}", "run", task, arm, "pass",
+                {"Input tokens": value, "Output tokens": value})
+        for task in (f"task-{index}" for index in range(6))
+        for arm, value in (("vanilla", 100.0), ("candidate", 1.0))
+    ]
+    directory = _write_run(tmp_path / "run", attempts, {})
+    results = Path(directory) / "report/results.json"
+    data = json.loads(results.read_text())
+    data["schema_version"] = schema
+    for row in data["observations"]:
+        row["host"] = host
+        status = "validated" if row["attempt_id"].startswith("vanilla-") else validation
+        if status is not None:
+            row["provenance"] = {"usage_validation": {"status": status}}
+    results.write_text(json.dumps(data))
+    before = results.read_bytes()
+    specs = [directory + "=vanilla", directory + "=candidate"]
+    evidence = load_evidence(specs)
+    gates_path = tmp_path / "gates.yaml"
+    gates_path.write_text(yaml.safe_dump({"count_overlap_passes": True,
+                                        "gates": [_gate("tokens").model_dump(exclude_none=True)]}))
+    gates = load_gates(gates_path)
+    tasks = [f"task-{index}" for index in range(6)]
+    for gate in (
+        _gate("tokens"),
+        Gate(name="paired tokens", against="vanilla", direction="lower",
+             metrics=["Input tokens", "Output tokens"], bound="upper", factor=1.3),
+    ):
+        assert check_gate(evidence, gates, gate, "candidate", tasks).result == expected
+    output = CliRunner().invoke(cli.app, ["compare", *specs, "--gates",
+                                        str(gates_path)])
+    assert output.exit_code == 0, output.output
+    note = f"rebuild with `pluginbench report {directory}` to re-validate token usage"
+    assert output.stdout.count(note) == (1 if expected == "undetermined" else 0)
+    assert results.read_bytes() == before

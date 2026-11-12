@@ -615,3 +615,38 @@ def test_a_run_saved_before_the_not_measured_list_shows_no_such_warning(tmp_path
 
     assert status["measures"]["not_measured"] == []
     assert "Warning:" not in run_status.format_status(status)
+
+
+@pytest.mark.parametrize("projection", ["validated", "unavailable", "historical", "claude"])
+def test_status_uses_current_usage_and_labels_historical_receipts(
+    tmp_path: Path, projection: str
+) -> None:
+    root = _run(tmp_path / "run", states={**STATES, "a3": "pending"}, ledger=True)
+    handoff = root / "evidence/attempts/a1/handoff"
+    if projection in {"validated", "unavailable"}:
+        _write(handoff / "execution-current.json", {
+            "usage": USAGE if projection == "validated" else None,
+            "usage_validation": {"status": projection, "reasons":
+                                 ["rejected saved rollout"] if projection == "unavailable" else []},
+        })
+    elif projection == "claude":
+        execution = json.loads((handoff / "execution.json").read_text())
+        execution["launch"] = {"harness": "claude-cli"}
+        _write(handoff / "execution.json", execution)
+    before = _tree(root)
+    status = run_status.run_status(root)
+    row = next(row for row in status["attempts"] if row["id"] == "a1")
+    expected = {"validated": "exact", "unavailable": "unknown",
+                "historical": "unvalidated", "claude": "exact"}
+    assert row["tokens_status"] == expected[projection]
+    if projection == "unavailable":
+        assert row["tokens"] is None
+        assert "rejected saved rollout" in row["tokens_reason"]
+    else:
+        assert row["tokens"] == USAGE
+    if projection == "historical":
+        assert status["arms"]["vanilla"]["tokens"]["unvalidated"] is True
+        note = f"rebuild with `pluginbench report {root}` to re-validate token usage"
+        assert note in row["tokens_reason"]
+        assert note in run_status.format_status(status)
+    assert _tree(root) == before

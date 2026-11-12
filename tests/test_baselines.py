@@ -720,6 +720,11 @@ def test_saved_usage_is_revalidated_on_report_and_cache_reuse(
         root = study.run_study(two, tmp_path / "second", baseline_cache=cache,
                                baseline_identity=_coding(two.tasks))
         assert len(calls) == 6  # Two cached baselines, no model replay.
+        run = json.loads((root / "run.json").read_text())
+        for attempt_id in run["baseline_origin"]:
+            reference = run["executions"][attempt_id]["handoff"]
+            assert reference["path"] == f"attempts/{attempt_id}/handoff/execution-current.json"
+            assert study._bound_document(root, reference)["usage_validation"]
         manifest = json.loads((root / "assessment-input.json").read_text())
         for row in manifest["records"]:
             if row["arm"] == "baseline":

@@ -123,6 +123,7 @@ def metrics_reference() -> str:
         "Saved Codex usage is re-validated on cache reuse and report generation. Invalid, disagreeing,",
         "or legacy stdout-only evidence makes tokens unavailable; token gates treat it as unknown.",
         "Token provenance retains original figures and recording time in `usage_validation`.",
+        "Compare treats Codex tokens without validated provenance as unknown in every report schema.",
         "Higher coverage or lower cost alone does not establish a better solution.",
         "Correctness gates use `correctness: passes` or `correctness: unknown` instead of metric names.",
         "See [running evaluations](running-evaluations.md#compare-runs) for gate statistics and bounds.",
