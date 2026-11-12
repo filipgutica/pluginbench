@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, wait, FIRST_COMPLETED
+import sys
 from queue import Empty, SimpleQueue
 from threading import Event
 
@@ -86,6 +87,25 @@ def run_jobs[T](
                 first_failure = first_failure or exc
                 cancelled.set()
                 # Current native calls finish under their existing timeout. No new work is admitted.
+                if isinstance(exc, KeyboardInterrupt):
+                    _report_stop(sum(not future.done() for future in active))
     drain_updates()
     if first_failure is not None:
         raise first_failure
+
+
+def _report_stop(running: int) -> None:
+    """Answer each Ctrl-C while draining, so a repeated press is not met with silence."""
+    if not running:
+        return
+    try:
+        print(
+            f"Stopping: no new work starts. Waiting for {running} running call(s) to finish, "
+            "so the work already paid for is kept.",
+            file=sys.stderr,
+            flush=True,
+        )
+    except (OSError, ValueError, KeyboardInterrupt):
+        # A broken stderr, or another Ctrl-C while writing, must not stop the drain that
+        # saves finished work; the run is already stopping.
+        pass
