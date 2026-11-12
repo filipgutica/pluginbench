@@ -2515,12 +2515,11 @@ def invoke_native(
     }
     config["pluginbench_boundary"] = boundary
     delivery = native_treatments.DELIVERY_POLICY
-    recorded_capabilities = capabilities.model_dump(mode="json")
+    recorded_capabilities = claude_launch.recorded_capabilities(capabilities, host)
     if host == "claude":
         run = claude.CodingRun(str(models[host]), effort, capabilities.subagents, timeout)
         boundary["coding_run"] = vars(run)
         delivery = claude_treatments.DELIVERY_POLICY
-        recorded_capabilities = claude_launch.capabilities(capabilities.subagents)
     launch = {
         "harness": host + "-cli",
         "requested_model": models[host],

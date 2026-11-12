@@ -8,5 +8,6 @@ They were captured offline on 2026-11-12 with a fake subscription token, so no m
 | --- | --- |
 | `vanilla` | None |
 | `treated` | The `treatment()` of `tests/test_claude_launch.py`: guidance, a loose skill, and a plugin with a skill and a SessionStart `startup` hook |
+| `superpowers` | `treated` with Superpowers' hook matcher, `startup\|clear\|compact`. The CLI still names the event `SessionStart:startup`. |
 
 Paths are replaced with the container's: `/tmp/pluginbench-treatments` (staged treatment), `/logs/agent/sessions` (`CLAUDE_CONFIG_DIR`), `/app` (task source) and `/SCRATCH` (anything else).

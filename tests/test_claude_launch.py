@@ -621,6 +621,14 @@ SESSION_CHANGES: dict[str, tuple[bool, Callable[[list[dict[str, Any]]], None], s
 }
 
 
+@pytest.mark.parametrize("arm", ["vanilla", "treated", "superpowers"])
+def test_each_captured_real_session_matches_its_real_receipt(arm: str) -> None:
+    captured = FIXTURES / "session-start" / arm
+    receipt = json.loads((captured / "receipt.json").read_text())
+    stream = (captured / "session-start.jsonl").read_text()
+    assert claude_launch.session_errors(stream, receipt, model=MODEL, subagents=True) == []
+
+
 @pytest.mark.parametrize("change", sorted(SESSION_CHANGES))
 def test_a_session_that_differs_from_its_discovery_receipt_fails_the_attempt(
     attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch, change: str

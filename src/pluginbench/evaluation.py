@@ -30,7 +30,8 @@ from pluginbench import (
 )
 from pluginbench.treatments import Treatment, resolve_treatment, treatment_inventory
 from pluginbench.native_treatments import NativeCapabilities, DELIVERY_POLICY, admit
-from pluginbench.claude_launch import UNENFORCED_LIMITS, refuse_unenforced_limits
+from pluginbench.claude_launch import UNENFORCED_LIMITS, recorded_capabilities
+from pluginbench.claude_launch import refuse_unenforced_limits
 from pluginbench.task_sources import Tasks, cache_root
 from pluginbench.measurement_profiles import (
     REMOVED_TEST_OVERLAP,
@@ -347,7 +348,7 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
         "tasks": identities,
         "runner": config.runner.model_dump(mode="json", exclude={"cli_version"}),
         "delivery": study.delivery_policy(config.runner.harness),
-        "capabilities": config.capabilities.model_dump(mode="json"),
+        "capabilities": recorded_capabilities(config.capabilities, config.runner.harness),
         "measurement_settings": config.measurement_settings.model_dump(mode="json"),
         "fallow_config_sha256": hashlib.sha256(
             config.measurement_settings.fallow_config.read_bytes()
@@ -387,7 +388,7 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
             for name, item in config.treatments.items()
         },
         "delivery": study.delivery_policy(config.runner.harness),
-        "capabilities": config.capabilities.model_dump(mode="json"),
+        "capabilities": recorded_capabilities(config.capabilities, config.runner.harness),
         "tasks": config.tasks.task_ids,
         "measurements": config.measurements,
         "measurement_capabilities": capabilities,

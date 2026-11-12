@@ -22,7 +22,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # The optional artifact destination is judge-only; coding launch behavior stays v1.
             "codex.py": "185d0c33e1389051ddfb97a85c08978a6f65773c2378d601cdf608f4b0c17ccf",
             # The Claude launch contract; tests/test_codex_identity.py proves Codex launches equal.
-            "harbor_backend.py": "9b49b3205324a68de2332e717a48e5f70e91ae16dea839a8249360b75e164c28",
+            "harbor_backend.py": "064876b86b1a0e601cffb4af2a510e2eda6939e6d948f407217d3ea187f3934d",
             "processes.py": "0170e0a4902fc610d19b50ed5656c601474adad97b9b8d6fb5b08c6ab6ad00d1",
             # Claude admission dispatch only; Codex admission is unchanged.
             "native_treatments.py": "cfe17310a7f43de42af556e98fe63380493aeaf6a419ad612d51e01d671f0f19",
@@ -37,7 +37,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             "claude_treatment_runtime.js": (
                 "61ac207ea357796c3ed935cac8b3d1574e0c562a7651cade586aad7e5cc5731b"
             ),
-            "claude_launch.py": "7d663da4c084714e3b09cabed5507588fb7cfddd710bb14797819b329ad82f19",
+            "claude_launch.py": "bb7fb87196ae746a98acb109fff4eca13bf30bcaa782b7609d8a233a020d7b83",
         },
     ),
     "analysis_observer": (

@@ -63,6 +63,38 @@ def capabilities(subagents: bool) -> dict[str, object]:
     return {"subagents": subagents, **dict.fromkeys(UNENFORCED_LIMITS, NOT_ENFORCED)}
 
 
+def recorded_capabilities(policy: NativeCapabilities, harness: str) -> dict[str, object]:
+    """A run's capability policy as its plans and comparison identity record it."""
+    if harness == "claude":
+        return capabilities(policy.subagents)
+    return policy.model_dump(mode="json")
+
+
+def validated_launch(execution: dict[str, Any], model: str, effort: str) -> bool:
+    """Whether a coding attempt ran the pinned Claude argv for this model and effort.
+
+    Claude does not report its effective effort, so this binds the requested one to the launch.
+    """
+    launch = execution.get("launch")
+    if not isinstance(launch, dict) or execution.get("actual_primary_models") != [model]:
+        return False
+    policy = launch.get("capabilities")
+    subagents = policy.get("subagents") if isinstance(policy, dict) else None
+    if effort not in claude.EFFORTS or not isinstance(subagents, bool):
+        return False
+    # The timeout sets only the environment, so any value gives the same argv.
+    argv = claude.coding_launch(claude.CodingRun(model, effort, subagents, 0))[0]
+    return bool(
+        launch.get("harness") == "claude-cli"
+        and launch.get("delivery") == claude_treatments.DELIVERY_POLICY
+        and launch.get("requested_model") == model
+        and launch.get("requested_effort") == effort
+        and launch.get("harness_version")
+        and launch.get("argv") == argv
+        and execution.get("runtime_effort_evidence") in ([], [effort])
+    )
+
+
 def pin_exec(agent: object, boundary: dict[str, Any], *, qualification: str) -> None:
     """Replace the agent's `exec_as_agent` with the contract.
 

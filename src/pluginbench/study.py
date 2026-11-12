@@ -31,7 +31,7 @@ from pluginbench.treatments import (
 )
 from pluginbench.native_treatments import NativeCapabilities, DELIVERY_POLICY, admit
 from pluginbench.claude_launch import refuse_unenforced_limits
-from pluginbench import claude_treatments
+from pluginbench import claude_launch, claude_treatments
 from pluginbench.baselines import BaselineCache
 from pluginbench.ledger import LEDGER_NAME, Ledger
 from pluginbench.run_lock import RunMoved
@@ -244,7 +244,7 @@ def plan_study(study: ResolvedStudy) -> dict[str, Any]:
         "requested_reasoning_effort": recipe.reasoning,
         "delivery": delivery_policy(recipe.harness),
         "treatment_selection": study.treatment_selection,
-        "capabilities": recipe.capabilities.model_dump(mode="json"),
+        "capabilities": claude_launch.recorded_capabilities(recipe.capabilities, recipe.harness),
         "baseline": "no supplied custom guidance; native built-in instructions remain",
         "seed": recipe.seed,
         "jobs": recipe.jobs,
@@ -1871,12 +1871,16 @@ def report_study(
                 codex.validated_claude_launch(
                     execution, plan["model"], plan["requested_reasoning_effort"]
                 )
+                or claude_launch.validated_launch(
+                    execution, plan["model"], plan["requested_reasoning_effort"]
+                )
                 for execution in executions
             )
             and executions
         ):
             attempt["provenance"].update(
                 comparison_reasoning_effort=plan["requested_reasoning_effort"],
+                capabilities=plan["capabilities"],
                 launch_harness_version=_observed_harness_version(executions),
                 effort_evidence_source="native session event"
                 if _consistent_observation(executions, "runtime_effort_evidence")
