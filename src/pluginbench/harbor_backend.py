@@ -42,6 +42,7 @@ HARBOR_VERSION = "0.24.0"
 PROTOCOL = "harbor-docker-v1"
 _OWNER_LABEL = "org.pluginbench.trial"
 _BASE_TOOLS = "curl bash node npm"
+CLI_VERSION_PATTERN = r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?"
 _DOCKER_TIMEOUT = 60
 _CODEX_TRANSPORT_VERSION = "codex-stdout-stderr-v1"
 _CODEX_RUN_SHA256 = "5b14fbcc889a398f80c7b5f7e2a621efc1337ba72e748fafefbab2ad09ad86bd"
@@ -588,7 +589,7 @@ def _required_tools(harness: str) -> str:
 def _cli_guard(harness: str, version: str) -> str:
     if (
         harness not in {"codex", "claude"}
-        or re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?", version) is None
+        or re.fullmatch(CLI_VERSION_PATTERN, version) is None
     ):
         raise ValueError("Toolchains require a supported harness and exact CLI version")
     tools = _required_tools(harness) + "; "
@@ -613,6 +614,9 @@ async def run_trial(config: dict[str, Any]) -> dict[str, Any]:
     if boundary is not None:
         install_native_hooks(trial, _native_object(boundary, "native boundary"))
     if separate_codex:
+        nonzero_exit = importlib.import_module(
+            "harbor.agents.installed.base"
+        ).NonZeroAgentExitCodeError
         original_exec = trial.agent.exec_as_agent
         treatment_installed = False
 
@@ -636,6 +640,35 @@ async def run_trial(config: dict[str, Any]) -> dict[str, Any]:
                         raise ValueError("native treatment was already used; use a fresh attempt")
                     if env is None:
                         raise ValueError("native coding command has no private environment")
+                    # Harbor has uploaded auth.json by this point. Use the same private home
+                    # as the model call, and suppress status output that can contain key data.
+                    try:
+                        await original_exec(
+                            environment,
+                            _CODEX_EXEC_PREFIX.partition("codex exec")[0]
+                            + "codex login status >/dev/null 2>&1",
+                            env=env,
+                            cwd=cwd,
+                            timeout_sec=15,
+                        )
+                    except nonzero_exit as error:
+                        host_version = "unavailable"
+                        try:
+                            host = subprocess.run(
+                                ["codex", "--version"], capture_output=True, text=True,
+                                timeout=15, check=False,
+                            )
+                            match = re.search(CLI_VERSION_PATTERN, host.stdout)
+                            if host.returncode == 0 and match:
+                                host_version = match.group()
+                        except (OSError, subprocess.TimeoutExpired):
+                            pass  # Diagnostic only: the container's rejection is the failure.
+                        raise ValueError(
+                            f"Pinned container Codex CLI {boundary['version']} rejected credentials "
+                            f"supplied by host Codex CLI {host_version}; credential formats may "
+                            "be incompatible. Re-authenticate with the pinned CLI or start a new "
+                            "run with a compatible runner.cli_version; model call refused"
+                        ) from error
                     await native_treatments.install(
                         environment=environment,
                         treatment=Treatment.model_validate(boundary["treatment"]),

@@ -533,7 +533,7 @@ def test_image_inspection_error_does_not_trigger_a_pull(monkeypatch: pytest.Monk
 
 @pytest.mark.parametrize(
     "case",
-    ["stderr", "malformed", "turn.failed", "error", "exit-nonzero", "mismatch", "source-drift", "native-success", "native-failure"],
+    ["stderr", "malformed", "turn.failed", "error", "exit-nonzero", "mismatch", "source-drift", "native-success", "native-failure", "native-auth-failure"],
 )
 def test_codex_transport_delegates_to_sdk_pipefail_and_preserves_separate_stderr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
@@ -562,6 +562,9 @@ def test_codex_transport_delegates_to_sdk_pipefail_and_preserves_separate_stderr
     binary = binaries / "codex"
     binary.write_text(
         "#!/bin/sh\n"
+        + 'if [ "$1 $2" = "login status" ]; then '
+        + ("exit 1" if case == "native-auth-failure" else "exit 0")
+        + '; fi\nif [ "$1" = "--version" ]; then echo "codex-cli 0.167.1"; exit 0; fi\n'
         + f"printf called >> {shlex.quote(str(counter))}\n"
         + f"cat {shlex.quote(str(first))}\n"
         + f"printf '%s\\n' {shlex.quote(diagnostic)} >&2\n"
@@ -569,6 +572,7 @@ def test_codex_transport_delegates_to_sdk_pipefail_and_preserves_separate_stderr
         + ("exit 7\n" if case == "exit-nonzero" else "exit 0\n")
     )
     binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(binaries) + os.pathsep + os.environ.get("PATH", os.defpath))
     commands: list[str] = []
     created: list[object] = []
 
@@ -585,7 +589,8 @@ def test_codex_transport_delegates_to_sdk_pipefail_and_preserves_separate_stderr
         ) -> object:
             commands.append(command)
             mapped = command.replace("/logs/agent/", str(agent_directory) + "/")
-            assert cwd == "/workspace" and timeout_sec == 5 and user is None
+            assert cwd == "/workspace" and user is None
+            assert timeout_sec == (15 if "codex login status" in command else 5)
             assert env == ({"SETUP": "unchanged"} if len(commands) == 1 else {"TASK": "unchanged"})
             result = run_command(
                 ["bash", "-c", mapped],
@@ -648,12 +653,14 @@ def test_codex_transport_delegates_to_sdk_pipefail_and_preserves_separate_stderr
     if case.startswith("native-"):
         trial_config["pluginbench_boundary"] = {
             "treatment": {}, "image": {"workdir": "/workspace"}, "area": str(tmp_path),
+            "version": "0.167.0",
         }
         # Source-export hooks are unrelated to this transport-ordering boundary.
         monkeypatch.setattr(harbor, "install_native_hooks", lambda *args: None)
 
         async def install(**kwargs: Any) -> dict[str, object]:
-            assert commands == ["set -o pipefail; printf setup"]
+            assert len(commands) == 2 and commands[0] == "set -o pipefail; printf setup"
+            assert "codex login status >/dev/null 2>&1" in commands[1]
             assert not counter.exists()
             await kwargs["environment"].exec(
                 command="printf native-installed",
@@ -666,11 +673,15 @@ def test_codex_transport_delegates_to_sdk_pipefail_and_preserves_separate_stderr
         monkeypatch.setattr(native_treatments, "install", install)
     if case == "source-drift":
         monkeypatch.setattr(harbor, "_CODEX_RUN_SHA256", "changed", raising=False)
-    if case in {"mismatch", "source-drift", "exit-nonzero", "native-failure"}:
-        with pytest.raises((ValueError, RuntimeError)):
+    if case in {"mismatch", "source-drift", "exit-nonzero", "native-failure", "native-auth-failure"}:
+        with pytest.raises((ValueError, RuntimeError)) as failed:
             asyncio.run(harbor.run_trial(trial_config))
-        if case in {"mismatch", "source-drift", "native-failure"}:
+        if case in {"mismatch", "source-drift", "native-failure", "native-auth-failure"}:
             assert not counter.exists()
+        if case == "native-auth-failure":
+            assert "container Codex CLI 0.167.0 rejected credentials" in str(failed.value)
+            assert "host Codex CLI 0.167.1" in str(failed.value)
+            assert "model call refused" in str(failed.value)
         if case == "source-drift":
             assert not created
         return
@@ -687,7 +698,8 @@ def test_codex_transport_delegates_to_sdk_pipefail_and_preserves_separate_stderr
     assert commands[0] == "set -o pipefail; printf setup"
     assert "--model gpt-6.1-sol --json --enable unified_exec -- 'task'" in commands[-1]
     if case == "native-success":
-        assert commands[1] == "printf native-installed"
+        assert "codex login status >/dev/null 2>&1" in commands[1]
+        assert commands[2] == "printf native-installed"
     assert counter.read_text() == "called"
 
 

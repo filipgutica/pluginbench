@@ -1174,6 +1174,67 @@ def test_check_accepts_an_unverified_codex_version_and_warns_once(
     assert checkable["calls"] == []
 
 
+@pytest.mark.parametrize("cli_version", ["0.167.0", None])
+def test_prepare_pins_the_selected_coding_cli_and_records_its_source(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch, cli_version: str | None
+) -> None:
+    raw = yaml.safe_load(checkable["path"].read_text())
+    if cli_version is not None:
+        raw["runner"]["cli_version"] = cli_version
+    else:
+        raw["runner"].pop("cli_version", None)
+    checkable["path"].write_text(yaml.safe_dump(raw))
+    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.167.1"})
+    admitted: list[str] = []
+    monkeypatch.setattr(codex, "admit_version", admitted.append)
+    config = evaluation.load_evaluation(checkable["path"])
+    root = evaluation.prepare_evaluation(config, checkable["output"])
+    pinned = cli_version or "0.167.1"
+    selection = evaluation._load_selection(root)
+    comparison = selection["comparison_identity"]
+    assert isinstance(comparison, dict)
+    runner_identity = comparison["runner"]
+    assert isinstance(runner_identity, dict)
+    recipe = json.loads((root / "inputs/study.json").read_text())
+    assert recipe["harness_version"] == pinned
+    assert selection["cli_version_source"] == ("runner.cli_version" if cli_version else "host")
+    assert comparison["harness_version"] == pinned
+    assert "cli_version" not in runner_identity
+    assert "cli_version_source" not in comparison
+    identity = json.loads((root / "inputs/vanilla-identity.json").read_text())
+    assert identity["harness_version"] == pinned
+    for task in identity["task_environment"].values():
+        assert task["toolchain_identity"]["harness_version"] == pinned
+    assert admitted == [pinned]
+    # The pin's provenance is not another coding identity input.
+    config.runner.cli_version = pinned
+    planned = evaluation.plan_evaluation(config)["comparison_identity"]
+    assert isinstance(planned, dict)
+    assert planned["runner"] == runner_identity
+    assert not checkable["calls"]
+
+
+@pytest.mark.parametrize("cli_version", ["latest", "^0.167.0", "0.167", "0.167.0\n", "0.167.0;id", 167])
+def test_invalid_coding_cli_version_is_rejected_at_config_load(
+    config: evaluation.Evaluation, tmp_path: Path, cli_version: object
+) -> None:
+    raw = config.model_dump(mode="json")
+    raw["runner"]["cli_version"] = cli_version
+    path = tmp_path / "invalid-version.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="cli_version"):
+        evaluation.load_evaluation(path)
+
+
+@pytest.mark.parametrize("cli_version", ["0.167.0-beta.1", "0.167.0+build.2"])
+def test_coding_cli_version_accepts_the_exact_toolchain_version_pattern(cli_version: str) -> None:
+    runner = evaluation.Runner(
+        harness="codex", model="gpt-6.1-sol", reasoning="medium", cli_version=cli_version
+    )
+    assert runner.cli_version == cli_version
+    assert cli_version in harbor_backend._cli_guard(runner.harness, runner.cli_version)
+
+
 def test_required_measure_that_is_not_configured_blocks_the_check(
     checkable: dict[str, Any],
 ) -> None:
@@ -2435,6 +2496,29 @@ def test_resume_refuses_before_coding_what_would_fail_after_it(
     blocked = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
     assert blocked.exit_code == 2 and "codex-code-mode-host" in blocked.stderr
     assert len(calls) == coded
+
+
+def test_resume_after_host_cli_update_keeps_the_pinned_container_version(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, calls, reviews = _stopped_after_two_attempts(config, tmp_path, monkeypatch)
+    coded = len(calls)
+    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.167.1"})
+    admitted: list[str] = []
+    monkeypatch.setattr(codex, "admit_version", admitted.append)
+    backend = harbor_backend.invoke_native
+
+    def invoke(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs["protocol"]["harness_version"] == "0.167.0"
+        return backend(**kwargs)
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
+    result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert len(calls) == coded + 7 and len(reviews) == 9
+    assert admitted == ["0.167.0"]
+    assert json.loads((root / "evidence/run.json").read_text())["status"] == "complete"
+    assert json.loads((root / "inputs/study.json").read_text())["harness_version"] == "0.167.0"
 
 
 def test_stopped_run_copied_to_a_new_path_resumes_there(

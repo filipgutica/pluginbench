@@ -17,6 +17,7 @@ See [running evaluations](running-evaluations.md) for valid combinations and exe
 | `runner.harness` | `Literal['codex', 'claude']` | `—` | yes | Selects the coding or review CLI. |
 | `runner.model` | `str` | `—` | yes | Selects the model ID, with an exact claude-* ID required for Claude. |
 | `runner.reasoning` | `Literal['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']` | `—` | yes | Selects reasoning effort, subject to harness and evaluation validation. |
+| `runner.cli_version` | `str \| None` | `null` | no | Pins the coding CLI version installed in the task container; defaults to the host CLI's version at prepare time. |
 | `treatments` | `dict[str, Treatment]` | `—` | yes | Maps treatment names to nonempty native packages, with vanilla included automatically. |
 | `treatments.<name>.guidance` | `list[Path]` | `[]` | no | Selects UTF-8 .md or .txt instruction files relative to the config file. |
 | `treatments.<name>.skills` | `list[Path]` | `[]` | no | Selects standalone skill roots or collections relative to the config file. |
@@ -56,6 +57,7 @@ See [running evaluations](running-evaluations.md) for valid combinations and exe
 | `reviewer.harness` | `Literal['codex', 'claude']` | `—` | yes | Selects the coding or review CLI. |
 | `reviewer.model` | `str` | `—` | yes | Selects the model ID, with an exact claude-* ID required for Claude. |
 | `reviewer.reasoning` | `Literal['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']` | `—` | yes | Selects reasoning effort, subject to harness and evaluation validation. |
+| `reviewer.cli_version` | `NoneType` | `null` | no | Reviews use the host CLI; only runner.cli_version can pin a container CLI. |
 | `reviewer.timeout_seconds` | `int \| None` | `null` | no | Sets the review timeout in seconds, or inherits the evaluation timeout when null. |
 | `reviewer.guidance` | `list[Path]` | `[]` | no | Selects files or directories of review criteria relative to the config file. |
 | `repeats` | `int` | `3` | no | Sets the number of attempts for each task and arm. |
