@@ -1,3 +1,3 @@
 """Compare native instructions, skills, and plugins with vanilla coding agents."""
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"

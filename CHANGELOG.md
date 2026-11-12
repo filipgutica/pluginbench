@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.6.0](https://github.com/filipgutica/pluginbench/compare/v0.5.1...v0.6.0) (2026-11-12)
+
+
+### Features
+
+* accept new Codex CLI versions and validate token usage per attempt ([#54](https://github.com/filipgutica/pluginbench/issues/54)) ([0160f18](https://github.com/filipgutica/pluginbench/commit/0160f182838ef2318b3f12de8a2b4ce585169859))
+* **judge:** bind verdicts and report bias and token usage ([#56](https://github.com/filipgutica/pluginbench/issues/56)) ([78324ef](https://github.com/filipgutica/pluginbench/commit/78324ef18366ebe7a8c6a521f2d3d5b78287e759))
+* make the coding CLI version a run input ([#57](https://github.com/filipgutica/pluginbench/issues/57)) ([8591493](https://github.com/filipgutica/pluginbench/commit/8591493311a0a01c65c77fc2f0009c61ed7b6c52))
+
+
+### Bug Fixes
+
+* drain active attempts when running a single job ([#53](https://github.com/filipgutica/pluginbench/issues/53)) ([d653259](https://github.com/filipgutica/pluginbench/commit/d6532593c278f03c9c4383513ba33c6f9f534a17))
+* explain stops and unconfirmable runs instead of going silent ([#58](https://github.com/filipgutica/pluginbench/issues/58)) ([0994314](https://github.com/filipgutica/pluginbench/commit/0994314834e75c525fb20141a6ebacbf07314b54))
+* name the vanilla arm vanilla in report outputs ([#60](https://github.com/filipgutica/pluginbench/issues/60)) ([0541137](https://github.com/filipgutica/pluginbench/commit/0541137d4b1d2545a01af83a76489458d49cd6e8))
+* revalidate saved token usage on reuse and report ([#59](https://github.com/filipgutica/pluginbench/issues/59)) ([a22afa7](https://github.com/filipgutica/pluginbench/commit/a22afa72e0dd44dab472baf8aff5166d91fd0fa6))
+* run judges and reviews with the Codex standalone install, and refuse unable verdicts ([#55](https://github.com/filipgutica/pluginbench/issues/55)) ([ea5a5b6](https://github.com/filipgutica/pluginbench/commit/ea5a5b6f2bfb4df6ef556a9fcf328f485463fe93))
+
 ## [0.5.1](https://github.com/filipgutica/pluginbench/compare/v0.5.0...v0.5.1) (2026-11-11)
 
 
