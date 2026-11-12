@@ -300,12 +300,30 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
     origins = (run or {}).get("baseline_origin", {})
     report = _read(root / "report/results.json")
     measured, references = _measures(report)
+    # A rebuilt report re-validates saved usage without writing evidence, so its verdict
+    # stands in for a missing execution-current.json.
+    report_validation = {
+        row["attempt_id"]: validation
+        for row in (report or {}).get("observations", [])
+        if isinstance(validation := (row.get("provenance") or {}).get("usage_validation"), dict)
+    }
 
     attempts = []
     for row in slots:
         handoff = evidence / "attempts" / row["id"] / _STAGE
         current = handoff / "execution-current.json"
         execution = _read(current if current.is_file() else handoff / "execution.json")
+        validation = report_validation.get(row["id"])
+        if execution is not None and not current.is_file() and validation is not None:
+            execution = {
+                **execution,
+                "usage_validation": validation,
+                # A rejection keeps its re-parsed usage for the record; it is not a usable figure.
+                "usage": validation.get("validated_usage")
+                if validation.get("status") == "validated"
+                else None,
+                "usage_accounting": None,
+            }
         tokens, tokens_status = _usage(execution, host=host)
         if row["state"] == "pending":
             tokens_status = "not_started"
