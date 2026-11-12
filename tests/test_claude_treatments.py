@@ -424,6 +424,14 @@ REFUSALS: dict[str, tuple[Callable[[Attempt], object], str]] = {
         ),
         "Claude discovery is not authenticated by the subscription token alone",
     ),
+    "third-party provider": (
+        _responses(
+            lambda r: r["initialize"].update(
+                account={"tokenSource": "CLAUDE_CODE_OAUTH_TOKEN", "apiProvider": "bedrock"}
+            )
+        ),
+        "Claude discovery is not authenticated by the subscription token alone",
+    ),
     "API key in the environment": (
         lambda attempt: attempt.extra_env.update(ANTHROPIC_API_KEY="sk-ant-unwanted"),
         "Claude treatment installation refuses ANTHROPIC_API_KEY",
@@ -563,6 +571,7 @@ def test_install_keeps_stderr_apart_and_writes_the_receipt(tmp_path: Path, defec
         ({"CLAUDE_CONFIG_DIR": "/root/.claude"}, "private CLAUDE_CONFIG_DIR"),
         ({"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "0"}, "pinned launch environment"),
         ({"ANTHROPIC_BASE_URL": "https://proxy.invalid"}, "refuses ANTHROPIC_BASE_URL"),
+        ({"ANTHROPIC_API_KEY": "sk-ant-unwanted"}, "refuses ANTHROPIC_API_KEY"),
     ],
 )
 def test_install_refuses_an_environment_coding_would_not_use(
