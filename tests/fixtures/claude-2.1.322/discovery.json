@@ -89,8 +89,7 @@
       ],
       "output_style": "default",
       "account": {
-        "tokenSource": "none",
-        "apiKeySource": "ANTHROPIC_API_KEY",
+        "tokenSource": "CLAUDE_CODE_OAUTH_TOKEN",
         "apiProvider": "firstParty"
       },
       "claude_code_version": "2.1.322",
