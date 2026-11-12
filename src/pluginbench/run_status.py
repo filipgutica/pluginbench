@@ -19,8 +19,9 @@ from pluginbench import run_lock, trial_containers
 from pluginbench.evaluation_report import correctness_state
 from pluginbench.ledger import LEDGER_NAME, Ledger
 
-# Bump on any change that removes or renames a field; adding a field keeps the version.
-SCHEMA_VERSION = 1
+# Bump on any change that removes or renames a field, or adds a value to an existing enum;
+# adding a field keeps the version. 2: `tokens_status` gained `unvalidated`.
+SCHEMA_VERSION = 2
 
 TOKEN_FIELDS = (
     "input_tokens",

@@ -160,7 +160,7 @@ def test_status_counts_outcomes_tokens_reuse_and_discarded_attempts(tmp_path: Pa
     with run_lock.hold(root):
         status = run_status.run_status(root)
 
-    assert status["schema_version"] == run_status.SCHEMA_VERSION
+    assert status["schema_version"] == run_status.SCHEMA_VERSION == 2
     assert status["phase"] == "coding" and status["active"]
     assert status["states_source"] == "ledger"
     assert status["outcomes"] == {"pass": 1, "fail": 1}

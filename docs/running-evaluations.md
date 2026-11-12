@@ -287,11 +287,11 @@ Only the process that holds `run.lock` measures. So when a resume holds the lock
 
 `pluginbench status runs/<run>` shows the run's phase, the process that owns it, its last activity, attempt states and outcomes per arm and task, coding tokens, vanilla cache reuse, discarded attempts, and the measurement and review revisions. `--watch` redraws every 2 seconds and exits when the run ends or is stopped. A redraw that catches a file mid-write is skipped. `status` only reads: it opens `evidence/ledger.sqlite` read-only and falls back to `evidence/run.json` for runs from before the ledger, or while the ledger cannot be read: busy, left with a crashed writer's journal, or not in rollback-journal mode. It works on any run directory, including stopped and old ones. For each attempt it prefers `execution-current.json` over `execution.json`, so rejected cached usage stays unavailable. It does not parse traces or re-validate historical receipts; recorded Codex figures without validation provenance are labelled `unvalidated`, with a command to rebuild the report.
 
-`status --json` prints one JSON object for dashboards. Fields are only added within a `schema_version`; a removed or renamed field bumps it. Version 1:
+`status --json` prints one JSON object for dashboards. Fields are only added within a `schema_version`; a removed or renamed field, or a new value for an existing enum, bumps it. Version 2 adds the `unvalidated` value to `tokens_status`; nothing else changed from version 1. Version 2:
 
 | Field | Meaning |
 | --- | --- |
-| `schema_version` | `1` |
+| `schema_version` | `2` |
 | `run`, `name` | Absolute run directory and evaluation name |
 | `phase` | `starting`, `coding`, `measuring`, `reviewing`, `reporting`, `complete`, `stopped` (the latest operation was stopped, or an unfinished run with saved coding state and no events has no live owner), `interrupted` (no live owner, and the last event is `started` or `progress`: the worker was killed or its host went down before it could record an exit; a process killed before its `started` event is not detected), `failed` (the last event is a failure), or `not_started`. `stop` and Ctrl-C record a `stopped` event, not a failure |
 | `resume_command` | The shell-quoted `pluginbench run <run>` command for a run that has work left and no owner, otherwise null. It names the command, not its result: `run` checks the saved state first and refuses, before any model call, a run it cannot continue, such as one whose first review had started |
