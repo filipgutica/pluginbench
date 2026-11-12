@@ -639,7 +639,10 @@ def test_a_run_saved_before_the_not_measured_list_shows_no_such_warning(tmp_path
     assert "Warning:" not in run_status.format_status(status)
 
 
-@pytest.mark.parametrize("projection", ["validated", "unavailable", "historical", "claude"])
+@pytest.mark.parametrize(
+    "projection",
+    ["validated", "unavailable", "historical", "claude", "report-validated", "report-rejected"],
+)
 def test_status_uses_current_usage_and_labels_historical_receipts(
     tmp_path: Path, projection: str
 ) -> None:
@@ -651,6 +654,18 @@ def test_status_uses_current_usage_and_labels_historical_receipts(
             "usage_validation": {"status": projection, "reasons":
                                  ["rejected saved rollout"] if projection == "unavailable" else []},
         })
+    elif projection.startswith("report-"):
+        # A report rebuilt after the upgrade re-validated this attempt's saved usage.
+        validated = projection == "report-validated"
+        validation = {
+            "status": "validated" if validated else "unavailable",
+            "validated_usage": USAGE if validated else None,
+            "reasons": [] if validated else ["rejected saved rollout"],
+        }
+        _write(root / "report/results.json", {"observations": [{
+            "attempt_id": "a1", "metric": "Input tokens", "status": "measured",
+            "value": USAGE["input_tokens"], "provenance": {"usage_validation": validation},
+        }]})
     elif projection == "claude":
         execution = json.loads((handoff / "execution.json").read_text())
         execution["launch"] = {"harness": "claude-cli"}
@@ -659,9 +674,10 @@ def test_status_uses_current_usage_and_labels_historical_receipts(
     status = run_status.run_status(root)
     row = next(row for row in status["attempts"] if row["id"] == "a1")
     expected = {"validated": "exact", "unavailable": "unknown",
-                "historical": "unvalidated", "claude": "exact"}
+                "historical": "unvalidated", "claude": "exact",
+                "report-validated": "exact", "report-rejected": "unknown"}
     assert row["tokens_status"] == expected[projection]
-    if projection == "unavailable":
+    if projection in {"unavailable", "report-rejected"}:
         assert row["tokens"] is None
         assert "rejected saved rollout" in row["tokens_reason"]
     else:
