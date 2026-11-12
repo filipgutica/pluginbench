@@ -111,6 +111,28 @@ def _tree(root: Path) -> dict[str, tuple[int, int]]:
 STATES = {"a1": "complete", "a2": "complete", "a3": "running", "a4": "pending"}
 
 
+@pytest.mark.parametrize(("version", "arm"), [(1, "baseline"), (2, "vanilla")])
+def test_status_reads_both_report_arm_names(tmp_path: Path, version: int, arm: str) -> None:
+    root = _run(tmp_path / "run", states=STATES, ledger=False)
+    _write(root / "report/results.json", {
+        "schema_version": version,
+        "attempts": [{"id": "a1", "guidance": arm}],
+        "observations": [{
+            "attempt_id": "a1", "arm": arm, "metric": "Input tokens",
+            "value": 42, "status": "measured", "unit": "tokens",
+        }],
+    })
+    before = _tree(root)
+    result = CliRunner().invoke(cli.app, ["status", str(root), "--json"])
+    assert result.exit_code == 0, result.output
+    attempt = next(row for row in json.loads(result.stdout)["attempts"] if row["id"] == "a1")
+    assert attempt["arm"] == "vanilla"
+    assert attempt["measures"]["Input tokens"] == {
+        "value": 42, "status": "measured", "unit": "tokens", "reason": None,
+    }
+    assert _tree(root) == before
+
+
 def test_an_old_run_without_a_ledger_or_owner_reads_as_stopped_and_is_not_touched(
     tmp_path: Path,
 ) -> None:

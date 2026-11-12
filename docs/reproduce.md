@@ -29,6 +29,10 @@ Each coding attempt keeps its execution evidence under `evidence/attempts/<attem
 including `execution.json`, `artifacts/`, and snapshots when available.
 `evidence/run.json` binds evidence files; `evaluation-binding.json` binds the evaluation settings.
 `report/results.json` supplies the saved observations read by `compare`.
+Public JSON, CSV, and HTML reports call the no-guidance arm `vanilla`.
+JSON schema version 2 also renames arm-specific fields; see the [report format](metrics.md#report-files) for the complete inventory.
+`compare`, `status`, and `judge prepare` accept version 1 reports that use `baseline` and version 2 reports that use `vanilla`.
+Evidence, `inputs/study.json`, attempt IDs, and cache identities retain their stored names, so existing runs need no migration.
 Vanilla cache hits reuse verified attempts, so a new directory does not necessarily make fresh coding calls.
 See [running evaluations](running-evaluations.md) for cache identities and runtime drift checks.
 

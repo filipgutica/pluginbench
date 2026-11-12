@@ -167,8 +167,21 @@ def _prepare(tmp_path: Path, run: Path, **options: object) -> Path:
     return prepare(**arguments)  # type: ignore[arg-type]
 
 
-def test_prepare_writes_blinded_task_folders_and_a_separate_key(tmp_path: Path) -> None:
-    directory = _prepare(tmp_path, _two_arms(tmp_path))
+@pytest.mark.parametrize(("version", "arm"), [(1, "baseline"), (2, "vanilla")])
+def test_prepare_writes_blinded_task_folders_and_a_separate_key(
+    tmp_path: Path, version: int, arm: str
+) -> None:
+    run = _two_arms(tmp_path)
+    results = run / "report/results.json"
+    data = json.loads(results.read_text())
+    data["schema_version"] = version
+    for row in data["attempts"]:
+        if row["guidance"] == "baseline":
+            row["guidance"] = arm
+    results.write_text(json.dumps(data))
+    before = results.read_bytes()
+    directory = _prepare(tmp_path, run)
+    assert results.read_bytes() == before
     key = json.loads((directory / "key.json").read_text())
     assert key["tasks"]["task-1"]["task"] == "alpha"
     assert set(key["tasks"]["task-2"]["pairs"]) == {"1", "2", "3"}

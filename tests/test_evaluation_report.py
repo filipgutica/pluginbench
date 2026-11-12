@@ -72,6 +72,58 @@ def _token_report() -> dict[str, object]:
     return report
 
 
+def test_public_outputs_use_vanilla_without_renaming_saved_evidence(tmp_path: Path) -> None:
+    report = _fixed_review_report()
+    report["baseline_origin"] = {
+        "baseline": {"cache_key": "unchanged-key", "origin_attempt": "baseline-original"}
+    }
+    original = copy.deepcopy(report)
+    config = _config("tokens", "lines", "cognitive", "coverage", "review")
+    config["prices"] = {
+        "exact-model": {
+            "as_of": "2026-10-01",
+            "input_per_million": 2,
+            "cached_input_per_million": 0.5,
+            "output_per_million": 8,
+        }
+    }
+    data = json.loads(write_evaluation_report(report, config, tmp_path).read_text())
+
+    assert {row["guidance"] for row in data["attempts"]} == {"vanilla", "candidate"}
+    assert data["schema_version"] == 2
+    assert data["comparison_identity"] == config["comparison_identity"]
+    assert report == original
+    assert data["reused_vanilla_attempts"] == 1
+    vanilla = next(row for row in data["attempts"] if row["id"] == "baseline")
+    assert vanilla["guidance"] == "vanilla"
+    assert vanilla["vanilla_origin"]["cache_key"] == "unchanged-key"
+    assert vanilla["vanilla_origin"]["origin_attempt"] == "baseline-original"
+    assert {row["id"] for row in data["attempts"]} == {
+        row["id"] for row in _rows(original, "attempts")
+    }
+
+    def check_names(value: object) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                assert "baseline" not in key, key
+                if key in {"arm", "guidance"}:
+                    assert item != "baseline"
+                check_names(item)
+        elif isinstance(value, list):
+            for item in value:
+                check_names(item)
+
+    check_names(data)
+    csv_rows = list(csv.DictReader(io.StringIO((tmp_path / "results.csv").read_text())))
+    assert csv_rows and {row["arm"] for row in csv_rows} == {"vanilla", "candidate"}
+    assert all("baseline" not in column for column in csv_rows[0])
+    html = (tmp_path / "report.html").read_text()
+    payload = re.search(
+        r'<script id="assessment-data" type="application/json">(.*?)</script>', html, re.S
+    )
+    assert payload is not None and json.loads(payload.group(1)) == data
+
+
 @pytest.mark.parametrize("target", ["directory", "results.json", "results.csv", "report.html"])
 def test_public_report_rejects_symlinks_before_any_write(tmp_path: Path, target: str) -> None:
     external = tmp_path / "external"
@@ -99,20 +151,20 @@ def test_each_guidance_set_has_its_own_delta_against_the_same_evaluation_baselin
         for row in _rows(data, "comparisons")
         if row["metric"] == "Input tokens"
     }
-    assert comparisons["workflow"]["baseline_median"] == 100
+    assert comparisons["workflow"]["vanilla_median"] == 100
     assert comparisons["workflow"]["guidance_median"] == 70
     assert comparisons["workflow"]["absolute_delta_vs_vanilla"] == -30
     assert comparisons["workflow"]["percentage_delta_vs_vanilla"] == -30
-    assert comparisons["superpowers"]["baseline_median"] == 100
+    assert comparisons["superpowers"]["vanilla_median"] == 100
     assert comparisons["superpowers"]["guidance_median"] == 130
     assert comparisons["superpowers"]["absolute_delta_vs_vanilla"] == 30
     assert all(
-        row["baseline_assigned"] == row["baseline_measured"] == 3 for row in comparisons.values()
+        row["vanilla_assigned"] == row["vanilla_measured"] == 3 for row in comparisons.values()
     )
     raw = [
         row["value"]
         for row in _rows(data, "observations")
-        if row["arm"] == "baseline" and row["metric"] == "Input tokens"
+        if row["arm"] == "vanilla" and row["metric"] == "Input tokens"
     ]
     assert raw == [80, 100, 120]
     assert data["comparison_identity"] == _config()["comparison_identity"]
@@ -150,13 +202,13 @@ def test_reused_baseline_is_disclosed_without_recounting_original_calls() -> Non
     report["study_progress"] = {"native_invocations": 8}
     data = evaluation_data(report, _config())
     assert data["coding_invocations"] == 8
-    assert data["reused_baseline_attempts"] == 1
+    assert data["reused_vanilla_attempts"] == 1
     limitations = data["limitations"]
     assert isinstance(limitations, list)
     assert "reused" in " ".join(str(row) for row in limitations)
     row = next(row for row in _rows(data, "attempts") if row["id"] == "baseline-0")
     # A historical origin keeps its origin_run; newer runs record origin_cohort instead.
-    assert row["baseline_origin"] == {
+    assert row["vanilla_origin"] == {
         "cache_key": "key",
         "origin_cohort": None,
         "origin_run": "earlier",
@@ -233,7 +285,7 @@ def test_selected_complexity_completeness_keeps_complete_empty_populations() -> 
     baseline = next(
         row
         for row in _rows(data, "observations")
-        if row["arm"] == "baseline" and row["metric"] == "Net cognitive complexity added"
+        if row["arm"] == "vanilla" and row["metric"] == "Net cognitive complexity added"
     )
     provenance = baseline["provenance"]
     assert isinstance(provenance, dict)
@@ -384,7 +436,7 @@ def _evaluation_plot_rows(
         + json.dumps(settings)
         + ";\n"
         + "const comparisonView={value:settings.view}, chartBreakdown={value:'tasks'}, taskSelect={value:settings.task};\n"
-        + "const unique=items=>[...new Set(items)]; const armLabel=arm=>arm==='baseline'?'Vanilla':arm;\n"
+        + "const unique=items=>[...new Set(items)]; const armLabel=arm=>arm==='vanilla'?'Vanilla':arm;\n"
         + function.group(0)
         + "\nconsole.log(JSON.stringify(evaluationPlotRows({rows:data.observations.filter(row=>row.metric===settings.metric),metric:settings.metric})));\n"
     )
@@ -393,7 +445,7 @@ def _evaluation_plot_rows(
     return _rows({"rows": json.loads(result.stdout)}, "rows")
 
 
-def test_actual_task_plot_rows_have_raw_status_and_reason_and_baseline_first(
+def test_actual_task_plot_rows_have_raw_status_and_reason_and_vanilla_first(
     tmp_path: Path,
 ) -> None:
     data = evaluation_data(_unequal_repeat_report(), _config("tokens"))
@@ -401,13 +453,17 @@ def test_actual_task_plot_rows_have_raw_status_and_reason_and_baseline_first(
     assert [(row["task"], row["guidance"]) for row in rows] == [
         (task, arm)
         for task in ("fixture-task", "second-task")
-        for arm in ("baseline", "superpowers", "workflow")
+        for arm in ("vanilla", "superpowers", "workflow")
     ]
     assert [row["plotted"] for row in rows] == [100, 130, 70, 300, 200, 400]
     assert all(
         row["status"] == "measured" and isinstance(row["reason"], str) and row["reason"]
         for row in rows
     )
+    deltas = _evaluation_plot_rows(data, tmp_path, metric="Input tokens", view="delta")
+    assert {row["population"] for row in deltas} == {
+        "Vanilla 3/3 · guidance 3/3 runs", "Vanilla 1/1 · guidance 1/1 runs"
+    }
     complexity = evaluation_data(_unknown_baseline_code_added_report(), _config("cognitive"))
     metric = "Net cognitive complexity added"
     assert [
@@ -458,7 +514,7 @@ def test_zero_vanilla_keeps_absolute_delta_but_percentage_unknown() -> None:
     assert comparison["status"] == "complete"
     missing = next(row for row in _rows(data, "comparisons") if row["metric"] == "Output tokens")
     assert missing["absolute_delta_vs_vanilla"] is None
-    assert missing["baseline_assigned"] == missing["guidance_assigned"] == 1
+    assert missing["vanilla_assigned"] == missing["guidance_assigned"] == 1
     assert missing["status"] == "unknown"
 
 
@@ -485,7 +541,7 @@ def test_unpaired_guidance_complexity_stays_visible_in_raw_task_and_overview_val
         baseline = next(
             row
             for row in _rows(data, "aggregates")
-            if row["metric"] == metric and row["guidance"] == "baseline"
+            if row["metric"] == metric and row["guidance"] == "vanilla"
         )
         assert baseline["value"] is None and baseline["measured_tasks"] == 0
     assert data["measurement_completeness"]
@@ -650,6 +706,8 @@ def _shared_helpers(controller: str) -> str:
     names = (
         "formatCompact",
         "formatSigned",
+        "vanillaArm",
+        "armLabel",
         "packageNames",
         "armRank",
         "byArm",
@@ -694,7 +752,7 @@ def _outcome_text(
         "const document={getElementById:element},packageSummary=element(),taskSelect={value:"
         + json.dumps(task)
         + "},observations=data.observations,metricSelect={value:''};\n"
-        "const unique=items=>[...new Set(items)],armLabel=arm=>arm==='baseline'?'Vanilla':arm;\n"
+        "const unique=items=>[...new Set(items)];\n"
         "const format=value=>String(value);\n"
         "const create=(tag,text,parent)=>{if(text!==undefined)texts.push(String(text));return element();};\n"
         + _shared_helpers(controller)
@@ -999,7 +1057,7 @@ def test_overview_weights_task_medians_equally_not_repetitions() -> None:
         row["guidance"]: row for row in _rows(data, "aggregates") if row["metric"] == "Input tokens"
     }
     assert (
-        rows["baseline"]["value"] == 200
+        rows["vanilla"]["value"] == 200
     )  # Mean of task medians 100 and 300; not repeat-weighted 150.
     assert rows["workflow"]["value"] == 235  # Task medians 70 and 400.
     assert rows["workflow"]["absolute_delta_vs_vanilla"] == 35
@@ -1080,7 +1138,7 @@ def test_selected_but_missing_review_stays_assigned_and_unknown() -> None:
     assert len(rows) == 22  # Eleven review metrics for each assigned attempt.
     assert all(row["value"] is None and row["status"] == "unknown" for row in rows)
     assert all(
-        row["baseline_assigned"] == row["guidance_assigned"] == 1
+        row["vanilla_assigned"] == row["guidance_assigned"] == 1
         for row in _rows(data, "comparisons")
     )
     assert all(
@@ -1233,29 +1291,29 @@ def test_completeness_matrix_shows_each_task_measure_and_arm(tmp_path: Path) -> 
         assert isinstance(row_cells, dict)
         for arm, cell in row_cells.items():
             cells[matrix_row["task"], matrix_row["metric"], arm] = cell
-    assert cells["fixture-task", "Output tokens", "baseline"]["text"] == "measured"
+    assert cells["fixture-task", "Output tokens", "vanilla"]["text"] == "measured"
     missing = cells["fixture-task", "Output tokens", "workflow"]
     assert missing["state"] == "unknown" and (missing["measured"], missing["assigned"]) == (2, 3)
     assert missing["text"].startswith("unknown: ") and missing["text"].endswith("(2 of 3 measured)")
     assert cells["fixture-task", "Line coverage %", "workflow"]["text"] == "not_configured"
     covered = cells["covered-task", "Line coverage %", "superpowers"]
     assert covered["state"] == "unknown" and covered["measured"] == 0
-    assert ("covered-task", "Line coverage %", "baseline") not in cells
+    assert ("covered-task", "Line coverage %", "vanilla") not in cells
     visible = _completeness_text(data, tmp_path)
     header = visible.index("Task")
     assert visible[header : header + 5] == [
         "Task",
         "Measure",
+        "Vanilla",
         "superpowers",
-        "baseline",
         "workflow",
     ]
     row = visible.index("Output tokens", visible.index("fixture-task", header)) - 1
     assert visible[row : row + 5] == [
         "fixture-task",
         "Output tokens",
-        "",
         "measured",
+        "",
         missing["text"],
     ]
 
@@ -1263,14 +1321,21 @@ def test_completeness_matrix_shows_each_task_measure_and_arm(tmp_path: Path) -> 
 def _completeness_text(data: dict[str, object], tmp_path: Path) -> list[str]:
     controller = Path("src/pluginbench/assessment-charts.html").read_text().rsplit("<script>", 1)[1]
     function = re.search(r"function showCompleteness\(\) \{.*?\n\}", controller, re.S)
-    assert function is not None
+    # The template's own arm naming and order, so the rendered columns are what users see.
+    helpers = [
+        re.search(rf"^const {name} = .*$", controller, re.M)
+        for name in ("vanillaArm", "armLabel", "packageNames", "armRank", "byArm")
+    ]
+    assert function is not None and all(helpers)
     script = tmp_path / "completeness.js"
     script.write_text(
         "const data=" + json.dumps(data) + ";\n"
         "const texts=[];const element=()=>({replaceChildren(){},querySelector(){return element()}});\n"
         "const document={getElementById:element},taskSelect={value:''};\n"
-        "const unique=items=>[...new Set(items)],armLabel=arm=>arm;\n"
+        "const unique=items=>[...new Set(items)],observations=data.observations;\n"
         "const create=(tag,text,parent)=>{if(text!==undefined)texts.push(String(text));return element();};\n"
+        + "\n".join(helper.group(0) for helper in helpers if helper)
+        + "\n"
         + function.group(0)
         + "\nshowCompleteness();console.log(JSON.stringify(texts));\n"
     )
