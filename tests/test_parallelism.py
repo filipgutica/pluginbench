@@ -131,3 +131,36 @@ def test_coordinator_interrupt_drains_worker_updates_without_admitting_more(
     with pytest.raises(KeyboardInterrupt, match="coordinator interrupted"):
         parallel.run_jobs(list(range(8)), jobs=2, operation=operation, on_submit=submitted.append)
     assert submitted == [0, 1] and sorted(saved) == [0, 1]
+
+
+def test_every_interrupt_while_draining_says_what_it_waits_for(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gate = Barrier(3)
+    release = Event()
+    interrupts = 0
+
+    def wait(*args: object, **kwargs: object) -> object:
+        nonlocal interrupts
+        if interrupts < 2:
+            if interrupts == 0:
+                gate.wait(timeout=5)
+            interrupts += 1
+            raise KeyboardInterrupt("stop")
+        release.set()
+        active = args[0]
+        assert isinstance(active, set)
+        return wait_for_futures(active, timeout=0.05, return_when=FIRST_COMPLETED)
+
+    def operation(item: int, cancelled: Event, emit: Callable[[Callable[[], None]], None]) -> None:
+        gate.wait(timeout=5)
+        assert release.wait(timeout=5)
+
+    monkeypatch.setattr(parallel, "wait", wait)
+    with pytest.raises(KeyboardInterrupt, match="stop"):
+        parallel.run_jobs(list(range(4)), jobs=2, operation=operation)
+    notices = capsys.readouterr().err.splitlines()
+    assert notices == [
+        "Stopping: no new work starts. Waiting for 2 running call(s) to finish, "
+        "so the work already paid for is kept."
+    ] * 2

@@ -71,6 +71,14 @@ def pick(
         _error(exc)
 
 
+def _confirm(question: str) -> bool:
+    """Ask before paid work; without a terminal, explain how to start instead of aborting."""
+    if not sys.stdin.isatty():
+        typer.echo("No terminal to confirm in. Pass --yes to start without confirmation.", err=True)
+        raise typer.Exit(1)
+    return typer.confirm(question)
+
+
 def _error(exc: Exception) -> None:
     if isinstance(exc, CheckFailed):
         typer.echo(_readiness_table(exc.report), err=True)
@@ -392,7 +400,7 @@ def run(
                 "no notification will be sent.",
                 err=True,
             )
-        if not yes and not typer.confirm("Start evaluation?"):
+        if not yes and not _confirm("Start evaluation?"):
             raise typer.Exit()
         progress = _notifying_progress(plan["coding_calls"]) if notify else typer.echo
         if evaluation is None:
@@ -563,7 +571,7 @@ def review(
         with run_lock.hold(run):
             plan = plan_review(run, revision)
             typer.echo(f"{plan['review_calls']} review calls as review revision {revision}.")
-            if not yes and not typer.confirm("Start review?"):
+            if not yes and not _confirm("Start review?"):
                 raise typer.Exit()
             _review(run, revision)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:

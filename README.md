@@ -113,7 +113,7 @@ This run uses one public DeepSWE task, vanilla only, and one repeat. It needs no
    pluginbench run evaluation.yaml
    ```
 
-   `run` prints the plan and asks `Start evaluation?` (`--yes` skips the question).
+   `run` prints the plan and asks `Start evaluation?` (`--yes` skips the question; without a terminal, such as in a script, pass `--yes`).
    It then runs the same checks as `check`, starts the run in the background, and prints the run directory, for example `runs/20261110T101500123456Z`.
 
 5. Follow it:

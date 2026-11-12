@@ -149,6 +149,21 @@ def test_config_dry_run_includes_fresh_vanilla_and_every_package(
     assert not summary.stdout.lstrip().startswith("{")
 
 
+def test_run_without_a_terminal_says_to_pass_yes(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "eval.yaml"
+    path.write_text(yaml.safe_dump(config.model_dump(mode="json")))
+    monkeypatch.setattr(
+        cli, "prepare_evaluation", lambda *args, **kwargs: pytest.fail("unconfirmed run started")
+    )
+    # CliRunner's stdin is not a terminal, like a script or an agent shell.
+    result = CliRunner().invoke(cli.app, ["run", str(path)], input="")
+    assert result.exit_code == 1
+    assert "Pass --yes to start without confirmation." in result.stderr
+    assert "Aborted" not in result.output
+
+
 def test_vanilla_only_config_plans_two_attempts_without_treatments(
     config: evaluation.Evaluation, tmp_path: Path
 ) -> None:
