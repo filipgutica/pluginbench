@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/filipgutica/pluginbench/compare/v0.6.0...v0.6.1) (2026-11-12)
+
+
+### Bug Fixes
+
+* let status use the rebuilt report's token validation ([#62](https://github.com/filipgutica/pluginbench/issues/62)) ([3cc30e4](https://github.com/filipgutica/pluginbench/commit/3cc30e4973d9c37175b779b6f151a9a0ef4862fd))
+
 ## [0.6.0](https://github.com/filipgutica/pluginbench/compare/v0.5.1...v0.6.0) (2026-11-12)
 
 
