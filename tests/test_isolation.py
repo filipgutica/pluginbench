@@ -184,3 +184,79 @@ def test_reviewer_probe_fails_when_the_sandbox_would_not_grant_the_host(
     monkeypatch.setattr(isolation, "tool_roots", lambda: [])
     with pytest.raises(ValueError, match="sandbox"):
         isolation.codex_code_mode_host()
+
+
+@pytest.mark.parametrize(
+    "layout", ["standalone", "linuxbrew-cask", "linuxbrew-cellar", "arbitrary"]
+)
+@pytest.mark.parametrize("launch_by_name", [False, True])
+def test_codex_symlink_launch_keeps_helpers_visible_without_granting_private_parents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str, launch_by_name: bool
+) -> None:
+    home = tmp_path / "home"
+    launcher = home / ".local/bin/codex"
+    if layout == "standalone":
+        package = home / ".codex/packages/standalone"
+        release = package / "releases/0.167.1-x86_64-unknown-linux-musl"
+        release.mkdir(parents=True)
+        (package / "current").symlink_to(release.relative_to(package), target_is_directory=True)
+        target = package / "current/bin/codex"
+    elif layout.startswith("linuxbrew"):
+        kind = "Caskroom" if layout == "linuxbrew-cask" else "Cellar"
+        prefix = home / f"linuxbrew/.linuxbrew/{kind}"
+        launcher = prefix.parent / "bin/codex"
+        release = prefix / "codex/0.167.0"
+        target = release / "bin/codex"
+        monkeypatch.setattr(
+            isolation,
+            "PACKAGE_ROOTS",
+            tuple(
+                tmp_path / root.relative_to("/") for root in getattr(isolation, "PACKAGE_ROOTS", ())
+            ),
+            raising=False,
+        )
+    else:
+        release = home / "private"
+        target = release / "bin/codex"
+    binary = release / "bin/codex"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    for name in ("codex", "codex-code-mode-host", "codex-exec-server"):
+        path = binary.with_name(name)
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+    launcher.parent.mkdir(parents=True)
+    launcher.symlink_to(target)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    which = shutil.which
+    monkeypatch.setattr(
+        shutil, "which", lambda name: str(launcher) if name == "codex" else which(name)
+    )
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    wrapped, _ = isolation.command(
+        ["codex" if launch_by_name else str(launcher), "--version"], writable=[]
+    )
+    launched = Path(wrapped[wrapped.index("--") + 1])
+    binds = [
+        (Path(wrapped[index + 1]), Path(wrapped[index + 2]))
+        for index, value in enumerate(wrapped)
+        if value == "--ro-bind"
+    ]
+
+    def visible(path: Path) -> bool:
+        return any(
+            path == destination or (source.is_dir() and path.is_relative_to(destination))
+            for source, destination in binds
+        )
+
+    assert launched.is_absolute()
+    for name in ("codex-code-mode-host", "codex-exec-server"):
+        assert visible(launched.with_name(name)), (launched, binds)
+    assert isolation.codex_code_mode_host() == binary.with_name("codex-code-mode-host")
+    assert not visible(home / "AGENTS.md")
+    assert not visible(launcher.parent / "private-file")
+    if layout != "arbitrary":
+        assert (release, release) in binds
+        assert not visible(release.parent / "other-version/private-file")
+    else:
+        assert not visible(release / "private-file")
+        assert not visible(binary.parent / "private-file")
