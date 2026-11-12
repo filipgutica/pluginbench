@@ -391,6 +391,18 @@ def observed_cli_version(startup: object) -> str | None:
 # Claude Code versions that coding evidence (discovery control requests, session transcripts,
 # and token reconciliation) is qualified against. Other versions run with a warning.
 QUALIFIED_VERSIONS = frozenset({"2.1.322"})
+# The tools a qualified CLI offers the pinned coding launch with subagents on, as `system/init`
+# lists them. From the paid 2.1.322 probe (subscription login): an offline, fake-token start
+# omits WebFetch. `system/init` names the subagent tool Task; `--disallowed-tools Agent`
+# removes it.
+SUBAGENT_TOOL = "Task"
+QUALIFIED_TOOLS: dict[str, frozenset[str]] = {
+    "2.1.322": frozenset({
+        "Bash", "CronDelete", "CronList", "Edit", "EnterWorktree", "ExitWorktree", "ListAgents",
+        "Monitor", "NotebookEdit", "Read", "ReportFindings", "Skill", "Task", "TaskStop",
+        "ToolSearch", "WebFetch", "WebSearch", "Write",
+    }),
+}
 
 
 @cache

@@ -306,6 +306,31 @@ def test_claude_refuses_hook_file_modules(tmp_path: Path) -> None:
         _claude(Treatment(plugins=[plugin]), tmp_path)
 
 
+# CLI 2.1.322 ran a SessionStart hook for each refused matcher below: it reads a matcher
+# outside names, `|` and `*` as a regular expression.
+@pytest.mark.parametrize(
+    ("matcher", "admitted"),
+    [
+        ("", True), ("*", True), ("startup", True), ("startup|clear|compact", True),
+        ("Bash", True), ("start.*", False), ("^startup$", False), (".*", False),
+        ("(startup)", False), (" startup", False), ("star*", False), ("Edit|Write*", False),
+    ],
+)
+def test_claude_admits_only_hook_matchers_it_can_check_without_a_regex(
+    tmp_path: Path, matcher: str, admitted: bool
+) -> None:
+    plugin = _claude_plugin(tmp_path / "plugin")
+    (plugin / "hooks").mkdir()
+    (plugin / "hooks/hooks.json").write_text(json.dumps({"hooks": {"SessionStart": [
+        {"matcher": matcher, "hooks": [{"type": "command", "command": "true"}]},
+    ]}}))
+    if admitted:
+        _claude(Treatment(plugins=[plugin]), tmp_path)
+    else:
+        with pytest.raises(ValueError, match="Claude hook matcher"):
+            _claude(Treatment(plugins=[plugin]), tmp_path)
+
+
 def test_claude_refuses_a_root_skill(tmp_path: Path) -> None:
     plugin = _claude_plugin(tmp_path / "plugin")
     shutil.rmtree(plugin / "skills")

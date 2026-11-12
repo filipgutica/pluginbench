@@ -22,7 +22,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # The optional artifact destination is judge-only; coding launch behavior stays v1.
             "codex.py": "185d0c33e1389051ddfb97a85c08978a6f65773c2378d601cdf608f4b0c17ccf",
             # The Claude launch contract; tests/test_codex_identity.py proves Codex launches equal.
-            "harbor_backend.py": "064876b86b1a0e601cffb4af2a510e2eda6939e6d948f407217d3ea187f3934d",
+            "harbor_backend.py": "70b32fd5198c99e76d2b8751d40bc854eb193555f68b954658b1697da43992b8",
             "processes.py": "0170e0a4902fc610d19b50ed5656c601474adad97b9b8d6fb5b08c6ab6ad00d1",
             # Claude admission dispatch only; Codex admission is unchanged.
             "native_treatments.py": "cfe17310a7f43de42af556e98fe63380493aeaf6a419ad612d51e01d671f0f19",
@@ -30,14 +30,14 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
                 "229d01b78fd893b8e502139507b74d18f0147079c58f15f90b0548b5520e67c5"
             ),
             # Claude plugin admission rules; Codex admission and every admitted launch stay v1.
-            "treatments.py": "441498fa24855b0ed5e8b713be2bdf1eb8d06bc29b9d01cdbdb762f838bcc81c",
+            "treatments.py": "68bc11023a601c7bcf2ababdbb5007f0515eb1c64e9a1194862cfa939541ebab",
             # Claude version admission and coding launch contract; Claude-only, so Codex stays v1.
-            "claude.py": "0387f14438368ed964f678202fcadf6c3ac8a18f30adae037676c01e42becfda",
+            "claude.py": "7010fe7d5242a43138c63a09af1cb73b63f4ccc0a44a87732024791395ecdfab",
             "claude_treatments.py": "15d5d5de89f34e2b1b6982bb0f1eb1fbbcf28be2b08586500e489d2db55e2aa5",
             "claude_treatment_runtime.js": (
                 "61ac207ea357796c3ed935cac8b3d1574e0c562a7651cade586aad7e5cc5731b"
             ),
-            "claude_launch.py": "bb7fb87196ae746a98acb109fff4eca13bf30bcaa782b7609d8a233a020d7b83",
+            "claude_launch.py": "f06f63ca474b69e4e1db9722a96a796754f633d75676230e6fe71f541b507462",
         },
     ),
     "analysis_observer": (

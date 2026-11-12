@@ -13,7 +13,6 @@ import importlib
 import importlib.metadata
 import inspect
 import json
-import re
 import shlex
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -27,8 +26,16 @@ TRANSPORT_VERSION = "claude-pinned-launch-v1"
 _HARBOR_VERSION = "0.24.0"
 # ClaudeCode.run in Harbor 0.24.0. The contract matches the command this source builds.
 _HARBOR_RUN_SHA256 = "a1cf6f922478cac2c8501fafc8575a924e726bd213f44d787034c0be81e2703f"
-# A command that starts the CLI: `claude` as a word, not a path such as ~/.claude/skills.
-_INVOKES_CLI = re.compile(r"(?:^|[\s;|&(])claude(?:\s|$)")
+# The setup command of ClaudeCode.run in Harbor 0.24.0 for PluginBench's agent config: no
+# settings file, memory or MCP servers. Harbor appends the skills copy when it was given skills.
+_HARBOR_SETUP = (
+    "mkdir -p $CLAUDE_CONFIG_DIR/debug $CLAUDE_CONFIG_DIR/projects/-app "
+    "$CLAUDE_CONFIG_DIR/shell-snapshots $CLAUDE_CONFIG_DIR/statsig "
+    "$CLAUDE_CONFIG_DIR/todos $CLAUDE_CONFIG_DIR/skills && "
+    "if [ -d ~/.claude/skills ]; then "
+    "cp -r ~/.claude/skills/. $CLAUDE_CONFIG_DIR/skills/ 2>/dev/null || true; "
+    "fi"
+)
 # Codex limits Claude Code ignores (council C3). A recipe that sets one is refused, and a
 # Claude run records them as not enforced instead of numbers it never used.
 UNENFORCED_LIMITS = ("max_threads", "max_depth")
@@ -95,15 +102,27 @@ def validated_launch(execution: dict[str, Any], model: str, effort: str) -> bool
     )
 
 
-def pin_exec(agent: object, boundary: dict[str, Any], *, qualification: str) -> None:
-    """Replace the agent's `exec_as_agent` with the contract.
+def harbor_setup(skills_dir: str | None) -> str:
+    """The setup command Harbor runs before coding, given the skills directory it was handed."""
+    if not skills_dir:
+        return _HARBOR_SETUP
+    return (
+        f"{_HARBOR_SETUP} && (cp -r {shlex.quote(skills_dir)}/* "
+        "$CLAUDE_CONFIG_DIR/skills/ 2>/dev/null || true)"
+    )
 
-    Every command is refused when its environment carries a refused variable, so an API key
-    stops the attempt before Harbor's setup runs. `qualification` is the version guard, the
-    only other command allowed to start the CLI.
+
+def pin_exec(agent: object, boundary: dict[str, Any], *, qualification: str) -> None:
+    """Replace the agent's `exec_as_agent` with the contract, an allowlist of three commands.
+
+    The agent may run the version guard `qualification`, Harbor's setup, and Harbor's coding
+    command, which runs as the pinned argv; any other command is refused. Every command is
+    refused when its environment carries a refused variable, so an API key stops the attempt
+    before Harbor's setup runs.
     """
     original: Callable[..., Awaitable[object]] = getattr(agent, "exec_as_agent")
     run = claude.CodingRun(**boundary["coding_run"])
+    allowed = {qualification, harbor_setup(getattr(agent, "skills_dir", None))}
     coded = False
 
     async def pinned_exec(
@@ -118,12 +137,13 @@ def pin_exec(agent: object, boundary: dict[str, Any], *, qualification: str) -> 
         # scoped agent env, which outranks both.
         merged = dict(getattr(environment, "_merge_env")(env) or {})
         claude.refuse_env(merged)
-        if not _INVOKES_CLI.search(command) or command == qualification:
+        if command in allowed:
             return await original(environment, command, env=env, cwd=cwd, timeout_sec=timeout_sec)
+        # Anything else must be the coding command.
+        pinned = claude.contract_command(command, run)
         if coded:
             raise ValueError("a Claude attempt runs one coding command; use a fresh attempt")
         coded = True
-        pinned = claude.contract_command(command, run)
         claude.check_coding_env(merged, run)
         # Discovery and coding get this same dict, so discovery sees what coding will.
         receipt = await claude_treatments.install(
@@ -183,16 +203,14 @@ def session_errors(
 ) -> list[str]:
     """How a coding session differs from the discovery receipt it was launched after (D2).
 
-    Its `system/init` must report what discovery found, and its hook events must be the
-    listed hooks: each SessionStart hook that matches `startup` starts once and exits 0
-    before the first assistant message, and no other hook event appears.
+    Its `system/init` must report what discovery found and offer the pinned tools, its
+    result must record no permission denial, and its hook events must be the listed hooks:
+    the SessionStart hooks that match `startup` start once each and exit 0 before the first
+    assistant message, other listed hooks exit 0 or 2 (a deliberate block), and no other hook
+    event appears.
     """
-    events = [
-        event
-        for line in stream.splitlines()
-        if line.startswith("{") and isinstance(event := _json(line), dict)
-    ]
-    inits = [e for e in events if e.get("type") == "system" and e.get("subtype") == "init"]
+    events = _events(stream)
+    inits = _inits(events)
     if len(inits) != 1:
         return ["the coding stream needs exactly one system/init"]
     init = inits[0]
@@ -232,9 +250,18 @@ def session_errors(
         for key in expected
         if observed[key] != expected[key]
     ]
-    refused = set(claude.DISALLOWED_TOOLS) | (set() if subagents else {"Agent", "Task"})
-    if not isinstance(init.get("tools"), list) or refused & set(init["tools"]):
+    tools = init.get("tools")
+    refused = set(claude.DISALLOWED_TOOLS) | (set() if subagents else {"Agent", claude.SUBAGENT_TOOL})
+    qualified = claude.QUALIFIED_TOOLS.get(str(receipt["cli_version"]))
+    if not isinstance(tools, list) or refused & set(tools):
         errors.append("system/init offers a disallowed tool")
+    elif qualified is not None and sorted(tools) != sorted(
+        qualified - (set() if subagents else {claude.SUBAGENT_TOOL})
+    ):
+        errors.append("system/init tools differ from the pinned tool set")
+    for result in (e for e in events if e.get("type") == "result"):
+        if result.get("permission_denials") != []:
+            errors.append("the run records permission denials")
     return errors + _hook_errors(events, listing)
 
 
@@ -263,32 +290,55 @@ def _hook_errors(events: list[dict[str, Any]], listing: list[tuple[str, str]]) -
             responses.setdefault(event.get("hook_id"), []).append(event)
     for _, event in started:
         answer = responses.pop(event.get("hook_id"), [])
-        if len(answer) != 1 or answer[0].get("exit_code") != 0 or answer[0].get("outcome") != "success":
-            errors.append(f"hook {event.get('hook_name')} did not exit 0 exactly once")
+        # Exit 2 is a hook's deliberate block; a session must start cleanly.
+        session = event.get("hook_event") == "SessionStart"
+        if len(answer) != 1 or (
+            (answer[0].get("exit_code"), answer[0].get("outcome")) != (0, "success")
+            if session
+            else answer[0].get("exit_code") not in (0, 2)
+        ):
+            errors.append(f"hook {event.get('hook_name')} did not exit as allowed exactly once")
     if responses:
         errors.append("a hook responded without starting")
     at_startup = sum(
         1 for name, matcher in listing if name == "SessionStart" and _matches(matcher, "startup")
     )
-    ran = sum(
-        1
-        for index, event in started
-        if event.get("hook_name") == "SessionStart:startup" and index < first_reply
-    )
-    if ran != at_startup:
-        errors.append(
-            f"{ran} SessionStart startup hooks ran before the first reply; {at_startup} are listed"
-        )
+    startup = [index for index, event in started if event.get("hook_name") == "SessionStart:startup"]
+    # CLI 2.1.322 names a hook event only by event and trigger, so hooks are counted, not
+    # told apart: one that ran twice and one that never ran look like two runs.
+    if any(index > first_reply for index in startup):
+        errors.append("a SessionStart startup hook ran after the first reply")
+    if len(startup) != at_startup:
+        errors.append(f"{len(startup)} SessionStart startup hooks ran; {at_startup} are listed")
     return errors
 
 
 def _matches(matcher: str, trigger: str) -> bool:
-    """Claude's matcher: empty or `*` matches all; otherwise `|`-separated exact names."""
+    """Claude's matcher in the grammar admission allows: empty or `*` matches all; otherwise
+    `|`-separated exact names (verified on CLI 2.1.322: `start` does not match `startup`)."""
     return matcher in ("", "*") or trigger in matcher.split("|")
 
 
 def _sorted(value: object) -> list[str]:
     return sorted(str(item) for item in value) if isinstance(value, list) else []
+
+
+def init_tools(stream: str) -> list[str] | None:
+    """The tools a coding session's one `system/init` offered, for the attempt's record."""
+    inits = _inits(_events(stream))
+    return _sorted(inits[0].get("tools")) if len(inits) == 1 else None
+
+
+def _events(stream: str) -> list[dict[str, Any]]:
+    return [
+        event
+        for line in stream.splitlines()
+        if line.startswith("{") and isinstance(event := _json(line), dict)
+    ]
+
+
+def _inits(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [e for e in events if e.get("type") == "system" and e.get("subtype") == "init"]
 
 
 def _json(line: str) -> object:

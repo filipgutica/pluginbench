@@ -101,9 +101,7 @@ class Container:
         (init,) = [event for event in coding if event.get("subtype") == "init"]
         for event in start:
             event["session_id"] = init["session_id"]
-            if event.get("subtype") == "init" and not self.subagents:
-                # The real CLI drops its subagent tool, Task, for `--disallowed-tools Agent`.
-                event["tools"].remove("Task")
+        _as_probed(start, subagents=self.subagents)
         self.edit_start(start)
         return "".join(json.dumps(event) + "\n" for event in start + coding if event is not init)
 
@@ -133,8 +131,10 @@ class Container:
     def local(self, text: str) -> str:
         """Container paths in a command or env value, as their host directories."""
         assert self.agent_root is not None
-        return text.replace("/logs/agent/", f"{self.agent_root}/").replace(
-            REMOTE_ROOT, str(self.remote)
+        return (
+            text.replace("/logs/agent/", f"{self.agent_root}/")
+            .replace(REMOTE_ROOT, str(self.remote))
+            .replace("/tmp/claude-code-settings", str(self.root / "claude-code-settings"))
         )
 
     def run_trial(self, config: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> object:
@@ -333,7 +333,7 @@ def coding_command(container: Container) -> tuple[str, dict[str, str]]:
 
 @pytest.mark.parametrize(
     ("treated", "case", "subagents"),
-    [(False, "plain", False), (True, "one-subagent", True)],
+    [(False, "plain", False), (True, "two-parallel", True)],
 )
 def test_a_claude_attempt_runs_the_pinned_command_with_the_pinned_subscription_env(
     attempt: Callable[..., Attempt],
@@ -378,6 +378,9 @@ def test_a_claude_attempt_runs_the_pinned_command_with_the_pinned_subscription_e
     assert saved == json.loads(json.dumps(execution))
     assert saved["successful_native_completion"] is True
     assert "treatment_error" not in saved and saved["native_treatment"]["status"] == "verified"
+    assert saved["claude_init_tools"] == sorted(
+        claude.QUALIFIED_TOOLS[VERSION] - (set() if subagents else {"Task"})
+    )
     assert saved["launch"]["delivery"] == claude_treatments.DELIVERY_POLICY
     assert saved["launch"]["argv"] == argv
     assert saved["launch"]["capabilities"] == {
@@ -407,7 +410,7 @@ def test_a_fresh_attempt_with_unreconciled_usage_is_unvalidated_at_launch(
     # The subagent transcript answers a call the stream never made.
     made = attempt(
         treated=False,
-        case="one-subagent",
+        case="two-parallel",
         after_sessions='for meta in "$CLAUDE_CONFIG_DIR"/projects/*/*/subagents/*.meta.json; '
         "do echo '{\"toolUseId\": \"toolu_orphan\"}' > \"$meta\"; done",
     )
@@ -474,6 +477,61 @@ def test_a_command_off_the_contract_is_refused_before_the_cli_starts(
     assert saved["successful_native_completion"] is False
     assert "differs from the pinned launch contract" in json.dumps(saved["error"])
     assert not made.container.installs and not made.container.argv_log.exists()
+    # Neither did Harbor's setup or cleanup of the settings folder a config adds.
+    assert not any("claude-code-settings" in command for command, _ in made.container.commands)
+
+
+def _pinned_agent(skills_dir: str | None = None) -> tuple[Any, list[str]]:
+    """An agent whose own `exec_as_agent` records commands, behind the contract."""
+    ran: list[str] = []
+
+    async def exec_as_agent(environment: object, command: str, **kwargs: object) -> object:
+        ran.append(command)
+        return SimpleNamespace(stdout="", stderr="", return_code=0)
+
+    agent = SimpleNamespace(exec_as_agent=exec_as_agent, skills_dir=skills_dir)
+    boundary = {"coding_run": {"model": MODEL, "effort": "high", "subagents": False,
+                                "timeout_seconds": 1800}}
+    claude_launch.pin_exec(agent, boundary, qualification="guard")
+    return agent, ran
+
+
+class _Environment:
+    def _merge_env(self, env: dict[str, str] | None) -> dict[str, str] | None:
+        return env
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/root/.local/bin/claude -p hi",
+        '"$HOME/.local/bin/claude" -p hi',
+        "claude<<<x",
+        "claude>f",
+        "env",
+        claude_launch.harbor_setup(None) + "; env > /tmp/env",
+        claude_launch.harbor_setup(None) + " && mkdir -p /tmp/claude-code-settings",
+        claude_launch.harbor_setup("/skills"),
+    ],
+)
+def test_the_agent_runs_only_the_guard_harbors_setup_and_the_coding_command(command: str) -> None:
+    agent, ran = _pinned_agent()
+    with pytest.raises(ValueError, match="pinned launch contract"):
+        asyncio.run(agent.exec_as_agent(_Environment(), command))
+    assert ran == []
+
+
+def test_harbors_setup_with_task_skills_is_allowed(
+    attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made = attempt(treated=False)
+    # Harbor's trial hands the agent a skills folder when the task or Harbor has one.
+    made.container.harbor_config = {"skills_dir": "/task skills"}
+    made.invoke(monkeypatch)
+    saved = json.loads((made.area / "artifacts/execution.json").read_text())
+    assert saved["successful_native_completion"] is True
+    setup = "set -o pipefail; " + claude_launch.harbor_setup("/task skills")
+    assert setup in [command for command, _ in made.container.commands]
 
 
 @pytest.mark.parametrize(
@@ -560,6 +618,19 @@ def test_the_claude_transport_pins_harbors_run_source(monkeypatch: pytest.Monkey
         claude_launch.transport()
 
 
+def _as_probed(events: list[dict[str, Any]], *, subagents: bool) -> None:
+    """Give a captured offline start the tools of a signed-in 2.1.322 session.
+
+    The fixtures were captured with a fake token, where the CLI leaves out WebFetch; every
+    signed-in probe run offered it. The real CLI drops its subagent tool, Task, for
+    `--disallowed-tools Agent`.
+    """
+    tools = _init(events)["tools"]
+    tools.append("WebFetch")
+    if not subagents:
+        tools.remove("Task")
+
+
 def _init(events: list[dict[str, Any]]) -> dict[str, Any]:
     (init,) = [event for event in events if event.get("subtype") == "init"]
     return init
@@ -568,6 +639,17 @@ def _init(events: list[dict[str, Any]]) -> dict[str, Any]:
 def _hook(events: list[dict[str, Any]], subtype: str) -> dict[str, Any]:
     (hook,) = [event for event in events if event.get("subtype") == subtype]
     return hook
+
+
+def _repeat_hook(events: list[dict[str, Any]], *, before_reply: bool) -> None:
+    """Run the start's one SessionStart hook a second time, under a new id."""
+    pair = [
+        {**_hook(events, subtype), "hook_id": "again"} for subtype in ("hook_started", "hook_response")
+    ]
+    if before_reply:
+        events[:0] = pair
+    else:
+        events.extend([{"type": "assistant", "message": {"content": []}}, *pair])
 
 
 def _drop_hooks(events: list[dict[str, Any]]) -> None:
@@ -600,11 +682,27 @@ SESSION_CHANGES: dict[str, tuple[bool, Callable[[list[dict[str, Any]]], None], s
     ),
     "mcp": (False, lambda e: _init(e).update(mcp_servers=[{"name": "m"}]), "mcp_servers differs"),
     "subagent tool": (False, lambda e: _init(e)["tools"].append("Task"), "disallowed tool"),
+    "tool removed": (
+        False, lambda e: _init(e).update(tools=["Read"]), "tools differ from the pinned tool set",
+    ),
+    "tool added": (
+        False, lambda e: _init(e)["tools"].append("LSP"), "tools differ from the pinned tool set",
+    ),
     "remote tool": (False, lambda e: _init(e)["tools"].append("RemoteTrigger"), "disallowed tool"),
     "hook did not run": (True, lambda e: _drop_hooks(e), "0 SessionStart startup hooks ran"),
     "hook failed": (
         True, lambda e: _hook(e, "hook_response").update(exit_code=1, outcome="error"),
-        "did not exit 0 exactly once",
+        "did not exit as allowed exactly once",
+    ),
+    "startup hook blocked": (
+        True, lambda e: _hook(e, "hook_response").update(exit_code=2, outcome="error"),
+        "did not exit as allowed exactly once",
+    ),
+    "startup hook ran twice": (
+        True, lambda e: _repeat_hook(e, before_reply=True), "2 SessionStart startup hooks ran",
+    ),
+    "startup hook ran after the first reply": (
+        True, lambda e: _repeat_hook(e, before_reply=False), "ran after the first reply",
     ),
     "unlisted hook": (
         True,
@@ -623,10 +721,7 @@ SESSION_CHANGES: dict[str, tuple[bool, Callable[[list[dict[str, Any]]], None], s
 
 @pytest.mark.parametrize("arm", ["vanilla", "treated", "superpowers"])
 def test_each_captured_real_session_matches_its_real_receipt(arm: str) -> None:
-    captured = FIXTURES / "session-start" / arm
-    receipt = json.loads((captured / "receipt.json").read_text())
-    stream = (captured / "session-start.jsonl").read_text()
-    assert claude_launch.session_errors(stream, receipt, model=MODEL, subagents=True) == []
+    assert _errors(*_captured(arm)) == []
 
 
 @pytest.mark.parametrize("change", sorted(SESSION_CHANGES))
@@ -641,6 +736,68 @@ def test_a_session_that_differs_from_its_discovery_receipt_fails_the_attempt(
     assert saved["successful_native_completion"] is False
     assert "differs from its discovery receipt" in saved["treatment_error"]
     assert reason in saved["treatment_error"]
+
+
+def test_a_run_with_a_permission_denial_fails_the_attempt(
+    attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The paid probe's one-subagent run: the subagent's Bash call was denied.
+    made = attempt(treated=False, case="one-subagent")
+    made.invoke(monkeypatch)
+    saved = json.loads((made.area / "artifacts/execution.json").read_text())
+    assert saved["successful_native_completion"] is False
+    assert "the run records permission denials" in saved["treatment_error"]
+
+
+def _captured(arm: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    captured = FIXTURES / "session-start" / arm
+    events = [json.loads(line) for line in (captured / "session-start.jsonl").read_text().splitlines()]
+    _as_probed(events, subagents=True)
+    return events, json.loads((captured / "receipt.json").read_text())
+
+
+def _errors(events: list[dict[str, Any]], receipt: dict[str, Any]) -> list[str]:
+    stream = "".join(json.dumps(event) + "\n" for event in events)
+    return claude_launch.session_errors(stream, receipt, model=MODEL, subagents=True)
+
+
+@pytest.mark.parametrize(("exit_code", "allowed"), [(0, True), (2, True), (1, False)])
+def test_a_listed_tool_hook_may_allow_or_block(exit_code: int, allowed: bool) -> None:
+    events, receipt = _captured("treated")
+    receipt["hooks"]["hooks"].append({"event": "PreToolUse", "matcher": "Bash"})
+    hook = {"type": "system", "hook_id": "tool", "hook_name": "PreToolUse:Bash",
+            "hook_event": "PreToolUse"}
+    events += [
+        {"type": "assistant", "message": {"content": []}},
+        {**hook, "subtype": "hook_started"},
+        {**hook, "subtype": "hook_response", "exit_code": exit_code, "outcome": "error"},
+    ]
+    assert (_errors(events, receipt) == []) is allowed
+
+
+def test_an_unqualified_version_is_held_only_to_the_disallowed_tools() -> None:
+    events, receipt = _captured("vanilla")
+    receipt["cli_version"] = "2.1.400"
+    _init(events).update(claude_code_version="2.1.400", tools=["Read"])
+    assert _errors(events, receipt) == []
+    _init(events)["tools"].append("RemoteTrigger")
+    assert _errors(events, receipt) == ["system/init offers a disallowed tool"]
+
+
+def test_a_failed_usage_check_leaves_the_attempt_usage_unvalidated(
+    attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*args: object) -> dict[str, Any]:
+        raise ValueError("unreadable transcript")
+
+    monkeypatch.setattr(saved_usage, "claude_attempt_usage", broken)
+    made = attempt(treated=False)
+    made.invoke(monkeypatch)
+    saved = json.loads((made.area / "artifacts/execution.json").read_text())
+    assert saved["usage"] is None
+    assert saved["usage_accounting"] == {
+        "status": "incomplete", "reasons": ["the usage check failed: unreadable transcript"],
+    }
 
 
 @pytest.mark.parametrize(

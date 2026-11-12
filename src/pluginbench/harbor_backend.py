@@ -2366,11 +2366,22 @@ def _native_completion(
                     ),
                 )
             )
-            if host == "claude":
-                # The rules reuse and reports revalidate with, applied to the fresh attempt.
-                execution.update(saved_usage.claude_attempt_usage(artifacts, launch))
         except (OSError, ValueError) as error:
             execution["evidence_error"] = str(error)
+        else:
+            if host == "claude":
+                try:
+                    # The rules reuse and reports revalidate with, applied to the fresh attempt.
+                    execution.update(saved_usage.claude_attempt_usage(artifacts, launch))
+                except Exception as error:
+                    # Never keep the stream's unvalidated usage from the evidence parse.
+                    execution.update(
+                        usage=None,
+                        usage_accounting={
+                            "status": "incomplete",
+                            "reasons": [f"the usage check failed: {error}"],
+                        },
+                    )
     native_error = native_result.get("exception_info")
     if native_error is not None:
         execution["error"] = native_error
@@ -2399,8 +2410,12 @@ def _native_completion(
                     or treatment_receipt.get("inventory") != launch.get("treatment_inventory")):
                 raise ValueError("native treatment installation was not verified for this attempt")
             if launch.get("delivery") == claude_treatments.DELIVERY_POLICY:
+                stream = (artifacts / "stdout.jsonl").read_text(errors="replace")
+                # Kept for every version: an unqualified one is checked only against the
+                # disallowed tools.
+                execution["claude_init_tools"] = claude_launch.init_tools(stream)
                 mismatches = claude_launch.session_errors(
-                    (artifacts / "stdout.jsonl").read_text(errors="replace"),
+                    stream,
                     treatment_receipt,
                     model=str(launch["requested_model"]),
                     subagents=bool(

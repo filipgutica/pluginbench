@@ -3102,9 +3102,10 @@ def test_a_claude_evaluation_with_default_limits_prepares_and_resumes(
     evaluation._saved_evaluation(selection)
     loaded = study.load_study(root / "inputs/study.json")
     assert loaded.recipe.capabilities.subagents is declared.get("subagents", True)
-    assert evaluation.plan_evaluation(evaluation.load_evaluation(checkable["path"]))[
+    comparison = evaluation.plan_evaluation(evaluation.load_evaluation(checkable["path"]))[
         "comparison_identity"
-    ]["delivery"] == "claude-native-v1"
+    ]
+    assert isinstance(comparison, dict) and comparison["delivery"] == "claude-native-v1"
 
 
 @pytest.mark.parametrize("limit", ["max_threads", "max_depth"])
