@@ -196,8 +196,9 @@ def test_preflight_checks_help_without_model_calls(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.parametrize("exit_code", [0, 2])
+@pytest.mark.parametrize("persistent_artifacts", [False, True])
 def test_invoke_uses_explicit_auth_and_effort_and_removes_private_data(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int, persistent_artifacts: bool
 ) -> None:
     area = tmp_path / "trial"
     (area / "workspace").mkdir(parents=True)
@@ -224,6 +225,9 @@ def test_invoke_uses_explicit_auth_and_effort_and_removes_private_data(
         return [sys.executable, "-c", script]
 
     monkeypatch.setattr(codex, "command", command)
+    artifacts = tmp_path / "call-1" if persistent_artifacts else area / "artifacts"
+    if persistent_artifacts:
+        artifacts.mkdir()  # The judge reserves this directory before launching.
     result = codex.invoke(
         area=area,
         entry={"host": "codex", "arm": "baseline"},
@@ -234,11 +238,12 @@ def test_invoke_uses_explicit_auth_and_effort_and_removes_private_data(
         },
         prompt="task",
         timeout=5,
+        **({"artifacts": artifacts} if persistent_artifacts else {}),
     )
     assert observed["effort"] == "high"
     assert result["actual_primary_models"] == ["observed-model"]
     assert result["observed_cli_version"] == "0.134.0"
-    evidence = json.loads((area / "artifacts/host-evidence.json").read_text())
+    evidence = json.loads((artifacts / "host-evidence.json").read_text())
     assert evidence["observed_cli_version"] == "0.134.0"
     assert codex.observed_cli_version(evidence["startup"]) == "0.134.0"
     assert result["runtime_effort_evidence"] == ["low"]
@@ -246,7 +251,7 @@ def test_invoke_uses_explicit_auth_and_effort_and_removes_private_data(
     assert result["successful_native_completion"] is (exit_code == 0)
     assert result["usage"] == {"input_tokens": 10, "output_tokens": 3}
     assert result["private_runtime_removed"] and not (area / "private").exists()
-    for artifact in (area / "artifacts").iterdir():
+    for artifact in artifacts.iterdir():
         assert token not in artifact.read_text()
     assert auth.exists()
 

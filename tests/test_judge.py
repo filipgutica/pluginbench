@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import signal
+import subprocess
+import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -302,6 +307,8 @@ def _fake_judge(
     root: Path,
     tool_failure: bool = False,
     expect_unable_contract: bool = False,
+    usage: dict[str, int] | None = None,
+    on_call: Callable[[], None] | None = None,
 ) -> list[Path]:
     """Answer every pair with answers[model]; check what the judge's workspace holds."""
     calls: list[Path] = []
@@ -313,6 +320,7 @@ def _fake_judge(
         protocol: dict[str, object],
         prompt: str,
         output_schema: Path,
+        artifacts: Path | None = None,
         **kwargs: object,
     ) -> dict[str, object]:
         calls.append(area)
@@ -336,8 +344,10 @@ def _fake_judge(
                 for n in pairs
             ]
         }
-        (area / "artifacts").mkdir()
-        (area / "artifacts" / "stdout.jsonl").write_text(json.dumps(response) + "\n")
+        artifacts = area / "artifacts" if artifacts is None else artifacts
+        artifacts.mkdir(exist_ok=True)
+        (artifacts / "stdout.jsonl").write_text(json.dumps(response) + "\n")
+        (artifacts / "host-evidence.json").write_text(json.dumps({"usage": usage}))
         trace = (
             json.dumps(
                 {
@@ -353,10 +363,13 @@ def _fake_judge(
             else ""
         )
         if trace:
-            (area / "artifacts/host-trace-0.jsonl").write_text(trace + "\n")
+            (artifacts / "host-trace-0.jsonl").write_text(trace + "\n")
         parsed = codex.parse_events("", [trace], "codex")
+        if on_call is not None:
+            on_call()
         return {
             **parsed,
+            "usage": usage,
             "successful_native_completion": True,
             "actual_primary_models": [model],
             "runtime_effort_evidence": [protocol["reasoning"]],
@@ -625,3 +638,364 @@ def test_retry_of_old_prepared_folder_uses_the_unable_contract(
         (directory / f"{folder.name}.brief.md").write_text("Read the inputs and return A, B, or tie.")
     _fake_judge(monkeypatch, {"m1": "unable"}, root=tmp_path, expect_unable_contract=True)
     assert judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 2
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "pair-1-A.diff",
+        "pair-1-B.diff",
+        "instruction.md",
+        "review-standard.md",
+        "response-schema.json",
+        "brief",
+        "judge_spec",
+        "prepare_seed",
+        "key",
+        "source/src/main.py",
+    ],
+)
+def test_tally_refuses_changed_bound_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _fake_judge(monkeypatch, {"m1": "A"}, root=tmp_path)
+    judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print)
+    verdict = directory / "results/codex-m1-high/task-1.json"
+    saved = json.loads(verdict.read_text())
+    assert saved["binding"]
+    assert tally(directory, require_bound=True)["unbound"] == 0
+    if field == "judge_spec":
+        path = directory / "judge-specs/codex-m1-high.json"
+        path.write_text(json.dumps({"harness": "codex", "model": "changed", "effort": "high"}))
+    elif field in {"prepare_seed", "key"}:
+        path = directory / "key.json"
+        key = json.loads(path.read_text())
+        key["seed" if field == "prepare_seed" else "criteria"] = "changed"
+        path.write_text(json.dumps(key))
+    else:
+        path = directory / "task-1.brief.md" if field == "brief" else directory / "task-1" / field
+        path.write_text(path.read_text() + "\nchanged\n")
+    with pytest.raises(ValueError) as error:
+        tally(directory)
+    assert str(verdict) in str(error.value)
+    assert field in str(error.value)
+    # Resume must also refuse stale results rather than silently counting them as done.
+    with pytest.raises(ValueError, match="binding mismatch"):
+        judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print)
+
+
+def test_legacy_binding_policy_is_visible_and_can_be_strict(tmp_path: Path) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _votes(directory, {"j1": {}})
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["judge", "tally", str(directory)])
+    assert result.exit_code == 0, result.output
+    assert "unbound verdict (written before binding)" in result.output
+    assert "task-1.json" in result.output and "task-2.json" in result.output
+    assert json.loads((directory / "tally.json").read_text())["unbound"] == 2
+    strict = runner.invoke(cli.app, ["judge", "tally", str(directory), "--require-bound"])
+    assert strict.exit_code != 0
+    assert "task-1.json" in strict.output and "unbound verdict" in strict.output
+
+
+@pytest.mark.parametrize(
+    ("pairs", "a_votes", "status"),
+    [
+        (9, 9, "too_small"),
+        (10, 10, "flagged"),
+        (10, 0, "flagged"),
+        (10, 1, "flagged"),
+        (10, 9, "flagged"),
+        (10, 2, "within_band"),
+        (10, 8, "within_band"),
+        (10, 5, "within_band"),
+    ],
+)
+def test_position_bias_counts_ties_in_denominator(
+    tmp_path: Path, pairs: int, a_votes: int, status: str
+) -> None:
+    attempts = [
+        {"id": f"{arm[0]}{repeat}", "task": "alpha", "repeat": repeat, "guidance": arm}
+        for arm in ("baseline", "workflow-r9")
+        for repeat in range(1, pairs + 1)
+    ]
+    directory = _prepare(tmp_path, _run(tmp_path / "run", attempts), tasks=["alpha"])
+    _votes(directory, {"j1": {}})
+    path = directory / "results/j1/task-1.json"
+    verdict = json.loads(path.read_text())
+    for row in verdict["pairs"][:a_votes]:
+        row["preferred"] = "A"
+    path.write_text(json.dumps(verdict))
+    result = tally(directory)
+    stats = result["judge_stats"]["j1"]
+    assert stats["side_a_rate"] == a_votes / pairs
+    assert stats["position_bias"] == status
+    expected = {
+        "too_small": "sample too small to tell",
+        "flagged": "FLAG: position bias",
+        "within_band": "within 0.2–0.8",
+    }[status]
+    assert expected in judge.format_tally(result)
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_judge_token_totals_include_retries_and_unknown_calls(
+    tmp_path: Path, unknown: bool
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _votes(directory, {"claude-m1-high": {}})
+    # Legacy raw logs remain usable: no new run or API call is needed to tally cost.
+    for task, call in [("task-1", 1), ("task-1", 2), ("task-2", 1)]:
+        raw = directory / f"results/claude-m1-high/{task}/call-{call}"
+        raw.mkdir(parents=True)
+        event = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 4,
+                "cache_read_input_tokens": 20,
+                "cache_creation_input_tokens": 5,
+            },
+        }
+        (raw / "stdout.jsonl").write_text(json.dumps(event) + "\n")
+    if unknown:
+        (directory / "results/claude-m1-high/task-1/call-1/stdout.jsonl").unlink()
+    result = tally(directory)
+    usage = result["judge_stats"]["claude-m1-high"]["usage"]
+    assert usage["calls"] == 3
+    assert usage["unknown_calls"] == int(unknown)
+    assert usage["known_tokens"]["input_tokens"] == 35 * (2 if unknown else 3)
+    assert usage["known_tokens"]["output_tokens"] == 4 * (2 if unknown else 3)
+    assert usage["tokens"] == (None if unknown else usage["known_tokens"])
+    assert ("unknown" if unknown else "117") in judge.format_tally(result)
+
+
+def test_run_records_usage_even_for_rejected_answers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _fake_judge(
+        monkeypatch, {"m1": "unable"}, root=tmp_path, usage={"input_tokens": 10, "output_tokens": 3}
+    )
+    assert judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 2
+    _fake_judge(
+        monkeypatch, {"m1": "tie"}, root=tmp_path, usage={"input_tokens": 20, "output_tokens": 4}
+    )
+    assert judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 0
+    usage = tally(directory)["judge_stats"]["codex-m1-high"]["usage"]
+    assert usage == {
+        "tokens": {"input_tokens": 60, "output_tokens": 14},
+        "known_tokens": {"input_tokens": 60, "output_tokens": 14},
+        "calls": 4,
+        "unknown_calls": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    "usage", [None, {"input_tokens": 2}, {"input_tokens": -1, "output_tokens": 1}]
+)
+def test_incomplete_call_usage_does_not_become_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, usage: dict[str, int] | None
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _fake_judge(monkeypatch, {"m1": "tie"}, root=tmp_path, usage=usage)
+    assert judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 0
+    result = tally(directory)
+    totals = result["judge_stats"]["codex-m1-high"]["usage"]
+    assert totals["tokens"] is None and totals["known_tokens"] is None
+    assert totals["unknown_calls"] == 2
+    assert "unknown (2 of 2 calls)" in judge.format_tally(result)
+
+
+@pytest.mark.parametrize("change", ["delete_diff", "during_call", "reprepare"])
+def test_verdict_binding_rejects_input_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _fake_judge(monkeypatch, {"m1": "A"}, root=tmp_path)
+    if change == "during_call":
+
+        def change_diff() -> None:
+            path = directory / "task-1/pair-1-A.diff"
+            path.write_text("changed during judging")
+
+        _fake_judge(monkeypatch, {"m1": "A"}, root=tmp_path, on_call=change_diff)
+        assert (
+            judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 1
+        )
+        assert not (directory / "results/codex-m1-high/task-1.json").exists()
+        return
+    assert judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 0
+    if change == "delete_diff":
+        (directory / "task-1/pair-1-A.diff").unlink()
+        field = "files/pair-1-A.diff"
+    else:
+        # Same presentation can unblind to a different arm after re-preparing the key.
+        key_path = directory / "key.json"
+        key = json.loads(key_path.read_text())
+        pair = key["tasks"]["task-1"]["pairs"]["1"]
+        pair["A"], pair["B"] = pair["B"], pair["A"]
+        key_path.write_text(json.dumps(key))
+        field = "key"
+    with pytest.raises(ValueError, match=f"task-1.json.*binding mismatch: {field}"):
+        tally(directory)
+
+
+@pytest.mark.parametrize("kind", ["file", "directory"])
+@pytest.mark.parametrize("when", ["before_call", "after_verdict"])
+def test_bound_tree_symlinks_are_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, when: str
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    source = (directory / "task-1/source").resolve()
+    target = source / ("src/main.py" if kind == "file" else "src")
+    calls = _fake_judge(monkeypatch, {"m1": "A"}, root=tmp_path)
+    if when == "after_verdict":
+        assert (
+            judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 0
+        )
+    (source / "current").symlink_to(target, target_is_directory=kind == "directory")
+    if when == "before_call":
+        messages: list[str] = []
+        assert (
+            judge.run(
+                directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=messages.append
+            )
+            == 1
+        )
+        assert len(calls) == 1  # Only the task without a nested link can launch.
+        assert any("symlink" in line and "source/current" in line for line in messages)
+    else:
+        with pytest.raises(ValueError, match="binding mismatch: symlink.*source/current"):
+            tally(directory, require_bound=True)
+        with pytest.raises(ValueError, match="binding mismatch: symlink.*source/current"):
+            judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print)
+
+
+def test_killed_judge_attempt_remains_unknown_after_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    script = """
+import os
+from pathlib import Path
+import signal
+import sys
+from pluginbench import codex, judge
+
+def killed(*, area, artifacts=None, **kwargs):
+    destination = artifacts if artifacts is not None else area / "artifacts"
+    destination.mkdir(exist_ok=True)
+    (destination / "stdout.jsonl").write_text('{"type":"turn.started"}\\n')
+    os.kill(os.getpid(), signal.SIGKILL)
+
+codex.invoke = killed
+judge.run(Path(sys.argv[1]), judges=["codex:m1:high"], timeout=60, jobs=1, progress=print)
+"""
+    child = subprocess.run(
+        [sys.executable, "-c", script, str(directory)],
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+        capture_output=True,
+        timeout=30,
+    )
+    assert child.returncode == -signal.SIGKILL, child.stderr.decode()
+    raw = directory / "results/codex-m1-high/task-1"
+    assert (raw / "call-1/stdout.jsonl").is_file()
+    _fake_judge(
+        monkeypatch, {"m1": "A"}, root=tmp_path, usage={"input_tokens": 10, "output_tokens": 3}
+    )
+    assert judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 0
+    usage = tally(directory)["judge_stats"]["codex-m1-high"]["usage"]
+    assert usage["calls"] == 3 and usage["unknown_calls"] == 1
+    assert usage["tokens"] is None
+    assert usage["known_tokens"] == {"input_tokens": 20, "output_tokens": 6}
+
+
+@pytest.mark.parametrize("target", ["key", "verdict"])
+def test_tally_uses_single_validated_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    _fake_judge(monkeypatch, {"m1": "A"}, root=tmp_path)
+    assert judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 0
+    path = directory / ("key.json" if target == "key" else "results/codex-m1-high/task-1.json")
+    original = path.read_bytes()
+    replacement = json.loads(original)
+    if target == "key":
+        pair = replacement["tasks"]["task-1"]["pairs"]["1"]
+        pair["A"], pair["B"] = pair["B"], pair["A"]
+        path.write_text(json.dumps(replacement))
+        after_first_read = original  # Restore the bound key after the first read.
+    else:
+        replacement["pairs"][0]["preferred"] = "unable"
+        after_first_read = json.dumps(replacement).encode()
+    reads = 0
+    original_bytes, original_text = Path.read_bytes, Path.read_text
+
+    def replace_after_read(item: Path) -> None:
+        nonlocal reads
+        if item == path:
+            reads += 1
+            if reads == 1:
+                path.write_bytes(after_first_read)
+
+    def read_bytes(item: Path) -> bytes:
+        value = original_bytes(item)
+        replace_after_read(item)
+        return value
+
+    def read_text(item: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        value = original_text(item, encoding=encoding, errors=errors)
+        replace_after_read(item)
+        return value
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(Path, "read_text", read_text)
+    if target == "key":
+        with pytest.raises(ValueError, match="task-1.json.*binding mismatch: key"):
+            tally(directory, require_bound=True)
+    else:
+        result = tally(directory, require_bound=True)
+        assert result["tasks"][0]["pairs"][0]["votes"] == {"codex-m1-high": "A"}
+    assert reads == 1
+
+
+def test_queued_call_refuses_changed_launch_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    calls = _fake_judge(monkeypatch, {"m1": "A"}, root=tmp_path)
+    messages: list[str] = []
+
+    def progress(message: str) -> None:
+        messages.append(message)
+        if message == "codex-m1-high task-1: done":
+            (directory / "judge-specs/codex-m1-high.json").write_text(
+                json.dumps({"harness": "codex", "model": "changed", "effort": "high"})
+            )
+
+    assert (
+        judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=progress) == 1
+    )
+    assert len(calls) == 1
+    assert not (directory / "results/codex-m1-high/task-2.json").exists()
+    assert any("task-2: failed:" in message and "judge_spec" in message for message in messages)
+
+
+def test_workspace_filename_cannot_replace_key_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path), tasks=["alpha"])
+    (directory / "task-1/key").write_text("ordinary workspace file")
+    _fake_judge(monkeypatch, {"m1": "A"}, root=tmp_path)
+    assert judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=print) == 0
+    path = directory / "key.json"
+    key = json.loads(path.read_text())
+    pair = key["tasks"]["task-1"]["pairs"]["1"]
+    pair["A"], pair["B"] = pair["B"], pair["A"]
+    path.write_text(json.dumps(key))
+    with pytest.raises(ValueError, match="task-1.json.*binding mismatch: key"):
+        tally(directory, require_bound=True)
