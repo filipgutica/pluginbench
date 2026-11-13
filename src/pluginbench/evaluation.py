@@ -1635,6 +1635,9 @@ def measure_evaluation(
         jobs=_saved_evaluation(selection).jobs,
         masks_listed_pairs=bool(listed),
     )
+    current = _selected_revision(selection, "measurement_revision")
+    if current is not None:
+        _refuse_lost_observations(evidence, current, revision)
     comparison = _object(selection["comparison_identity"])
     selected = [*TypeAdapter(list[str]).validate_python(selection["measurements"]), *measurements]
     selection["measurements"] = selected
@@ -1662,6 +1665,39 @@ def measure_evaluation(
     _save_selection(root, selection)
     regenerate_report(root)
     return revision
+
+
+def _refuse_lost_observations(evidence: Path, current: str, proposed: str) -> None:
+    """Refuse a proposal that loses a collector observation the selected revision measured.
+
+    A collector can pass on a task's starting source and still fail on some submissions, so
+    this compares every attempt, stage and collector of the two revisions after collection.
+    """
+
+    def measured(revision: str) -> dict[tuple[str, str, str], str]:
+        path = evidence / "observer-revisions" / revision / "revision.json"
+        state = study._bound_document(evidence, study._reference(evidence, path))
+        tasks = {
+            record["id"]: record["task_id"]
+            for record in study._bound_document(evidence, state["proposed_assessment"])["records"]
+        }
+        return {
+            (kind, row["attempt_id"], row["stage"]): tasks[row["attempt_id"]]
+            for row in state["observations"]
+            for kind, outcome in row["outcomes"].items()
+            if outcome["status"] == "available"
+        }
+
+    before, after = measured(current), measured(proposed)
+    lost = sorted(key for key in before if key not in after)
+    if lost:
+        kinds = sorted({kind for kind, _, _ in lost})
+        examples = ", ".join(f"{before[key]} {key[1]}/{key[2]}" for key in lost[:3])
+        raise ValueError(
+            f"measurement revision {proposed} would lose {len(lost)} measured {'/'.join(kinds)} "
+            f"observations that revision {current} has, such as {examples}. It stays in evidence "
+            "and is not selected; the run's settings are unchanged"
+        )
 
 
 def _save_selection(root: Path, selection: object) -> None:

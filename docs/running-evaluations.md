@@ -433,6 +433,7 @@ It refuses:
 - An unknown measure, or one the run already measures.
 - A requested measure that no task can measure.
 - A measure the run measures now that no longer passes its readiness check, such as coverage whose task image is gone. The new revision would replace its values with unknown ones.
+- A collected revision that loses an observation the selected revision measured, such as coverage that passes on the starting source but fails on a submission. That check runs after collection; the revision stays in evidence, is not selected, and the settings are unchanged.
 
 The steps:
 
