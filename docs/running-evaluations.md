@@ -178,7 +178,7 @@ Known limits:
 - Claude Code attempts never enter the vanilla cache. Every Claude run codes its own vanilla arm.
 - A timeout leaves no result event, so its usage is unknown with no lower bound. Codex keeps a lower bound.
 - Automatic compaction within a single prompt has not been observed. The compaction rule is calibrated on a manual compaction only.
-- On a compaction run, each compact boundary in the root transcript bounds the runner model's untranscribed excess. Input may exceed the transcripts by at most `preTokens` plus a 4,000-token compaction-prompt allowance, and output by at most `postTokens`. Bounds of several compactions add up. A boundary without these counts, or an excess above the bound, leaves usage unavailable.
+- On a 2.1.322 compaction run, each compact boundary in the root transcript bounds the runner model's untranscribed excess. Input may exceed the transcripts by at most `preTokens` plus a 4,000-token compaction-prompt allowance, and output by at most `postTokens`. Bounds of several compactions add up. A boundary without these counts, or an excess above the bound, leaves usage unavailable.
 - The bound is calibrated on one manual compaction, whose call read 1,995 tokens more than `preTokens`. An automatic compaction that exceeds it is refused, not accepted.
 - Command hooks make total usage unknown, as for Codex; see [Measurements](#measurements).
 
