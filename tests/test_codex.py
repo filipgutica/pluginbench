@@ -871,6 +871,17 @@ def test_native_spawn_override_is_descendant_evidence_without_the_child_trace() 
     assert parsed["actual_descendant_efforts"] == ["low"]
 
 
+def test_native_spawn_override_without_captured_output_is_descendant_evidence() -> None:
+    spawn = named_native_spawn()[:1]
+    call = spawn[0]["payload"]
+    assert isinstance(call, dict)
+    call["arguments"] = '{"model":"other-model","reasoning_effort":"low"}'
+    root = native_session("root", [{"input_tokens": 20, "output_tokens": 5}], extra=spawn)
+    parsed = codex.parse_events("", [root], "codex", include_descendants=True)
+    assert parsed["actual_descendant_models"] == ["other-model"]
+    assert parsed["actual_descendant_efforts"] == ["low"]
+
+
 def test_native_rejected_spawn_override_is_not_descendant_evidence() -> None:
     spawn = named_native_spawn()
     call, output = spawn[0]["payload"], spawn[1]["payload"]
