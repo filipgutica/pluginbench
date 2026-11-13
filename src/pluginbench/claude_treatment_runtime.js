@@ -201,19 +201,27 @@ function verifyDiscovery({ responses, events }, { marketplace, installs }, guida
   // Hook rows first, so a hook that ran is reported as such and not as an unknown event.
   check(!events.some(event => event.type === "system" && String(event.subtype).startsWith("hook_")),
     "Claude hook ran during discovery");
-  const unexpected = events.find(event => event.type !== "control_response");
+  // CLI 2.1.322 under the pinned launch announces its render surface once; the event names
+  // nothing from the session. While plugins load it adds `prompts_screened` ("mods not yet
+  // known"); admission refuses the hook modules that would make it mean more.
+  const redraw = event => event.type === "system" && event.subtype === "ui_invalidate"
+    && event.event === "ui.render"
+    && Object.keys(event).filter(key => key !== "prompts_screened").sort().join()
+      === "event,session_id,subtype,type,uuid"
+    && (!("prompts_screened" in event) || (event.prompts_screened === true && installs.length > 0));
+  const unexpected = events.find(event => event.type !== "control_response" && !redraw(event));
   check(!unexpected, "Unexpected Claude discovery event: " + (unexpected && unexpected.type + "/" + unexpected.subtype));
 
   const init = responses.initialize;
   shape(init && Array.isArray(init.commands) && Array.isArray(init.agents), "initialize");
   check(init.claude_code_version === payload.cli_version,
     "Claude CLI version " + init.claude_code_version + " differs from the pinned " + payload.cli_version);
-  // CLI 2.1.322 reports a subscription token as tokenSource and omits apiKeySource. It
-  // reports the same when an API key is also set, so the refused environment, checked
-  // first, is what rules a key out.
-  check(init.account && init.account.tokenSource === "CLAUDE_CODE_OAUTH_TOKEN"
-    && !("apiKeySource" in init.account) && init.account.apiProvider === "firstParty",
-    "Claude discovery is not authenticated by the subscription token alone");
+  // CLI 2.1.322, offline: a credentials file alone reports only subscriptionType and
+  // apiProvider. A token in the environment adds tokenSource; an API key adds apiKeySource.
+  check(init.account && init.account.apiProvider === "firstParty"
+    && typeof init.account.subscriptionType === "string"
+    && Object.keys(init.account).sort().join() === "apiProvider,subscriptionType",
+    "Claude discovery is not authenticated by the subscription credentials file alone");
 
   const expectedSkills = new Map(payload.inventory.skills.map(skill => [skill.name, "user"]));
   for (const install of installs) {

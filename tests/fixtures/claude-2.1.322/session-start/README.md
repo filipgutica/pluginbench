@@ -8,7 +8,7 @@ Each arm has three files from the same private configuration:
 
 `tests/test_claude_launch.py` uses them.
 
-They were captured offline on 2026-11-12 with a fake subscription token and a dead proxy, so no model turn ran. The coding run used the pinned launch (`default` permission mode with the pinned allow rules) and stopped after its first failed model request. The CLI printed no "Permission mode forced" warning.
+They were captured offline on 2026-11-12 with a fake subscription token and a dead proxy, so no model turn ran. The token was in the CLI's credentials file only, as `claude.credentials` writes it, and not in the environment. The coding run used the pinned launch (`bypassPermissions`, no `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`) and stopped after its first failed model request.
 
 | Arm | Treatment |
 | --- | --- |

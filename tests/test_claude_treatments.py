@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import os
 import shutil
@@ -18,7 +17,7 @@ from typing import Any
 import pytest
 
 from pluginbench import claude
-from pluginbench.claude_treatments import CONFIG_DIR, DELIVERY_POLICY, install, stage
+from pluginbench.claude_treatments import CONFIG_DIR, DELIVERY_POLICY, admit, install, stage
 from pluginbench.native_treatments import REMOTE_ROOT
 from pluginbench.treatments import Treatment
 
@@ -79,6 +78,12 @@ class Attempt:
         return [
             json.loads(line) for line in (self.root / "claude-calls.jsonl").read_text().splitlines()
         ]
+
+
+REDRAW = {
+    "type": "system", "subtype": "ui_invalidate", "event": "ui.render",
+    "uuid": "a83dae5f-ddbb-43ad-800c-4872897249d5", "session_id": "f0c0ff5f-0d39-459c-9ab9-a7f1c53a744f",
+}
 
 
 def skill(root: Path, name: str) -> Path:
@@ -152,8 +157,7 @@ def responses(attempt: Attempt) -> dict[str, Any]:
     else:
         settings["effective"] = {"disableAllHooks": True}
         settings["sources"] = []
-    # CLI 2.1.322 reports the pinned permission rules as given (offline capture).
-    settings["effective"]["permissions"] = copy.deepcopy(claude.PINNED_SETTINGS["permissions"])
+
     return captured
 
 
@@ -198,6 +202,8 @@ def attempt(tmp_path: Path, *, vanilla: bool = False) -> Attempt:
     stage(treatment, tmp_path / "staged", run=RUN, cli_version=VERSION)
     result = Attempt(tmp_path, treatment, {})
     result.scenario["responses"] = responses(result)
+    # The real CLI announces its render surface once under the pinned launch (offline).
+    result.scenario["stream"] = [dict(REDRAW)]
     return result
 
 
@@ -330,6 +336,10 @@ REFUSALS: dict[str, tuple[Callable[[Attempt], object], str]] = {
         "Undeclared Claude agent discovered: rogue",
     ),
     "user agent in the private configuration": (_user_agent, "Undeclared Claude user agents exist"),
+    "redraw with an unknown field": (
+        lambda attempt: attempt.scenario["stream"][0].update(instances=[]),
+        "Unexpected Claude discovery event: system/ui_invalidate",
+    ),
     "unexpected discovery event": (
         lambda attempt: attempt.scenario.update(stream=[{"type": "system", "subtype": "init"}]),
         "Unexpected Claude discovery event: system/init",
@@ -403,37 +413,56 @@ REFUSALS: dict[str, tuple[Callable[[Attempt], object], str]] = {
         _responses(lambda r: r["initialize"].update(claude_code_version="2.1.321")),
         "Claude CLI version 2.1.321 differs from the pinned 2.1.322",
     ),
+    # CLI 2.1.322 account shapes, offline: an API key beside the file, a token in the
+    # environment, no usable credential, and a third-party provider.
     "API key source": (
         _responses(
             lambda r: r["initialize"].update(
                 account={
-                    "tokenSource": "none",
+                    "tokenSource": "claude.ai",
                     "apiKeySource": "ANTHROPIC_API_KEY",
                     "apiProvider": "firstParty",
                 }
             )
         ),
-        "Claude discovery is not authenticated by the subscription token alone",
+        "Claude discovery is not authenticated by the subscription credentials file alone",
     ),
-    "API key beside the subscription token": (
+    # Not observed: any source named beside the file's subscription is refused too.
+    "key source beside the file": (
         _responses(
             lambda r: r["initialize"].update(
                 account={
-                    "tokenSource": "CLAUDE_CODE_OAUTH_TOKEN",
+                    "subscriptionType": "Claude API",
                     "apiKeySource": "ANTHROPIC_API_KEY",
                     "apiProvider": "firstParty",
                 }
             )
         ),
-        "Claude discovery is not authenticated by the subscription token alone",
+        "Claude discovery is not authenticated by the subscription credentials file alone",
+    ),
+    "token in the environment": (
+        _responses(
+            lambda r: r["initialize"].update(
+                account={"tokenSource": "CLAUDE_CODE_OAUTH_TOKEN", "apiProvider": "firstParty"}
+            )
+        ),
+        "Claude discovery is not authenticated by the subscription credentials file alone",
+    ),
+    "not logged in": (
+        _responses(
+            lambda r: r["initialize"].update(
+                account={"tokenSource": "none", "apiProvider": "firstParty"}
+            )
+        ),
+        "Claude discovery is not authenticated by the subscription credentials file alone",
     ),
     "third-party provider": (
         _responses(
             lambda r: r["initialize"].update(
-                account={"tokenSource": "CLAUDE_CODE_OAUTH_TOKEN", "apiProvider": "bedrock"}
+                account={"subscriptionType": "Claude API", "apiProvider": "bedrock"}
             )
         ),
-        "Claude discovery is not authenticated by the subscription token alone",
+        "Claude discovery is not authenticated by the subscription credentials file alone",
     ),
     "API key in the environment": (
         lambda attempt: attempt.extra_env.update(ANTHROPIC_API_KEY="sk-ant-unwanted"),
@@ -599,3 +628,40 @@ def test_install_refuses_an_environment_coding_would_not_use(
                 cli_version=VERSION,
             )
         )
+
+
+def _hooked_plugin(root: Path, name: str, commands: list[tuple[str, str]]) -> Path:
+    skill(root / "skills/demo-skill", "demo-skill")
+    (root / ".claude-plugin").mkdir()
+    (root / ".claude-plugin/plugin.json").write_text(json.dumps({"name": name}))
+    (root / "hooks").mkdir()
+    (root / "hooks/hooks.json").write_text(json.dumps({"hooks": {"SessionStart": [
+        {"matcher": matcher, "hooks": [{"type": "command", "command": command}]}
+        for matcher, command in commands
+    ]}}))
+    return root
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "refused"),
+    [
+        ([("startup", "${CLAUDE_PLUGIN_ROOT}/hooks/run")], [("startup", "${CLAUDE_PLUGIN_ROOT}/hooks/run")], True),
+        ([("startup", "echo A"), ("startup|clear", "echo A")], [], True),
+        ([("startup", "echo A")], [("startup", "echo B")], False),
+    ],
+)
+def test_admission_refuses_hooks_the_session_could_not_tell_apart(
+    tmp_path: Path,
+    first: list[tuple[str, str]],
+    second: list[tuple[str, str]],
+    refused: bool,
+) -> None:
+    plugins = [_hooked_plugin(tmp_path / "one", "one", first)]
+    if second:
+        plugins.append(_hooked_plugin(tmp_path / "two", "two", second))
+    treatment = Treatment(plugins=plugins)
+    if refused:
+        with pytest.raises(ValueError, match="Claude hooks share an event and command"):
+            admit(treatment)
+    else:
+        admit(treatment)

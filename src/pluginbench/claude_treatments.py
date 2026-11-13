@@ -14,6 +14,7 @@ import json
 import shlex
 import shutil
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,19 @@ def admit(treatment: Treatment) -> dict[str, Any]:
         raise ValueError(
             f"native guidance exceeds {MAX_GUIDANCE_BYTES} bytes; refusing silent truncation"
         )
+    # CLI 2.1.322 names a hook run by its event and command text only, with no plugin, so
+    # two such hooks could not be told apart in the session.
+    hooks = Counter(
+        (event, hook["command"])
+        for plugin in inventory["plugins"]
+        for config in plugin.get("hooks", [])
+        for event, groups in config.get("hooks", {}).items()
+        for group in groups
+        for hook in group["hooks"]
+    )
+    shared = sorted(f"{event} {command!r}" for (event, command), count in hooks.items() if count > 1)
+    if shared:
+        raise ValueError("Claude hooks share an event and command: " + "; ".join(shared))
     return inventory
 
 

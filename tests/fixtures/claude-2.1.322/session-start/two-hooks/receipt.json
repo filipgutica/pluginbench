@@ -1,7 +1,7 @@
 {
  "account": {
   "apiProvider": "firstParty",
-  "tokenSource": "CLAUDE_CODE_OAUTH_TOKEN"
+  "subscriptionType": "Claude API"
  },
  "auto_memory": {
   "enabled": false,
@@ -74,12 +74,12 @@
    "--verbose",
    "--output-format=stream-json",
    "--settings",
-   "{\"disableAllHooks\":true,\"permissions\":{\"allow\":[\"Agent\",\"Bash\",\"CronDelete\",\"CronList\",\"Edit\",\"EnterWorktree\",\"ExitWorktree\",\"ListAgents\",\"Monitor\",\"NotebookEdit\",\"Read\",\"ReportFindings\",\"Skill\",\"TaskStop\",\"ToolSearch\",\"WebFetch\",\"WebSearch\",\"Write\"]}}",
+   "{\"disableAllHooks\":true}",
    "--model",
    "claude-opus-5-5",
    "--effort",
    "high",
-   "--permission-mode=default",
+   "--permission-mode=bypassPermissions",
    "--setting-sources",
    "user",
    "--strict-mcp-config",
@@ -325,15 +325,15 @@
    "enabled": true,
    "id": "demo@pluginbench-frozen",
    "installPath": "/logs/agent/sessions/plugins/cache/pluginbench-frozen/demo/unknown",
-   "installedAt": "2026-11-12T23:35:25.435Z",
-   "lastUpdated": "2026-11-12T23:35:25.435Z",
+   "installedAt": "2026-11-13T01:15:23.973Z",
+   "lastUpdated": "2026-11-13T01:15:23.973Z",
    "projectEnabled": false,
    "readFromFolder": "/tmp/pluginbench-treatments/marketplace/plugins/demo",
    "scope": "user",
    "version": "unknown"
   }
  ],
- "session_cost": "Total cost:            $0.0000\nTotal duration (API):  0s\nTotal duration (wall): 22s\nTotal code changes:    0 lines added, 0 lines removed\nUsage:                 0 input, 0 output, 0 cache read, 0 cache write",
+ "session_cost": "Total cost:            $0.0000\nTotal duration (API):  0s\nTotal duration (wall): 19s\nTotal code changes:    0 lines added, 0 lines removed\nUsage:                 0 input, 0 output, 0 cache read, 0 cache write",
  "settings": {
   "disableAllHooks": true,
   "enabledPlugins": {
@@ -346,28 +346,6 @@
      "source": "directory"
     }
    }
-  },
-  "permissions": {
-   "allow": [
-    "Agent",
-    "Bash",
-    "CronDelete",
-    "CronList",
-    "Edit",
-    "EnterWorktree",
-    "ExitWorktree",
-    "ListAgents",
-    "Monitor",
-    "NotebookEdit",
-    "Read",
-    "ReportFindings",
-    "Skill",
-    "TaskStop",
-    "ToolSearch",
-    "WebFetch",
-    "WebSearch",
-    "Write"
-   ]
   }
  },
  "skill_activation": "not observed by discovery; native availability is verified",

@@ -722,6 +722,12 @@ async def run_trial(config: dict[str, Any]) -> dict[str, Any]:
             qualification=_native_cli_qualification("claude", str(boundary["version"])),
         )
     result = await trial.run()
+    if pinned_claude:
+        assert isinstance(boundary, dict)
+        # The host redacts it afterwards too; a token in an artifact still refuses the attempt.
+        claude_launch.refuse_leaked_token(
+            Path(str(boundary["area"])) / "artifacts", os.environ.get(claude.TOKEN_ENV, "")
+        )
     return {
         "result": result.model_dump(mode="json"),
         "session_id": trial.agent_environment.session_id,

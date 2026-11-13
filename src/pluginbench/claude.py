@@ -108,20 +108,12 @@ def command(
 
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
-# The pinned launch runs in `default` permission mode: CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, which
-# keeps the token out of tool subprocesses, makes CLI 2.1.322 force `default` over any
-# --permission-mode. Print mode denies whatever a rule does not allow, so every tool the
-# launch offers is allowed by its bare name, which matches every use of that tool (a bare
-# `Bash` matches every command, compound ones included). Subagents inherit these rules.
-# The subagent tool, named Task in `system/init`, is `Agent` in permission rules.
-PERMISSION_MODE = "default"
-ALLOWED_TOOLS = (
-    "Agent", "Bash", "CronDelete", "CronList", "Edit", "EnterWorktree", "ExitWorktree",
-    "ListAgents", "Monitor", "NotebookEdit", "Read", "ReportFindings", "Skill", "TaskStop",
-    "ToolSearch", "WebFetch", "WebSearch", "Write",
-)
+# The pinned launch bypasses permission prompts, which print mode would turn into denials.
+# It needs no CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: that forces `default` mode and sandboxes Bash
+# (CLI 2.1.322), and the subscription token reaches the CLI as a file, not through the env.
+PERMISSION_MODE = "bypassPermissions"
 # Settings every Claude coding launch passes, identical in vanilla and treatment arms.
-PINNED_SETTINGS: dict[str, object] = {"permissions": {"allow": list(ALLOWED_TOOLS)}}
+PINNED_SETTINGS: dict[str, object] = {}
 # Discovery adds only this: it lists hooks without running them.
 DISCOVERY_SETTINGS: dict[str, object] = {"disableAllHooks": True}
 DISALLOWED_TOOLS = ("RemoteTrigger", "CronCreate", "ScheduleWakeup", "SendMessage", "Workflow")
@@ -140,6 +132,20 @@ REFUSED_ENV = (
     "DISABLE_PROMPT_CACHING",
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
 )
+
+
+# The subscription token reaches the CLI only as this file, linked into its private
+# configuration from a secrets folder outside the downloaded /logs; it is never in the
+# environment of a command in the container. CLI 2.1.322 accepts this shape for a
+# setup-token (offline check): `scopes` must grant inference; no refresh token or expiry,
+# so the CLI never rewrites the file.
+SECRETS_DIR = "/tmp/claude-secrets"
+CREDENTIALS_FILE = ".credentials.json"
+TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
+
+
+def credentials(token: str) -> str:
+    return json.dumps({"claudeAiOauth": {"accessToken": token, "scopes": ["user:inference"]}})
 
 
 @dataclass(frozen=True)
@@ -187,7 +193,10 @@ def coding_launch(run: CodingRun) -> tuple[list[str], dict[str, str]]:
         "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
         "DISABLE_UPDATES": "1",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-        "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+        # Subagents run in the foreground, so one run is one init and one result; without
+        # it, CLI 2.1.322 starts an Agent call in the background unless the model asks not to.
+        # It also removes Bash's run_in_background, in every arm alike.
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
         "CLAUDE_CODE_SUBAGENT_MODEL": run.model,
         "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": str(run.timeout_seconds * 1000),
     }
@@ -210,10 +219,8 @@ _HARBOR_CODING = re.compile(
 def contract_command(command: str, run: CodingRun) -> str:
     """Harbor's coding command with the pinned argv in place of Harbor's own flags.
 
-    Only the exact command Harbor builds for this run is accepted. Harbor always asks for
-    bypassPermissions; the pinned argv replaces Harbor's flags, so the CLI runs in the pinned
-    mode. The pinned command keeps stderr out of the stream-json stdout, and Harbor's
-    `set -o pipefail` keeps the CLI's exit.
+    Only the exact command Harbor builds for this run is accepted. The pinned command keeps
+    stderr out of the stream-json stdout, and Harbor's `set -o pipefail` keeps the CLI's exit.
     """
     match = _HARBOR_CODING.fullmatch(command)
     harbor = (
@@ -232,14 +239,19 @@ def refuse_env(env: Mapping[str, str]) -> None:
         raise ValueError(f"Claude coding refuses {', '.join(refused)}; model call refused")
 
 
-def check_coding_env(env: Mapping[str, str], run: CodingRun) -> None:
-    """The environment a coding command runs with: pinned, subscription-authenticated."""
+def refuse_container_env(env: Mapping[str, str]) -> None:
+    """A command in the container: no refused variable, and no token, which is a file there."""
     refuse_env(env)
+    if TOKEN_ENV in env:
+        raise ValueError(f"Claude coding refuses {TOKEN_ENV} in the container; model call refused")
+
+
+def check_coding_env(env: Mapping[str, str], run: CodingRun) -> None:
+    """The environment a coding command runs with: pinned, with no credential in it."""
+    refuse_container_env(env)
     unpinned = sorted(name for name, value in coding_launch(run)[1].items() if env.get(name) != value)
     if unpinned:
         raise ValueError(f"Claude coding requires the pinned {', '.join(unpinned)}")
-    if not env.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip():
-        raise ValueError("Claude coding requires the subscription token CLAUDE_CODE_OAUTH_TOKEN")
 
 
 def discovery_launch(run: CodingRun) -> tuple[list[str], dict[str, str]]:

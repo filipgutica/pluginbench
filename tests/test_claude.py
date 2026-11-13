@@ -121,12 +121,9 @@ def test_coding_launch_is_the_pinned_contract() -> None:
     )
     assert claude.coding_launch(run) == (
         [
-            "claude", "--verbose", "--output-format=stream-json", "--settings",
-            '{"permissions":{"allow":["Agent","Bash","CronDelete","CronList","Edit",'
-            '"EnterWorktree","ExitWorktree","ListAgents","Monitor","NotebookEdit","Read",'
-            '"ReportFindings","Skill","TaskStop","ToolSearch","WebFetch","WebSearch","Write"]}}',
+            "claude", "--verbose", "--output-format=stream-json", "--settings", "{}",
             "--model", "claude-opus-5-5", "--effort", "high",
-            "--permission-mode=default", "--setting-sources", "user",
+            "--permission-mode=bypassPermissions", "--setting-sources", "user",
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
             "--include-hook-events", "--no-chrome", "--disallowed-tools",
             "RemoteTrigger,CronCreate,ScheduleWakeup,SendMessage,Workflow,Agent", "--print",
@@ -135,7 +132,7 @@ def test_coding_launch_is_the_pinned_contract() -> None:
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
             "DISABLE_UPDATES": "1",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+            "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
             "CLAUDE_CODE_SUBAGENT_MODEL": "claude-opus-5-5",
             "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "1800000",
         },

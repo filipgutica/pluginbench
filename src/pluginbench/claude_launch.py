@@ -120,8 +120,13 @@ def pin_exec(agent: object, boundary: dict[str, Any], *, qualification: str) -> 
     command, which runs as the pinned argv; any other command is refused. Every command is
     refused when its environment carries a refused variable, so an API key stops the attempt
     before Harbor's setup runs.
+
+    Harbor passes the subscription token in each command's env; no command gets it. The
+    coding command first stores it as the CLI's credentials file, which discovery and coding
+    read, and removes the file when it ends, before Harbor downloads /logs.
     """
     original: Callable[..., Awaitable[object]] = getattr(agent, "exec_as_agent")
+    upload: Callable[..., Awaitable[None]] = getattr(agent, "_upload_config_text")
     run = claude.CodingRun(**boundary["coding_run"])
     allowed = {qualification, harbor_setup(getattr(agent, "skills_dir", None))}
     coded = False
@@ -134,10 +139,12 @@ def pin_exec(agent: object, boundary: dict[str, Any], *, qualification: str) -> 
         timeout_sec: int | None = None,
     ) -> object:
         nonlocal coded
+        env = dict(env or {})
+        token = env.pop(claude.TOKEN_ENV, "").strip()
         # What the environment will actually run with: its own, this call's and Harbor's
         # scoped agent env, which outranks both.
         merged = dict(getattr(environment, "_merge_env")(env) or {})
-        claude.refuse_env(merged)
+        claude.refuse_container_env(merged)
         if command in allowed:
             return await original(environment, command, env=env, cwd=cwd, timeout_sec=timeout_sec)
         # Anything else must be the coding command.
@@ -146,6 +153,35 @@ def pin_exec(agent: object, boundary: dict[str, Any], *, qualification: str) -> 
             raise ValueError("a Claude attempt runs one coding command; use a fresh attempt")
         coded = True
         claude.check_coding_env(merged, run)
+        if not token:
+            raise ValueError(f"Harbor passed no {claude.TOKEN_ENV} for the Claude coding run")
+        secret = f"{claude.SECRETS_DIR}/{claude.CREDENTIALS_FILE}"
+        link = f"{claude_treatments.CONFIG_DIR}/{claude.CREDENTIALS_FILE}"
+        try:
+            await original(
+                environment, f"mkdir -p -m 700 {claude.SECRETS_DIR}", env=merged, cwd=cwd,
+                timeout_sec=30,
+            )
+            # Harbor's private upload: owned by the agent user, mode 600.
+            await upload(
+                environment, content=claude.credentials(token), remote_path=secret,
+                filename=claude.CREDENTIALS_FILE,
+            )
+            await original(
+                environment, f"chmod 600 {secret} && ln -s {secret} {link}", env=merged,
+                cwd=cwd, timeout_sec=30,
+            )
+            return await _discover_and_code(environment, pinned, merged, cwd, timeout_sec)
+        finally:
+            await original(environment, f"rm -f {link} {secret}", env=merged, cwd=cwd, timeout_sec=30)
+
+    async def _discover_and_code(
+        environment: object,
+        pinned: str,
+        merged: dict[str, str],
+        cwd: str | None,
+        timeout_sec: int | None,
+    ) -> object:
         # Discovery and coding get this same dict, so discovery sees what coding will.
         receipt = await claude_treatments.install(
             environment=environment,
@@ -179,6 +215,21 @@ def pin_exec(agent: object, boundary: dict[str, Any], *, qualification: str) -> 
     setattr(agent, "exec_as_agent", pinned_exec)
 
 
+def refuse_leaked_token(artifacts: Path, token: str) -> None:
+    """Refuse an attempt whose saved artifacts hold the subscription token anywhere."""
+    if not token.strip():
+        raise ValueError(f"no {claude.TOKEN_ENV} to check the saved artifacts against")
+    leaked = sorted(
+        str(path.relative_to(artifacts))
+        for path in artifacts.rglob("*")
+        if path.is_file() and not path.is_symlink() and token.encode() in path.read_bytes()
+    )
+    if leaked:
+        raise ValueError(
+            "the Claude subscription token reached saved artifacts: " + ", ".join(leaked)
+        )
+
+
 def _treatment_trees(receipt: dict[str, Any]) -> list[tuple[str, list[dict[str, Any]]]]:
     """Each delivered tree the CLI reads during coding, with its frozen inventory entries."""
     inventory = receipt["inventory"]
@@ -204,9 +255,8 @@ def session_errors(
 ) -> list[str]:
     """How a coding session differs from the discovery receipt it was launched after (D2).
 
-    Discovery must have run with the pinned permission rules. The session's `system/init`
-    must report what discovery found, the pinned permission mode and the pinned tools, and
-    its result must record no permission denial. Its hook events must be the listed hooks:
+    The session's `system/init` must report what discovery found, the pinned permission mode
+    and the pinned tools, and its result must record no permission denial. Its hook events must be the listed hooks:
     each SessionStart hook that matches `startup` runs once, by its command in the root
     `transcript`, and exits 0 before the first assistant message; other listed hooks exit 0
     or 2 (a deliberate block), and no other hook event appears.
@@ -226,7 +276,6 @@ def session_errors(
             for hook in receipt["hooks"]["hooks"]
             if hook["event"] == "SessionStart" and _matches(hook.get("matcher") or "", "startup")
         )
-        rules = receipt["settings"].get("permissions")
         expected = {
             "claude_code_version": receipt["cli_version"],
             "model": model,
@@ -258,8 +307,6 @@ def session_errors(
         for key in expected
         if observed[key] != expected[key]
     ]
-    if rules != claude.PINNED_SETTINGS["permissions"]:
-        errors.append("discovery's effective settings lack the pinned permission rules")
     if init.get("permissionMode") != claude.PERMISSION_MODE:
         errors.append(f"system/init permissionMode is not {claude.PERMISSION_MODE}")
     tools = init.get("tools")
@@ -271,7 +318,7 @@ def session_errors(
         qualified - (set() if subagents else {claude.SUBAGENT_TOOL})
     ):
         errors.append("system/init tools differ from the pinned tool set")
-    # Every tool is allowed, so a denial is an action no rule allows: refused, not compared.
+    # bypassPermissions allows every tool, so a denial is something it still refuses.
     if any(event.get("permission_denials") != [] for event in events if event.get("type") == "result"):
         errors.append("the run records permission denials")
     return errors + _hook_errors(events, listing) + _startup_hook_errors(transcript, at_startup)

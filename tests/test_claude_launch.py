@@ -33,6 +33,7 @@ VERSION = "2.1.322"
 MODEL = "claude-opus-5-5"
 TOKEN = "sk-ant-oat01-fake-subscription-token"
 DIAGNOSTIC = "claude diagnostic on stderr"
+CREDENTIALS = f"{claude_treatments.CONFIG_DIR}/{claude.CREDENTIALS_FILE}"
 
 
 def treatment(root: Path) -> Treatment:
@@ -131,6 +132,9 @@ class Container:
         binary.write_text(
             "#!/bin/sh\n"
             'if [ "$1" = "--version" ]; then echo "2.1.322 (Claude Code)"; exit 0; fi\n'
+            # The token reaches the CLI as its credentials file, never through the env.
+            'if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then echo "token in env" >&2; exit 3; fi\n'
+            f'grep -q {shlex.quote(TOKEN)} "$CLAUDE_CONFIG_DIR/.credentials.json" || exit 4\n'
             f'printf "%s\\n" "$@" > {shlex.quote(str(self.argv_log))}\n'
             f"cat > {shlex.quote(str(self.root / 'prompt.txt'))}\n"
             f'cp -R {shlex.quote(str(sessions))}/. "$CLAUDE_CONFIG_DIR/"\n'
@@ -152,6 +156,7 @@ class Container:
             text.replace("/logs/agent/", f"{self.agent_root}/")
             .replace(REMOTE_ROOT, str(self.remote))
             .replace("/tmp/claude-code-settings", str(self.root / "claude-code-settings"))
+            .replace(claude.SECRETS_DIR, str(self.root / "claude-secrets"))
         )
 
     def run_trial(self, config: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> object:
@@ -173,8 +178,8 @@ class Container:
                 # Harbor's precedence: persistent < per-command < the trial's scoped agent env.
                 return {**container.persistent, **(env or {}), **self.scoped} or None
 
-            async def upload_file(self, *args: object, **kwargs: object) -> None:
-                pass
+            async def upload_file(self, source_path: Path | str, target_path: str) -> None:
+                shutil.copyfile(source_path, container.local(target_path))
 
             async def exec(
                 self,
@@ -316,8 +321,11 @@ def attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[..., At
         )
 
         async def install(**kwargs: Any) -> dict[str, Any]:
-            # Discovery runs before the coding command, with the env the coding command gets.
+            # Discovery runs before the coding command, with the env the coding command gets,
+            # and reads the token from the credentials file.
             assert not container.argv_log.exists()
+            assert TOKEN not in json.dumps(kwargs["env"])
+            assert TOKEN in Path(container.local(CREDENTIALS)).read_text()
             container.installs.append(kwargs)
             # What the real runtime leaves in the container: the staged treatment, and the
             # loose skills Harbor copies into the private configuration.
@@ -373,7 +381,14 @@ def test_a_claude_attempt_runs_the_pinned_command_with_the_pinned_subscription_e
     assert made.container.argv_log.read_text().splitlines() == argv[1:]
     assert (made.container.root / "prompt.txt").read_text() == "Fix the bug."
     assert {name: env[name] for name in pinned} == pinned
-    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == TOKEN
+    # No command in the container got the token, and its file is gone before Harbor
+    # downloads /logs.
+    assert all(TOKEN not in json.dumps(env) for _, env in made.container.commands)
+    for path in (CREDENTIALS, f"{claude.SECRETS_DIR}/{claude.CREDENTIALS_FILE}"):
+        assert not os.path.lexists(made.container.local(path))
+    assert made.container.commands[-1][0] == (
+        f"set -o pipefail; rm -f {CREDENTIALS} {claude.SECRETS_DIR}/{claude.CREDENTIALS_FILE}"
+    )
     assert env["CLAUDE_CONFIG_DIR"] == claude_treatments.CONFIG_DIR
     assert not set(env) & set(claude.REFUSED_ENV)
     # Discovery got the very dict the coding command ran with.
@@ -421,6 +436,29 @@ def test_a_claude_attempt_runs_the_pinned_command_with_the_pinned_subscription_e
         assert revalidated["usage_validation"]["status"] == "validated"
 
 
+def test_a_token_in_a_saved_artifact_refuses_the_attempt(
+    attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Say the CLI rewrote its credentials file in place: /logs would then hold the token.
+    made = attempt(
+        treated=False,
+        after_sessions='cat "$CLAUDE_CONFIG_DIR/.credentials.json" > "$CLAUDE_CONFIG_DIR/copy.json"',
+    )
+    with pytest.raises(ValueError, match="token reached saved artifacts: harbor/.*/copy.json"):
+        made.invoke(monkeypatch)
+
+
+def test_the_credentials_file_is_removed_when_the_coding_run_fails(
+    attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made = attempt(treated=False, after_sessions="exit 1")
+    with pytest.raises(Exception, match="exit"):
+        made.invoke(monkeypatch)
+    assert made.container.argv_log.exists()
+    for path in (CREDENTIALS, f"{claude.SECRETS_DIR}/{claude.CREDENTIALS_FILE}"):
+        assert not os.path.lexists(made.container.local(path))
+
+
 def test_a_fresh_attempt_with_unreconciled_usage_is_unvalidated_at_launch(
     attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -440,13 +478,14 @@ def test_a_fresh_attempt_with_unreconciled_usage_is_unvalidated_at_launch(
     )
 
 
-def test_an_api_key_in_the_container_env_stops_the_attempt_before_any_command(
-    attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("name", ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"])
+def test_a_credential_in_the_container_env_stops_the_attempt_before_any_command(
+    attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch, name: str
 ) -> None:
     made = attempt(treated=False)
-    # A task's own environment can name a key; Harbor would pass it to every command.
-    made.container.persistent = {"ANTHROPIC_API_KEY": "sk-ant-api-key"}
-    with pytest.raises(ValueError, match="refuses ANTHROPIC_API_KEY"):
+    # A task's own environment can name one; Harbor would pass it to every command.
+    made.container.persistent = {name: "sk-ant-credential"}
+    with pytest.raises(ValueError, match=f"refuses {name}"):
         made.invoke(monkeypatch)
     assert made.container.commands == [] and not made.container.installs
     assert not made.container.argv_log.exists()
@@ -506,7 +545,12 @@ def _pinned_agent(skills_dir: str | None = None) -> tuple[Any, list[str]]:
         ran.append(command)
         return SimpleNamespace(stdout="", stderr="", return_code=0)
 
-    agent = SimpleNamespace(exec_as_agent=exec_as_agent, skills_dir=skills_dir)
+    async def upload(environment: object, **kwargs: object) -> None:
+        ran.append("upload")
+
+    agent = SimpleNamespace(
+        exec_as_agent=exec_as_agent, _upload_config_text=upload, skills_dir=skills_dir
+    )
     boundary = {"coding_run": {"model": MODEL, "effort": "high", "subagents": False,
                                 "timeout_seconds": 1800}}
     claude_launch.pin_exec(agent, boundary, qualification="guard")
@@ -707,8 +751,8 @@ SESSION_CHANGES: dict[str, tuple[bool, Callable[[list[dict[str, Any]]], None], s
     "mcp": (False, lambda e: _init(e).update(mcp_servers=[{"name": "m"}]), "mcp_servers differs"),
     "subagent tool": (False, lambda e: _init(e)["tools"].append("Task"), "disallowed tool"),
     "permission mode": (
-        False, lambda e: _init(e).update(permissionMode="bypassPermissions"),
-        "permissionMode is not default",
+        False, lambda e: _init(e).update(permissionMode="default"),
+        "permissionMode is not bypassPermissions",
     ),
     "tool removed": (
         False, lambda e: _init(e).update(tools=["Read"]), "tools differ from the pinned tool set",
@@ -769,8 +813,8 @@ def test_a_session_that_differs_from_its_discovery_receipt_fails_the_attempt(
 def test_a_permission_denial_fails_the_attempt_and_is_recorded(
     attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The paid probe's one-subagent run, forced into `default` mode without allow rules:
-    # print mode denied the subagent's Bash call.
+    # The paid probe's one-subagent run, which the scrub forced into `default` mode: print
+    # mode denied the subagent's Bash call.
     made = attempt(treated=False, case="one-subagent")
     made.invoke(monkeypatch)
     saved = json.loads((made.area / "artifacts/execution.json").read_text())
@@ -781,9 +825,6 @@ def test_a_permission_denial_fails_the_attempt_and_is_recorded(
 
 def test_the_qualified_tool_set_is_the_captured_one() -> None:
     assert sorted(claude.QUALIFIED_TOOLS[VERSION]) == INIT_TOOLS["signed_in"]
-    # The rules allow each tool the launch offers; the subagent tool's rule name is Agent.
-    offered = set(INIT_TOOLS["signed_in"]) - {"Task"} | {"Agent"}
-    assert set(claude.ALLOWED_TOOLS) == offered
 
 
 def _captured(
@@ -829,14 +870,6 @@ def test_an_unqualified_version_is_held_only_to_the_disallowed_tools() -> None:
     assert _errors(events, receipt, transcript) == []
     _init(events)["tools"].append("RemoteTrigger")
     assert _errors(events, receipt, transcript) == ["system/init offers a disallowed tool"]
-
-
-def test_discovery_must_have_run_with_the_pinned_permission_rules() -> None:
-    events, receipt, transcript = _captured("vanilla")
-    del receipt["settings"]["permissions"]
-    assert _errors(events, receipt, transcript) == [
-        "discovery's effective settings lack the pinned permission rules"
-    ]
 
 
 def _run_twice(transcript: list[dict[str, Any]]) -> None:
@@ -908,8 +941,9 @@ def test_treatment_files_changed_during_the_run_fail_the_attempt(
 )
 @pytest.mark.parametrize("subagents", [False, True])
 def test_the_real_cli_starts_the_pinned_launch_as_pinned(tmp_path: Path, subagents: bool) -> None:
-    """The pinned launch starts in `default` mode without the scrub's forced-mode warning,
-    offering the captured tools; `--disallowed-tools Agent` removes the subagent tool, Task.
+    """The pinned launch, signed in by the credentials file alone, starts in
+    bypassPermissions without a forced-mode warning, offering the captured tools;
+    `--disallowed-tools Agent` removes the subagent tool, Task.
 
     A fake token and a dead proxy: the CLI reports init before its first model request, and
     the test stops it there.
@@ -922,9 +956,10 @@ def test_the_real_cli_starts_the_pinned_launch_as_pinned(tmp_path: Path, subagen
         (tmp_path / name).mkdir()
     env = {
         "PATH": os.environ["PATH"], "HOME": str(tmp_path / "home"),
-        "CLAUDE_CONFIG_DIR": str(tmp_path / "config"), "CLAUDE_CODE_OAUTH_TOKEN": TOKEN,
+        "CLAUDE_CONFIG_DIR": str(tmp_path / "config"),
         "HTTPS_PROXY": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1:9", **pinned,
     }
+    (tmp_path / "config" / claude.CREDENTIALS_FILE).write_text(claude.credentials(TOKEN))
     stderr = tmp_path / "stderr.log"
     process = subprocess.Popen(
         argv, cwd=tmp_path, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
