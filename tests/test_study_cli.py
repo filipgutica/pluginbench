@@ -1703,8 +1703,9 @@ def test_each_predictable_failure_stops_before_any_coding_call(
     assert not (checkable["output"] / "evidence").exists()
 
 
+@pytest.mark.parametrize("relative_source", [False, True])
 def test_check_warns_when_a_prebuilt_image_ignores_the_task_dockerfile(
-    checkable: dict[str, Any],
+    checkable: dict[str, Any], relative_source: bool
 ) -> None:
     # A git-identity fix in this Dockerfile silently did nothing, and a whole pilot was lost.
     raw = yaml.safe_load(checkable["path"].read_text())
@@ -1712,9 +1713,14 @@ def test_check_warns_when_a_prebuilt_image_ignores_the_task_dockerfile(
     (task / "environment/Dockerfile").write_text(
         "FROM fixture:pinned\nRUN git config --global user.name x\n"
     )
-    result = CliRunner().invoke(
-        cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"])]
-    )
+    path = checkable["path"]
+    if relative_source:
+        # A source that climbs out of the config's directory names the same tasks.
+        path = checkable["path"].parent / "runs/x/validation/eval.yaml"
+        path.parent.mkdir(parents=True)
+        raw["tasks"]["source"] = os.path.relpath(raw["tasks"]["source"], path.parent)
+        path.write_text(yaml.safe_dump(raw))
+    result = CliRunner().invoke(cli.app, ["check", str(path), "--output", str(checkable["output"])])
     assert result.exit_code == 0, result.stderr
     assert "Warning: arbitrary-native-task: runs the prebuilt image fixture:pinned" in result.stdout
     report = json.loads((checkable["output"] / "check.json").read_text())
@@ -1726,6 +1732,12 @@ def test_check_warns_when_a_prebuilt_image_ignores_the_task_dockerfile(
     environment = report["matrix"]["arbitrary-native-task"]["coding_environment"]
     assert environment["image_source"] == "prebuilt"
     assert environment["ignored_dockerfile"] == "environment/Dockerfile"
+    planned, absolute = (
+        evaluation.plan_evaluation(evaluation.load_evaluation(config))["comparison_identity"]
+        for config in (path, checkable["path"])
+    )
+    assert isinstance(planned, dict) and isinstance(absolute, dict)
+    assert planned["tasks"] == absolute["tasks"]
 
 
 def _build_with_fresh_image_ids(

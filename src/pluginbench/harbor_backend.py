@@ -925,7 +925,8 @@ def validate_native_task(task_dir: Path) -> dict[str, object]:
         "coding_image": {
             "source": "prebuilt" if image else "dockerfile",
             "image": image,
-            "ignored_dockerfile": str(dockerfile.relative_to(task_dir))
+            # Harbor resolves its paths, so a source given with `..` or a link still matches here.
+            "ignored_dockerfile": str(dockerfile.relative_to(task.paths.task_dir))
             if image and dockerfile.is_file()
             else None,
         },
