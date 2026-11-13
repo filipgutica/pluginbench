@@ -287,7 +287,11 @@ def session_errors(
             # Discovery saw a subscription token and no API key.
             "apiKeySource": "none" if "apiKeySource" not in receipt["account"] else None,
             "mcp_servers": [],
-            "agents": receipt["builtins"]["agents"],
+            # A receipt lists plugin agents apart from the built-ins, and only when declared.
+            "agents": sorted([
+                *receipt["builtins"]["agents"],
+                *(row["agentType"] for row in receipt.get("agents", [])),
+            ]),
             "slash_commands": sorted(builtin | skills),
             "skills": sorted(skills),
             "plugins": plugins,

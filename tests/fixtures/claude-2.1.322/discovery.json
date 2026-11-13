@@ -1,5 +1,5 @@
 {
-  "_source": "Claude Code 2.1.322, captured offline 2026-11-12 with a fake API key and no route to api.anthropic.com; trimmed. /SCRATCH replaces private paths. A demo plugin (one skill, one SessionStart command hook) and a loose user skill were installed. auto_memory is the CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 shape; initialize.account is the shape a subscription credentials file alone gives (offline, same CLI); policy.allDisabled is as captured without disableAllHooks.",
+  "_source": "Claude Code 2.1.322, captured offline 2026-11-12 with a fake API key and no route to api.anthropic.com; trimmed. /SCRATCH replaces private paths. A demo plugin (one skill, one SessionStart command hook) and a loose user skill were installed. auto_memory is the CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 shape; initialize.account is the shape a subscription credentials file alone gives (offline, same CLI); policy.allDisabled is as captured without disableAllHooks. get_context_usage.agents is the empty list CLI 2.1.322 reports with no agent beyond the built-ins (2026-11-13 plugin-support spike: pstack without agents/, Ponytail).",
   "stream": [
     {
       "type": "system",
@@ -96,6 +96,7 @@
       "session_state": "idle"
     },
     "get_context_usage": {
+      "agents": [],
       "categories": [
         {
           "id": "system_prompt",

@@ -227,10 +227,15 @@ function verifyDiscovery({ responses, events }, { marketplace, installs }, guida
   for (const install of installs) {
     for (const skill of install.expected.skills) expectedSkills.set(install.expected.name + ":" + skill.name, "plugin");
   }
-  // A treatment declares no agents, and admission refuses plugin agents.
+  // Plugin agents are the only agents a treatment declares; any other agent beyond the
+  // built-ins, such as a user or project one, is undeclared.
+  const declaredAgents = installs.flatMap(install => (install.expected.agents || []).map(agent => ({
+    agentType: install.expected.name + ":" + agent.name, source: "plugin", pluginId: install.id,
+    path: path.join(install.loadedFrom, agent.path),
+  })));
   const agents = init.agents.map(item => item.name);
-  const undeclaredAgents = agents.filter(name => !BUILTIN_AGENTS.has(name));
-  check(!undeclaredAgents.length, "Undeclared Claude agent discovered: " + undeclaredAgents.join(", "));
+  check(sameSet(agents.filter(name => !BUILTIN_AGENTS.has(name)), declaredAgents.map(agent => agent.agentType)),
+    "Claude agents differ from the declared plugin agents: " + agents.join(", "));
   const commands = init.commands.filter(item => item.builtin !== true).map(item => item.name);
   check(new Set(commands).size === commands.length, "Claude discovered duplicate commands");
   const undeclared = commands.filter(name => !expectedSkills.has(name));
@@ -276,6 +281,15 @@ function verifyDiscovery({ responses, events }, { marketplace, installs }, guida
   shape(Number.isInteger(memoryTokens), "get_context_usage");
   check(payload.inventory.guidance.length ? memoryTokens > 0 : memoryTokens === 0,
     "Claude memory_files tokens (" + memoryTokens + ") disagree with the declared guidance");
+  // Where each agent beyond the built-ins came from: exactly the declared plugin files, in
+  // every treatment, so a user or project agent fails discovery even when none is declared.
+  shape(Array.isArray(context.agents), "get_context_usage");
+  const agentSources = context.agents.map(row => ({
+    agentType: row.agentType, source: row.source, pluginId: row.pluginId,
+    path: typeof row.path === "string" ? resolved(row.path) : row.path,
+  }));
+  check(sameSet(agentSources.map(stable), declaredAgents.map(stable)),
+    "Claude agent sources differ from the declared plugin agents: " + stable(agentSources));
 
   const listing = responses.get_hooks_listing;
   shape(listing && Array.isArray(listing.hooks) && listing.policy, "get_hooks_listing");
@@ -306,7 +320,7 @@ function verifyDiscovery({ responses, events }, { marketplace, installs }, guida
   shape(usage && /Total cost:\s+\$\d+\.\d+/.test(cost.text), "get_session_cost");
   check(usage.slice(1).every(count => Number(count) === 0) && /Total cost:\s+\$0\.0+\b/.test(cost.text),
     "Claude discovery reported model usage: " + cost.text);
-  return { commands, memoryTokens };
+  return { commands, memoryTokens, agents: declaredAgents.length ? context.agents : null };
 }
 
 async function main() {
@@ -335,7 +349,7 @@ async function main() {
   }
   const plugins = installPlugins();
   const discovery = await discover();
-  const { commands, memoryTokens } = verifyDiscovery(discovery, plugins, guidancePath);
+  const { commands, memoryTokens, agents } = verifyDiscovery(discovery, plugins, guidancePath);
   const { responses } = discovery;
   const receipt = {
     status: "verified", delivery: payload.delivery, inventory: payload.inventory,
@@ -348,8 +362,11 @@ async function main() {
     skills: responses.get_skills_dialog.skills,
     builtins: {
       commands: responses.initialize.commands.filter(item => item.builtin === true).map(item => item.name).sort(),
-      agents: responses.initialize.agents.map(item => item.name).sort(),
+      agents: responses.initialize.agents.map(item => item.name).filter(name => BUILTIN_AGENTS.has(name)).sort(),
     },
+    // The verified get_context_usage rows, only when the treatment declares plugin agents, so
+    // an agent-free receipt is unchanged.
+    ...(agents ? { agents } : {}),
     marketplace: { path: plugins.marketplace, add: plugins.marketplaceAdd },
     plugin_installs: plugins.installs.map(item => ({
       id: item.id, loaded_from: item.loadedFrom, cache_path: item.cachePath, output: item.output,

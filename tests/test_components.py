@@ -31,17 +31,22 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
                 "229d01b78fd893b8e502139507b74d18f0147079c58f15f90b0548b5520e67c5"
             ),
             # Claude plugin admission rules; Codex admission and every admitted launch stay v1.
-            "treatments.py": "cf2f455d0da41f1795d4c28dc0fd1f0cdd9253b6648834342d454bb41ae10482",
+            # Claude plugin agents admit; a Codex inventory and an agent-free Claude one are
+            # unchanged.
+            "treatments.py": "33412b7f2fee49a064809a5f1113f23c5d325e5efc364cc6783b706c82af1c51",
             # Claude version admission, coding launch contract and the subscription-only refusal
             # every Claude launch shares; a token-only launch is unchanged, so this stays v1.
             # The forced subagent model joins the coding env, which the Claude vanilla
             # identity binds by value, so the launcher stays v1 and Codex is untouched.
             "claude.py": "bb4eb9656c40f86147e098aa418a2cb80aa1fab353014bdf35cd8e1133327dcc",
             "claude_treatments.py": "0149a2dd1c0f0db6f2e29b030885bacbad2e0569e43cdf45c25764181bc9ea97",
+            # Discovery proves plugin agents exactly; an agent-free receipt is unchanged and
+            # verifies as before unless an agent loads, so the launcher stays v1.
             "claude_treatment_runtime.js": (
-                "89ede82ff3dc1045c6e22e1639a1dccc9a611a514cb4474048c090bfc32e1bc9"
+                "3fb19c0a255775fe1df4f6bb04db4dba0615be016bb67d6109fc5db15e26a656"
             ),
-            "claude_launch.py": "7eb3fee369a56de2c2b37a1c2fe71a1f9f1433955f58fe826e53026541db4314",
+            # The launch check expects the receipt's plugin agents beside the built-ins.
+            "claude_launch.py": "5a2c4eb9e16ef7763fa972241cd3e82101a3f5ae46b7e67e649446aba7b2648a",
         },
     ),
     "analysis_observer": (
