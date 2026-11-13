@@ -30,14 +30,14 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
                 "229d01b78fd893b8e502139507b74d18f0147079c58f15f90b0548b5520e67c5"
             ),
             # Claude plugin admission rules; Codex admission and every admitted launch stay v1.
-            "treatments.py": "68bc11023a601c7bcf2ababdbb5007f0515eb1c64e9a1194862cfa939541ebab",
+            "treatments.py": "d47d888ba764795aa8be88fb1decd9bd69c1702e9f910d5198b1f0a4786925a4",
             # Claude version admission and coding launch contract; Claude-only, so Codex stays v1.
             "claude.py": "90f62955622d1dd517c37f04b9dcddacc8e997378a0096a5c97cb074f3de4676",
-            "claude_treatments.py": "27b2e0a5012180c044f2d2d111d30c348c7c44a04945ee2c4cedde239731b958",
+            "claude_treatments.py": "0149a2dd1c0f0db6f2e29b030885bacbad2e0569e43cdf45c25764181bc9ea97",
             "claude_treatment_runtime.js": (
-                "607e3e13e7f49ffe92b31a0cb893ee3cac4f061b12224251480c40ec0f26bf12"
+                "89ede82ff3dc1045c6e22e1639a1dccc9a611a514cb4474048c090bfc32e1bc9"
             ),
-            "claude_launch.py": "3c59f32a7c192881f4731608fb1b174c2fee511406ead236980badf17c9f0f5f",
+            "claude_launch.py": "7eb3fee369a56de2c2b37a1c2fe71a1f9f1433955f58fe826e53026541db4314",
         },
     ),
     "analysis_observer": (

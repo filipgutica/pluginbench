@@ -23,6 +23,12 @@ def revalidate_usage(execution: dict[str, Any], receipt: Path) -> dict[str, Any]
     parsed: dict[str, Any] = {}
     reasons = []
     launch = execution.get("launch") or {}
+    # Native session accounting cannot meter subprocesses launched by command hooks.
+    hooks = execution.get("native_treatment", {}).get("hooks", {}).get("hooks")
+    recorded = original["recorded_usage"]
+    if hooks and launch.get("harness") == "claude-cli":
+        # A Claude launch keeps the session usage there before the hook rule clears `usage`.
+        recorded = execution.get("native_session_usage")
     try:
         codex.validate_artifacts(artifacts)
         traces = sorted(artifacts.glob("host-trace-*.jsonl"))
@@ -45,12 +51,10 @@ def revalidate_usage(execution: dict[str, Any], receipt: Path) -> dict[str, Any]
             )
         if parsed:
             reasons.extend(parsed["usage_accounting"]["reasons"])
-            if parsed["usage"] != original["recorded_usage"]:
+            if parsed["usage"] != recorded:
                 reasons.append("revalidated usage disagrees with recorded usage")
     except (OSError, ValueError) as error:
         reasons.append(f"saved usage evidence is unreadable: {error}")
-    # Native session accounting cannot meter subprocesses launched by command hooks.
-    hooks = execution.get("native_treatment", {}).get("hooks", {}).get("hooks")
     if hooks:
         reasons.append("command-hook subprocess usage is not independently metered")
     usage = parsed.get("usage") if not reasons else None

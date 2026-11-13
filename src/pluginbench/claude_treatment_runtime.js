@@ -235,16 +235,29 @@ function verifyDiscovery({ responses, events }, { marketplace, installs }, guida
   check(new Set(commands).size === commands.length, "Claude discovered duplicate commands");
   const undeclared = commands.filter(name => !expectedSkills.has(name));
   check(!undeclared.length, "Undeclared Claude command or skill discovered: " + undeclared.join(", "));
+  // Who may invoke each skill comes from its frozen frontmatter. A skill without it is refused.
+  const invocation = name => {
+    const declared = payload.skill_invocation[name];
+    check(declared, "Claude skill has no declared invocation: " + name);
+    return declared;
+  };
+  // CLI 2.1.322 leaves a `user-invocable: false` skill out of commands.
+  check(sameSet(commands, [...expectedSkills.keys()].filter(name => invocation(name).user)),
+    "Claude commands differ from the declared user-invocable skills");
   const dialog = responses.get_skills_dialog;
   shape(dialog && Array.isArray(dialog.skills), "get_skills_dialog");
-  // The dialog, not commands, proves presence: a `user-invocable: false` skill is on in the
-  // dialog but absent from commands. The dialog names a loose skill by its folder and shows
+  // The dialog, not commands, proves presence. It names a loose skill by its folder and shows
   // its frontmatter name as display_name, which is the name commands use (CLI 2.1.322).
   check(sameSet(dialog.skills.map(skill => skill.display_name), expectedSkills.keys()),
     "Claude skills dialog differs from the declared skills");
   for (const skill of dialog.skills) {
-    check(skill.state === "on" && skill.source === expectedSkills.get(skill.display_name),
-      "Claude skill is not on from its declared source: " + skill.display_name);
+    // CLI 2.1.322 shows a `disable-model-invocation: true` skill as user-invocable-only,
+    // locked by its author; any other state means the CLI changed what the skill may do.
+    const state = invocation(skill.display_name).model
+      ? skill.state === "on"
+      : skill.state === "user-invocable-only" && skill.locked_by === "author";
+    check(state && skill.source === expectedSkills.get(skill.display_name),
+      "Claude skill is not in its declared state from its declared source: " + skill.display_name);
   }
 
   const memory = responses.get_memory_dialog;

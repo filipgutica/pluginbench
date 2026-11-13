@@ -20,7 +20,12 @@ from typing import Any
 
 from pluginbench import claude
 from pluginbench.native_treatments import MARKETPLACE, MAX_GUIDANCE_BYTES, REMOTE_ROOT
-from pluginbench.treatments import Treatment, resolve_treatment, treatment_inventory
+from pluginbench.treatments import (
+    Treatment,
+    resolve_treatment,
+    skill_frontmatter,
+    treatment_inventory,
+)
 
 DELIVERY_POLICY = "claude-native-v1"
 # Harbor's claude-code agent keeps its private configuration in its logs directory.
@@ -78,6 +83,7 @@ def stage(
     payload = {
         "delivery": DELIVERY_POLICY,
         "inventory": inventory,
+        "skill_invocation": _skill_invocation(treatment, inventory),
         "guidance_sha256": hashlib.sha256(guidance).hexdigest(),
         "guidance_bytes": len(guidance),
         "marketplace": MARKETPLACE,
@@ -90,6 +96,30 @@ def stage(
     (directory / "treatment.json").write_text(json.dumps(payload, sort_keys=True) + "\n")
     shutil.copy2(Path(__file__).with_name("claude_treatment_runtime.js"), directory / "install.cjs")
     return payload
+
+
+def _skill_invocation(treatment: Treatment, inventory: dict[str, Any]) -> dict[str, Any]:
+    """Who may invoke each declared skill, from its frozen frontmatter, by its command name.
+
+    CLI 2.1.322 shows a `disable-model-invocation: true` skill as `user-invocable-only`,
+    locked by its author, and leaves a `user-invocable: false` skill out of its commands.
+    """
+    resolved = resolve_treatment(treatment, Path.cwd(), "claude")
+    roots = {
+        skill["name"]: root
+        for skill, root in zip(inventory["skills"], resolved.skills, strict=True)
+    }
+    for plugin, root in zip(inventory["plugins"], resolved.plugins, strict=True):
+        for skill in plugin["skills"]:
+            roots[plugin["name"] + ":" + skill["name"]] = root / skill["path"]
+    invocation = {}
+    for name, root in roots.items():
+        frontmatter = skill_frontmatter(root)
+        invocation[name] = {
+            "model": frontmatter.get("disable-model-invocation") is not True,
+            "user": frontmatter.get("user-invocable") is not False,
+        }
+    return invocation
 
 
 async def install(
