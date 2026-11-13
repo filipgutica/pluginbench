@@ -520,6 +520,40 @@ def native_session(
     return stream(*events)
 
 
+def test_a_hooked_saved_codex_run_checks_the_session_usage_kept_at_launch(tmp_path: Path) -> None:
+    from pluginbench.saved_usage import revalidate_usage
+
+    counts = {"input_tokens": 10, "output_tokens": 5}
+    trace = native_session("root", [counts])
+    stdout = stream({"type": "turn.completed", "usage": counts})
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "stdout.jsonl").write_text(stdout)
+    (artifacts / "host-trace-0.jsonl").write_text(trace)
+    receipt = tmp_path / "execution.json"
+    receipt.write_text("{}")
+    # At launch a hooked run keeps the session usage as native_session_usage and clears usage.
+    execution: dict[str, object] = {
+        "launch": {"harness": "codex-cli"},
+        "native_treatment": {"hooks": {"hooks": [{"event": "SessionStart"}]}},
+        "native_session_usage": codex.parse_events(stdout, [trace], "codex")["usage"],
+        "usage": None,
+    }
+    revalidated = revalidate_usage(execution, receipt)
+    assert revalidated["usage"] is None
+    assert revalidated["usage_validation"]["status"] == "unavailable"
+    assert revalidated["usage_validation"]["reasons"] == [
+        "command-hook subprocess usage is not independently metered"
+    ]
+    execution["native_session_usage"] = {"input_tokens": 1, "output_tokens": 4}
+    revalidated = revalidate_usage(execution, receipt)
+    assert revalidated["usage"] is None
+    assert revalidated["usage_validation"]["reasons"] == [
+        "revalidated usage disagrees with recorded usage",
+        "command-hook subprocess usage is not independently metered",
+    ]
+
+
 def test_native_descendant_usage_counts_session_totals_once_and_keeps_primary_identity() -> None:
     root = native_session(
         "root",
