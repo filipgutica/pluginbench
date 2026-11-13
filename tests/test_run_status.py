@@ -290,19 +290,22 @@ def test_status_errors_say_what_to_do(tmp_path: Path, arguments: list[str], mess
     assert result.exit_code == 2 and message in result.stderr
 
 
-def test_a_finished_run_reads_as_reviewing_while_review_owns_it(tmp_path: Path) -> None:
+@pytest.mark.parametrize("command, phase", [("review", "reviewing"), ("measure", "measuring")])
+def test_a_finished_run_reads_as_revised_while_a_command_owns_it(
+    tmp_path: Path, command: str, phase: str
+) -> None:
     root = _run(tmp_path / "run", states=dict.fromkeys(STATES, "complete"), ledger=True)
     run = json.loads((root / "evidence/run.json").read_text())
     _write(root / "evidence/run.json", {**run, "status": "complete"})
     _write(root / "report/report.html", "")
     assert run_status.run_status(root)["phase"] == "complete"
     (root / "events.jsonl").write_text(
-        json.dumps({"at": "2026-11-07T00:00:00+00:00", "event": "started", "command": "review"})
+        json.dumps({"at": "2026-11-07T00:00:00+00:00", "event": "started", "command": command})
         + "\n"
     )
 
     with run_lock.hold(root):
-        assert run_status.run_status(root)["phase"] == "reviewing"
+        assert run_status.run_status(root)["phase"] == phase
 
 
 def test_a_stopped_run_reads_as_stopped_not_failed(

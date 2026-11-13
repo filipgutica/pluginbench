@@ -34,7 +34,9 @@ from pluginbench.claude_launch import UNENFORCED_LIMITS, recorded_capabilities
 from pluginbench.claude_launch import refuse_unenforced_limits
 from pluginbench.task_sources import Tasks, cache_root
 from pluginbench.measurement_profiles import (
+    FALLOW_MEASUREMENTS,
     REMOVED_TEST_OVERLAP,
+    CoverageSettings,
     MeasurementSettings,
     blocking_findings,
     not_measured,
@@ -42,10 +44,12 @@ from pluginbench.measurement_profiles import (
     prepare_profiles,
     probe_measurements,
     readiness_state,
+    selected_measurements,
 )
 from pluginbench.assessment_metrics import scoped_code_size, scoped_test_size
 from pluginbench.datasets import TaskCatalog, TaskEntry, load_tasks, portable_native_identity
 from pluginbench.collectors import Collector
+from pluginbench.assessment_charts import chart_data
 from pluginbench.evaluation_report import write_evaluation_report
 from pluginbench.remeasure import (
     _native_state,
@@ -1146,8 +1150,13 @@ def _adopt_measurement_revision(root: Path, selection: dict[str, object], revisi
     if not isinstance(saved_history, list):
         raise ValueError("measurement history must be a list of bound revision receipts")
     history = list(saved_history)
-    prior = selection.get("recovery_measurement_revision")
-    if prior is not None:
+    # A failed revision this one recovers from, and a selected one it replaces, stay listed.
+    for prior in (
+        selection.get("recovery_measurement_revision"),
+        selection.get("measurement_revision"),
+    ):
+        if prior is None:
+            continue
         path = evidence / "observer-revisions" / str(prior) / "revision.json"
         receipt = study._reference(evidence, path)
         if receipt not in history:
@@ -1455,6 +1464,243 @@ def review_evaluation(
     _save_selection(root, selection)
     regenerate_report(root)
     return selected
+
+
+# The measures `measure` can add: each is collected from saved submissions, with no model call.
+_COLLECTED = FALLOW_MEASUREMENTS | {"coverage"}
+
+
+def _measure_inputs(
+    root: Path,
+    selection: dict[str, object],
+    measurements: list[str],
+    revision: str,
+    coverage_profiles: Path | None,
+) -> MeasurementSettings:
+    """Refuse what `measure` cannot add; return the settings it measures with."""
+    if (
+        not _coding_done(root)
+        or selection.get("pending_measurement_revision") is not None
+        or selection.get("recovery_measurement_revision") is not None
+        or (selection["measurement_required"] and selection["measurement_revision"] is None)
+        or (selection.get("reviewer") and selection["review_revision"] is None)
+    ):
+        raise ValueError(f"this run has not finished; finish it with `pluginbench run {root}`")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", revision):
+        raise ValueError("--revision must be one name of letters, digits, '.', '_' and '-'")
+    if (root / "evidence/observer-revisions" / revision).exists() or (
+        root / "measure" / revision
+    ).exists():
+        raise ValueError(
+            f"measurement revision {revision} already exists; choose a new --revision name"
+        )
+    if not measurements or len(set(measurements)) != len(measurements):
+        raise ValueError("give each measurement to add once")
+    selected_measurements(measurements)
+    if other := [name for name in measurements if name not in _COLLECTED]:
+        raise ValueError(
+            f"measure adds only {', '.join(sorted(_COLLECTED))}, which are collected from saved "
+            f"submissions; it cannot add {', '.join(other)}"
+        )
+    saved = TypeAdapter(list[str]).validate_python(selection["measurements"])
+    if already := [name for name in measurements if name in saved]:
+        raise ValueError(f"this run already measures {', '.join(already)}")
+    settings = _saved_evaluation(selection).measurement_settings
+    fallow = settings.fallow_config
+    if fallow is not None and FALLOW_MEASUREMENTS & {*saved, *measurements}:
+        expected = _object(selection["comparison_identity"])["fallow_config_sha256"]
+        if not fallow.is_file() or hashlib.sha256(fallow.read_bytes()).hexdigest() != expected:
+            raise ValueError(f"the run's Fallow settings {fallow} changed or are missing")
+    if coverage_profiles is None:
+        return settings
+    if "coverage" not in measurements:
+        raise ValueError("--coverage-profiles is for adding coverage; add coverage too")
+    added = TypeAdapter(dict[str, CoverageSettings]).validate_python(
+        yaml.safe_load(coverage_profiles.read_text())
+    )
+    # Only new profiles: a changed one would change what the run's earlier settings meant.
+    if changed := [
+        key
+        for key, value in added.items()
+        if key in settings.coverage_profiles and settings.coverage_profiles[key] != value
+    ]:
+        raise ValueError(f"--coverage-profiles changes saved profiles: {', '.join(changed)}")
+    return settings.model_copy(
+        update={"coverage_profiles": {**settings.coverage_profiles, **added}}
+    )
+
+
+def plan_measure(
+    root: Path, measurements: list[str], revision: str, coverage_profiles: Path | None = None
+) -> dict[str, object]:
+    """Check that a finished run can gain `measurements` as measurement revision `revision`."""
+    root = root.expanduser().resolve()
+    selection = _load_selection(root)
+    _measure_inputs(root, selection, measurements, revision, coverage_profiles)
+    saved = TypeAdapter(list[str]).validate_python(selection["measurements"])
+    catalog = TaskCatalog.model_validate_json((root / "evidence/frozen/tasks.json").read_text())
+    return {
+        "name": selection["name"],
+        "revision": revision,
+        "measurements": measurements,
+        "collected": sorted({*saved, *measurements} & _COLLECTED),
+        "tasks": len(catalog.tasks),
+    }
+
+
+def measure_evaluation(
+    root: Path,
+    measurements: list[str],
+    revision: str,
+    *,
+    coverage_profiles: Path | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> str:
+    """Add `measurements` to a finished run as measurement revision `revision`, then select it.
+
+    No model call. A revision is built from the run's own saved submissions, so this one
+    collects every collector-backed measure the run selects, earlier ones included. Earlier
+    revisions stay in evidence and measurement history; coding, correctness, token and review
+    evidence is unchanged. Profiles, readiness probes and the replaced settings stay in
+    measure/<revision>.
+    """
+    root = root.expanduser().resolve()
+    plan = plan_measure(root, measurements, revision, coverage_profiles)
+    selection = _load_selection(root)
+    settings = _measure_inputs(root, selection, measurements, revision, coverage_profiles)
+    evidence = root / "evidence"
+    work = root / "measure" / revision
+    work.mkdir(parents=True)
+    shutil.copy2(root / "evaluation.json", work / "evaluation-before.json")
+    readiness = _object(selection["measurement_readiness"])
+    collected = TypeAdapter(list[str]).validate_python(plan["collected"])
+    catalog = TaskCatalog.model_validate_json((evidence / "frozen/tasks.json").read_text())
+    profiles: dict[str, list[Collector]] = {}
+    rows: dict[str, dict[str, dict[str, object]]] = {}
+    for entry in catalog.tasks:
+        if progress:
+            progress(f"Preparing measurement profiles for {entry.id}")
+        # This run's frozen copies: saved identities name the paths of the run that coded them.
+        task_dir = evidence / "frozen" / entry.native_task
+        fixture = evidence / "frozen" / entry.fixture
+        identity = {
+            **json.loads(entry.provenance["native_task_identity"]),
+            "task_dir": str(task_dir),
+            "fixture_dir": str(fixture),
+        }
+        output = work / entry.id
+        profiles[entry.id] = prepare_profiles(
+            fixture, output / "measurements", collected, settings, identity
+        )
+        provenance = json.loads((output / "measurements/measurement-provenance.json").read_text())
+        # Earlier measures are collected again too, so each is checked again: one that was ready
+        # and no longer is would replace its measured values with unknown ones.
+        probed = probe_measurements(
+            fixture,
+            output / "measurement-readiness",
+            profiles[entry.id],
+            collected,
+            _object(provenance["capabilities"]),
+        )
+        for name in set(collected) - set(measurements):
+            row = probed[name]
+            if row["state"] != "ready" and (
+                _object(_object(readiness[entry.id]).get(name, {})).get("state") == "ready"
+            ):
+                raise ValueError(
+                    f"{entry.id}: {name} is measured now but is {row['state']} on the task's "
+                    f"starting source, so this revision would lose it: {row.get('reason')}"
+                )
+        rows[entry.id] = {name: probed[name] for name in measurements}
+    matrix = {
+        task: {
+            name: {"state": row["state"], "reason": row.get("reason")} for name, row in by.items()
+        }
+        for task, by in rows.items()
+    }
+    if findings := blocking_findings(matrix, require_ready=settings.require_ready):
+        raise ValueError("cannot add these measurements: " + "; ".join(findings))
+    skipped = [] if settings.require_ready else not_measured(matrix)
+    for row in skipped:
+        if progress:
+            progress(f"Warning: {row['task']}: {row['measure']} is broken, so it is not measured")
+    listed = [
+        *TypeAdapter(list[dict[str, object]]).validate_python(selection.get("not_measured", [])),
+        *skipped,
+    ]
+    propose_remeasurement(
+        evidence,
+        profiles=profiles,
+        revision=revision,
+        progress=progress,
+        jobs=_saved_evaluation(selection).jobs,
+        masks_listed_pairs=bool(listed),
+    )
+    current = _selected_revision(selection, "measurement_revision")
+    if current is not None:
+        _refuse_lost_observations(evidence, current, revision)
+    comparison = _object(selection["comparison_identity"])
+    selected = [*TypeAdapter(list[str]).validate_python(selection["measurements"]), *measurements]
+    selection["measurements"] = selected
+    comparison["measurements"] = sorted(selected)
+    coverage = settings.model_dump(mode="json")["coverage_profiles"]
+    for owner in (selection, comparison):
+        owner["measurement_settings"] = {
+            **_object(owner["measurement_settings"]),
+            "coverage_profiles": coverage,
+        }
+    for owner, key in (
+        (selection, "measurement_capabilities"),
+        (selection, "measurement_readiness"),
+        (comparison, "measurement_capabilities"),
+    ):
+        saved = _object(owner[key])
+        owner[key] = {
+            **saved,
+            **{task: {**_object(saved[task]), **by} for task, by in rows.items()},
+        }
+    selection["comparison_identity"] = comparison
+    selection["not_measured"] = listed
+    selection["measurement_required"] = True
+    _adopt_measurement_revision(root, selection, revision)
+    _save_selection(root, selection)
+    regenerate_report(root)
+    return revision
+
+
+def _refuse_lost_observations(evidence: Path, current: str, proposed: str) -> None:
+    """Refuse a proposal that loses any observation the selected revision measured.
+
+    A collector can pass on a task's starting source and still fail on some submissions, in
+    whole or for one metric, so this compares the observation records the report reads, per
+    metric, attempt and stage, after collection.
+    """
+
+    def measured(revision: str) -> dict[tuple[str, str, str], str]:
+        path = evidence / "observer-revisions" / revision / "revision.json"
+        state = study._bound_document(evidence, study._reference(evidence, path))
+        report = study._bound_document(evidence, state["proposed_report"])
+        rows = TypeAdapter(list[dict[str, object]]).validate_python(
+            chart_data(report)["observations"]
+        )
+        return {
+            (str(row["metric"]), str(row["attempt_id"]), str(row["stage"])): str(row["task"])
+            for row in rows
+            if row["status"] != "unknown"
+        }
+
+    before, after = measured(current), measured(proposed)
+    if lost := sorted(key for key in before if key not in after):
+        counts = ", ".join(
+            f"{metric} ({sum(key[0] == metric for key in lost)})"
+            for metric in sorted({key[0] for key in lost})
+        )
+        examples = ", ".join(f"{before[key]} {key[1]}/{key[2]}" for key in lost[:3])
+        raise ValueError(
+            f"measurement revision {proposed} would lose {len(lost)} observations that revision "
+            f"{current} measured: {counts}; such as {examples}. It stays in evidence and is not "
+            "selected; the run's settings are unchanged"
+        )
 
 
 def _save_selection(root: Path, selection: object) -> None:

@@ -422,6 +422,32 @@ States are `pending`, `running`, `complete`, and `interrupted`. Outcomes are `pa
 
 `pluginbench review runs/<run> --revision <name>` reviews every submission of a finished run again with the run's frozen reviewer, criteria, seed, and jobs, as review revision `<name>`. It prints the number of review calls and asks before starting unless `--yes` is set; when no answer can be read, such as an empty pipe, it exits and says to pass `--yes`. It owns `run.lock` while it works, so it refuses an active run, and it checks the reviewer's CLI, credentials, and sandbox host before the first call. Earlier revisions stay in evidence. The new revision, or `<name>-citations` when offline citation recovery repaired its formatting, becomes the selected one, and the report is rebuilt. A name that already exists is refused; choose a new one. A run with no reviewer, or whose first review has not finished, is refused.
 
+## Measure again
+
+`pluginbench measure runs/<run> --measurements cyclomatic,cognitive --revision <name>` adds measures to a finished run from its saved submissions, as measurement revision `<name>`. It makes no model calls and codes nothing again. It adds only measures that a collector takes from saved submissions: `cyclomatic`, `cognitive`, `dead_code`, and `coverage`. It prints what it will measure and asks before starting unless `--yes` is set. It owns `run.lock` while it works, so it refuses an active run.
+
+It refuses:
+
+- A run whose coding, measurement, or first review has not finished. Finish it with `pluginbench run runs/<run>`.
+- A revision name that already exists. Choose a new one.
+- An unknown measure, or one the run already measures.
+- A requested measure that no task can measure.
+- A measure the run measures now that no longer passes its readiness check, such as coverage whose task image is gone. The new revision would replace its values with unknown ones.
+- A collected revision that loses an observation the selected revision measured, compared per metric, attempt, and stage, such as an analyzer that reads the starting source but fails on a submission. That check runs after collection; the revision stays in evidence, is not selected, and the settings are unchanged.
+
+The steps:
+
+1. For each task, it prepares profiles in the run's own frozen copy of the task.
+2. It checks each measure it collects twice on the task's starting source, as `check` does. This includes the earlier ones, because it collects them again.
+3. A new measure that is broken on one task while other tasks can measure it is added to `not_measured` for that task, as `check` does. With `require_ready`, any new measure that is not ready refuses the request.
+4. It collects the revision, and then selects it and rebuilds the report.
+
+A revision is built from the run's saved submissions, not from an earlier revision. So the new revision collects every collector measure the run selects, the earlier ones included: measuring a run that already has coverage again needs its task images again. The earlier selected revision stays in evidence and in `measurement_history`. Coding evidence, correctness, tokens, lines, and reviews are not changed. The working files of each request stay in `measure/<name>/`: profiles, readiness checks, and `evaluation-before.json`, the settings as they were before.
+
+The run's saved settings change only through this command, as `review` changes the selected review. The command adds the new measures to `measurements` and `comparison_identity.measurements`. It adds their readiness rows to `measurement_capabilities`, `measurement_readiness`, and `comparison_identity.measurement_capabilities`, and it updates `comparison_identity.effective_observer_scripts`. It then writes `evaluation.json` and its binding again. `compare` checks these identity fields, so measure every run in a batch with the same build and the same request.
+
+Coverage needs a coverage profile for the task. If the run's settings have none, pass `--coverage-profiles <file>`, a YAML `coverage_profiles` mapping such as the files in [coverage profiles](coverage-profiles/README.md). The command adds the mapping to `measurement_settings.coverage_profiles`. It refuses a key that the run already saved with a different profile. Pass the same file for every run in a batch.
+
 Use exact model IDs. Harbor does not support `ultra` reasoning. Requested effort is separate from effective effort when native evidence cannot verify it.
 
 ## Compare runs
