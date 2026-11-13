@@ -860,6 +860,17 @@ def test_native_named_spawn_requires_captured_child_even_without_legacy_spawn_ev
     )
 
 
+def test_native_spawn_override_is_descendant_evidence_without_the_child_trace() -> None:
+    spawn = named_native_spawn()
+    call = spawn[0]["payload"]
+    assert isinstance(call, dict)
+    call["arguments"] = '{"model":"other-model","reasoning_effort":"low"}'
+    root = native_session("root", [{"input_tokens": 20, "output_tokens": 5}], extra=spawn)
+    parsed = codex.parse_events("", [root], "codex", include_descendants=True)
+    assert parsed["actual_descendant_models"] == ["other-model"]
+    assert parsed["actual_descendant_efforts"] == ["low"]
+
+
 @pytest.mark.parametrize("boundary", [None, True, -1, 0, 2, 5, 99])
 def test_native_inherited_child_rejects_missing_or_invalid_own_history_boundary(
     boundary: object,

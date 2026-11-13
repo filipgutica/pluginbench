@@ -860,6 +860,7 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
                             "partial_usage",
                             "usage_accounting",
                             "actual_descendant_models",
+                            "actual_descendant_efforts",
                             "native_treatment",
                             "native_session_usage",
                             "error",

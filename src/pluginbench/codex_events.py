@@ -519,6 +519,16 @@ def _descendant_usage(
                         named_spawns[call_id] = None
                     else:
                         reasons.add(f"unidentified named spawn for session {identity}")
+                    # A requested override is evidence even when the child's own trace is lost.
+                    try:
+                        arguments = json.loads(payload.get("arguments") or "{}")
+                    except (TypeError, ValueError):
+                        arguments = None
+                    if isinstance(arguments, dict):
+                        if isinstance(arguments.get("model"), str):
+                            child_models.add(arguments["model"])
+                        if isinstance(arguments.get("reasoning_effort"), str):
+                            child_efforts.add(arguments["reasoning_effort"])
                 if (
                     payload.get("type") == "function_call_output"
                     and isinstance(call_id, str)
