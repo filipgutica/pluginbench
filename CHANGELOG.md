@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.7.0](https://github.com/filipgutica/pluginbench/compare/v0.6.1...v0.7.0) (2026-11-13)
+
+
+### Features
+
+* admit any Claude CLI version for coding with a warning ([#65](https://github.com/filipgutica/pluginbench/issues/65)) ([0faba74](https://github.com/filipgutica/pluginbench/commit/0faba74d1bed59c481516363ca4ff7ed829ef6c0))
+* admit Claude plugins with Claude component rules ([#67](https://github.com/filipgutica/pluginbench/issues/67)) ([03c9d0d](https://github.com/filipgutica/pluginbench/commit/03c9d0d14d3d4a75e3258f5437b254ac86cf5c9a))
+* deliver Claude treatments and prove discovery without a model call ([#68](https://github.com/filipgutica/pluginbench/issues/68)) ([3dfeb06](https://github.com/filipgutica/pluginbench/commit/3dfeb067c6b7830d7c0d92c017de97ff22109082))
+* **judge:** bind verdicts to the judge CLI version ([#70](https://github.com/filipgutica/pluginbench/issues/70)) ([3bb6f70](https://github.com/filipgutica/pluginbench/commit/3bb6f70e1f16613beb15a9831487d0170d2ae7c7))
+* launch Claude coding attempts through the pinned contract ([#72](https://github.com/filipgutica/pluginbench/issues/72)) ([f3478ad](https://github.com/filipgutica/pluginbench/commit/f3478ad6711d6b2889da83f2a29c35bbeb474602))
+* validate saved Claude coding token usage on reuse and report ([#71](https://github.com/filipgutica/pluginbench/issues/71)) ([315540a](https://github.com/filipgutica/pluginbench/commit/315540aa9c3cb05ea2fea9e721dbdd86cba64cfa))
+
+
+### Bug Fixes
+
+* authenticate Claude coding with the subscription token, never an API key ([#69](https://github.com/filipgutica/pluginbench/issues/69)) ([270e180](https://github.com/filipgutica/pluginbench/commit/270e1804cf7738d4b364caf3dc53f38187b22a54))
+* clearer compare notes, vanilla in progress lines, explained judge agreement ([#74](https://github.com/filipgutica/pluginbench/issues/74)) ([2c1de6a](https://github.com/filipgutica/pluginbench/commit/2c1de6a3d6bce51976d7e2aead5d3462d1bd4a30))
+* **judge:** parse judge evidence with the judge's own harness ([#64](https://github.com/filipgutica/pluginbench/issues/64)) ([1501d64](https://github.com/filipgutica/pluginbench/commit/1501d6406ce1fcb61dbe58641bb31ed07a26ddb6))
+* name no harness in the unvalidated usage note of status ([#76](https://github.com/filipgutica/pluginbench/issues/76)) ([53ab15f](https://github.com/filipgutica/pluginbench/commit/53ab15fbbbd6bcbe72d4c6883ff169f1d608bdfe))
+* validate reused raw artifacts without parsing JSON ([#73](https://github.com/filipgutica/pluginbench/issues/73)) ([017bd36](https://github.com/filipgutica/pluginbench/commit/017bd36e4764a5ec66cf257cb06105ed8233d7a9))
+
+
+### Documentation
+
+* document Claude Code as a coding harness ([#75](https://github.com/filipgutica/pluginbench/issues/75)) ([567dd2d](https://github.com/filipgutica/pluginbench/commit/567dd2d574821a4c070ad7805ab6cae70d2d7453))
+
 ## [0.6.1](https://github.com/filipgutica/pluginbench/compare/v0.6.0...v0.6.1) (2026-11-12)
 
 
