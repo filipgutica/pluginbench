@@ -266,6 +266,8 @@ When 3 attempts in a row each end with a failed call and no submission, no new a
 
 `pluginbench run evaluation.yaml` checks in the foreground, then starts the run in the background and returns once the background process owns `runs/<run>/run.lock`. It prints the `pluginbench status runs/<run> --watch` command. The lock records the process ID, process group, start time, and run directory. The background process appends one JSON line per event to `events.jsonl` and writes its output to `run.log`. Use `--foreground` to run in the terminal instead.
 
+Progress and attempt failure messages call the no-guidance arm `vanilla`, including messages saved in `run.log` and `events.jsonl`. Frozen identities and attempt records keep the internal name `baseline`.
+
 The background process runs in a new session. On Linux with a systemd user manager, it also runs in its own transient user scope (`systemd-run --user --scope`), so it keeps running when the terminal, agent session, or service that launched it ends, even when that launcher's whole cgroup is killed. The scope keeps the launcher's environment, including `PATH`, and the worker's process ID; `run.log` names the scope, and `systemctl --user status <pid>` shows it. Without a reachable user manager, as in most containers and on macOS, the new session survives a closed terminal but not a kill of the launcher's cgroup.
 
 ```sh
