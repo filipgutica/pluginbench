@@ -705,4 +705,6 @@ def test_status_uses_current_usage_and_labels_historical_receipts(
         note = f"rebuild with `pluginbench report {root}` to re-validate token usage"
         assert note in row["tokens_reason"]
         assert note in run_status.format_status(status)
+        # Codex and Claude runs share the note, so it names neither harness.
+        assert "Recorded token usage is unvalidated" in run_status.format_status(status)
     assert _tree(root) == before

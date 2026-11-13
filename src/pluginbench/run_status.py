@@ -514,7 +514,7 @@ def format_status(status: dict[str, Any]) -> str:
         for row in [*status["attempts"], *status["discarded"]]
     ):
         lines.append(
-            "Recorded Codex usage is unvalidated; "
+            "Recorded token usage is unvalidated; "
             f"rebuild with `{shlex.join(['pluginbench', 'report', status['run']])}` "
             "to re-validate token usage"
         )
