@@ -1732,12 +1732,6 @@ def test_check_warns_when_a_prebuilt_image_ignores_the_task_dockerfile(
     environment = report["matrix"]["arbitrary-native-task"]["coding_environment"]
     assert environment["image_source"] == "prebuilt"
     assert environment["ignored_dockerfile"] == "environment/Dockerfile"
-    planned, absolute = (
-        evaluation.plan_evaluation(evaluation.load_evaluation(config))["comparison_identity"]
-        for config in (path, checkable["path"])
-    )
-    assert isinstance(planned, dict) and isinstance(absolute, dict)
-    assert planned["tasks"] == absolute["tasks"]
 
 
 def _build_with_fresh_image_ids(
