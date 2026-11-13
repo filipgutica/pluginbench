@@ -284,7 +284,12 @@ def paired_comparison(
             for side in totals
             for value in side
         ):
-            missing_tokens[task] = (
+            reasons = sorted({
+                _missing_reason(row, TOKEN_METRICS)
+                for rows in sides for row in rows
+                if _sum(row.values, TOKEN_METRICS) is None
+            })
+            missing_tokens[task] = "; ".join(reasons) or (
                 "missing, nonfinite, or negative token total on at least one attempt"
             )
             continue
@@ -327,16 +332,23 @@ def load_evidence(specs: list[str]) -> Evidence:
             )
             if unvalidated:
                 measured = False
-                evidence.unvalidated_runs.add(directory)
+                if not isinstance(validation, dict):
+                    evidence.unvalidated_runs.add(directory)
             values.setdefault(row["attempt_id"], {})[row["metric"]] = (
                 float(row["value"]) if measured else None
             )
             if not measured:
-                reasons.setdefault(row["attempt_id"], {})[row["metric"]] = str(
-                    "Token usage lacks validated provenance; rebuild the report"
-                    if unvalidated
-                    else row.get("reason") or row.get("status") or "no value"
-                )
+                reason = row.get("reason") or row.get("status") or "no value"
+                if unvalidated:
+                    if isinstance(validation, dict):
+                        reason = (
+                            "; ".join(validation.get("reasons") or [])
+                            or row.get("reason")
+                            or f"Token usage validation: {validation.get('status', 'unknown')}"
+                        )
+                    else:
+                        reason = "Token usage lacks validated provenance; rebuild the report"
+                reasons.setdefault(row["attempt_id"], {})[row["metric"]] = str(reason)
         found: set[str] = set()
         for row in data["attempts"]:
             arm = normalize_arm_name(row["guidance"])

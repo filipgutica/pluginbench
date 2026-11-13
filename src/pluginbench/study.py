@@ -23,6 +23,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from pluginbench import codex, harbor_backend, submissions, trial_containers
+from pluginbench.arms import normalize_arm_name
 from pluginbench.codex_events import failed_before_first_turn
 from pluginbench.saved_usage import revalidate_usage
 from pluginbench.harbor_backend import binary_native_reward as _binary_native_reward
@@ -463,7 +464,10 @@ def _failed_call(root: Path, record: dict[str, Any]) -> str | None:
         if error and execution.get("submission_collected") is not True:
             if isinstance(error, dict):  # Harbor's exception_info for the agent.
                 error = f"{error.get('exception_type')}: {error.get('exception_message')}"
-            return f"{record['task_id']} · {record['arm']} · repeat {record['attempt']}: {error}"
+            return (
+                f"{record['task_id']} · {normalize_arm_name(record['arm'])} · "
+                f"repeat {record['attempt']}: {error}"
+            )
     return None
 
 
@@ -585,7 +589,8 @@ def _execute_stage(
         # and codes its slot again, and it never reaches the vanilla cache.
         raise BackendUnavailable(
             f"{study.recipe.harness} failed before its first model turn in attempt {entry['id']} "
-            f"({entry['task_id']} · {entry['arm']} · repeat {entry['attempt']}): {backend_error}. "
+            f"({entry['task_id']} · {normalize_arm_name(entry['arm'])} · "
+            f"repeat {entry['attempt']}): {backend_error}. "
             "The attempt is not scored and the run stops. Resume the run once the backend is "
             "reachable; this attempt is coded again"
         )
@@ -1335,7 +1340,8 @@ def _run_attempts(
             entry = plan["entries"][index]
             if progress:
                 progress(
-                    f"Coding {index + 1}/{len(plan['entries'])}: {entry['task_id']} · {entry['arm']} · repeat {entry['attempt']}"
+                    f"Coding {index + 1}/{len(plan['entries'])}: {entry['task_id']} · "
+                    f"{normalize_arm_name(entry['arm'])} · repeat {entry['attempt']}"
                 )
             states[entry["id"]] = "running"
             ledger.set_state(entry["id"], "running")
