@@ -442,6 +442,10 @@ class BackendUnavailable(ValueError):
     """A coding session failed before its first model turn; the run stops instead of scoring it."""
 
 
+class BuiltinsDiffer(ValueError):
+    """A fresh Claude attempt's built-ins differ from the reused vanilla's; the run stops."""
+
+
 def _call_error(error: BaseException) -> str:
     """The saved error of a failed coding call. A timeout's own text holds its command line."""
     if not isinstance(error, subprocess.TimeoutExpired):
@@ -484,13 +488,14 @@ def _execute_stage(
     expected_runtime: dict[str, object],
     guard: Callable[[], None] = lambda: None,
     reused_vanilla: list[str] | None = None,
+    reused_cohorts: list[str] | None = None,
     pinned_builtins: object = None,
     claude_version: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run one native invocation and persist its evidence under root.
 
     `reused_vanilla` names the cached vanilla attempts a Claude run reuses; a fresh attempt
-    whose receipt lacks their pinned built-ins fails.
+    whose receipt lacks their pinned built-ins fails and stops the run.
 
     `guard` runs before each write to root. A run moved during the call therefore writes
     nothing more to its old path; that call's evidence is lost with its temporary work area,
@@ -558,12 +563,11 @@ def _execute_stage(
             execution["submission_collected"] = False
         if isinstance(exc, KeyboardInterrupt):
             interrupted = exc
-    if (
-        reused_vanilla
-        and isinstance(execution.get("native_treatment"), dict)
-        and not _has_pinned_builtins(execution, pinned_builtins)
-    ):
-        _refuse_mixed_builtins(execution, reused_vanilla, claude_version)
+    mixed = None
+    if reused_vanilla:
+        receipt = _discovery_receipt(execution, area / "artifacts")
+        if receipt is not None and not _has_pinned_builtins(receipt, pinned_builtins):
+            mixed = _refuse_mixed_builtins(execution, reused_vanilla, claude_version)
     guard()
     target = root / "attempts" / entry["id"] / stage_id
     target.mkdir(parents=True)
@@ -595,6 +599,18 @@ def _execute_stage(
             {"status": "unsubmitted interrupted workspace; not graded"},
         )
         raise interrupted
+    if mixed is not None:
+        # Every later attempt would code with the same built-ins and be refused too. Never
+        # recorded as complete: a resume discards this attempt and codes its slot again.
+        raise BuiltinsDiffer(
+            f"attempt {entry['id']} ({entry['task_id']} · {normalize_arm_name(entry['arm'])} · "
+            f"repeat {entry['attempt']}) is not scored and the run stops: {mixed}. Resume the "
+            "run once Claude Code reports the pinned built-ins again, and this attempt is coded "
+            "again. Otherwise move "
+            + ", ".join(reused_cohorts or [])
+            + " out of the PluginBench cache root and start a new run, which codes its own "
+            "vanilla"
+        )
     backend_error = failed_before_first_turn(execution)
     if backend_error is not None:
         # Never recorded as complete: the attempt stays interrupted, so a resume discards it
@@ -1176,12 +1192,24 @@ def _claude_identity(
     return {"claude": baselines.claude_identity(run, str(identity["harness_version"]))}
 
 
-def _has_pinned_builtins(execution: dict[str, Any], pinned: object) -> bool:
-    """Whether a Claude attempt's discovery receipt reports the built-ins the cache pins."""
+def _discovery_receipt(execution: dict[str, Any], artifacts: Path) -> dict[str, Any] | None:
+    """A Claude attempt's verified discovery receipt, also when its session check failed.
+
+    A session that differs from its receipt never records it in the execution, but the
+    receipt file stays; a failed discovery made no model call and has none to check.
+    """
     receipt = execution.get("native_treatment")
-    return (
-        pinned is not None and isinstance(receipt, dict) and receipt.get("builtins") == pinned
-    )
+    if not isinstance(receipt, dict):
+        try:
+            receipt = json.loads((artifacts / "native-treatment.json").read_text())
+        except (OSError, ValueError):
+            return None
+    return receipt if isinstance(receipt, dict) and receipt.get("status") == "verified" else None
+
+
+def _has_pinned_builtins(receipt: dict[str, Any] | None, pinned: object) -> bool:
+    """Whether a discovery receipt reports the built-ins the vanilla cache pins."""
+    return pinned is not None and receipt is not None and receipt.get("builtins") == pinned
 
 
 def _reused_vanilla(plan: dict[str, Any]) -> list[str]:
@@ -1193,7 +1221,18 @@ def _reused_vanilla(plan: dict[str, Any]) -> list[str]:
     ]
 
 
-def _refuse_mixed_builtins(execution: dict[str, Any], reused: list[str], version: str) -> None:
+def _reused_cohorts(plan: dict[str, Any]) -> list[str]:
+    """The cache cohorts this run reuses vanilla attempts from, relative to the cache root."""
+    return sorted({
+        str(decision["origin_cohort"]).rpartition("/")[0]
+        for decision in (plan.get("baseline_cache") or {}).values()
+        if isinstance(decision, dict)
+        and decision.get("status") == "hit"
+        and isinstance(decision.get("origin_cohort"), str)
+    })
+
+
+def _refuse_mixed_builtins(execution: dict[str, Any], reused: list[str], version: str) -> str:
     """Fail a fresh Claude attempt whose built-ins differ from the reused vanilla attempts'.
 
     As a session that differs from its receipt, it does not pass, and its session usage is
@@ -1213,12 +1252,14 @@ def _refuse_mixed_builtins(execution: dict[str, Any], reused: list[str], version
         exit_code=1,
         mixed_builtins=reason,
         usage=None,
+        # The hook rule's shape.
         usage_accounting={
             "status": "incomplete",
-            "reasons": [reason],
+            "reason": reason,
             "native_sessions": execution.get("usage_accounting"),
         },
     )
+    return reason
 
 
 def _run_attempts(
@@ -1323,7 +1364,11 @@ def _run_attempts(
             cache is not None
             and frozen.recipe.harness == "claude"
             and not _reused_vanilla(plan)
-            and any(decision["status"] == "hit" for decision in cache.decisions().values())
+            # A hit for a repeat this run already coded is its own published entry.
+            and any(
+                decision["status"] == "hit" and states[attempt_id] != "complete"
+                for attempt_id, decision in cache.decisions().items()
+            )
         ):
             # Attempts coded before any reuse must have the built-ins the cached ones have.
             unpinned = [
@@ -1332,13 +1377,15 @@ def _run_attempts(
                 if states[record["id"]] == "complete"
                 and not all(
                     _has_pinned_builtins(
-                        json.loads(
-                            (root / "attempts" / record["id"] / stage["id"] / "execution.json")
-                            .read_text()
+                        _discovery_receipt(
+                            json.loads((target / "execution.json").read_text()),
+                            target / "artifacts",
                         ),
                         pinned_builtins,
                     )
-                    for stage in record["stages"]
+                    for target in (
+                        root / "attempts" / record["id"] / stage["id"] for stage in record["stages"]
+                    )
                 )
             ]
             if unpinned:
@@ -1557,6 +1604,7 @@ def _run_attempts(
                         reused_vanilla=_reused_vanilla(plan)
                         if frozen.recipe.harness == "claude"
                         else None,
+                        reused_cohorts=_reused_cohorts(plan),
                         pinned_builtins=pinned_builtins,
                         claude_version=claude_version,
                     )
