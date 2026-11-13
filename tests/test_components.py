@@ -64,8 +64,10 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
     "coverage_observer": (
         1,
         {
+            # An optional Go `go list` sidecar narrows completeness to compiled files. A
+            # profile that writes none parses as before, so v1-frozen profiles keep v1.
             "coverage_report.py": (
-                "1a097f128f99b6ce57b23d903a52a199061a00039f7662767d8e6777821186cc"
+                "a8bf3c15a0f54c1b26e270b9d964312f2e2f594ebdeed27e55344c0c2770ae6d"
             ),
         },
     ),

@@ -5,12 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import fnmatch
 import base64
+import hashlib
 import json
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 import re
 
-from pluginbench.assessment_metrics import inspect_snapshot
+from pluginbench.assessment_metrics import coverage_sources, inspect_snapshot
 
 
 class CoveragePopulationUnavailable(RuntimeError):
@@ -532,6 +533,104 @@ def _go_source(
     return _source_path(path, files, source_scope, workdir)
 
 
+def _go_func_free(text: str) -> bool:
+    """Whether Go source has no `func` keyword outside comments, strings and runes.
+
+    Go's cover tool counts statements only inside function declarations and literals, and
+    both need the keyword, so such a file has none to measure. A file with only a func type
+    keeps the keyword: it stays expected, so the check never makes a report falsely complete.
+    """
+    code = re.sub(
+        r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|`[^`]*`|\'(?:\\.|[^\'\\\n])*\'',
+        " ",
+        text,
+        flags=re.S,
+    )
+    return re.search(r"\bfunc\b", code) is None
+
+
+def _go_build(
+    listing: Path,
+    *,
+    snapshot: Path,
+    files: set[str],
+    modules: dict[str, list[PurePosixPath]],
+    source_scope: list[str],
+    workdir: str,
+    measured: set[str],
+) -> dict[str, object]:
+    """Split scoped sources by the `go list -json` output the coverage command wrote.
+
+    Files that no listed package compiles are recorded with a reason, never as empty
+    records. Compiled files the report omits stay expected unless they hold no statements.
+    """
+    text = listing.read_text()
+    decoder = json.JSONDecoder(object_pairs_hook=_json_pairs)
+    compiled: set[str] = set()
+    ignored: dict[str, str] = {}
+    listed: dict[str, str] = {}
+    index, spaces = 0, re.compile(r"\s*")
+    while True:
+        # `go list -json` writes a stream of objects, not one JSON document.
+        space = spaces.match(text, index)
+        assert space is not None
+        if (index := space.end()) == len(text):
+            break
+        value, index = decoder.raw_decode(text, index)
+        package = _json_object(value, "go list package")
+        directory, name = package.get("Dir"), package.get("ImportPath")
+        if not isinstance(directory, str) or not isinstance(name, str):
+            raise ValueError("go list package requires Dir and ImportPath")
+        try:
+            relative = PurePosixPath(directory).relative_to(PurePosixPath(workdir))
+        except ValueError as exc:
+            raise ValueError(
+                f"go list package escapes the measured repository: {directory}"
+            ) from exc
+        listed[relative.as_posix()] = name
+        for field_name in ("GoFiles", "CgoFiles", "IgnoredGoFiles"):
+            items = package.get(field_name, [])
+            if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+                raise ValueError(f"go list {field_name} must hold file names")
+            for item in items:
+                path = (relative / item).as_posix()
+                if path not in files:
+                    raise ValueError(f"go list file is absent from the frozen snapshot: {path}")
+                if field_name == "IgnoredGoFiles":
+                    ignored[path] = f"excluded from package {name} by build constraints"
+                else:
+                    compiled.add(path)
+    expected = coverage_sources(files, source_scope)
+    roots = {directory.as_posix() for directories in modules.values() for directory in directories}
+
+    def reason(path: str) -> str:
+        if path in ignored:
+            return ignored[path]
+        parent = PurePosixPath(path).parent
+        if parent.as_posix() in listed:
+            return f"not among the files go list compiles for package {listed[parent.as_posix()]}"
+        module = next(
+            (str(p) for p in (parent, *parent.parents) if str(p) in roots and str(p) != "."), None
+        )
+        if module is not None and not any(
+            directory == module or directory.startswith(module + "/") for directory in listed
+        ):
+            return f"in nested module {module}, which go list did not list"
+        return "in no package that go list listed"
+
+    in_scope = compiled & expected
+    return {
+        "go_list_sha256": hashlib.sha256(listing.read_bytes()).hexdigest(),
+        "compiled_files": sorted(in_scope),
+        "not_compiled_files": {path: reason(path) for path in sorted(expected - compiled)},
+        "files_without_statements": sorted(
+            path
+            for path in in_scope - measured
+            if _go_func_free((snapshot / path).read_text())
+        ),
+    }
+
+
 def parse_go_coverage(
     report: Path, *, snapshot: Path, source_scope: list[str], test_scope: list[str], workdir: str
 ) -> dict[str, object]:
@@ -586,6 +685,17 @@ def parse_go_coverage(
     population = _population(set(weights), covered, list(records), "statements")
     population["weights"] = weights
     result["statements"] = population
+    listing = report.with_name(report.name + ".go-list.json")
+    if listing.is_file():
+        result["go_build"] = _go_build(
+            listing,
+            snapshot=snapshot,
+            files=files,
+            modules=modules,
+            source_scope=source_scope,
+            workdir=workdir,
+            measured=set(records),
+        )
     return result
 
 

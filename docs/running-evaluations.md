@@ -249,6 +249,12 @@ The command runs without model credentials in a fresh copy of the frozen task im
 
 Use `format: coverage-py-json` for coverage.py JSON, or `format: go-coverprofile` for Go. `coverage_profiles` maps a language or exact task metadata `repository_url` to the same command/format settings; repository entries override language entries and the shared `coverage` default.
 
+A Go coverprofile lists only files the test build compiled, and only those with a function. To keep other `.go` files from making the report incomplete, the same command can write `go list -e -json=Dir,ImportPath,GoFiles,CgoFiles,IgnoredGoFiles ./...` to `<report_path>.go-list.json`, before `go test` so the test status stays the exit code:
+- The completeness check then expects only the `GoFiles` and `CgoFiles` in scope. An untested compiled file, including one an agent adds, still makes the report incomplete.
+- Each scoped file the build does not compile is recorded under `go_files_not_compiled` with a reason, such as build constraints, `testdata/`, or a nested module. It gets no coverage record.
+- A compiled file the report omits and that has no `func` keyword outside comments, strings and runes has no statements to measure. It is recorded under `go_files_without_statements` and does not make the report incomplete.
+- As with the LCOV sidecar, the frozen input must not already contain it. Native collection retains it as `report.raw.go-list.json`. Without it, every scoped source file stays expected.
+
 Coverage.py can trace lines outside its executable-statement population. A trusted reporting command can add `statement_lines` from `Coverage.analysis2` to every file, with `meta.statement_lines_source: coverage.Coverage.analysis2`. Use the same reporting configuration, retain the original JSON, and keep strict covered/missing and summary checks; without statement coordinates, an inconsistent report remains unavailable.
 
 A coverage profile's `source_scope` declares its measured package independently of repository-wide LOC and analysis.
