@@ -919,3 +919,125 @@ def test_measurement_ignores_the_launcher_version_and_runs_the_current_docker(
             timeout=10,
         )
     assert calls[0][:3] == [current["docker_cli"]["resolved_path"], "--host", "unix:///var/run/docker.sock"]
+
+
+# How the coding agent was launched. Work that starts no coding agent never compares these.
+LAUNCH_ONLY_RUNTIME = {
+    "launcher_version",
+    "codex_transport.version",
+    "codex_transport.harbor_run_sha256",
+}
+
+
+def test_measurement_and_regrade_compare_every_exact_field_except_how_coding_launched() -> None:
+    saved = legacy_json("runtime.json")
+    regrade = set(EXACT_RUNTIME_CHANGES) - LAUNCH_ONLY_RUNTIME
+    assert _leaves(harbor.runtime_contract(saved, launcher=False)) == regrade
+    # Measurement runs Docker directly, so the Harbor version does not bind it either.
+    measurement = regrade - {"harbor_version"}
+    assert _leaves(harbor.runtime_contract(saved, launcher=False, harbor=False)) == measurement
+
+
+def _claude_runtime(saved: dict[str, Any]) -> dict[str, Any]:
+    runtime = {key: value for key, value in saved.items() if key != "codex_transport"}
+    return {**runtime, "claude_transport": {"version": "claude-pinned-launch-v1", "harbor_run_sha256": "a" * 64}}
+
+
+def _measure(entry: str, saved: dict[str, Any], tmp_path: Path) -> None:
+    """Run a measurement entry point until its first Docker call, which follows the check."""
+    if entry == "capacity":
+        harbor.assert_capacity([[saved]], jobs=1)
+        return
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "index.ts").write_text("original code\n")
+    with pytest.raises(_FirstDockerCall):
+        harbor.run_native_command(
+            snapshot=snapshot,
+            task_identity={"isolation": saved, "image_identity": base_image(), "workdir": "/app"},
+            destination=tmp_path / "measurement",
+            command=["coverage"],
+            report_path="coverage/lcov.info",
+            timeout=10,
+        )
+
+
+def _changed(saved: dict[str, Any], path: str, value: object) -> dict[str, Any]:
+    current = current_runtime(saved)
+    *parents, field = path.split(".")
+    node = current
+    for key in parents:
+        node = node[key]
+    node[field] = value
+    return current
+
+
+@pytest.mark.parametrize("entry", ["capacity", "command"])
+@pytest.mark.parametrize(
+    ("harness", "path", "value"),
+    [
+        ("codex", "harbor_version", "0.25.0"),
+        ("codex", "codex_transport.version", "codex-stdout-stderr-v2"),
+        ("codex", "codex_transport.harbor_run_sha256", "0" * 64),
+        ("claude", "harbor_version", "0.25.0"),
+        ("claude", "claude_transport.version", "claude-pinned-launch-v2"),
+        ("claude", "claude_transport.harbor_run_sha256", "0" * 64),
+    ],
+)
+def test_measurement_of_a_saved_run_survives_a_harbor_or_transport_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+    harness: str,
+    path: str,
+    value: object,
+) -> None:
+    saved = legacy_json("runtime.json")
+    if harness == "claude":
+        saved = _claude_runtime(saved)
+    current = _changed(saved, path, value)
+    monkeypatch.setattr(harbor, "runtime_identity", lambda **kwargs: current)
+
+    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise _FirstDockerCall
+
+    monkeypatch.setattr(harbor, "run_command", run)
+    _measure(entry, saved, tmp_path)
+    # A coding launch still refuses the same difference.
+    with pytest.raises(isolation.RuntimeDriftError, match=f"{path} was "):
+        harbor.assert_runtime(saved)
+
+
+@pytest.mark.parametrize("entry", ["capacity", "command"])
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("docker_engine.platform", "linux/arm64"),
+        ("resources.cpus", 3),
+        ("resources.memory_mb", 4096),
+        ("resources.memory_enforcement", "reservation"),
+    ],
+)
+def test_measurement_still_refuses_a_changed_platform_or_resource(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str, path: str, value: object
+) -> None:
+    saved = legacy_json("runtime.json")
+    current = _changed(saved, path, value)
+    monkeypatch.setattr(harbor, "runtime_identity", lambda **kwargs: current)
+    with pytest.raises(isolation.RuntimeDriftError, match=f"{path} was "):
+        _measure(entry, saved, tmp_path)
+    with pytest.raises(isolation.RuntimeDriftError, match=f"{path} was "):
+        harbor.assert_runtime(saved)
+
+
+def test_regrade_ignores_the_transport_but_not_the_harbor_that_runs_its_verifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved = legacy_json("runtime.json")
+    transport = _changed(saved, "codex_transport.harbor_run_sha256", "0" * 64)
+    monkeypatch.setattr(harbor, "runtime_identity", lambda **kwargs: transport)
+    assert harbor.assert_runtime(saved, launcher=False) == transport
+    harbor_bump = _changed(saved, "harbor_version", "0.25.0")
+    monkeypatch.setattr(harbor, "runtime_identity", lambda **kwargs: harbor_bump)
+    with pytest.raises(isolation.RuntimeDriftError, match="harbor_version was "):
+        harbor.assert_runtime(saved, launcher=False)
