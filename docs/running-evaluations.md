@@ -152,7 +152,7 @@ PluginBench runs Harbor 0.24.0's `ClaudeCode` agent and refuses to launch when t
 
 | Setting | Value in every arm |
 | --- | --- |
-| Model and effort | `--model <runner.model> --effort <runner.reasoning>`; subagents use the runner model |
+| Model and effort | `--model <runner.model> --effort <runner.reasoning>`; subagents always use the runner model, because `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` makes Claude Code ignore an `Agent` call's `model` and an agent's `model:` frontmatter |
 | Permission mode | `bypassPermissions` |
 | Setting sources | `user` only, with no MCP servers (`--strict-mcp-config`) |
 | Disallowed tools | `RemoteTrigger`, `CronCreate`, `ScheduleWakeup`, `SendMessage`, and `Workflow`; `Agent` too when `subagents: false` |

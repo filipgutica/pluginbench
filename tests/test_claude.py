@@ -141,9 +141,20 @@ def test_coding_launch_is_the_pinned_contract() -> None:
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
             "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
             "CLAUDE_CODE_SUBAGENT_MODEL": "claude-opus-5-5",
+            "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1",
             "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "1800000",
         },
     )
+
+
+def test_a_coding_env_without_the_forced_subagent_model_is_refused() -> None:
+    # Without it, an Agent call's `model` or an agent's frontmatter picks another model.
+    run = claude.CodingRun("claude-opus-5-5", "high", True, 1800)
+    env = dict(claude.coding_launch(run)[1])
+    claude.check_coding_env(env, run)
+    del env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"]
+    with pytest.raises(ValueError, match="pinned CLAUDE_CODE_SUBAGENT_MODEL_FORCE"):
+        claude.check_coding_env(env, run)
 
 
 @pytest.mark.parametrize("subagents", [False, True])
