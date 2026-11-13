@@ -74,8 +74,9 @@ Admission applies these Claude Code rules in addition to the shared ones. A trea
 | Part | Rule |
 | --- | --- |
 | Plugin manifest | Only `.claude-plugin/plugin.json` is read. A root `plugin.json` is refused, because Claude Code would ignore it. `displayName` is accepted as metadata. |
-| Plugin default paths | `agents/`, `commands/`, `workflows/`, `output-styles/`, `monitors/`, `.mcp.json`, `.lsp.json`, a root `settings.json`, and a root `SKILL.md` are refused. `bin/` and `themes/` are admitted and recorded. |
+| Plugin default paths | `commands/`, `workflows/`, `output-styles/`, `monitors/`, `.mcp.json`, `.lsp.json`, a root `settings.json`, and a root `SKILL.md` are refused. `bin/` and `themes/` are admitted and recorded. |
 | Plugin skills | `skills/` is always scanned, even when the manifest names other skill paths. |
+| Plugin agents | `agents/` may hold only `.md` files, directly in it, with no subdirectory. Each file's frontmatter has only a kebab-case `name` and a `description`; any other key, `model` included, is refused, as are an empty `agents/` and the manifest `agents` field. |
 | Skill frontmatter | Only `name`, `description`, `dependencies`, `license`, `metadata`, `allowed-tools`, `disable-model-invocation`, `user-invocable`, and `argument-hint`. Keys such as `model`, `effort`, `context`, `agent`, and `hooks` are refused. `disable-model-invocation` and `user-invocable` must be YAML booleans (`true` or `false`) when present. |
 | Hook files | Only the `hooks` and `description` keys. The default `hooks/hooks.json` is checked even when the manifest names other hook files. |
 | Hook matchers | Empty, `*`, or exact names of letters, digits, and `_` joined by `\|`. Names match exactly: `start` does not match `startup`. |
@@ -88,7 +89,8 @@ Before coding, a discovery run of the pinned CLI checks what loaded. It sends co
 | No model call | The session cost reports zero usage and $0. |
 | CLI | The reported version equals the pinned version. |
 | Authentication | The subscription credentials file is the only credential source. |
-| Skills and commands | The skills dialog lists exactly the declared skills, each from its declared source. Each skill is on, or user-invocable-only when its frontmatter sets `disable-model-invocation: true`. The non-built-in commands equal the declared skills without `user-invocable: false`. No undeclared agent is present. |
+| Skills and commands | The skills dialog lists exactly the declared skills, each from its declared source. Each skill is on, or user-invocable-only when its frontmatter sets `disable-model-invocation: true`. The non-built-in commands equal the declared skills without `user-invocable: false`. |
+| Agents | The agents beyond the built-ins, and every agent's reported type, source, plugin and file, are exactly the declared plugin agents, so a user or project agent stops the attempt. The receipt lists the plugin agents apart from the built-ins, and the coding session must report both. |
 | Guidance | The only memory file is the declared `CLAUDE.md`, or none when the arm declares no guidance. |
 | Plugins | Only the declared plugins are installed and enabled, and their trees match the frozen inventory. |
 | Hooks | The hook listing equals the declared hooks, and no hook ran. |

@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from pluginbench import claude
+from pluginbench import baselines, claude, study
 from pluginbench.claude_treatments import CONFIG_DIR, DELIVERY_POLICY, admit, install, stage
 from pluginbench.native_treatments import REMOTE_ROOT
 from pluginbench.treatments import Treatment, skill_frontmatter
@@ -96,6 +96,11 @@ def skill(root: Path, name: str, frontmatter: str = "") -> Path:
     return root
 
 
+def agent_name(file: Path) -> str:
+    """The `name:` line of an agent file the tests write."""
+    return file.read_text().split("\nname: ", 1)[1].split("\n", 1)[0]
+
+
 def responses(attempt: Attempt) -> dict[str, Any]:
     """What CLI 2.1.322 answers for the attempt's declared treatment, from captured shapes."""
     captured: dict[str, Any] = json.loads(
@@ -117,6 +122,22 @@ def responses(attempt: Attempt) -> dict[str, Any]:
         for path in treatment.skills
     ]
     initialize = captured["initialize"]
+    # CLI 2.1.322 names a plugin agent `<plugin>:<name>` in initialize and reports the file it
+    # loaded in get_context_usage (2026-11-13 plugin-support spike).
+    agents = [
+        {
+            "agentType": f"{plugin.name}:{agent_name(file)}",
+            "source": "plugin",
+            "pluginId": f"{plugin.name}@pluginbench-frozen",
+            "path": str(attempt.staged / "marketplace/plugins" / plugin.name / "agents" / file.name),
+            "tokens": 12,
+        }
+        for plugin in treatment.plugins
+        if (plugin / "agents").is_dir()
+        for file in sorted((plugin / "agents").iterdir())
+    ]
+    captured["get_context_usage"]["agents"] = agents
+    initialize["agents"] += [{"name": row["agentType"], "description": ""} for row in agents]
     # CLI 2.1.322 leaves a `user-invocable: false` skill out of commands.
     initialize["commands"] = [
         *[
@@ -169,9 +190,13 @@ def responses(attempt: Attempt) -> dict[str, Any]:
 
 
 def attempt(
-    tmp_path: Path, *, vanilla: bool = False, frontmatter: dict[str, str] | None = None
+    tmp_path: Path, *, vanilla: bool = False, frontmatter: dict[str, str] | None = None,
+    agents: bool = False,
 ) -> Attempt:
-    """An attempt whose skills `demo-skill` and `loose-skill` add `frontmatter[name]`."""
+    """An attempt whose skills `demo-skill` and `loose-skill` add `frontmatter[name]`.
+
+    With `agents`, the plugin also declares the agent `helper`.
+    """
     extra = frontmatter or {}
     if shutil.which("node") is None:
         pytest.skip("Claude installer needs Node")
@@ -190,6 +215,11 @@ def attempt(
         (plugin / ".claude-plugin/plugin.json").write_text(
             json.dumps({"name": "demo", "version": "1.0.0"})
         )
+        if agents:
+            (plugin / "agents").mkdir()
+            (plugin / "agents/helper.md").write_text(
+                "---\nname: helper\ndescription: Demo helper.\n---\nHelp.\n"
+            )
         (plugin / "hooks").mkdir()
         (plugin / "hooks/hooks.json").write_text(
             json.dumps(
@@ -230,6 +260,8 @@ def test_vanilla_receipt_proves_nothing_loaded_without_a_model_call(tmp_path: Pa
         "policy": {**CAPTURED["responses"]["get_hooks_listing"]["policy"], "allDisabled": True},
     }
     assert receipt["guidance"]["path"] is None and receipt["guidance"]["memory_files_tokens"] == 0
+    # Only a treatment that declares plugin agents adds the key, so this receipt is unchanged.
+    assert "agents" not in receipt and "agents" not in json.dumps(receipt["inventory"])
     assert receipt["builtins"] == {
         "commands": ["code-review", "debug"],
         "agents": [
@@ -253,6 +285,7 @@ def test_treatment_receipt_proves_guidance_skills_plugin_and_hook_loaded(tmp_pat
     receipt = json.loads(result.stdout)
     assert receipt["status"] == "verified"
     assert receipt["commands"] == ["demo:demo-skill", "loose-skill"]
+    assert "agents" not in receipt and "agents" not in receipt["inventory"]["plugins"][0]
     assert {(item["display_name"], item["source"]) for item in receipt["skills"]} == {
         ("demo:demo-skill", "plugin"),
         ("loose-skill", "user"),
@@ -327,6 +360,15 @@ def _undeclared_invocation(attempt: Attempt) -> None:
 
 STAGED_PLUGIN = "{staged}/marketplace/plugins/demo"
 
+PROJECT_AGENT = {
+    "agentType": "project-agent", "source": "projectSettings",
+    "path": "/app/.claude/agents/project-agent.md", "tokens": 9,
+}
+USER_AGENT = {
+    "agentType": "user-agent", "source": "userSettings",
+    "path": "/logs/agent/sessions/agents/user-agent.md", "tokens": 9,
+}
+
 # Each defect and the refusal it must cause; {staged} is the attempt's canonical staged root.
 REFUSALS: dict[str, tuple[Callable[[Attempt], object], str]] = {
     "undeclared non-builtin skill": (
@@ -369,7 +411,17 @@ REFUSALS: dict[str, tuple[Callable[[Attempt], object], str]] = {
     ),
     "undeclared agent": (
         _responses(lambda r: r["initialize"]["agents"].append({"name": "rogue", "description": ""})),
-        "Undeclared Claude agent discovered: rogue",
+        "Claude agents differ from the declared plugin agents",
+    ),
+    # No agent is declared, so any agent source fails, as a project one would (CLI 2.1.322
+    # loads none under --setting-sources user; the 2026-11-13 probe shows this row shape).
+    "project agent": (
+        _responses(lambda r: r["get_context_usage"]["agents"].append(PROJECT_AGENT)),
+        "Claude agent sources differ from the declared plugin agents",
+    ),
+    "agent sources missing": (
+        _responses(lambda r: r["get_context_usage"].pop("agents")),
+        "Claude get_context_usage response changed shape",
     ),
     "user agent in the private configuration": (_user_agent, "Undeclared Claude user agents exist"),
     "redraw with an unknown field": (
@@ -535,6 +587,108 @@ def test_discovery_refuses_each_receipt_rule(tmp_path: Path, defect: str) -> Non
     result = treated.run()
     assert result.returncode != 0
     assert message.format(staged=treated.staged.resolve()) in result.stderr
+    assert result.stdout == ""
+
+
+def test_a_plugin_agent_receipt_keeps_the_verified_agent_rows_apart_from_built_ins(
+    tmp_path: Path,
+) -> None:
+    treated = attempt(tmp_path, agents=True)
+    result = treated.run()
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(result.stdout)
+    [plugin] = receipt["inventory"]["plugins"]
+    assert plugin["agents"] == [{"name": "helper", "path": "agents/helper.md"}]
+    # The rows as get_context_usage reported them; their paths are the staged files.
+    assert receipt["agents"] == treated.scenario["responses"]["get_context_usage"]["agents"]
+    assert Path(receipt["agents"][0]["path"]).resolve() == (
+        Path(receipt["plugin_installs"][0]["loaded_from"]) / "agents/helper.md"
+    )
+    assert "demo:helper" not in receipt["builtins"]["agents"]
+
+
+def test_an_arm_with_plugin_agents_pairs_with_the_verified_vanilla(tmp_path: Path) -> None:
+    # A run reusing cached vanilla attempts admits a fresh attempt only when its discovery
+    # reports the pinned built-ins, as a receipt without plugin agents does.
+    pinned = baselines.CLAUDE_BUILTINS[VERSION]
+    treated = attempt(tmp_path, agents=True)
+    initialize = treated.scenario["responses"]["initialize"]
+    initialize["agents"] = [
+        *[agent for agent in initialize["agents"] if agent["name"] == "demo:helper"],
+        *[{"name": name, "description": ""} for name in pinned["agents"]],
+    ]
+    initialize["commands"] = [
+        *[command for command in initialize["commands"] if not command.get("builtin")],
+        *[{"name": name, "description": "", "builtin": True} for name in pinned["commands"]],
+    ]
+    result = treated.run()
+    assert result.returncode == 0, result.stderr
+    receipt = json.loads(result.stdout)
+    assert receipt["builtins"] == pinned
+    assert study._has_pinned_builtins(receipt, pinned)
+
+
+def _agent_rows(attempt: Attempt) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = attempt.scenario["responses"]["get_context_usage"]["agents"]
+    return rows
+
+
+def _init_agents(attempt: Attempt) -> list[dict[str, Any]]:
+    agents: list[dict[str, Any]] = attempt.scenario["responses"]["initialize"]["agents"]
+    return agents
+
+
+def _also_loaded(row: dict[str, Any]) -> Callable[[Attempt], None]:
+    """The CLI loaded an agent beyond the declared ones, and lists it in both responses."""
+    def change(attempt: Attempt) -> None:
+        _agent_rows(attempt).append(row)
+        _init_agents(attempt).append({"name": row["agentType"], "description": ""})
+    return change
+
+
+AGENT_REFUSALS: dict[str, tuple[Callable[[Attempt], object], str]] = {
+    "undeclared plugin agent": (
+        _also_loaded({**USER_AGENT, "agentType": "demo:rogue", "source": "plugin",
+                      "pluginId": "demo@pluginbench-frozen"}),
+        "Claude agents differ from the declared plugin agents",
+    ),
+    "declared agent missing": (
+        lambda attempt: _init_agents(attempt).pop(),
+        "Claude agents differ from the declared plugin agents",
+    ),
+    "declared agent source missing": (
+        lambda attempt: _agent_rows(attempt).clear(),
+        "Claude agent sources differ from the declared plugin agents",
+    ),
+    "other plugin id": (
+        lambda attempt: _agent_rows(attempt)[0].update(pluginId="demo@other"),
+        "Claude agent sources differ from the declared plugin agents",
+    ),
+    "other path": (
+        lambda attempt: _agent_rows(attempt)[0].update(path="/tmp/other/agents/helper.md"),
+        "Claude agent sources differ from the declared plugin agents",
+    ),
+    "project agent": (
+        _also_loaded(PROJECT_AGENT), "Claude agents differ from the declared plugin agents",
+    ),
+    "user agent": (_also_loaded(USER_AGENT), "Claude agents differ from the declared plugin agents"),
+    "user agent source only": (
+        lambda attempt: _agent_rows(attempt).append(USER_AGENT),
+        "Claude agent sources differ from the declared plugin agents",
+    ),
+}
+
+
+@pytest.mark.parametrize("defect", sorted(AGENT_REFUSALS))
+def test_discovery_refuses_agents_other_than_the_declared_plugin_files(
+    tmp_path: Path, defect: str
+) -> None:
+    treated = attempt(tmp_path, agents=True)
+    change, message = AGENT_REFUSALS[defect]
+    change(treated)
+    result = treated.run()
+    assert result.returncode != 0
+    assert message in result.stderr
     assert result.stdout == ""
 
 

@@ -795,6 +795,24 @@ SESSION_CHANGES: dict[str, tuple[bool, Callable[[list[dict[str, Any]]], None], s
 }
 
 
+def test_a_session_lists_the_built_in_agents_and_the_declared_plugin_agents() -> None:
+    # The receipt keeps plugin agents apart from the built-ins; system/init lists both.
+    events, receipt, transcript = _captured("treated")
+    receipt["agents"] = [{
+        "agentType": "demo:helper", "source": "plugin", "pluginId": "demo@pluginbench-frozen",
+        "path": "/tmp/pluginbench-treatments/marketplace/plugins/demo/agents/helper.md",
+        "tokens": 12,
+    }]
+    agents = _init(events)["agents"]
+    agents.insert(0, "demo:helper")
+    assert _errors(events, receipt, transcript) == []
+    agents.append("demo:other")
+    assert "system/init agents differs from discovery" in _errors(events, receipt, transcript)
+    agents.remove("demo:other")
+    agents.remove("demo:helper")
+    assert "system/init agents differs from discovery" in _errors(events, receipt, transcript)
+
+
 @pytest.mark.parametrize("arm", ["vanilla", "treated", "superpowers", "two-hooks"])
 def test_each_captured_real_session_matches_its_real_receipt(arm: str) -> None:
     assert _errors(*_captured(arm)) == []

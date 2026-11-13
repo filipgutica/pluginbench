@@ -349,7 +349,7 @@ def test_claude_explicit_default_hook_file_is_checked_once(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize("path", [
-    "agents/reviewer.md", "commands/review.md", "workflows/ship.md", "output-styles/terse.md",
+    "commands/review.md", "workflows/ship.md", "output-styles/terse.md",
     "monitors/monitors.json", ".lsp.json", "settings.json", ".mcp.json",
 ])
 def test_claude_default_components_are_refused(tmp_path: Path, path: str) -> None:
@@ -358,6 +358,64 @@ def test_claude_default_components_are_refused(tmp_path: Path, path: str) -> Non
     # Flat .mcp.json servers have no mcpServers key; presence alone must refuse.
     (plugin / path).write_text(json.dumps({"server": {"command": "serve"}}))
     with pytest.raises(ValueError, match="default components"):
+        _claude(Treatment(plugins=[plugin]), tmp_path)
+
+
+AGENT = "---\nname: reviewer\ndescription: Reviews the change.\n---\nReview it.\n"
+
+
+def test_claude_plugin_agents_admit_and_join_only_the_claude_inventory(tmp_path: Path) -> None:
+    plugin = _claude_plugin(tmp_path / "plugin")
+    (plugin / "agents").mkdir()
+    (plugin / "agents/review.md").write_text(AGENT)
+    claude = treatment_inventory(_claude(Treatment(plugins=[plugin]), tmp_path), "claude")
+    # The frontmatter name, not the file name, is the agent's name.
+    assert claude["plugins"][0]["agents"] == [{"name": "reviewer", "path": "agents/review.md"}]
+    (plugin / ".codex-plugin").mkdir()
+    (plugin / ".codex-plugin/plugin.json").write_text(json.dumps({"name": "repairs"}))
+    codex = treatment_inventory(_resolve(Treatment(plugins=[plugin]), tmp_path), "codex")
+    assert "agents" not in codex["plugins"][0]
+
+
+@pytest.mark.parametrize(
+    ("files", "message"),
+    [
+        ({"agents/review.md": AGENT.replace("---\nR", "model: sonnet\n---\nR")},
+         r"Claude agent frontmatter \['model'\]"),
+        ({"agents/review.md": AGENT.replace("---\nR", "tools: Read\n---\nR")},
+         r"Claude agent frontmatter \['tools'\]"),
+        ({"agents/nested/review.md": AGENT}, "only .md files directly in it"),
+        ({"agents/review.md": AGENT, "agents/notes.txt": "x"}, "only .md files directly in it"),
+        ({"agents/review.md": AGENT, "agents/again.md": AGENT}, "duplicate Claude plugin agent"),
+        ({"agents/review.md": AGENT.replace("Reviews the change.", "''")},
+         "agent requires a description"),
+        ({"agents/review.md": "Review it.\n"}, "agent requires YAML frontmatter"),
+        ({"agents/.keep": ""}, "only .md files directly in it"),
+    ],
+)
+def test_claude_plugin_agents_outside_the_admitted_shape_are_refused(
+    tmp_path: Path, files: dict[str, str], message: str
+) -> None:
+    plugin = _claude_plugin(tmp_path / "plugin")
+    for name, text in files.items():
+        (plugin / name).parent.mkdir(parents=True, exist_ok=True)
+        (plugin / name).write_text(text)
+    with pytest.raises(ValueError, match=message):
+        _claude(Treatment(plugins=[plugin]), tmp_path)
+
+
+def test_an_empty_claude_plugin_agents_directory_is_refused(tmp_path: Path) -> None:
+    plugin = _claude_plugin(tmp_path / "plugin")
+    (plugin / "agents").mkdir()
+    with pytest.raises(ValueError, match="agents/ must be a directory of agent files"):
+        _claude(Treatment(plugins=[plugin]), tmp_path)
+
+
+def test_a_claude_manifest_agents_field_stays_refused(tmp_path: Path) -> None:
+    plugin = _claude_plugin(tmp_path / "plugin", agents="./agents/")
+    (plugin / "agents").mkdir()
+    (plugin / "agents/review.md").write_text(AGENT)
+    with pytest.raises(ValueError, match="unsupported declared plugin component agents"):
         _claude(Treatment(plugins=[plugin]), tmp_path)
 
 

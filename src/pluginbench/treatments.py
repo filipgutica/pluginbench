@@ -100,20 +100,24 @@ _CLAUDE_SKILL_KEYS = {
 
 def skill_frontmatter(root: Path) -> dict[str, Any]:
     """The YAML frontmatter object of the skill at `root`."""
-    skill = root / "SKILL.md"
+    return _frontmatter(root / "SKILL.md", "skill")
+
+
+def _frontmatter(file: Path, kind: str) -> dict[str, Any]:
+    """The YAML frontmatter object of a Markdown skill or agent file."""
     try:
-        text = skill.read_text(encoding="utf-8")
+        text = file.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
-        raise ValueError(f"skill requires a UTF-8 SKILL.md: {root}") from error
+        raise ValueError(f"{kind} requires a UTF-8 {file.name}: {file.parent}") from error
     lines = text.splitlines()
     if not lines or lines[0] != "---" or "---" not in lines[1:]:
-        raise ValueError(f"skill requires YAML frontmatter: {skill}")
+        raise ValueError(f"{kind} requires YAML frontmatter: {file}")
     try:
         metadata = yaml.safe_load("\n".join(lines[1 : lines.index("---", 1)]))
     except yaml.YAMLError as error:
-        raise ValueError(f"invalid skill frontmatter: {skill}") from error
+        raise ValueError(f"invalid {kind} frontmatter: {file}") from error
     if not isinstance(metadata, dict):
-        raise ValueError(f"skill frontmatter must be an object: {skill}")
+        raise ValueError(f"{kind} frontmatter must be an object: {file}")
     return metadata
 
 
@@ -248,10 +252,43 @@ _COMPONENTS = {"skills", "hooks", "mcpServers", "apps", "agents", "commands", "d
 # Plugin-root paths Claude Code loads without a manifest declaration.
 # A root SKILL.md is loaded as a skill when the plugin declares no skills.
 _CLAUDE_REFUSED_DEFAULTS = (
-    "agents", "commands", "workflows", "output-styles", "monitors", ".mcp.json", ".lsp.json",
+    "commands", "workflows", "output-styles", "monitors", ".mcp.json", ".lsp.json",
     "settings.json", "SKILL.md",
 )
 _CLAUDE_ADMITTED_DEFAULTS = ("bin", "themes")
+# Plugin agent frontmatter Claude Code may load: what the agent is called and when to use it.
+# Every other key changes its model, tools, skills, hooks, permissions or effort, so it is
+# refused. A cohort runs one model, so `model` is refused too.
+_CLAUDE_AGENT_KEYS = {"name", "description"}
+
+
+def _claude_agents(root: Path) -> list[dict[str, str]]:
+    """The plugin agents CLI 2.1.322 loads from `agents/`, by frontmatter name and file.
+
+    The CLI loads `agents/` recursively, naming a nested agent `<plugin>:<dir>:<name>`, and
+    skips other files, so only `.md` files directly inside it are admitted.
+    """
+    directory = root / "agents"
+    files = sorted(directory.iterdir()) if directory.is_dir() and not directory.is_symlink() else []
+    if not files:
+        raise ValueError(f"Claude plugin agents/ must be a directory of agent files: {directory}")
+    agents: list[dict[str, str]] = []
+    for file in files:
+        if file.is_symlink() or not file.is_file() or not file.name.endswith(".md"):
+            raise ValueError(f"Claude plugin agents/ admits only .md files directly in it: {file}")
+        metadata = _frontmatter(file, "agent")
+        unsupported = sorted(set(metadata) - _CLAUDE_AGENT_KEYS)
+        if unsupported:
+            raise ValueError(f"unsupported Claude agent frontmatter {unsupported}: {file}")
+        name, description = metadata.get("name"), metadata.get("description")
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name):
+            raise ValueError(f"agent requires a kebab-case name: {file}")
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError(f"agent requires a description: {file}")
+        agents.append({"name": name, "path": file.relative_to(root).as_posix()})
+    if len({agent["name"] for agent in agents}) != len(agents):
+        raise ValueError(f"duplicate Claude plugin agent names: {directory}")
+    return agents
 
 
 def _plugin(root: Path, harness: str) -> dict[str, Any]:
@@ -369,6 +406,9 @@ def _plugin(root: Path, harness: str) -> dict[str, Any]:
         plugin["default_components"] = [
             path for path in _CLAUDE_ADMITTED_DEFAULTS if (root / path).exists()
         ]
+        # Added only when present, so an agent-free inventory is unchanged.
+        if (root / "agents").exists() or (root / "agents").is_symlink():
+            plugin["agents"] = _claude_agents(root)
     return plugin
 
 
