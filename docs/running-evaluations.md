@@ -432,12 +432,12 @@ It refuses:
 - A revision name that already exists. Choose a new one.
 - An unknown measure, or one the run already measures.
 - A requested measure that no task can measure.
-- A measure the run measures now but whose collector cannot be prepared again, such as a missing analyzer.
+- A measure the run measures now that no longer passes its readiness check, such as coverage whose task image is gone. The new revision would replace its values with unknown ones.
 
 The steps:
 
 1. For each task, it prepares profiles in the run's own frozen copy of the task.
-2. It checks each new measure twice on the task's starting source, as `check` does.
+2. It checks each measure it collects twice on the task's starting source, as `check` does. This includes the earlier ones, because it collects them again.
 3. A new measure that is broken on one task while other tasks can measure it is added to `not_measured` for that task, as `check` does. With `require_ready`, any new measure that is not ready refuses the request.
 4. It collects the revision, and then selects it and rebuilds the report.
 

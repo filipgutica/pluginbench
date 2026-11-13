@@ -1592,24 +1592,25 @@ def measure_evaluation(
             fixture, output / "measurements", collected, settings, identity
         )
         provenance = json.loads((output / "measurements/measurement-provenance.json").read_text())
-        capabilities = _object(provenance["capabilities"])
+        # Earlier measures are collected again too, so each is checked again: one that was ready
+        # and no longer is would replace its measured values with unknown ones.
+        probed = probe_measurements(
+            fixture,
+            output / "measurement-readiness",
+            profiles[entry.id],
+            collected,
+            _object(provenance["capabilities"]),
+        )
         for name in set(collected) - set(measurements):
-            row = _object(capabilities[name])
-            if row["status"] != "available" and (
+            row = probed[name]
+            if row["state"] != "ready" and (
                 _object(_object(readiness[entry.id]).get(name, {})).get("state") == "ready"
             ):
                 raise ValueError(
-                    f"{entry.id}: {name} is measured now but cannot be prepared again, so this "
-                    f"revision would lose it: {row['reason']}"
+                    f"{entry.id}: {name} is measured now but is {row['state']} on the task's "
+                    f"starting source, so this revision would lose it: {row.get('reason')}"
                 )
-        kinds = {_object(capabilities[name]).get("collector") for name in measurements}
-        rows[entry.id] = probe_measurements(
-            fixture,
-            output / "measurement-readiness",
-            [collector for collector in profiles[entry.id] if collector.kind in kinds],
-            measurements,
-            capabilities,
-        )
+        rows[entry.id] = {name: probed[name] for name in measurements}
     matrix = {
         task: {
             name: {"state": row["state"], "reason": row.get("reason")} for name, row in by.items()

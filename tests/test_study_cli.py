@@ -2424,6 +2424,34 @@ def test_measure_refuses_a_measure_no_task_can_collect(
     assert not (root / "evidence/observer-revisions/m1").exists()
 
 
+def test_measure_refuses_to_lose_an_earlier_measure_that_no_longer_collects(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, _, _ = _recorded_calls(config, tmp_path, monkeypatch)
+    task = config.tasks.resolve() / config.tasks.ids[0] / "task.toml"
+    task.write_text(task.read_text().replace("[agent]", "[metadata]\nlanguage='python'\n[agent]"))
+    root = tmp_path / "run"
+    evaluation.run_evaluation(config, root)
+    assert {row["status"] for row in _observations(root, {"coverage"})} >= {"measured"}
+    _python_analysis(monkeypatch)
+    # Coverage measured this run, but its collector now fails, as when a task image is gone.
+    monkeypatch.setattr(
+        harbor_backend,
+        "run_native_command",
+        lambda **kwargs: {"exit_code": 3, "timed_out": False, "report_collected": False},
+    )
+    before = (root / "evaluation.json").read_bytes()
+
+    refused = CliRunner().invoke(
+        cli.app, ["measure", str(root), "--measurements", "cyclomatic", "--revision", "m1", "--yes"]
+    )
+
+    assert refused.exit_code == 2
+    assert "coverage is measured now but is broken" in refused.stderr, refused.stderr
+    assert (root / "evaluation.json").read_bytes() == before
+    assert not (root / "evidence/observer-revisions/m1").exists()
+
+
 def test_measure_lists_a_new_measure_broken_on_one_task_as_not_measured(
     checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:

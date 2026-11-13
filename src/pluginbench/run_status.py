@@ -230,8 +230,12 @@ def _phase(
     events: list[dict[str, Any]],
 ) -> str:
     started = [event for event in events if event.get("event") == "started"]
-    if active and started and started[-1].get("command") == "review":
+    # A finished run that `review` or `measure` owns is revised, not complete.
+    command = started[-1].get("command") if active and started else None
+    if command == "review":
         return "reviewing"
+    if command == "measure":
+        return "measuring"
     if active and pending:
         return pending
     # The latest operation, such as a re-review of a finished run, may have stopped or failed.
