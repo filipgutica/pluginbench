@@ -13,6 +13,7 @@ import signal
 import shutil
 import subprocess
 import sys
+from copy import deepcopy
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -34,6 +35,7 @@ from pluginbench import (
     evaluation,
     harbor_backend,
     isolation,
+    language_analysis,
     parallel,
     remeasure,
     run_lock,
@@ -123,6 +125,7 @@ def test_public_commands_cover_evaluations_reports_and_task_selection() -> None:
         "compare",
         "report",
         "review",
+        "measure",
         "tasks",
         "judge",
     }
@@ -2265,6 +2268,196 @@ def test_review_adds_a_selected_revision_with_the_frozen_reviewer(
         refused = CliRunner().invoke(cli.app, ["review", str(root), "--revision", "r3", "--yes"])
         assert refused.exit_code == 2 and message in refused.stderr
     assert len(reviews) == reviewed + 9
+
+
+def _python_analysis(monkeypatch: pytest.MonkeyPatch, *, vulture: bool = True) -> None:
+    """Stand-ins for the pinned Python analyzers, which CI does not install."""
+    tools = {
+        name: {
+            "status": "available" if vulture or name == "rca" else "unavailable",
+            "reason": None if vulture or name == "rca" else "Install the pinned vulture",
+            "path": f"/trusted/{name}",
+            "version": "fixture",
+            "sha256": name,
+        }
+        for name in ("rca", "vulture")
+    }
+
+    def complexity(root: Path, paths: list[str], *args: object) -> list[dict[str, object]]:
+        # One function per file, scored by its branches, so a changed file changes its score.
+        return [
+            {
+                "path": path,
+                "name": "module",
+                "line": 1,
+                "col": None,
+                "end_line": 1,
+                "line_count": 1,
+                "cognitive": (root / path).read_text().count("if"),
+                "cyclomatic": 1 + (root / path).read_text().count("if"),
+            }
+            for path in paths
+        ]
+
+    monkeypatch.setattr(language_analysis, "probe_language_tools", lambda *args: deepcopy(tools))
+    monkeypatch.setattr(language_analysis, "_complexity", complexity)
+    monkeypatch.setattr(language_analysis, "_execute", lambda *args: "")
+
+
+def _evidence_digests(root: Path) -> dict[str, str]:
+    """Every evidence file but measurement revisions and the reports projected from them."""
+    return {
+        path: digest
+        for path, digest in _tree(root / "evidence").items()
+        if not path.startswith("observer-revisions/") and "/report-native/" not in path
+    }
+
+
+def _observations(root: Path, families: set[str]) -> list[dict[str, object]]:
+    rows = json.loads((root / "report/results.json").read_text())["observations"]
+    return [row for row in rows if row["family"] in families]
+
+
+def test_measure_adds_a_selected_measurement_revision_from_saved_submissions(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, calls, reviews = _recorded_calls(config, tmp_path, monkeypatch)
+    config.measurements.remove("coverage")
+    task = config.tasks.resolve() / config.tasks.ids[0] / "task.toml"
+    task.write_text(task.read_text().replace("[agent]", "[metadata]\nlanguage='python'\n[agent]"))
+    root = tmp_path / "run"
+    evaluation.run_evaluation(config, root)
+    assert evaluation._load_selection(root)["measurement_revision"] is None
+    _python_analysis(monkeypatch)
+    kept = {"tokens", "lines", "review"}
+    observed, evidence = _observations(root, kept), _evidence_digests(root)
+    coded, reviewed = len(calls), len(reviews)
+
+    first = CliRunner().invoke(
+        cli.app,
+        ["measure", str(root), "--measurements", "cyclomatic,cognitive", "--revision", "m1"],
+        input="y\n",
+    )
+
+    assert first.exit_code == 0, first.stderr + first.stdout
+    assert "Adds cyclomatic, cognitive on 1 tasks as measurement revision m1" in first.stdout
+    assert "0 model calls" in first.stdout
+    selection = evaluation._load_selection(root)
+    assert selection["measurement_revision"] == "m1"
+    assert selection["measurements"] == ["tokens", "lines", "review", "cyclomatic", "cognitive"]
+    comparison = selection["comparison_identity"]
+    assert isinstance(comparison, dict)
+    assert comparison["measurements"] == sorted(selection["measurements"])
+    assert set(comparison["measurement_capabilities"][config.tasks.ids[0]]) >= {"cyclomatic"}
+    added = _observations(root, {"cyclomatic", "cognitive"})
+    assert added and {row["status"] for row in added} == {"measured"}
+
+    second = CliRunner().invoke(
+        cli.app,
+        ["measure", str(root), "--measurements", "dead_code", "--revision", "m2", "--yes"],
+    )
+
+    assert second.exit_code == 0, second.stderr + second.stdout
+    selection = evaluation._load_selection(root)
+    assert selection["measurement_revision"] == "m2"
+    assert selection["measurement_history"] == [
+        study._reference(root / "evidence", root / "evidence/observer-revisions/m1/revision.json")
+    ]
+    assert _observations(root, {"cyclomatic", "cognitive"}) == added
+    dead = _observations(root, {"dead_code"})
+    assert {row["status"] for row in dead if row["metric"] == "Introduced dead findings"} == {
+        "measured"
+    }
+    assert _observations(root, kept) == observed
+    assert _evidence_digests(root) == evidence
+    assert (len(calls), len(reviews)) == (coded, reviewed)
+    status = json.loads(CliRunner().invoke(cli.app, ["status", str(root), "--json"]).stdout)
+    assert [
+        (row["revision"], row["selected"]) for row in status["measures"]["measurement_revisions"]
+    ] == [("m1", False), ("m2", True)]
+    assert status["last_event"]["event"] == "finished"
+
+    saved = evaluation._load_selection(root)
+    for arguments, message in (
+        (["--measurements", "coverage", "--revision", "m2"], "choose a new --revision name"),
+        (["--measurements", "bogus", "--revision", "m3"], "unsupported measurements: bogus"),
+        (["--measurements", "tokens", "--revision", "m3"], "it cannot add tokens"),
+        (["--measurements", "cognitive", "--revision", "m3"], "already measures cognitive"),
+    ):
+        refused = CliRunner().invoke(cli.app, ["measure", str(root), *arguments, "--yes"])
+        assert refused.exit_code == 2 and message in refused.stderr, refused.stderr
+    with _held_by_another_process(root, {"pid": os.getpid() + 1}):
+        active = CliRunner().invoke(
+            cli.app, ["measure", str(root), "--measurements", "coverage", "--revision", "m3"]
+        )
+    assert active.exit_code == 2 and "already active" in active.stderr, active.stderr
+    evaluation._save_selection(root, {**saved, "review_revision": None})
+    unfinished = CliRunner().invoke(
+        cli.app, ["measure", str(root), "--measurements", "coverage", "--revision", "m3"]
+    )
+    assert unfinished.exit_code == 2 and "has not finished" in unfinished.stderr
+    assert not (root / "measure/m3").exists()
+    assert not (root / "evidence/observer-revisions/m3").exists()
+
+
+def test_measure_refuses_a_measure_no_task_can_collect(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, _, _ = _recorded_calls(config, tmp_path, monkeypatch)
+    config.measurements.remove("coverage")
+    task = config.tasks.resolve() / config.tasks.ids[0] / "task.toml"
+    task.write_text(task.read_text().replace("[agent]", "[metadata]\nlanguage='python'\n[agent]"))
+    root = tmp_path / "run"
+    evaluation.run_evaluation(config, root)
+    _python_analysis(monkeypatch, vulture=False)
+    before = (root / "evaluation.json").read_bytes()
+
+    refused = CliRunner().invoke(
+        cli.app,
+        ["measure", str(root), "--measurements", "cyclomatic,dead_code", "--revision", "m1"],
+        input="y\n",
+    )
+
+    assert refused.exit_code == 2
+    assert "dead_code is ready on no task" in refused.stderr, refused.stderr
+    assert (root / "evaluation.json").read_bytes() == before
+    assert not (root / "evidence/observer-revisions/m1").exists()
+
+
+def test_measure_lists_a_new_measure_broken_on_one_task_as_not_measured(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _coverage_broken_on_one_task(checkable, monkeypatch)
+    raw = yaml.safe_load(checkable["path"].read_text())
+    raw["measurements"].remove("coverage")
+    checkable["path"].write_text(yaml.safe_dump(raw))
+    root, result, _, _ = _run_checkable(checkable, monkeypatch)
+    assert result.exit_code == 0, result.stderr + result.stdout
+
+    added = CliRunner().invoke(
+        cli.app, ["measure", str(root), "--measurements", "coverage", "--revision", "m1", "--yes"]
+    )
+
+    assert added.exit_code == 0, added.stderr + added.stdout
+    assert "Warning: arbitrary-native-task: coverage is broken" in added.stdout
+    selection = evaluation._load_selection(root)
+    readiness = selection["measurement_readiness"]
+    assert isinstance(readiness, dict)
+    reason = readiness["arbitrary-native-task"]["coverage"]["reason"]
+    assert reason and selection["not_measured"] == [
+        {"task": "arbitrary-native-task", "measure": "coverage", "reason": reason}
+    ]
+    state = json.loads((root / "evidence/observer-revisions/m1/revision.json").read_text())
+    assert state["schema_version"] == 3
+    coverage = _observations(root, {"coverage"})
+    assert {
+        (row["task"], row["status"], row["value"] is None)
+        for row in coverage
+        if row["metric"] == "Line coverage %"
+    } == {
+        ("covered-native-task", "measured", False),
+        ("arbitrary-native-task", "unavailable", True),
+    }
 
 
 def test_run_on_a_stopped_run_codes_only_unfinished_slots_then_measures_and_reviews(

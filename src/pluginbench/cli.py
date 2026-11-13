@@ -1,4 +1,5 @@
-"""The pluginbench command line: init, check, run, status, stop, compare, report, review, judge."""
+"""The pluginbench command line: init, check, run, status, stop, compare, report, review, measure,
+judge."""
 
 from __future__ import annotations
 
@@ -25,7 +26,9 @@ from pluginbench.evaluation import (
     CheckFailed,
     check_evaluation,
     load_evaluation,
+    measure_evaluation,
     plan_evaluation,
+    plan_measure,
     plan_resume,
     plan_review,
     prepare_evaluation,
@@ -627,6 +630,68 @@ def _review(run: Path, revision: str) -> None:
             raise
         event("finished", command="review", revision=selected)
     typer.echo(f"Selected review revision {selected}.")
+    typer.echo(f"Report: {run / 'report/report.html'}")
+
+
+@app.command("measure")
+def measure(
+    run: Path = typer.Argument(..., help="A finished run directory."),
+    measurements: str = typer.Option(
+        ...,
+        "--measurements",
+        help="Comma-separated measures to add: cyclomatic, cognitive, dead_code, coverage.",
+    ),
+    revision: str = typer.Option(
+        ..., "--revision", help="Name for the new measurement revision, such as measurements-2."
+    ),
+    coverage_profiles: Path | None = typer.Option(
+        None,
+        "--coverage-profiles",
+        help="A YAML coverage_profiles mapping to add to the run's settings, with coverage.",
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Start without confirmation."),
+) -> None:
+    """Add measures to a finished run from its saved submissions, with no model calls.
+
+    The new measurement revision is selected and the report rebuilt. Earlier revisions stay in
+    evidence and measurement history.
+    """
+    names = [name.strip() for name in measurements.split(",") if name.strip()]
+    try:
+        with run_lock.hold(run):
+            plan = plan_measure(run, names, revision, coverage_profiles)
+            collected = plan["collected"]
+            assert isinstance(collected, list)
+            typer.echo(
+                f"Adds {', '.join(names)} on {plan['tasks']} tasks as measurement revision "
+                f"{revision}, collecting {', '.join(collected)} from saved "
+                "submissions. 0 model calls."
+            )
+            if not yes and not _confirm("Start measurement?"):
+                raise typer.Exit()
+            _measure(run, names, revision, coverage_profiles)
+    except (OSError, ValueError, yaml.YAMLError, subprocess.SubprocessError) as exc:
+        _error(exc)
+
+
+def _measure(run: Path, names: list[str], revision: str, coverage_profiles: Path | None) -> None:
+    """Run a planned measurement while this process owns the run, recording it in events.jsonl."""
+    with _events(run) as event:
+        event("started", command="measure", pid=os.getpid(), revision=revision)
+
+        def logged(message: str) -> None:
+            event("progress", message=message)
+            typer.echo(message)
+
+        try:
+            measure_evaluation(
+                run, names, revision, coverage_profiles=coverage_profiles, progress=logged
+            )
+        except BaseException as exc:
+            _ended(event, exc)
+            raise
+        event("finished", command="measure", revision=revision)
+    typer.echo(f"Selected measurement revision {revision}.")
     typer.echo(f"Report: {run / 'report/report.html'}")
 
 
