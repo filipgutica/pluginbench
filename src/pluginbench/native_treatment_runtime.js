@@ -16,6 +16,12 @@ const hash = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
 const check = (condition, message) => { if (!condition) throw new Error(message); };
 const canonical = value => fs.realpathSync(value);
 const inside = (value, parent) => value === parent || value.startsWith(parent + path.sep);
+// Codex 0.167.2 registers a plugin hook command with each of these placeholders replaced by
+// the plugin's installed root (codex-rs/hooks/src/engine/discovery.rs). It also replaces
+// ${PLUGIN_DATA} and ${CLAUDE_PLUGIN_DATA}; a command that names either stays refused.
+const ROOT_PLACEHOLDERS = ["${PLUGIN_ROOT}", "${CLAUDE_PLUGIN_ROOT}"];
+const withPluginRoot = (command, root) =>
+  ROOT_PLACEHOLDERS.reduce((text, placeholder) => text.split(placeholder).join(root), command);
 
 function cli(args) {
   return JSON.parse(execFileSync("codex", args, {
@@ -195,7 +201,8 @@ async function main() {
       const eventName = event[0].toLowerCase() + event.slice(1);
       check(observed.some(item => item.eventName === eventName && item.enabled === true
         && item.source === "plugin" && item.handlerType === "command" && !item.async
-        && item.command === hook.command && (item.matcher || null) === (group.matcher || null)
+        && item.command === withPluginRoot(hook.command, plugin.installedPath)
+        && (item.matcher || null) === (group.matcher || null)
         && inside(canonical(item.sourcePath), canonical(plugin.installedPath))),
       "Native plugin hook was not registered faithfully: " + plugin.pluginId + "/" + event);
     }

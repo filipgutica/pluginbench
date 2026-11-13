@@ -27,8 +27,10 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             "processes.py": "0170e0a4902fc610d19b50ed5656c601474adad97b9b8d6fb5b08c6ab6ad00d1",
             # Claude admission dispatch only; Codex admission is unchanged.
             "native_treatments.py": "cfe17310a7f43de42af556e98fe63380493aeaf6a419ad612d51e01d671f0f19",
+            # Admits a hook whose command Codex registers with its plugin-root placeholders
+            # expanded. Such hooks were always refused, so every admitted launch stays v1.
             "native_treatment_runtime.js": (
-                "229d01b78fd893b8e502139507b74d18f0147079c58f15f90b0548b5520e67c5"
+                "ca133df5f2d24e0a869e85ee063bdffd61cbb75be54112fb3a0a90fec1940a88"
             ),
             # Claude plugin admission rules; Codex admission and every admitted launch stay v1.
             # Claude plugin agents admit, and Claude plugin skills may set `paths`; a Codex

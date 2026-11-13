@@ -246,3 +246,120 @@ def test_signaled_discovery_process_fails_promptly(tmp_path: Path) -> None:
     )
     assert result.returncode != 0
     assert "Native discovery exited: null" in result.stderr
+
+
+# A pstack-shaped hook: Codex 0.167.2 expands only the braced root placeholders.
+ROOT_HOOK = (
+    '"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh" codex "${PLUGIN_ROOT}"'
+    ' "${CLAUDE_PLUGIN_ROOT}" $CLAUDE_PLUGIN_ROOT'
+)
+
+
+@pytest.mark.parametrize(("declared", "verified"), [
+    (ROOT_HOOK, True),
+    # Codex also expands the data placeholder, which admission does not accept.
+    ('"${CLAUDE_PLUGIN_DATA}/state.sh"', False),
+])
+def test_real_cli_registers_plugin_root_hooks_expanded(
+    tmp_path: Path, declared: str, verified: bool,
+) -> None:
+    treatment, env = native_fixture(tmp_path)
+    manifest = tmp_path / "plugin/.codex-plugin/plugin.json"
+    settings = json.loads(manifest.read_text())
+    settings["hooks"]["hooks"]["SessionStart"][0]["hooks"][0]["command"] = declared
+    manifest.write_text(json.dumps(settings))
+    stage(treatment, tmp_path / "staged")
+    shutil.copytree(treatment.skills[0], tmp_path / "home/.agents/skills/standalone")
+    result = run_installer(tmp_path, env)
+    if not verified:
+        assert result.returncode != 0
+        assert "Native plugin hook was not registered faithfully" in result.stderr
+        return
+    assert result.returncode == 0, result.stderr
+    root = tmp_path / "codex/plugins/cache/pluginbench-frozen/fixture/1.0.0"
+    [hook] = json.loads(result.stdout)["hooks"]["hooks"]
+    assert hook["command"] == (
+        f'"{root}/hooks/session-start.sh" codex "{root}" "{root}" $CLAUDE_PLUGIN_ROOT'
+    )
+
+
+# Stands in for Codex: installs the staged plugin and lists its one hook with the command the
+# test supplies, so registrations the real CLI never produces can be checked.
+FAKE_CODEX = r"""#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const readline = require("node:readline");
+const [command, action, target] = process.argv.slice(2);
+const root = path.join(process.env.CODEX_HOME, "plugins/cache/pluginbench-frozen/fixture/1.0.0");
+const id = "fixture@pluginbench-frozen";
+const print = value => process.stdout.write(JSON.stringify(value) + "\n");
+if (command === "plugin" && action === "marketplace") {
+  fs.cpSync(path.join(process.argv[5], "plugins/fixture"), root, { recursive: true });
+  print({ marketplaceName: "pluginbench-frozen" });
+} else if (command === "plugin" && action === "add") {
+  print({ pluginId: target, installedPath: root });
+} else if (command === "plugin" && action === "list") {
+  print({ installed: [{ pluginId: id, installed: true, enabled: true }] });
+} else if (command === "app-server") {
+  const cwd = process.cwd();
+  const hook = {
+    pluginId: id, eventName: "sessionStart", enabled: true, source: "plugin",
+    handlerType: "command", async: false, matcher: null,
+    command: process.env.REGISTERED_COMMAND, sourcePath: path.join(root, ".codex-plugin/plugin.json"),
+  };
+  const results = {
+    "skills/list": { data: [{ cwd, skills: [], errors: [] }] },
+    "hooks/list": { data: [{ cwd, hooks: [hook], errors: [], warnings: [] }] },
+  };
+  readline.createInterface({ input: process.stdin }).on("line", line => {
+    const message = JSON.parse(line);
+    if ("id" in message) print({ id: message.id, result: results[message.method] ?? {} });
+  });
+} else {
+  process.exit(1);
+}
+"""
+
+
+@pytest.mark.parametrize(("registered", "verified"), [
+    ('"{root}/hooks/session-start.sh" codex "{root}" "{root}" $CLAUDE_PLUGIN_ROOT', True),
+    (ROOT_HOOK, False),  # unexpanded: not what the pinned Codex registers
+    ('"/opt/fixture/hooks/session-start.sh" codex "/opt/fixture" "/opt/fixture"'
+     ' $CLAUDE_PLUGIN_ROOT', False),  # another root
+    ('"{root}/hooks/session-start.sh" codex "{root}" "${CLAUDE_PLUGIN_ROOT}"'
+     ' $CLAUDE_PLUGIN_ROOT', False),  # one occurrence left unexpanded
+    ('"{root}/hooks/session-start.sh" codex "{root}" "{root}" {root}', False),  # unbraced too
+    ('"{root}/hooks/session-start.sh" claude "{root}" "{root}" $CLAUDE_PLUGIN_ROOT', False),
+])
+def test_plugin_root_hook_must_equal_its_declaration_with_only_the_root_expanded(
+    tmp_path: Path, registered: str, verified: bool,
+) -> None:
+    if shutil.which("node") is None:
+        pytest.skip("Native installer needs Node")
+    for name in ("home", "codex", "workspace", "bin"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "codex/config.toml").write_text("")
+    plugin = tmp_path / "plugin"
+    (plugin / ".codex-plugin").mkdir(parents=True)
+    (plugin / ".codex-plugin/plugin.json").write_text(json.dumps({
+        "name": "fixture", "version": "1.0.0",
+        "hooks": {"hooks": {"SessionStart": [{"hooks": [{
+            "type": "command", "command": ROOT_HOOK,
+        }]}]}},
+    }))
+    binary = tmp_path / "bin/codex"
+    binary.write_text(FAKE_CODEX)
+    binary.chmod(0o755)
+    stage(Treatment(plugins=[plugin]), tmp_path / "staged")
+    root = tmp_path / "codex/plugins/cache/pluginbench-frozen/fixture/1.0.0"
+    result = run_installer(tmp_path, {
+        "PATH": str(tmp_path / "bin") + os.pathsep + os.environ.get("PATH", os.defpath),
+        "HOME": str(tmp_path / "home"), "CODEX_HOME": str(tmp_path / "codex"),
+        "REGISTERED_COMMAND": registered.replace("{root}", str(root)),
+    })
+    if verified:
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout)["status"] == "verified"
+    else:
+        assert result.returncode != 0
+        assert "Native plugin hook was not registered faithfully" in result.stderr
