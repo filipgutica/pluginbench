@@ -30,6 +30,12 @@ const STATES = {
   interrupted: ["Interrupted", "warning"],
 };
 
+// The status JSON keeps the recorded state. With no live owner, nothing is still running:
+// show such work as interrupted, as `pluginbench status` does.
+function shownState(state, active) {
+  return !active && (state === "running" || state === "collecting") ? "interrupted" : state;
+}
+
 let timer = null;
 let generation = 0;
 
@@ -155,14 +161,16 @@ function runRow(run) {
     h(
       "td",
       { "data-label": RUN_COLUMNS[1] },
-      phaseBadge(run.phase),
-      run.stale ? h("span", { class: "sub" }, "Showing the last good read") : null,
+      run.phase ? phaseBadge(run.phase) : badge(["Unreadable", "warning"]),
+      run.stale
+        ? h("span", { class: "sub" }, run.phase ? `Last good read shown; the latest failed: ${run.error}` : `Not read yet: ${run.error}`)
+        : null,
     ),
     h("td", { class: "num", "data-label": RUN_COLUMNS[2] }, typeof total === "number" ? `${complete} of ${total}` : "—"),
     h("td", { "data-label": RUN_COLUMNS[3] }, tally(run.outcomes, OUTCOMES)),
     h("td", { class: "num", "data-label": RUN_COLUMNS[4] }, tokens(run.tokens)),
     h("td", { "data-label": RUN_COLUMNS[5] }, runner(run.runner)),
-    h("td", { "data-label": RUN_COLUMNS[6] }, age(run.heartbeat)),
+    h("td", { "data-label": RUN_COLUMNS[6], id: `age-${run.key}` }, age(run.heartbeat)),
   );
 }
 
@@ -253,10 +261,22 @@ async function loadRuns(token) {
   try {
     const data = await getJSON("/api/runs");
     if (token !== generation) return;
-    renderRuns(data);
+    // Redraw only when a run changed, so focus and an open filter stay put. Heartbeat ages
+    // change on every read, so they are updated in place instead.
+    const signature = JSON.stringify(data.runs.map((run) => ({ ...run, heartbeat: null })).concat(data.roots));
+    if (signature !== loadRuns.last) {
+      loadRuns.last = signature;
+      renderRuns(data);
+    } else {
+      for (const run of data.runs) {
+        const cell = document.getElementById(`age-${run.key}`);
+        if (cell) cell.textContent = age(run.heartbeat);
+      }
+    }
     markUpdated(data.runs.some((run) => run.active));
   } catch (error) {
     if (token !== generation) return;
+    loadRuns.last = null;
     setMain(failure(error, true));
   }
   schedule(loadRuns, LIST_INTERVAL, token);
@@ -264,9 +284,19 @@ async function loadRuns(token) {
 
 // Run page -------------------------------------------------------------------
 
-function attemptLabel(attempt) {
+function attemptLabel(attempt, active) {
   if (attempt.state === "complete") return OUTCOMES[attempt.outcome] || [attempt.outcome || "Complete", ""];
-  return STATES[attempt.state] || [attempt.state, ""];
+  const state = shownState(attempt.state, active);
+  return STATES[state] || [state, ""];
+}
+
+function shownStates(states, active) {
+  const shown = {};
+  for (const [state, value] of Object.entries(states || {})) {
+    const name = shownState(state, active);
+    shown[name] = (shown[name] || 0) + value;
+  }
+  return shown;
 }
 
 function matrix(status) {
@@ -308,7 +338,7 @@ function matrix(status) {
                           "li",
                           null,
                           h("span", { class: "muted" }, `Repeat ${attempt.repeat}`),
-                          badge(attemptLabel(attempt), attempt.outcome_reason || null),
+                          badge(attemptLabel(attempt, status.active), attempt.outcome_reason || null),
                           attempt.reused ? h("span", { class: "muted" }, "reused") : null,
                           attempt.tokens ? h("span", { class: "muted" }, `${tokens({ total_tokens: (attempt.tokens || {}).total_tokens, lower_bound: ["lower_bound", "unknown"].includes(attempt.tokens_status) })} tokens`) : null,
                         ),
@@ -351,7 +381,7 @@ function armTable(status) {
             null,
             h("th", { scope: "row" }, arm),
             h("td", { class: "num" }, row.attempts),
-            h("td", null, tally(row.states, { ...STATES, complete: ["Complete"] })),
+            h("td", null, tally(shownStates(row.states, status.active), { ...STATES, complete: ["Complete"] })),
             h("td", null, tally(row.outcomes, OUTCOMES)),
             h("td", { class: "num" }, row.reused),
             h("td", { class: "num" }, tokens(row.tokens)),
@@ -390,7 +420,7 @@ function discardedTable(status) {
   );
 }
 
-function revisions(measures) {
+function revisions(measures, active) {
   const rows = [
     ...(measures.measurement_revisions || []).map((row) => ["Measurement", row]),
     ...(measures.review_revisions || []).map((row) => ["Review", row]),
@@ -403,7 +433,7 @@ function revisions(measures) {
       h(
         "li",
         null,
-        `${kind} ${row.revision}: ${row.status || "unknown"}`,
+        `${kind} ${row.revision}: ${shownState(row.status, active) || "unknown"}`,
         row.assigned !== undefined ? `, ${row.reviewed} of ${row.assigned} reviewed` : "",
         row.selected ? badge(["Selected", "info"]) : null,
       ),
@@ -450,7 +480,16 @@ function renderRun(data) {
   const status = data.status;
   const back = h("a", { class: "back", href: "#/" }, "All runs");
   if (!status) {
-    setMain(back, failure(new Error(data.error || "the run could not be read"), true));
+    // The server answered; the run's files could not be read yet.
+    setMain(
+      back,
+      h(
+        "div",
+        { class: "alert warning", role: "status" },
+        h("p", null, `This run could not be read yet: ${data.error || "no status"}.`),
+        h("p", null, "The page tries again automatically. A file caught mid-write reads correctly on a later try."),
+      ),
+    );
     return;
   }
   const total = status.attempts_total;
@@ -493,7 +532,7 @@ function renderRun(data) {
   if (status.discarded && status.discarded.length) {
     children.push(h("h2", null, "Discarded attempts"), h("p", { class: "muted" }, "Interrupted attempts that a resume replaced. Their tokens count toward spend."), discardedTable(status));
   }
-  const revisionList = revisions(status.measures || {});
+  const revisionList = revisions(status.measures || {}, status.active);
   if (revisionList) children.push(h("h2", null, "Revisions"), revisionList);
   if (!status.active) children.push(h("h2", null, "Containers"), containersPanel(data.key));
   setMain(...children);

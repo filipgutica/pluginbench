@@ -100,6 +100,17 @@ def test_discovery_finds_nested_runs_but_not_symlinks_hidden_folders_or_runs_ins
     assert found[dashboard.run_key(outer)] == outer
 
 
+def test_a_folder_that_cannot_be_searched_hides_no_other_run(tmp_path: Path) -> None:
+    run = _run(tmp_path / "run")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0)  # Such as a folder a container left owned by root.
+    try:
+        assert dashboard.discover([tmp_path]) == {dashboard.run_key(run): run}
+    finally:
+        locked.chmod(0o700)
+
+
 def test_a_run_no_process_owns_is_read_again_only_after_a_watched_file_changes(
     tmp_path: Path, no_docker: list[tuple[str, ...]]
 ) -> None:
@@ -147,6 +158,23 @@ def test_an_owned_run_is_read_on_every_poll_so_a_killed_owner_shows_at_once(
     assert after is not None and after.status is not None
     assert after.status["active"] is False
     assert len(status.calls) == 2
+
+
+def test_a_run_shows_as_owned_as_soon_as_a_process_takes_it(
+    tmp_path: Path, no_docker: list[tuple[str, ...]]
+) -> None:
+    root = _run(tmp_path / "run")
+    clock = _Clock()
+    runs = dashboard.Runs([tmp_path], clock=clock)
+    key = dashboard.run_key(root)
+    before = runs.snapshot(key)
+    assert before is not None and before.status is not None and not before.status["active"]
+
+    clock.now += dashboard.READ_INTERVAL
+    with run_lock.hold(root):
+        after = runs.snapshot(key)
+
+    assert after is not None and after.status is not None and after.status["active"]
 
 
 def test_a_failed_read_keeps_the_last_good_status_says_why_and_tries_again(
@@ -278,6 +306,8 @@ def test_reports_are_served_by_run_key_and_fixed_name_only(served: tuple[int, Pa
     code, headers, body = _get(port, f"/runs/{key}/report.html")
     assert (code, body) == (200, b"<p>report</p>")
     assert headers["Content-Type"] == "text/html; charset=utf-8"
+    # Whoever produced the run, its report cannot read the dashboard's API.
+    assert headers["Content-Security-Policy"].startswith("sandbox allow-scripts")
     assert _get(port, f"/runs/{key}/results.csv")[2] == b"arm\n"
     assert _get(port, f"/runs/{key}/results.json")[0] == 404
     assert _get(port, f"/runs/{key}/../secret.txt")[0] == 404

@@ -34,6 +34,7 @@ _WATCHED = (
     "evidence/ledger.sqlite",
     "evidence/run.json",
     "report/results.json",
+    "report/report.html",
 )
 # Never read a run that a process owns more often than `status --watch` does.
 READ_INTERVAL = 2.0
@@ -61,10 +62,14 @@ def run_key(path: Path) -> str:
     return sha256(str(path.resolve()).encode()).hexdigest()[:16]
 
 
+def _regular_file(path: Path) -> bool:
+    """A file that is not a symlink. False, not an error, where the folder cannot be searched."""
+    return os.path.isfile(path) and not os.path.islink(path)
+
+
 def _is_run(directory: Path) -> bool:
     return all(
-        (directory / name).is_file() and not (directory / name).is_symlink()
-        for name in ("evaluation.json", "evaluation-binding.json")
+        _regular_file(directory / name) for name in ("evaluation.json", "evaluation-binding.json")
     )
 
 
@@ -137,15 +142,25 @@ class Runs:
         self._lock = threading.Lock()
         self._paths: dict[str, Path] = {}
         self._walked_at: float | None = None
+        self._walking = threading.Lock()
         self._snapshots: dict[str, _Snapshot] = {}
         self._reading: dict[str, threading.Lock] = {}
 
     def paths(self) -> dict[str, Path]:
         with self._lock:
-            now = self._clock()
-            if self._walked_at is None or now - self._walked_at >= WALK_INTERVAL:
-                self._paths = discover(self.roots)
-                self._walked_at = now
+            first = self._walked_at is None
+            due = first or self._clock() - (self._walked_at or 0) >= WALK_INTERVAL
+        # Walk outside the lock, one walk at a time. Until the first walk ends every request
+        # waits for it; after that, requests use the runs found last while a walk runs.
+        if due and self._walking.acquire(blocking=first):
+            try:
+                if self._walked_at is None or self._clock() - self._walked_at >= WALK_INTERVAL:
+                    found = discover(self.roots)
+                    with self._lock:
+                        self._paths, self._walked_at = found, self._clock()
+            finally:
+                self._walking.release()
+        with self._lock:
             return dict(self._paths)
 
     def path(self, key: str) -> Path | None:
@@ -328,10 +343,17 @@ def _handler(runs: Runs) -> type[BaseHTTPRequestHandler]:
                 return
             directory, path = root / "report", root / "report" / name
             # Serve the run's own report file, never one a symlink points elsewhere.
-            if directory.is_symlink() or path.is_symlink() or not path.is_file():
+            if os.path.islink(directory) or not _regular_file(path):
                 self._error(HTTPStatus.NOT_FOUND, f"this run has no {name}")
                 return
-            self._send(HTTPStatus.OK, path.read_bytes(), _REPORT_FILES[name])
+            # A sandboxed report gets an opaque origin: its scripts run, but cannot read the
+            # dashboard's API, whoever produced the run directory.
+            self._send(
+                HTTPStatus.OK,
+                path.read_bytes(),
+                _REPORT_FILES[name],
+                Content_Security_Policy="sandbox allow-scripts allow-downloads",
+            )
 
         def _refuse(self) -> None:
             self._error(HTTPStatus.METHOD_NOT_ALLOWED, "the dashboard only reads")
