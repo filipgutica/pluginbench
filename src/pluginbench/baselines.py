@@ -15,12 +15,56 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
-from pluginbench import components, harbor_backend, submissions
+from pluginbench import claude, claude_treatments, components, harbor_backend, submissions
 from pluginbench.codex_events import failed_before_first_turn
 from pluginbench.native_treatments import DELIVERY_POLICY, NativeCapabilities
 from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.assessment_models import AttemptInput
 from pluginbench.datasets import TaskSpec, native_identity, portable_native_identity, task_digest
+
+
+# The built-in commands and agents a qualified Claude CLI's discovery reports for the pinned
+# launch under a subscription login: tests/fixtures/claude-2.1.322/subscription-builtins.json.
+# A run sees its own built-ins only in its own discovery, after the cache has decided, so a
+# cached vanilla attempt is admitted only when its receipt holds this set. A version without
+# an entry has no Claude vanilla cache.
+CLAUDE_BUILTINS: dict[str, dict[str, list[str]]] = {
+    "2.1.322": {
+        "agents": ["Explore", "Plan", "claude", "general-purpose", "statusline-setup"],
+        "commands": [
+            "__remote-workflow", "agents", "auto-mode-setup", "autocompact", "batch",
+            "claude-api", "clear", "code-review", "color", "compact", "config", "context",
+            "dataviz", "debug", "deep-research", "doctor", "effort", "fast",
+            "fewer-permission-prompts", "focus", "goal", "heapdump", "init", "insights",
+            "list-agents", "loop", "mcp", "model", "output-style", "plugin-authoring", "recap",
+            "reload-plugins", "reload-skills", "rename", "run", "run-skill-generator",
+            "schedule", "security-review", "simplify", "team-onboarding", "update-config",
+            "usage", "verify", "workflow-authoring", "workflow-launch-exec",
+        ],
+    },
+}
+
+
+def claude_identity(run: claude.CodingRun, cli_version: str) -> dict[str, object]:
+    """What a Claude vanilla attempt's cache identity binds beyond the shared fields.
+
+    The launcher version stays 1 while `claude.py` may change, so the launch contract is bound
+    here by value. A `None` init tool set or built-in set means this CLI version is not
+    qualified, and its attempts are never cached.
+    """
+    argv, env = claude.coding_launch(run)
+    tools = claude.QUALIFIED_TOOLS.get(cli_version)
+    return {
+        "coding_argv": argv,
+        "coding_env": env,
+        "refused_env": list(claude.REFUSED_ENV),
+        "discovery_argv": claude.discovery_launch(run)[0],
+        "discovery_settings": {**claude.PINNED_SETTINGS, **claude.DISCOVERY_SETTINGS},
+        "init_tools": None
+        if tools is None
+        else sorted(tools - (set() if run.subagents else {claude.SUBAGENT_TOOL})),
+        "builtins": CLAUDE_BUILTINS.get(cli_version),
+    }
 
 
 def _hash(value: object) -> str:
@@ -159,6 +203,10 @@ def _matches_treatment_delivery(
     """Bind a native vanilla cache entry to its installed policy and empty treatment."""
     if "delivery" not in coding:
         return True  # Historical cache identities cannot equal a native identity.
+    if coding["delivery"] == claude_treatments.DELIVERY_POLICY:
+        return _matches_claude_delivery(
+            artifacts=artifacts, invocation=invocation, execution=execution, coding=coding
+        )
     if coding["delivery"] != DELIVERY_POLICY:
         return False
     inventory: dict[str, list[object]] = {"guidance": [], "skills": [], "plugins": []}
@@ -191,6 +239,44 @@ def _matches_treatment_delivery(
         elif actual.get(key) != value:
             return False
     return True
+
+
+def _matches_claude_delivery(
+    *, artifacts: Path, invocation: dict[str, Any], execution: dict[str, Any],
+    coding: dict[str, Any],
+) -> bool:
+    """Bind a Claude vanilla entry to the pinned launch, its discovery receipt and its init."""
+    pinned = coding.get("claude")
+    if not isinstance(pinned, dict) or pinned.get("init_tools") is None or pinned.get(
+        "builtins"
+    ) is None:
+        return False
+    inventory: dict[str, list[object]] = {"guidance": [], "skills": [], "plugins": []}
+    launch = execution.get("launch")
+    if (not isinstance(launch, dict)
+            # Usage revalidation reads the execution's launch, so it must be the invocation's.
+            or any(invocation.get(key) != value for key, value in launch.items())
+            or invocation.get("delivery") != claude_treatments.DELIVERY_POLICY
+            or invocation.get("capabilities") != coding.get("capabilities")
+            or invocation.get("treatment_inventory") != inventory
+            or invocation.get("argv") != pinned["coding_argv"]
+            or (artifacts / "prompt.txt").read_bytes() != b""
+            or execution.get("claude_init_tools") != pinned["init_tools"]
+            or execution.get("claude_permission_denials") != []):
+        return False
+    receipt = json.loads((artifacts / "native-treatment.json").read_text())
+    discovery = receipt.get("discovery") if isinstance(receipt, dict) else None
+    return bool(
+        isinstance(discovery, dict)
+        and receipt.get("status") == "verified"
+        and receipt.get("delivery") == claude_treatments.DELIVERY_POLICY
+        and receipt.get("inventory") == inventory
+        and execution.get("native_treatment") == receipt
+        and receipt.get("cli_version") == coding.get("harness_version")
+        and receipt.get("builtins") == pinned["builtins"]
+        and receipt.get("settings") == pinned["discovery_settings"]
+        and discovery.get("argv") == pinned["discovery_argv"]
+    )
 
 
 def _matches_native_stage(
@@ -291,6 +377,22 @@ def _matches_native_stage(
             else:
                 return False
     return _native_cleanup_matches(receipt.get("cleanup"))
+
+
+def _never_reached_model(execution: dict[str, Any], harness: object) -> bool:
+    """Whether a session never got a model turn, so its empty outcome is no baseline.
+
+    Codex names that failure (`failed_before_first_turn`). Claude does not, and its startup
+    model stands in for an assistant's, so any Claude session without a timeout, usage, tool
+    call or message counts as one. A timeout is the agent's attempt, as for Codex.
+    """
+    if harness != "claude":
+        return failed_before_first_turn(execution) is not None
+    return not (
+        execution.get("timed_out") is True
+        or execution.get("usage") is not None
+        or any(execution.get(key) for key in ("command_items", "other_tools", "agent_messages"))
+    )
 
 
 def _native_grader_matches(verifier: object, identity: dict[str, Any]) -> bool:
@@ -739,29 +841,35 @@ class BaselineCache:
             stage.update(correctness=None, evidence=None)
         return record
 
-    def publish(self, record: dict[str, Any]) -> None:
-        """Cache one finished vanilla attempt now, unless it is a hit or not eligible."""
+    def publish(self, record: dict[str, Any]) -> str | None:
+        """Cache one finished vanilla attempt now, unless it is a hit or not eligible.
+
+        Returns why a finished vanilla attempt that is not a hit was not cached, else None.
+        """
         task_id = record["task_id"]
         if record["arm"] != "baseline" or (task_id, record["attempt"]) in self.hits:
-            return
+            return None
         key = self.keys[task_id]
         attempt = self.root / "attempts" / record["id"]
-        if not _eligible(
-            attempt=attempt,
-            record=record,
-            coding=self.contexts[task_id]["coding"],
-            task=self.tasks[task_id],
-        ):
-            return
+        coding = self.contexts[task_id]["coding"]
+        pinned = coding.get("claude")
+        if isinstance(pinned, dict) and None in (pinned.get("init_tools"), pinned.get("builtins")):
+            return (
+                f"Claude Code {coding.get('harness_version')} has no pinned built-ins and init "
+                "tools"
+            )
+        if not _eligible(attempt=attempt, record=record, coding=coding, task=self.tasks[task_id]):
+            return "its saved evidence does not match the vanilla cache identity"
         # A session that never reached the model is no baseline. Runs from before the coding
         # pass stopped on such a session recorded it as complete.
+        harness = coding["study"]["harness"]
         if any(
-            failed_before_first_turn(
-                json.loads((attempt / stage["id"] / "execution.json").read_text())
+            _never_reached_model(
+                json.loads((attempt / stage["id"] / "execution.json").read_text()), harness
             )
             for stage in record["stages"]
         ):
-            return
+            return "its session never reached the model"
         cohort = self.path / key
         cohort.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=f".{record['attempt']}-", dir=cohort) as temporary:
@@ -790,3 +898,4 @@ class BaselineCache:
             )
             self._validate(task_id, staged)
             staged.rename(cohort / staged.name)
+        return None

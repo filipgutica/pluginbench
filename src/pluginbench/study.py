@@ -22,7 +22,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from pluginbench import codex, harbor_backend, submissions, trial_containers
+from pluginbench import baselines, claude, codex, harbor_backend, submissions, trial_containers
 from pluginbench.arms import normalize_arm_name
 from pluginbench.codex_events import failed_before_first_turn
 from pluginbench.saved_usage import revalidate_usage
@@ -442,6 +442,10 @@ class BackendUnavailable(ValueError):
     """A coding session failed before its first model turn; the run stops instead of scoring it."""
 
 
+class BuiltinsDiffer(ValueError):
+    """A fresh Claude attempt's built-ins differ from the reused vanilla's; the run stops."""
+
+
 def _call_error(error: BaseException) -> str:
     """The saved error of a failed coding call. A timeout's own text holds its command line."""
     if not isinstance(error, subprocess.TimeoutExpired):
@@ -483,8 +487,15 @@ def _execute_stage(
     on_native_start: Callable[[], None],
     expected_runtime: dict[str, object],
     guard: Callable[[], None] = lambda: None,
+    reused_vanilla: list[str] | None = None,
+    reused_cohorts: list[str] | None = None,
+    pinned_builtins: object = None,
+    claude_version: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run one native invocation and persist its evidence under root.
+
+    `reused_vanilla` names the cached vanilla attempts a Claude run reuses; a fresh attempt
+    whose receipt lacks their pinned built-ins fails and stops the run.
 
     `guard` runs before each write to root. A run moved during the call therefore writes
     nothing more to its old path; that call's evidence is lost with its temporary work area,
@@ -552,6 +563,11 @@ def _execute_stage(
             execution["submission_collected"] = False
         if isinstance(exc, KeyboardInterrupt):
             interrupted = exc
+    mixed = None
+    if reused_vanilla:
+        receipt = _discovery_receipt(execution, area / "artifacts")
+        if receipt is not None and not _has_pinned_builtins(receipt, pinned_builtins):
+            mixed = _refuse_mixed_builtins(execution, reused_vanilla, claude_version)
     guard()
     target = root / "attempts" / entry["id"] / stage_id
     target.mkdir(parents=True)
@@ -583,6 +599,18 @@ def _execute_stage(
             {"status": "unsubmitted interrupted workspace; not graded"},
         )
         raise interrupted
+    if mixed is not None:
+        # Every later attempt would code with the same built-ins and be refused too. Never
+        # recorded as complete: a resume discards this attempt and codes its slot again.
+        raise BuiltinsDiffer(
+            f"attempt {entry['id']} ({entry['task_id']} · {normalize_arm_name(entry['arm'])} · "
+            f"repeat {entry['attempt']}) is not scored and the run stops: {mixed}. Resume the "
+            "run once Claude Code reports the pinned built-ins again, and this attempt is coded "
+            "again. Otherwise move "
+            + ", ".join(reused_cohorts or [])
+            + " out of the PluginBench cache root and start a new run, which codes its own "
+            "vanilla"
+        )
     backend_error = failed_before_first_turn(execution)
     if backend_error is not None:
         # Never recorded as complete: the attempt stays interrupted, so a resume discards it
@@ -1152,6 +1180,88 @@ def _assert_task_runtimes(frozen: ResolvedStudy, current: dict[str, object]) -> 
             harbor_backend.assert_prepared_images(prepared, current, label=f"task {task.task_id}")
 
 
+def _claude_identity(
+    recipe: StudyRecipe, identity: dict[str, object]
+) -> dict[str, object]:
+    """A Claude run's launch contract for its vanilla cache identity, from its frozen recipe."""
+    if recipe.harness != "claude":
+        return {}
+    run = claude.CodingRun(
+        recipe.model, recipe.reasoning, recipe.capabilities.subagents, recipe.timeout_seconds
+    )
+    return {"claude": baselines.claude_identity(run, str(identity["harness_version"]))}
+
+
+def _discovery_receipt(execution: dict[str, Any], artifacts: Path) -> dict[str, Any] | None:
+    """A Claude attempt's verified discovery receipt, also when its session check failed.
+
+    A session that differs from its receipt never records it in the execution, but the
+    receipt file stays; a failed discovery made no model call and has none to check.
+    """
+    receipt = execution.get("native_treatment")
+    if not isinstance(receipt, dict):
+        try:
+            receipt = json.loads((artifacts / "native-treatment.json").read_text())
+        except (OSError, ValueError):
+            return None
+    return receipt if isinstance(receipt, dict) and receipt.get("status") == "verified" else None
+
+
+def _has_pinned_builtins(receipt: dict[str, Any] | None, pinned: object) -> bool:
+    """Whether a discovery receipt reports the built-ins the vanilla cache pins."""
+    return pinned is not None and receipt is not None and receipt.get("builtins") == pinned
+
+
+def _reused_vanilla(plan: dict[str, Any]) -> list[str]:
+    """Each cached vanilla attempt this run reuses, by attempt and the cohort it came from."""
+    return [
+        f"{attempt_id} ({decision.get('origin_cohort')})"
+        for attempt_id, decision in sorted((plan.get("baseline_cache") or {}).items())
+        if isinstance(decision, dict) and decision.get("status") == "hit"
+    ]
+
+
+def _reused_cohorts(plan: dict[str, Any]) -> list[str]:
+    """The cache cohorts this run reuses vanilla attempts from, relative to the cache root."""
+    return sorted({
+        str(decision["origin_cohort"]).rpartition("/")[0]
+        for decision in (plan.get("baseline_cache") or {}).values()
+        if isinstance(decision, dict)
+        and decision.get("status") == "hit"
+        and isinstance(decision.get("origin_cohort"), str)
+    })
+
+
+def _refuse_mixed_builtins(execution: dict[str, Any], reused: list[str], version: str) -> str:
+    """Fail a fresh Claude attempt whose built-ins differ from the reused vanilla attempts'.
+
+    As a session that differs from its receipt, it does not pass, and its session usage is
+    kept aside, never trusted: `saved_usage` keeps it unavailable on every report and reuse.
+    """
+    reason = (
+        "this run reuses the cached vanilla attempts " + ", ".join(reused) + ", coded under "
+        f"the built-in commands and agents pinned for Claude Code {version}; this attempt's "
+        "discovery reported other built-ins, so it cannot be compared with them"
+    )
+    execution["treatment_error"] = "; ".join(
+        str(error) for error in (execution.get("treatment_error"), reason) if error
+    )
+    execution.setdefault("native_session_usage", execution.get("usage"))
+    execution.update(
+        successful_native_completion=False,
+        exit_code=1,
+        mixed_builtins=reason,
+        usage=None,
+        # The hook rule's shape.
+        usage_accounting={
+            "status": "incomplete",
+            "reason": reason,
+            "native_sessions": execution.get("usage_accounting"),
+        },
+    )
+    return reason
+
+
 def _run_attempts(
     run: _Run,
     *,
@@ -1175,6 +1285,13 @@ def _run_attempts(
     # the coding runtime, which may have changed since, and caches finished vanilla repeats
     # under the runtime they were coded with.
     coding = any(state != "complete" for state in states.values())
+    claude_version = str((baseline_identity or {}).get("harness_version"))
+    pinned_builtins = baselines.CLAUDE_BUILTINS.get(claude_version)
+
+    def uncached(record: dict[str, Any], reason: str | None) -> None:
+        # Claude only, so Codex runs print what they always printed.
+        if reason and progress and frozen.recipe.harness == "claude":
+            progress(f"Vanilla attempt {record['id']} was not cached in {baseline_cache}: {reason}")
 
     def skipped(error: Exception) -> None:
         if progress:
@@ -1219,8 +1336,11 @@ def _run_attempts(
                         **baseline_identity,
                         # New entries record the runtime they run with; saved ones still match.
                         "isolation": expected_runtime,
-                        "delivery": DELIVERY_POLICY,
-                        "capabilities": frozen.recipe.capabilities.model_dump(mode="json"),
+                        "delivery": delivery_policy(frozen.recipe.harness),
+                        "capabilities": claude_launch.recorded_capabilities(
+                            frozen.recipe.capabilities, frozen.recipe.harness
+                        ),
+                        **_claude_identity(frozen.recipe, baseline_identity),
                         "study": {
                             key: getattr(frozen.recipe, key)
                             for key in (
@@ -1240,6 +1360,44 @@ def _run_attempts(
                 if coding:
                     raise
                 skipped(error)
+        if (
+            cache is not None
+            and frozen.recipe.harness == "claude"
+            and not _reused_vanilla(plan)
+            # A hit for a repeat this run already coded is its own published entry.
+            and any(
+                decision["status"] == "hit" and states[attempt_id] != "complete"
+                for attempt_id, decision in cache.decisions().items()
+            )
+        ):
+            # Attempts coded before any reuse must have the built-ins the cached ones have.
+            unpinned = [
+                record["id"]
+                for record in records
+                if states[record["id"]] == "complete"
+                and not all(
+                    _has_pinned_builtins(
+                        _discovery_receipt(
+                            json.loads((target / "execution.json").read_text()),
+                            target / "artifacts",
+                        ),
+                        pinned_builtins,
+                    )
+                    for target in (
+                        root / "attempts" / record["id"] / stage["id"] for stage in record["stages"]
+                    )
+                )
+            ]
+            if unpinned:
+                cache.close()
+                cache = None
+                if progress:
+                    progress(
+                        "Cached vanilla attempts are not reused: this run's attempts "
+                        + ", ".join(unpinned)
+                        + " were coded without the built-ins pinned for Claude Code "
+                        f"{claude_version}, so cached ones could not be compared with them"
+                    )
         if cache is not None:
             # Decisions for complete attempts record what happened when they ran.
             decisions = plan.get("baseline_cache", {})
@@ -1257,7 +1415,7 @@ def _run_attempts(
             try:
                 for record in records:
                     if states[record["id"]] == "complete":
-                        cache.publish(record)
+                        uncached(record, cache.publish(record))
             except Exception as error:
                 if coding:
                     raise
@@ -1308,7 +1466,7 @@ def _run_attempts(
             _checkpoint(root, frozen, manifest, states, status="running")
             if cache is not None and status == "complete":
                 # Cached as it finishes, so a run that stops later still keeps it for reuse.
-                cache.publish(record)
+                uncached(record, cache.publish(record))
             if status == "complete" and record["id"] in called:
                 error = _failed_call(root, record)
                 if error is None:
@@ -1443,6 +1601,12 @@ def _run_attempts(
                         on_native_start=started,
                         expected_runtime=expected_runtime,
                         guard=unmoved,
+                        reused_vanilla=_reused_vanilla(plan)
+                        if frozen.recipe.harness == "claude"
+                        else None,
+                        reused_cohorts=_reused_cohorts(plan),
+                        pinned_builtins=pinned_builtins,
+                        claude_version=claude_version,
                     )
                     record.update(
                         stages=[stage],

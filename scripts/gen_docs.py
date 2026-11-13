@@ -122,7 +122,7 @@ def metrics_reference() -> str:
         "Definitions and units come from `METRIC_GUIDE` in `src/pluginbench/assessment_charts.py`.",
         "Point gates choose their direction; the code defines no universal better direction for each metric.",
         "Paired token bounds require both Input tokens and Output tokens, with `direction: lower`.",
-        "Saved Codex usage is re-validated on cache reuse and report generation; Claude Code usage on report generation.",
+        "Saved Codex and Claude Code usage is re-validated on cache reuse and report generation.",
         "Invalid, disagreeing, or legacy stdout-only evidence makes tokens unavailable; token gates treat it as unknown.",
         "Token provenance retains original figures and recording time in `usage_validation`.",
         "Compare treats tokens without validated provenance as unknown in every report schema.",

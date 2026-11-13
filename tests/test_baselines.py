@@ -2,15 +2,29 @@ from __future__ import annotations
 
 import json
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
 
-from pluginbench import baselines, harbor_backend, native_treatments, study, submissions
+from pluginbench import (
+    baselines,
+    claude,
+    claude_launch,
+    claude_treatments,
+    evaluation,
+    harbor_backend,
+    native_treatments,
+    saved_usage,
+    study,
+    submissions,
+    trial_containers,
+)
 from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.datasets import TaskSpec, native_identity, portable_native_identity
+from pluginbench.native_treatments import NativeCapabilities
 from native_support import (
     task_entry,
     runtime_identity,
@@ -76,10 +90,10 @@ def _coding(
 
 
 def _cohort(
-    directory: Path, cache_path: Path
+    directory: Path, cache_path: Path, runner: dict[str, str] | None = None
 ) -> tuple[baselines.BaselineCache, tuple[TaskSpec, ...], list[dict[str, Any]]]:
     directory.mkdir()
-    tasks = _study(directory / "config").tasks
+    tasks = _study(directory / "config", runner=runner).tasks
     identity = _coding(tasks)
     root = directory / "run"
     records = []
@@ -147,11 +161,11 @@ def _cohort(
     )
 
 
-def _publish(cache: baselines.BaselineCache, records: list[dict[str, Any]]) -> None:
+def _publish(cache: baselines.BaselineCache, records: list[dict[str, Any]]) -> list[str | None]:
+    """Publish each record; returns why each one was not cached, or None."""
     try:
         cache.reserve()
-        for record in records:
-            cache.publish(record)
+        return [cache.publish(record) for record in records]
     finally:
         cache.close()
 
@@ -785,6 +799,85 @@ def test_saved_usage_is_revalidated_on_report_and_cache_reuse(
 
 
 CLAUDE_RUNNER = {"harness": "claude", "model": "claude-opus-5-5", "harness_version": "2.1.322"}
+CLAUDE_FIXTURES = Path(__file__).parent / "fixtures/claude-2.1.322"
+
+
+def _claude_identity(
+    tasks: tuple[TaskSpec, ...], *, subagents: bool = True
+) -> dict[str, object]:
+    """The vanilla identity `check` and `run` give a Claude run of these tasks."""
+    config = evaluation.Evaluation.model_construct(
+        runner=evaluation.Runner(
+            harness="claude", model=CLAUDE_RUNNER["model"], reasoning="medium",
+            cli_version=CLAUDE_RUNNER["harness_version"],
+        ),
+        capabilities=NativeCapabilities(subagents=subagents),
+        # As the recipes of _study set them.
+        timeout_seconds=1800,
+        jobs=1,
+        seed=42,
+    )
+    comparison: dict[str, object] = {
+        "tasks": {task.task_id: "d" * 64 for task in tasks},
+        "runner": config.runner.model_dump(mode="json", exclude={"cli_version"}),
+        "isolation": runtime_identity(),
+        # As plan_evaluation records them.
+        "delivery": study.delivery_policy("claude"),
+        "capabilities": claude_launch.recorded_capabilities(config.capabilities, "claude"),
+    }
+    return evaluation._vanilla_identity(
+        config,
+        comparison,
+        CLAUDE_RUNNER["harness_version"],
+        {task.task_id: portable_native_identity(native_identity(task)) for task in tasks},
+    )
+
+
+def _claude_evidence(
+    artifacts: Path, execution: dict[str, Any], *, subagents: bool = True
+) -> dict[str, Any]:
+    """Turn a native fixture attempt into the receipts invoke_native writes for Claude."""
+    run = claude.CodingRun(CLAUDE_RUNNER["model"], "medium", subagents, 1800)
+    inventory: dict[str, list[object]] = {"guidance": [], "skills": [], "plugins": []}
+    launch = {
+        "harness": "claude-cli",
+        "requested_model": CLAUDE_RUNNER["model"],
+        "requested_effort": "medium",
+        "harness_version": CLAUDE_RUNNER["harness_version"],
+        "backend": harbor_backend.PROTOCOL,
+        "delivery": claude_treatments.DELIVERY_POLICY,
+        "capabilities": claude_launch.capabilities(subagents),
+        "treatment_inventory": inventory,
+        "argv": claude.coding_launch(run)[0],
+    }
+    invocation = json.loads((artifacts / "invocation.json").read_text())
+    (artifacts / "invocation.json").write_text(json.dumps({**invocation, **launch}))
+    builtins = json.loads((CLAUDE_FIXTURES / "subscription-builtins.json").read_text())
+    receipt = {
+        "status": "verified",
+        "delivery": claude_treatments.DELIVERY_POLICY,
+        "inventory": inventory,
+        "cli_version": CLAUDE_RUNNER["harness_version"],
+        "account": {"subscriptionType": "max", "apiProvider": "firstParty"},
+        "commands": [],
+        "skills": [],
+        "builtins": builtins["builtins"],
+        "plugin_installs": [],
+        "hooks": {"hooks": [], "policy": {"allDisabled": True}},
+        "settings": {"disableAllHooks": True},
+        "discovery": {"argv": claude.discovery_launch(run)[0], "exit_code": 0},
+    }
+    (artifacts / "native-treatment.json").write_text(json.dumps(receipt))
+    tools = json.loads((CLAUDE_FIXTURES / "init-tools.json").read_text())["signed_in"]
+    return {
+        **execution,
+        "launch": launch,
+        "native_treatment": receipt,
+        "claude_init_tools": tools if subagents else [tool for tool in tools if tool != "Task"],
+        "claude_permission_denials": [],
+        "actual_primary_models": [CLAUDE_RUNNER["model"]],
+        "runtime_effort_evidence": [],
+    }
 
 
 @pytest.mark.parametrize("evidence", ["valid", "orphan"])
@@ -792,9 +885,7 @@ CLAUDE_RUNNER = {"harness": "claude", "model": "claude-opus-5-5", "harness_versi
 def test_saved_claude_usage_is_revalidated_on_report_and_cache_reuse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, evidence: str, boundary: str
 ) -> None:
-    from pluginbench import claude
-
-    fixture = Path(__file__).parent / "fixtures/claude-2.1.322/coding/one-subagent"
+    fixture = CLAUDE_FIXTURES / "coding/one-subagent"
     stream = (fixture / "stream.jsonl").read_text()
     recorded = claude.parse_events(stream, [])["usage"]
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: runtime_identity())
@@ -803,8 +894,10 @@ def test_saved_claude_usage_is_revalidated_on_report_and_cache_reuse(
         harbor_backend, "regrade_native",
         lambda **kwargs: {"verifier_result": {"rewards": {"reward": 1}}, "exception_info": None},
     )
+    calls = []
 
     def invoke(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
         area = kwargs["area"]
         (area / "workspace/answer.py").write_text("answer = 1\n")
         execution = native_execution(
@@ -818,22 +911,7 @@ def test_saved_claude_usage_is_revalidated_on_report_and_cache_reuse(
         if evidence == "orphan":
             (subagent,) = sessions.rglob("agent-*.meta.json")
             subagent.write_text(json.dumps({"toolUseId": "toolu_orphan"}))
-        launch = {
-            "harness": "claude-cli", "requested_model": "claude-opus-5-5",
-            "harness_version": CLAUDE_RUNNER["harness_version"],
-        }
-        invocation = json.loads((artifacts / "invocation.json").read_text())
-        (artifacts / "invocation.json").write_text(json.dumps({**invocation, **launch}))
-        # Cache admission binds the Codex delivery receipt, which a real Claude attempt never
-        # has; shape it for this model so the second run reaches the reuse boundary.
-        treatment = execution["native_treatment"]
-        assert isinstance(treatment, dict)
-        treatment["effective_config"] = treatment["effective_config"].replace(
-            "gpt-6.1-sol", "claude-opus-5-5"
-        )
-        (artifacts / "native-treatment.json").write_text(json.dumps(treatment))
-        execution.update(usage=recorded, launch=launch, actual_primary_models=["claude-opus-5-5"])
-        return execution
+        return {**_claude_evidence(artifacts, execution), "usage": recorded}
 
     monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
     # The treatment is shaped as Codex packages; this test needs only saved runs.
@@ -843,12 +921,18 @@ def test_saved_claude_usage_is_revalidated_on_report_and_cache_reuse(
     one = _study(tmp_path / "one", runner=CLAUDE_RUNNER)
     cache = tmp_path / "cache"
     root = study.run_study(one, tmp_path / "first", baseline_cache=cache,
-                           baseline_identity=_coding(one.tasks, CLAUDE_RUNNER))
+                           baseline_identity=_claude_identity(one.tasks))
     study.report_study(root)
     if boundary == "reuse":
         two = _study(tmp_path / "two", guidance="another", runner=CLAUDE_RUNNER)
+        # `check` previews with the identity the run binds from its frozen recipe.
+        preview = baselines.preview(
+            path=cache, tasks=two.tasks, repeats=2, identity=_claude_identity(two.tasks)
+        )
+        assert [row["status"] for row in preview] == ["hit", "hit"]
         root = study.run_study(two, tmp_path / "second", baseline_cache=cache,
-                               baseline_identity=_coding(two.tasks, CLAUDE_RUNNER))
+                               baseline_identity=_claude_identity(two.tasks))
+        assert len(calls) == 6  # Two cached baselines, no model replay.
         run = json.loads((root / "run.json").read_text())
         assert len(run["baseline_origin"]) == 2
         manifest = json.loads((root / "assessment-input.json").read_text())
@@ -866,6 +950,452 @@ def test_saved_claude_usage_is_revalidated_on_report_and_cache_reuse(
         else:
             assert work["tokens"] is None and validation["status"] == "unavailable"
             assert "a subagent transcript has no matching Agent tool call" in validation["reasons"]
+
+
+def _claude_cohort(
+    directory: Path, cache_path: Path
+) -> tuple[baselines.BaselineCache, tuple[TaskSpec, ...], list[dict[str, Any]]]:
+    """Two Claude vanilla repeats, coded and ready to publish under the Claude identity."""
+    codex_shaped, tasks, records = _cohort(directory, cache_path, CLAUDE_RUNNER)
+    for record in records:
+        record["runtime"]["harness"] = "claude-cli"
+        target = codex_shaped.root / "attempts" / record["id"] / "handoff"
+        execution = json.loads((target / "execution.json").read_text())
+        execution = _claude_evidence(target / "artifacts", execution)
+        (target / "execution.json").write_text(json.dumps(execution))
+    cache = baselines.BaselineCache(
+        path=cache_path, root=codex_shaped.root, tasks=tasks, entries=records,
+        identity=_claude_identity(tasks),
+    )
+    return cache, tasks, records
+
+
+def _statuses(cache: baselines.BaselineCache) -> list[str]:
+    try:
+        cache.reserve()
+        return [row["status"] for row in cache.decisions().values()]
+    finally:
+        cache.close()
+
+
+def test_a_claude_vanilla_attempt_is_cached_and_reused_on_the_same_identity(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cache"
+    first, _, records = _claude_cohort(tmp_path / "first", path)
+    _publish(first, records)
+    second, _, entries = _claude_cohort(tmp_path / "second", path)
+    assert second.keys == first.keys
+    shutil.rmtree(second.root)
+    second.root.mkdir()
+    try:
+        second.reserve()
+        assert [row["status"] for row in second.decisions().values()] == ["hit", "hit"]
+        imported = [second.import_attempt(entry) for entry in entries]
+    finally:
+        second.close()
+    assert imported == records
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "unchanged",
+        "model",
+        "reasoning",
+        "cli_version",
+        "subagents",
+        "delivery",
+        "coding_argv",
+        "coding_env",
+        "refused_env",
+        "discovery_argv",
+        "discovery_settings",
+        "init_tools",
+        "builtins",
+        "harbor",
+        "task_assets",
+    ],
+)
+def test_changed_claude_coding_identity_misses(tmp_path: Path, field: str) -> None:
+    # Lookups scan saved contexts, so a different key alone does not prove a miss: reserve.
+    path = tmp_path / "cache"
+    first, _, records = _claude_cohort(tmp_path / "first", path)
+    _publish(first, records)
+    other, _, _ = _claude_cohort(tmp_path / "second", path)
+    context = json.loads(json.dumps(other.contexts["answer"]))
+    coding = context["coding"]
+    pinned = coding["claude"]
+    if field in {"model", "reasoning"}:
+        coding["study"][field] = "different"
+    elif field == "cli_version":
+        coding["harness_version"] = "2.1.323"
+    elif field == "subagents":
+        coding["capabilities"]["subagents"] = False
+    elif field == "delivery":
+        coding["delivery"] = "claude-native-v2"
+    elif field in {"coding_argv", "refused_env", "discovery_argv", "init_tools"}:
+        pinned[field] = [*pinned[field], "different"]
+    elif field in {"coding_env", "discovery_settings"}:
+        pinned[field] = {**pinned[field], "DIFFERENT": "1"}
+    elif field == "builtins":
+        pinned[field] = {**pinned[field], "agents": ["claude-code-guide"]}
+    elif field == "harbor":
+        coding["isolation"]["harbor_version"] = "0.25.0"
+    elif field == "task_assets":
+        coding["native_task_identity"]["task_assets_sha256"] = "9" * 64
+    other.contexts["answer"] = context
+    other.contracts["answer"] = baselines._cohort_contract(context)
+    other.keys["answer"] = baselines._cohort_key(context, other.tasks["answer"])
+    assert _statuses(other) == ["hit" if field == "unchanged" else "miss"] * 2
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "authentic",
+        "timeout-unknown-usage",
+        "never-reached-model",
+        "builtins",
+        "init-tools",
+        "no-init",
+        "permission-denial",
+        "argv",
+        "launch",
+        "capabilities",
+        "settings",
+        "discovery-argv",
+        "receipt-version",
+        "unverified-receipt",
+        "execution-receipt",
+        "codex-receipt",
+        "treatment-inventory",
+        "prompt",
+    ],
+)
+def test_claude_evidence_that_differs_from_its_identity_cannot_seed_the_cache(
+    tmp_path: Path, fault: str
+) -> None:
+    path = tmp_path / "cache"
+    cache, _, records = _claude_cohort(tmp_path / "first", path)
+    for record in records:
+        target = cache.root / "attempts" / record["id"] / "handoff"
+        artifacts = target / "artifacts"
+        execution = json.loads((target / "execution.json").read_text())
+        receipt = json.loads((artifacts / "native-treatment.json").read_text())
+        invocation = json.loads((artifacts / "invocation.json").read_text())
+        if fault == "timeout-unknown-usage":
+            # A timeout leaves no result event: usage is unknown, and the attempt is scored.
+            execution.update(usage=None, timed_out=True)
+        elif fault == "never-reached-model":
+            execution.update(usage=None, timed_out=False)
+        elif fault == "builtins":
+            receipt["builtins"]["agents"].append("claude-code-guide")
+        elif fault == "init-tools":
+            execution["claude_init_tools"].remove("WebFetch")
+        elif fault == "no-init":
+            execution["claude_init_tools"] = None
+        elif fault == "permission-denial":
+            execution["claude_permission_denials"] = ["Bash"]
+        elif fault == "argv":
+            invocation["argv"] = [*invocation["argv"], "--fork-session"]
+            execution["launch"]["argv"] = invocation["argv"]
+        elif fault == "launch":
+            execution["launch"]["requested_model"] = "claude-fable-5-2"
+        elif fault == "capabilities":
+            invocation["capabilities"] = claude_launch.capabilities(False)
+            execution["launch"]["capabilities"] = invocation["capabilities"]
+        elif fault == "settings":
+            receipt["settings"] = {"disableAllHooks": True, "permissions": {"allow": ["Bash"]}}
+        elif fault == "discovery-argv":
+            receipt["discovery"]["argv"] = receipt["discovery"]["argv"][:-1]
+        elif fault == "receipt-version":
+            receipt["cli_version"] = "2.1.323"
+        elif fault == "unverified-receipt":
+            receipt["status"] = "failed"
+        elif fault == "treatment-inventory":
+            invocation["treatment_inventory"] = {"guidance": ["CLAUDE.md"], "skills": [], "plugins": []}
+            execution["launch"]["treatment_inventory"] = invocation["treatment_inventory"]
+        elif fault == "prompt":
+            (artifacts / "prompt.txt").write_text("Follow the guidance.\n")
+        elif fault == "codex-receipt":
+            receipt = execution["native_treatment"] = json.loads(
+                json.dumps({**receipt, "delivery": native_treatments.DELIVERY_POLICY})
+            )
+        if fault != "execution-receipt":
+            execution["native_treatment"] = receipt
+        (target / "execution.json").write_text(json.dumps(execution))
+        (artifacts / "native-treatment.json").write_text(json.dumps(receipt))
+        (artifacts / "invocation.json").write_text(json.dumps(invocation))
+    if fault == "execution-receipt":
+        # The receipt file differs from the one the attempt's checks accepted.
+        for target in cache.root.glob("attempts/*/handoff/artifacts/native-treatment.json"):
+            saved = json.loads(target.read_text())
+            target.write_text(json.dumps({**saved, "commands": ["undeclared"]}))
+    reasons = _publish(cache, records)
+    second, _, _ = _claude_cohort(tmp_path / "second", path)
+    hit = fault in {"authentic", "timeout-unknown-usage"}
+    assert _statuses(second) == ["hit" if hit else "miss"] * 2
+    assert reasons == [
+        None
+        if hit
+        else "its session never reached the model"
+        if fault == "never-reached-model"
+        else "its saved evidence does not match the vanilla cache identity"
+    ] * 2
+
+
+def test_a_claude_cli_version_without_pinned_built_ins_and_tools_is_never_cached(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cache"
+    run = claude.CodingRun(CLAUDE_RUNNER["model"], "medium", True, 1800)
+    unqualified = baselines.claude_identity(run, "2.1.399")
+    assert unqualified["init_tools"] is None and unqualified["builtins"] is None
+    caches = []
+    for name in ("first", "second"):
+        cache, _, records = _claude_cohort(tmp_path / name, path)
+        # Everything else unchanged: only the qualification of the version is missing.
+        cache.contexts["answer"]["coding"]["claude"].update(init_tools=None, builtins=None)
+        cache.contracts["answer"] = baselines._cohort_contract(cache.contexts["answer"])
+        cache.keys["answer"] = baselines._cohort_key(cache.contexts["answer"], cache.tasks["answer"])
+        caches.append((cache, records))
+    assert _publish(*caches[0]) == ["Claude Code 2.1.322 has no pinned built-ins and init tools"] * 2
+    assert not any(path.glob("*/*/manifest.json"))
+    assert _statuses(caches[1][0]) == ["miss", "miss"]
+
+
+@pytest.mark.parametrize("cached", ["claude", "codex"])
+def test_a_vanilla_entry_never_satisfies_the_other_harness(tmp_path: Path, cached: str) -> None:
+    path = tmp_path / "cache"
+    cohorts = {"claude": _claude_cohort, "codex": _cohort}
+    other = "codex" if cached == "claude" else "claude"
+    first, _, records = cohorts[cached](tmp_path / "first", path)
+    _publish(first, records)
+    same, _, _ = cohorts[cached](tmp_path / "same", path)
+    assert _statuses(same) == ["hit", "hit"]
+    lookup, _, _ = cohorts[other](tmp_path / "other", path)
+    assert _statuses(lookup) == ["miss", "miss"]
+
+
+PLAIN = CLAUDE_FIXTURES / "coding/plain"
+
+
+def _claude_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    drifted: Callable[[dict[str, Any]], bool] = lambda entry: False,
+    interrupt_at: int | None = None,
+    session_mismatch: bool = False,
+) -> list[dict[str, Any]]:
+    """Claude attempts whose usage validates; `drifted` ones report other built-ins.
+
+    With `session_mismatch`, an attempt is recorded as invoke_native records a session that
+    differs from its receipt: failed, with the receipt file only.
+    """
+    stream = (PLAIN / "stream.jsonl").read_text()
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: runtime_identity())
+    monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
+    monkeypatch.setattr(
+        harbor_backend, "regrade_native",
+        lambda **kwargs: {"verifier_result": {"rewards": {"reward": 1}}, "exception_info": None},
+    )
+    # A resume looks for containers a stopped session left running; there are none.
+    monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
+    # The treatment is shaped as Codex packages; these tests need only saved runs.
+    monkeypatch.setattr(study, "admit", lambda treatment, harness: native_treatments.admit(
+        treatment, "codex"
+    ))
+    calls: list[dict[str, Any]] = []
+
+    def invoke(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs["entry"])
+        if len(calls) == interrupt_at:
+            raise KeyboardInterrupt("offline interrupt")
+        area = kwargs["area"]
+        (area / "workspace/answer.py").write_text("answer = 1\n")
+        execution = native_execution(
+            area, kwargs["protocol"]["native_task_identity"],
+            answer_path="answer.py", timeout=1800, version=CLAUDE_RUNNER["harness_version"],
+        )
+        artifacts = area / "artifacts"
+        (artifacts / "stdout.jsonl").write_text(stream)
+        shutil.copytree(PLAIN / "sessions", artifacts / "harbor/trial/agent/sessions")
+        coded: dict[str, Any] = {
+            **_claude_evidence(artifacts, execution),
+            "usage": claude.parse_events(stream, [])["usage"],
+        }
+        if drifted(kwargs["entry"]):
+            # The same CLI, as another plan or account would see it.
+            receipt = coded["native_treatment"]
+            receipt["builtins"] = {
+                **receipt["builtins"], "agents": [*receipt["builtins"]["agents"], "claude-code-guide"],
+            }
+            (artifacts / "native-treatment.json").write_text(json.dumps(receipt))
+        if session_mismatch:
+            del coded["native_treatment"]
+            coded.update(
+                treatment_error="the Claude coding session differs from its discovery receipt",
+                successful_native_completion=False,
+            )
+        return coded
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
+    return calls
+
+
+def _attempt_json(root: Path, attempt_id: str, name: str) -> dict[str, Any]:
+    value = json.loads((root / "attempts" / attempt_id / "handoff" / name).read_text())
+    assert isinstance(value, dict)
+    return value
+
+
+@pytest.mark.parametrize("recorded", ["receipt", "session-mismatch"])
+def test_a_fresh_claude_attempt_with_other_built_ins_stops_a_run_that_reuses_vanilla(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recorded: str
+) -> None:
+    cache = tmp_path / "cache"
+    _claude_backend(monkeypatch)
+    one = _study(tmp_path / "one", runner=CLAUDE_RUNNER)
+    study.run_study(one, tmp_path / "first", baseline_cache=cache,
+                    baseline_identity=_claude_identity(one.tasks))
+    (cohort,) = [path for path in cache.iterdir() if not path.name.startswith(".")]
+    calls = _claude_backend(
+        monkeypatch, drifted=lambda entry: True, session_mismatch=recorded == "session-mismatch"
+    )
+    two = _study(tmp_path / "two", guidance="another", runner=CLAUDE_RUNNER)
+    root = tmp_path / "second"
+    with pytest.raises(study.BuiltinsDiffer) as raised:
+        study.run_study(two, root, baseline_cache=cache,
+                        baseline_identity=_claude_identity(two.tasks))
+    message = str(raised.value)
+    assert "is not scored and the run stops: this run reuses the cached vanilla attempts" in message
+    assert f"(cache/{cohort.name}/" in message
+    assert "Resume the run once Claude Code reports the pinned built-ins again" in message
+    assert f"move cache/{cohort.name} out of the PluginBench cache root and start a new run" in (
+        message
+    )
+    # The first fresh attempt stops the run; no other attempt starts.
+    [attempt] = [entry["id"] for entry in calls]
+    assert json.loads((root / "run.json").read_text())["attempt_states"][attempt] == "interrupted"
+    execution = _attempt_json(root, attempt, "execution.json")
+    assert execution["successful_native_completion"] is False
+    assert execution["usage"] is None
+    assert "reuses the cached vanilla" in execution["treatment_error"]
+    revalidated = saved_usage.revalidate_usage(
+        execution, root / "attempts" / attempt / "handoff/execution.json"
+    )
+    assert revalidated["usage_validation"]["status"] == "unavailable"
+    assert any("reuses the cached vanilla" in reason
+               for reason in revalidated["usage_validation"]["reasons"])
+
+
+def test_a_fully_fresh_claude_run_with_other_built_ins_still_scores_and_says_why_nothing_is_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Nothing cached is mixed in, so the run is comparable within itself.
+    _claude_backend(monkeypatch, drifted=lambda entry: True)
+    cache = tmp_path / "cache"
+    progress: list[str] = []
+    one = _study(tmp_path / "one", runner=CLAUDE_RUNNER)
+    root = study.run_study(one, tmp_path / "run", baseline_cache=cache, progress=progress.append,
+                           baseline_identity=_claude_identity(one.tasks))
+    report = json.loads((root / "report/assessment-report.json").read_text())
+    for row in report["attempts"]:
+        assert _attempt_json(root, row["id"], "correctness.json")["checks"]["native_completion"]
+        assert row["stages"][0]["work"]["usage_validation"]["status"] == "validated"
+    assert not list(cache.glob("*/*/manifest.json"))
+    skipped = [line for line in progress if " was not cached in " in line]
+    assert len(skipped) == 2
+    assert all(line.endswith("its saved evidence does not match the vanilla cache identity")
+               for line in skipped)
+
+
+def test_a_resumed_claude_run_with_attempts_under_other_built_ins_reuses_no_cached_vanilla(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The first session misses the cache and codes under other built-ins; it stops midway.
+    cache = tmp_path / "cache"
+    _claude_backend(monkeypatch, drifted=lambda entry: True, interrupt_at=3)
+    one = _study(tmp_path / "one", runner=CLAUDE_RUNNER)
+    root = tmp_path / "run"
+    with pytest.raises(KeyboardInterrupt):
+        study.run_study(one, root, baseline_cache=cache,
+                        baseline_identity=_claude_identity(one.tasks))
+    states = json.loads((root / "run.json").read_text())["attempt_states"]
+    arms = {entry["id"]: entry["arm"] for entry in json.loads((root / "plan.json").read_text())[
+        "entries"
+    ]}
+    assert any(state == "complete" for state in states.values())
+    assert any(arms[attempt] == "baseline" and state != "complete"
+               for attempt, state in states.items())
+    # Meanwhile another run caches both vanilla repeats under the pinned built-ins.
+    _claude_backend(monkeypatch)
+    seed = _study(tmp_path / "seed", guidance="seed", runner=CLAUDE_RUNNER)
+    study.run_study(seed, tmp_path / "seed-run", baseline_cache=cache,
+                    baseline_identity=_claude_identity(seed.tasks))
+    assert len(list(cache.glob("*/*/manifest.json"))) == 2
+    progress: list[str] = []
+    study.resume_study(root, baseline_cache=cache, progress=progress.append,
+                       baseline_identity=_claude_identity(study._frozen_study(root).tasks))
+    assert json.loads((root / "run.json").read_text())["baseline_origin"] == {}
+    assert any(line.startswith("Cached vanilla attempts are not reused") for line in progress)
+
+
+def test_a_resumed_claude_run_whose_own_vanilla_is_cached_keeps_caching_its_vanilla(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The plan codes vanilla repeat 2, a treatment, the other treatment, then vanilla repeat 1.
+    # The first session caches repeat 2 under the pinned built-ins, codes a treatment under
+    # other ones, and stops; nothing it codes was reused, so nothing is mixed.
+    cache = tmp_path / "cache"
+    _claude_backend(monkeypatch, drifted=lambda entry: entry["arm"] != "baseline", interrupt_at=3)
+    one = _study(tmp_path / "one", runner=CLAUDE_RUNNER)
+    root = tmp_path / "run"
+    with pytest.raises(KeyboardInterrupt):
+        study.run_study(one, root, baseline_cache=cache,
+                        baseline_identity=_claude_identity(one.tasks))
+    assert len(list(cache.glob("*/*/manifest.json"))) == 1
+    progress: list[str] = []
+    _claude_backend(monkeypatch)
+    study.resume_study(root, baseline_cache=cache, progress=progress.append,
+                       baseline_identity=_claude_identity(study._frozen_study(root).tasks))
+    # Repeat 2's entry is the run's own, not a reuse: repeat 1 is cached too.
+    assert not any(line.startswith("Cached vanilla attempts are not reused") for line in progress)
+    assert len(list(cache.glob("*/*/manifest.json"))) == 2
+
+
+def test_a_claude_run_prepared_before_the_claude_identity_resumes_into_the_claude_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Decided: the run binds the Claude identity from its frozen recipe, as a new run does,
+    # so its vanilla repeats are cached under the key a fresh `check` computes.
+    cache = tmp_path / "cache"
+    one = _study(tmp_path / "one", runner=CLAUDE_RUNNER)
+    # inputs/vanilla-identity.json as fed4eba saved it for a Claude run, which `_code` passes
+    # to run_study and resume_study verbatim.
+    saved = _claude_identity(one.tasks)
+    saved.pop("claude")
+    saved.update(
+        delivery=native_treatments.DELIVERY_POLICY,
+        capabilities=NativeCapabilities().model_dump(mode="json"),
+    )
+    _claude_backend(monkeypatch, interrupt_at=3)
+    root = tmp_path / "run"
+    with pytest.raises(KeyboardInterrupt):
+        study.run_study(one, root, baseline_cache=cache, baseline_identity=saved)
+    _claude_backend(monkeypatch)
+    study.resume_study(root, baseline_cache=cache, baseline_identity=saved)
+    assert len(list(cache.glob("*/*/manifest.json"))) == 2
+    two = _study(tmp_path / "two", guidance="another", runner=CLAUDE_RUNNER)
+    preview = baselines.preview(
+        path=cache, tasks=two.tasks, repeats=2, identity=_claude_identity(two.tasks)
+    )
+    assert [row["status"] for row in preview] == ["hit", "hit"]
+    decisions = json.loads((root / "plan.json").read_text())["baseline_cache"]
+    assert {decision["cache_key"] for decision in decisions.values()} == {
+        row["cache_key"] for row in preview
+    }
 
 
 def test_a_claude_attempt_reports_its_pinned_launch_provenance(
