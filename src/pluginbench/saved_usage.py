@@ -26,8 +26,8 @@ def revalidate_usage(execution: dict[str, Any], receipt: Path) -> dict[str, Any]
     # Native session accounting cannot meter subprocesses launched by command hooks.
     hooks = execution.get("native_treatment", {}).get("hooks", {}).get("hooks")
     recorded = original["recorded_usage"]
-    if hooks and launch.get("harness") == "claude-cli":
-        # A Claude launch keeps the session usage there before the hook rule clears `usage`.
+    if hooks:
+        # The hook rule keeps the session usage there before it clears `usage`.
         recorded = execution.get("native_session_usage")
     try:
         codex.validate_artifacts(artifacts)
