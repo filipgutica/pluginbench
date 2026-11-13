@@ -268,8 +268,14 @@ def _left_running(evidence: Path) -> dict[str, Any]:
     }
 
 
-def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
-    """Everything `status` shows, as the documented JSON object; reads only."""
+def run_status(
+    root: Path, *, now: datetime | None = None, containers: bool = True
+) -> dict[str, Any]:
+    """Everything `status` shows, as the documented JSON object; reads only.
+
+    With `containers=False` it runs no Docker command and `left_running` is null, for
+    observers that poll many runs.
+    """
     root = root.expanduser().absolute()
     selection = _read(root / "evaluation.json")
     if not isinstance(selection, dict):
@@ -434,7 +440,7 @@ def run_status(root: Path, *, now: datetime | None = None) -> dict[str, Any]:
         else None,
         "log": str(log) if log.is_file() else None,
         # Only the run.lock holder stops them, so they are named while no process owns the run.
-        "left_running": None if active else _left_running(evidence),
+        "left_running": None if active or not containers else _left_running(evidence),
         "attempts": attempts,
     }
 

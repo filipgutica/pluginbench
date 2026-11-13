@@ -403,6 +403,15 @@ def test_a_killed_run_names_the_containers_it_left_running_until_a_resume_owns_i
     with run_lock.hold(root):
         assert run_status.run_status(root)["left_running"] is None
     assert not queries
+    # Observers that poll many runs skip Docker; the rest of the status is unchanged.
+    quiet = run_status.run_status(root, containers=False)
+    assert quiet["left_running"] is None
+    assert not queries
+    assert {**quiet, "left_running": None, "heartbeat": None} == {
+        **status,
+        "left_running": None,
+        "heartbeat": None,
+    }
 
 
 def test_status_says_it_could_not_check_for_containers_when_docker_fails(
