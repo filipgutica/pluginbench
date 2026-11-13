@@ -31,8 +31,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             ),
             # Claude plugin admission rules; Codex admission and every admitted launch stay v1.
             "treatments.py": "cf2f455d0da41f1795d4c28dc0fd1f0cdd9253b6648834342d454bb41ae10482",
-            # Claude version admission and coding launch contract; Claude-only, so Codex stays v1.
-            "claude.py": "90f62955622d1dd517c37f04b9dcddacc8e997378a0096a5c97cb074f3de4676",
+            # Claude version admission, coding launch contract and the subscription-only refusal
+            # every Claude launch shares; a token-only launch is unchanged, so this stays v1.
+            "claude.py": "f88c6a796fc55938d1cdbbc3989574508996a9ef7c514ad64420aafc242ce2a1",
             "claude_treatments.py": "0149a2dd1c0f0db6f2e29b030885bacbad2e0569e43cdf45c25764181bc9ea97",
             "claude_treatment_runtime.js": (
                 "89ede82ff3dc1045c6e22e1639a1dccc9a611a514cb4474048c090bfc32e1bc9"
