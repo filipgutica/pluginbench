@@ -62,8 +62,13 @@ class NativeCapabilities(BaseModel):
 
 def admit(treatment: Treatment, harness: str) -> dict[str, Any]:
     """Reject unsupported inputs before container preparation or any model call."""
+    if harness == "claude":
+        # Imported here: the Claude delivery module imports this one's constants.
+        from pluginbench import claude_treatments
+
+        return claude_treatments.admit(treatment)
     if harness != "codex":
-        raise ValueError("native treatment execution is currently qualified for Codex only")
+        raise ValueError(f"unsupported native treatment harness: {harness}")
     resolved = resolve_treatment(treatment, Path.cwd(), harness)
     inventory = treatment_inventory(resolved, harness)
     guidance = b"\n\n".join(path.read_bytes() for path in resolved.guidance)

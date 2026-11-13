@@ -21,21 +21,23 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         {
             # The optional artifact destination is judge-only; coding launch behavior stays v1.
             "codex.py": "185d0c33e1389051ddfb97a85c08978a6f65773c2378d601cdf608f4b0c17ccf",
-            # Credential readability checks preserve successful coding commands and cache identity.
-            "harbor_backend.py": "19cfcade250c1df3b54a45aec621f53a78d489523d23db3873c5173763d8542f",
+            # The Claude launch contract; tests/test_codex_identity.py proves Codex launches equal.
+            "harbor_backend.py": "047825b04291900daea861498773465b950b6e101be03262e483d08f0112b8fe",
             "processes.py": "0170e0a4902fc610d19b50ed5656c601474adad97b9b8d6fb5b08c6ab6ad00d1",
-            "native_treatments.py": "9660867a3fd8148864b48e75406a11a6c999f0445f4878d6cad924dc0167f78b",
+            # Claude admission dispatch only; Codex admission is unchanged.
+            "native_treatments.py": "cfe17310a7f43de42af556e98fe63380493aeaf6a419ad612d51e01d671f0f19",
             "native_treatment_runtime.js": (
                 "229d01b78fd893b8e502139507b74d18f0147079c58f15f90b0548b5520e67c5"
             ),
             # Claude plugin admission rules; Codex admission and every admitted launch stay v1.
-            "treatments.py": "441498fa24855b0ed5e8b713be2bdf1eb8d06bc29b9d01cdbdb762f838bcc81c",
-            # Claude version admission and coding launch builder; Claude-only, so Codex stays v1.
-            "claude.py": "780dda033e3b20e4a911f6d562ea407588fe76b9b8886a0f5f541c4f4d878b51",
-            "claude_treatments.py": "15d5d5de89f34e2b1b6982bb0f1eb1fbbcf28be2b08586500e489d2db55e2aa5",
+            "treatments.py": "68bc11023a601c7bcf2ababdbb5007f0515eb1c64e9a1194862cfa939541ebab",
+            # Claude version admission and coding launch contract; Claude-only, so Codex stays v1.
+            "claude.py": "90f62955622d1dd517c37f04b9dcddacc8e997378a0096a5c97cb074f3de4676",
+            "claude_treatments.py": "27b2e0a5012180c044f2d2d111d30c348c7c44a04945ee2c4cedde239731b958",
             "claude_treatment_runtime.js": (
-                "42c3d364df88c9ff66bece4bd7f8ae6780aa56942109be962f6c686a891a10c6"
+                "607e3e13e7f49ffe92b31a0cb893ee3cac4f061b12224251480c40ec0f26bf12"
             ),
+            "claude_launch.py": "3c59f32a7c192881f4731608fb1b174c2fee511406ead236980badf17c9f0f5f",
         },
     ),
     "analysis_observer": (

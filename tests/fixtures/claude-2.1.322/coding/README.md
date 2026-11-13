@@ -25,3 +25,5 @@ No single-prompt auto-compaction has been observed. The validation run will chec
 
 - that it leaves one result
 - that it writes a `compact_boundary` to both the stream and the root transcript
+
+Each result keeps the probe's `permission_denials`. Only `one-subagent` has one: the CLI denied the subagent's `Bash` call (`toolu_0007`). The probe ran in `default` mode, which the scrub forces, with no allow rules.

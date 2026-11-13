@@ -31,6 +31,7 @@ from typing import Any
 from uuid import uuid4
 
 from pluginbench import codex, components, isolation, submissions, native_treatments
+from pluginbench import claude, claude_launch, claude_treatments, saved_usage
 from pluginbench.treatments import Treatment
 from pluginbench.native_treatments import NativeCapabilities
 from pluginbench.code_diff import _is_source_path, _is_test_path
@@ -296,8 +297,14 @@ def _private_docker_config(
     }
 
 
-def runtime_identity(*, cpus: int = 1, memory_mb: int = 2048) -> dict[str, object]:
-    """Fingerprint the framework, wrapper, selected daemon and enforced limits."""
+def runtime_identity(
+    *, cpus: int = 1, memory_mb: int = 2048, harness: str = "codex"
+) -> dict[str, object]:
+    """Fingerprint the framework, wrapper, selected daemon and enforced limits.
+
+    The transport is the selected harness's: Harbor's `run` source that the launch contract
+    wraps. A Codex identity is unchanged by the Claude harness.
+    """
     try:
         version = importlib.metadata.version("harbor")
     except importlib.metadata.PackageNotFoundError as error:
@@ -319,10 +326,16 @@ def runtime_identity(*, cpus: int = 1, memory_mb: int = 2048) -> dict[str, objec
         "protocol": PROTOCOL,
         "harbor_version": version,
         "submission_receipt_version": 2,
-        "codex_transport": {
-            "version": _CODEX_TRANSPORT_VERSION,
-            "harbor_run_sha256": _assert_codex_transport_source(),
-        },
+        **(
+            {
+                "codex_transport": {
+                    "version": _CODEX_TRANSPORT_VERSION,
+                    "harbor_run_sha256": _assert_codex_transport_source(),
+                }
+            }
+            if harness == "codex"
+            else {"claude_transport": claude_launch.transport()}
+        ),
         "launcher_version": components.VERSIONS["launcher"],
         "implementation_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "docker_cli": _docker_cli(info),
@@ -426,8 +439,9 @@ def assert_runtime(
     if not isinstance(cpus, int) or not isinstance(memory, int):
         raise ValueError("Frozen container resource limits are missing")
     saved = runtime_contract(expected, launcher=launcher)
+    harness = "claude" if "claude_transport" in expected else "codex"
     try:
-        actual = runtime_identity(cpus=cpus, memory_mb=memory)
+        actual = runtime_identity(cpus=cpus, memory_mb=memory, harness=harness)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         raise isolation.RuntimeDriftError(
             "Cannot verify the frozen Harbor and Docker runtime"
@@ -504,9 +518,11 @@ def capacity_jobs(*, cpus: int = 1, memory_mb: int = 2048) -> int:
     return jobs
 
 
-def preflight(*, jobs: int = 1, cpus: int = 1, memory_mb: int = 2048) -> dict[str, Any]:
+def preflight(
+    *, jobs: int = 1, cpus: int = 1, memory_mb: int = 2048, harness: str = "codex"
+) -> dict[str, Any]:
     """Check local capabilities and capacity without installing or calling a model."""
-    runtime = runtime_identity(cpus=cpus, memory_mb=memory_mb)
+    runtime = runtime_identity(cpus=cpus, memory_mb=memory_mb, harness=harness)
     info, _ = _engine()
     if jobs < 1 or jobs * cpus > info.get("NCPU", 0):
         raise ValueError("Requested concurrent container CPU limits exceed Docker capacity")
@@ -608,6 +624,14 @@ async def run_trial(config: dict[str, Any]) -> dict[str, Any]:
     separate_codex = agent.get("name") == "codex" and config.get("source_trial") is None
     if separate_codex:
         _assert_codex_transport_source()
+    pinned_claude = (
+        agent.get("name") == "claude-code"
+        and config.get("source_trial") is None
+        and isinstance(boundary, dict)
+        and "coding_run" in boundary
+    )
+    if pinned_claude:
+        claude_launch.transport()
     trial_config = importlib.import_module("harbor.models.trial.config").TrialConfig
     trial_type = importlib.import_module("harbor.trial.trial").Trial
     trial = await trial_type.create(trial_config.model_validate(config))
@@ -690,7 +714,21 @@ async def run_trial(config: dict[str, Any]) -> dict[str, Any]:
             return result
 
         trial.agent.exec_as_agent = separated_exec
+    if pinned_claude:
+        assert isinstance(boundary, dict)
+        claude_launch.pin_exec(
+            trial.agent,
+            boundary,
+            qualification=_native_cli_qualification("claude", str(boundary["version"])),
+        )
     result = await trial.run()
+    if pinned_claude:
+        assert isinstance(boundary, dict)
+        # The host redacts it afterwards too; a token in an artifact still refuses the attempt.
+        area = Path(str(boundary["area"]))
+        claude_launch.refuse_leaked_token(
+            [area / "artifacts", area / "workspace"], os.environ.get(claude.TOKEN_ENV, "")
+        )
     return {
         "result": result.model_dump(mode="json"),
         "session_id": trial.agent_environment.session_id,
@@ -795,9 +833,18 @@ def _native_evidence(
         if not raw.is_file() or not stderr.is_file():
             raise ValueError("Native Codex separate stdout/stderr capture is incomplete")
         shutil.copyfile(stderr, artifacts / "codex.stderr.log")
+    else:
+        if transport != claude_launch.TRANSPORT_VERSION:
+            raise ValueError("Unsupported frozen Claude transport version")
+        stderr = agent / Path(claude.STDERR_LOG).name
+        if not raw.is_file() or not stderr.is_file():
+            raise ValueError("Native Claude separate stdout/stderr capture is incomplete")
+        shutil.copyfile(stderr, artifacts / stderr.name)
     (artifacts / "stdout.jsonl").write_text(stdout)
     for index, trace in enumerate(traces):
         (artifacts / f"host-trace-{index}.jsonl").write_text(trace)
+    if host == "claude":
+        return claude.parse_events(stdout, traces, requested_effort=effort, coding=True)
     return codex.parse_events(
         stdout, traces, host, requested_effort=effort, include_descendants=include_descendants
     )
@@ -1242,7 +1289,10 @@ def install_native_hooks(trial: object, boundary: dict[str, object]) -> None:
             if getattr(result, "return_code") != 0:
                 raise ValueError("Native CLI qualification failed during setup")
             command = (
-                "set -eu; rm -rf /tmp/codex-home /tmp/codex-secrets /root/.codex /root/.claude /root/.agents /root/.config /root/.claude.json /AGENTS.md /AGENTS.override.md /CLAUDE.md; find "
+                "set -eu; rm -rf /tmp/codex-home /tmp/codex-secrets /root/.codex /root/.claude /root/.agents /root/.config /root/.claude.json /AGENTS.md /AGENTS.override.md /CLAUDE.md; "
+                # Managed settings outrank every setting the Claude launch pins.
+                + ("rm -rf /etc/claude-code; " if boundary["harness"] == "claude" else "")
+                + "find "
                 + shlex.quote(str(image["workdir"]))
             )
             command += (
@@ -1272,7 +1322,12 @@ def install_native_hooks(trial: object, boundary: dict[str, object]) -> None:
 
 
 def _native_cli_qualification(harness: str, version: str) -> str:
-    prelude = _CODEX_EXEC_PREFIX.partition("codex exec")[0] if harness == "codex" else ""
+    # Each guard finds the CLI the way its coding command does.
+    prelude = (
+        _CODEX_EXEC_PREFIX.partition("codex exec")[0]
+        if harness == "codex"
+        else 'export PATH="$HOME/.local/bin:$PATH"; '
+    )
     return prelude + "set -eu; " + _cli_guard(harness, version)
 
 
@@ -1292,12 +1347,16 @@ def _native_config(
     capabilities: NativeCapabilities | None = None,
     agent_env: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    kwargs: dict[str, object] = {
-        "version": version,
-        "config": {"features": {"code_mode": True, "code_mode_only": True, "multi_agent": False}}
+    # Claude gets no `config`: Harbor would pass it as its own `--settings` file. The pinned
+    # settings travel in the launch contract's argv instead.
+    kwargs: dict[str, object] = (
+        {
+            "version": version,
+            "config": {"features": {"code_mode": True, "code_mode_only": True, "multi_agent": False}},
+        }
         if harness == "codex"
-        else {},
-    }
+        else {"version": version}
+    )
     if effort is not None:
         kwargs["reasoning_effort"] = effort
     if treatment is not None:
@@ -1306,8 +1365,13 @@ def _native_config(
             raise ValueError("native treatments cannot be appended to the task prompt")
         if capabilities is None or model is None or effort is None:
             raise ValueError("native treatment execution requires a fixed capability/model policy")
-        kwargs["config"] = capabilities.codex_config(model=model, effort=effort)
-        kwargs["dangerously_bypass_hook_trust"] = True
+        if harness == "codex":
+            kwargs["config"] = capabilities.codex_config(model=model, effort=effort)
+            kwargs["dangerously_bypass_hook_trust"] = True
+        else:
+            # Harbor's scoped agent env outranks every per-command env, its own included.
+            run = claude.CodingRun(model, effort, capabilities.subagents, timeout)
+            agent_env = {**claude.coding_launch(run)[1], **(agent_env or {})}
     return {
         "task": {"path": str(task_dir.resolve())},
         "trial_name": "pluginbench-" + owner,
@@ -1380,7 +1444,11 @@ def _native_process(
         }
         env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"))
     else:
-        env, secrets = codex.runtime_environment(private, harness, auth_file=auth_file)
+        env, secrets = (
+            claude.coding_environment(private, auth_file=auth_file)
+            if harness == "claude"
+            else codex.runtime_environment(private, harness, auth_file=auth_file)
+        )
         if harness == "codex":
             env["CODEX_AUTH_JSON_PATH"] = str(private / "codex/auth.json")
     engine = _native_object(expected["docker_engine"], "native engine")
@@ -1568,7 +1636,7 @@ def _prepare_native_task(
     expected = (
         resolved.runtime
         if resolved
-        else runtime_identity(cpus=limits["cpus"], memory_mb=limits["memory_mb"])
+        else runtime_identity(cpus=limits["cpus"], memory_mb=limits["memory_mb"], harness=harness)
     )
     destination.mkdir(parents=True, exist_ok=False)
     artifacts = destination / "artifacts"
@@ -1748,7 +1816,7 @@ def prepare_native_task(
             limits=limits,
         )
     admission = validate_native_task(task_dir)
-    expected = runtime_identity(cpus=limits["cpus"], memory_mb=limits["memory_mb"])
+    expected = runtime_identity(cpus=limits["cpus"], memory_mb=limits["memory_mb"], harness=harness)
     task = importlib.import_module("harbor.models.task.task").Task(task_dir)
     modes = importlib.import_module("harbor.models.task.verifier_mode")
     definition = modes.resolve_verifier_environment_definition(task.config, task.paths)
@@ -2297,7 +2365,9 @@ def _native_completion(
                     area=area,
                     host=host,
                     effort=str(launch["requested_effort"]),
-                    transport=_CODEX_TRANSPORT_VERSION if host == "codex" else None,
+                    transport=_CODEX_TRANSPORT_VERSION
+                    if host == "codex"
+                    else claude_launch.TRANSPORT_VERSION,
                     include_descendants=bool(
                         _native_object(launch.get("capabilities", {}), "coding capabilities").get("subagents")
                     ),
@@ -2305,6 +2375,20 @@ def _native_completion(
             )
         except (OSError, ValueError) as error:
             execution["evidence_error"] = str(error)
+        else:
+            if host == "claude":
+                try:
+                    # The rules reuse and reports revalidate with, applied to the fresh attempt.
+                    execution.update(saved_usage.claude_attempt_usage(artifacts, launch))
+                except Exception as error:
+                    # Never keep the stream's unvalidated usage from the evidence parse.
+                    execution.update(
+                        usage=None,
+                        usage_accounting={
+                            "status": "incomplete",
+                            "reasons": [f"the usage check failed: {error}"],
+                        },
+                    )
     native_error = native_result.get("exception_info")
     if native_error is not None:
         execution["error"] = native_error
@@ -2322,7 +2406,9 @@ def _native_completion(
         launch=launch,
         launch_harness_version=codex.observed_cli_version(execution.get("startup"), host=host),
     )
-    if launch.get("delivery") == native_treatments.DELIVERY_POLICY:
+    if launch.get("delivery") in (
+        native_treatments.DELIVERY_POLICY, claude_treatments.DELIVERY_POLICY
+    ):
         try:
             treatment_receipt = _native_object(
                 json.loads((artifacts / "native-treatment.json").read_text()), "native treatment receipt"
@@ -2330,6 +2416,28 @@ def _native_completion(
             if (treatment_receipt.get("status") != "verified"
                     or treatment_receipt.get("inventory") != launch.get("treatment_inventory")):
                 raise ValueError("native treatment installation was not verified for this attempt")
+            if launch.get("delivery") == claude_treatments.DELIVERY_POLICY:
+                stream = (artifacts / "stdout.jsonl").read_text(errors="replace")
+                # Kept for every version: an unqualified one is checked only against the
+                # disallowed tools.
+                execution["claude_init_tools"] = claude_launch.init_tools(stream)
+                execution["claude_permission_denials"] = claude_launch.permission_denials(stream)
+                mismatches = claude_launch.session_errors(
+                    stream,
+                    treatment_receipt,
+                    model=str(launch["requested_model"]),
+                    subagents=bool(
+                        _native_object(launch["capabilities"], "coding capabilities")["subagents"]
+                    ),
+                    transcript=claude_launch.root_transcript(
+                        artifacts / "harbor/trial/agent/sessions", stream
+                    ),
+                )
+                if mismatches:
+                    raise ValueError(
+                        "the Claude coding session differs from its discovery receipt: "
+                        + "; ".join(mismatches)
+                    )
             execution["native_treatment"] = treatment_receipt
             # Command hooks may execute subprocesses outside native session logging.
             # Preserve native observed usage, but never present it as complete total cost.
@@ -2418,7 +2526,7 @@ def invoke_native(
         capabilities=capabilities,
         agent_env=supplied_git_env(identity),
     )
-    config["pluginbench_boundary"] = {
+    boundary: dict[str, object] = {
         "treatment": treatment.model_dump(mode="json"),
         "capabilities": capabilities.model_dump(mode="json"),
         "area": str(area.resolve()),
@@ -2431,15 +2539,23 @@ def invoke_native(
         "harness": host,
         "version": version,
     }
+    config["pluginbench_boundary"] = boundary
+    delivery = native_treatments.DELIVERY_POLICY
+    recorded_capabilities = claude_launch.recorded_capabilities(capabilities, host)
+    if host == "claude":
+        run = claude.CodingRun(str(models[host]), effort, capabilities.subagents, timeout)
+        boundary["coding_run"] = vars(run)
+        delivery = claude_treatments.DELIVERY_POLICY
     launch = {
         "harness": host + "-cli",
         "requested_model": models[host],
         "requested_effort": effort,
         "harness_version": version,
         "backend": PROTOCOL,
-        "delivery": native_treatments.DELIVERY_POLICY,
-        "capabilities": capabilities.model_dump(mode="json"),
+        "delivery": delivery,
+        "capabilities": recorded_capabilities,
         "treatment_inventory": native_treatments.admit(treatment, host),
+        **({"argv": claude.coding_launch(run)[0]} if host == "claude" else {}),
     }
     codex.write_json(
         artifacts / "invocation.json",
@@ -2450,8 +2566,8 @@ def invoke_native(
             # What this attempt ran with: vanilla cache admission checks its Docker client.
             "runtime": expected,
             "timeout_seconds": timeout,
-            "delivery": native_treatments.DELIVERY_POLICY,
-            "capabilities": capabilities.model_dump(mode="json"),
+            "delivery": delivery,
+            "capabilities": recorded_capabilities,
             "treatment_inventory": native_treatments.admit(treatment, host),
         },
     )

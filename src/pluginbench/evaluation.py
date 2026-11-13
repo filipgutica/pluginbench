@@ -30,6 +30,8 @@ from pluginbench import (
 )
 from pluginbench.treatments import Treatment, resolve_treatment, treatment_inventory
 from pluginbench.native_treatments import NativeCapabilities, DELIVERY_POLICY, admit
+from pluginbench.claude_launch import UNENFORCED_LIMITS, recorded_capabilities
+from pluginbench.claude_launch import refuse_unenforced_limits
 from pluginbench.task_sources import Tasks, cache_root
 from pluginbench.measurement_profiles import (
     REMOVED_TEST_OVERLAP,
@@ -213,6 +215,8 @@ class Evaluation(BaseModel):
             for name, item in self.treatments.items()
         ):
             raise ValueError("treatments need nonempty named sets; vanilla is automatic")
+        if self.runner.harness == "claude":
+            refuse_unenforced_limits(self.capabilities)
         return self
 
 
@@ -343,8 +347,8 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
     comparison: dict[str, object] = {
         "tasks": identities,
         "runner": config.runner.model_dump(mode="json", exclude={"cli_version"}),
-        "delivery": DELIVERY_POLICY,
-        "capabilities": config.capabilities.model_dump(mode="json"),
+        "delivery": study.delivery_policy(config.runner.harness),
+        "capabilities": recorded_capabilities(config.capabilities, config.runner.harness),
         "measurement_settings": config.measurement_settings.model_dump(mode="json"),
         "fallow_config_sha256": hashlib.sha256(
             config.measurement_settings.fallow_config.read_bytes()
@@ -367,7 +371,9 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
             }
             for task, row in declared.items()
         },
-        "isolation": harbor_backend.runtime_identity(**limits),
+        "isolation": harbor_backend.runtime_identity(
+            cpus=limits["cpus"], memory_mb=limits["memory_mb"], harness=config.runner.harness
+        ),
     }
     if config.tasks.references:
         comparison["task_sources"] = config.tasks.references
@@ -381,8 +387,8 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
             name: treatment_inventory(item, config.runner.harness)
             for name, item in config.treatments.items()
         },
-        "delivery": DELIVERY_POLICY,
-        "capabilities": config.capabilities.model_dump(mode="json"),
+        "delivery": study.delivery_policy(config.runner.harness),
+        "capabilities": recorded_capabilities(config.capabilities, config.runner.harness),
         "tasks": config.tasks.task_ids,
         "measurements": config.measurements,
         "measurement_capabilities": capabilities,
@@ -470,6 +476,7 @@ def _vanilla_identity(
 ) -> dict[str, object]:
     """Everything a vanilla cohort's cache key binds; `check` previews with the run's own key."""
     return {
+        # Cache admission checks the Codex receipt, so a Claude attempt never enters the cache.
         "delivery": DELIVERY_POLICY,
         "capabilities": config.capabilities.model_dump(mode="json"),
         "task_assets": comparison["tasks"],
@@ -571,7 +578,10 @@ def _harness_version(harness: str, cli_version: str | None = None, *, coding: bo
         # Claude's qualification covers coding evidence; reviews keep their host behaviour.
         claude.admit_version(cli_version)
     with tempfile.TemporaryDirectory(prefix="pluginbench-auth-check-") as temporary:
-        codex.runtime_environment(Path(temporary) / "private", harness)
+        if harness == "claude" and coding:
+            claude.coding_environment(Path(temporary) / "private")
+        else:
+            codex.runtime_environment(Path(temporary) / "private", harness)
     return cli_version
 
 
@@ -638,7 +648,7 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
     if root.exists():
         raise ValueError(f"output must be a new directory: {root}")
     caches = _caches(root)
-    harbor_backend.preflight(jobs=config.jobs, **limits)
+    harbor_backend.preflight(jobs=config.jobs, harness=config.runner.harness, **limits)
     harness_versions: dict[str, str] = {
         config.runner.harness: _harness_version(
             config.runner.harness, config.runner.cli_version, coding=True
@@ -891,7 +901,10 @@ def prepare_evaluation(
         "treatments": {
             name: item.model_dump(mode="json") for name, item in config.treatments.items()
         },
-        "capabilities": config.capabilities.model_dump(mode="json"),
+        "capabilities": config.capabilities.model_dump(
+            mode="json",
+            exclude=set(UNENFORCED_LIMITS) if config.runner.harness == "claude" else None,
+        ),
         "model": config.runner.model,
         "reasoning": config.runner.reasoning,
         "repeats": config.repeats,
@@ -909,6 +922,9 @@ def prepare_evaluation(
     excluded = {"reviewer": {"cli_version"}}
     if config.runner.cli_version is None:
         excluded["runner"] = {"cli_version"}
+    if config.runner.harness == "claude":
+        # Saved as declared, so a resumed Claude evaluation does not read them as set.
+        excluded["capabilities"] = set(UNENFORCED_LIMITS)
     selection = {
         **config.model_dump(mode="json", exclude=excluded),
         "cli_version_source": "runner.cli_version" if config.runner.cli_version else "host",

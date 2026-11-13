@@ -1,0 +1,154 @@
+{
+ "_source": "codex_launch_snapshot() run on origin/main 315540a; regenerate only with a launcher version decision",
+ "snapshot": {
+  "runtime_identity": {
+   "protocol": "harbor-docker-v1",
+   "harbor_version": "0.24.0",
+   "submission_receipt_version": 2,
+   "codex_transport": {
+    "version": "codex-stdout-stderr-v1",
+    "harbor_run_sha256": "5b14fbcc889a398f80c7b5f7e2a621efc1337ba72e748fafefbab2ad09ad86bd"
+   },
+   "launcher_version": 1,
+   "docker_cli": {
+    "path": "/usr/bin/docker",
+    "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "version": "29.0.0"
+   },
+   "docker_plugins": {},
+   "docker_engine": {
+    "id": "engine",
+    "version": "29.0.0",
+    "platform": "linux/x86_64",
+    "endpoint": "unix:///var/run/docker.sock",
+    "capacity": {
+     "cpus": 8,
+     "memory_bytes": 17179869184
+    }
+   },
+   "resources": {
+    "cpus": 2,
+    "memory_mb": 4096,
+    "cpu_enforcement": "limit",
+    "memory_enforcement": "limit"
+   }
+  },
+  "config_vanilla": {
+   "task": {
+    "path": "/task"
+   },
+   "trial_name": "pluginbench-o",
+   "trials_dir": "/area/artifacts/harbor",
+   "agent": {
+    "name": "codex",
+    "model_name": "gpt-6.1-sol",
+    "override_timeout_sec": 600,
+    "override_setup_timeout_sec": 600,
+    "kwargs": {
+     "version": "0.167.0",
+     "config": {
+      "features": {
+       "code_mode": true,
+       "code_mode_only": true,
+       "plugins": true,
+       "remote_plugin": false,
+       "apps": false,
+       "hooks": true,
+       "multi_agent": true
+      },
+      "project_doc_max_bytes": 32768,
+      "agents": {
+       "enabled": true,
+       "max_threads": 4,
+       "max_depth": 1,
+       "default_subagent_model": "gpt-6.1-sol",
+       "default_subagent_reasoning_effort": "high"
+      }
+     },
+     "reasoning_effort": "high",
+     "dangerously_bypass_hook_trust": true
+    },
+    "skills": [],
+    "mcp_servers": [],
+    "extra_allowed_hosts": [
+     "api.openai.com",
+     "chatgpt.com",
+     "auth.openai.com"
+    ]
+   },
+   "environment": {
+    "type": "docker",
+    "delete": true,
+    "override_cpus": 2,
+    "override_memory_mb": 4096,
+    "cpu_enforcement_policy": "limit",
+    "memory_enforcement_policy": "limit",
+    "kwargs": {
+     "keep_containers": true
+    }
+   },
+   "verifier": {
+    "disable": false
+   },
+   "extra_instructions": []
+  },
+  "config_prepare": {
+   "task": {
+    "path": "/task"
+   },
+   "trial_name": "pluginbench-o",
+   "trials_dir": "/area/artifacts/harbor",
+   "agent": {
+    "name": "codex",
+    "model_name": null,
+    "override_timeout_sec": 600,
+    "override_setup_timeout_sec": 600,
+    "kwargs": {
+     "version": "0.167.0",
+     "config": {
+      "features": {
+       "code_mode": true,
+       "code_mode_only": true,
+       "multi_agent": false
+      }
+     }
+    },
+    "skills": [],
+    "mcp_servers": [],
+    "extra_allowed_hosts": [
+     "api.openai.com",
+     "chatgpt.com",
+     "auth.openai.com"
+    ]
+   },
+   "environment": {
+    "type": "docker",
+    "delete": true,
+    "override_cpus": 2,
+    "override_memory_mb": 4096,
+    "cpu_enforcement_policy": "limit",
+    "memory_enforcement_policy": "limit",
+    "kwargs": {
+     "keep_containers": true
+    }
+   },
+   "verifier": {
+    "disable": false
+   },
+   "extra_instructions": []
+  },
+  "qualification": "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; set -eu; for tool in curl bash node npm rg; do command -v \"$tool\" >/dev/null; done; test \"$(codex --version)\" = \"codex-cli 0.167.0\"",
+  "guard": "for tool in curl bash node npm rg; do command -v \"$tool\" >/dev/null; done; test \"$(codex --version)\" = \"codex-cli 0.167.0\"",
+  "launcher_files_codex": [
+   "codex.py",
+   "harbor_backend.py",
+   "processes.py",
+   "native_treatments.py",
+   "native_treatment_runtime.js",
+   "treatments.py"
+  ],
+  "exec_prefix": "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --model ",
+  "exec_suffix": "2>&1 </dev/null | tee /logs/agent/codex.txt",
+  "codex_run_sha256": "5b14fbcc889a398f80c7b5f7e2a621efc1337ba72e748fafefbab2ad09ad86bd"
+ }
+}

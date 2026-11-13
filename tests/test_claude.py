@@ -132,7 +132,7 @@ def test_coding_launch_is_the_pinned_contract() -> None:
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
             "DISABLE_UPDATES": "1",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+            "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
             "CLAUDE_CODE_SUBAGENT_MODEL": "claude-opus-5-5",
             "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "1800000",
         },
@@ -147,7 +147,10 @@ def test_discovery_differs_from_coding_by_exactly_the_discovery_delta(subagents:
     coding, coding_env = claude.coding_launch(run)
     discovery, discovery_env = claude.discovery_launch(run)
     expected = list(coding)
-    expected[coding.index("--settings") + 1] = '{"disableAllHooks":true}'
+    settings = json.loads(coding[coding.index("--settings") + 1])
+    expected[coding.index("--settings") + 1] = json.dumps(
+        {**settings, "disableAllHooks": True}, sort_keys=True, separators=(",", ":")
+    )
     printing = coding.index("--print")
     expected[printing:printing] = ["--input-format", "stream-json", "--no-session-persistence"]
     assert discovery == expected

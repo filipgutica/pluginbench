@@ -30,7 +30,7 @@ def revalidate_usage(execution: dict[str, Any], receipt: Path) -> dict[str, Any]
             # Older Harbor layouts may retain sessions without the flattened copies.
             traces = sorted((artifacts / "harbor/trial/agent/sessions").rglob("*.jsonl"))
         if launch.get("harness") == "claude-cli":
-            parsed = _claude_usage(artifacts, launch)
+            parsed = claude_attempt_usage(artifacts, launch)
         elif not traces:
             reasons.append("legacy usage has no saved session evidence to validate")
         else:
@@ -72,8 +72,11 @@ def revalidate_usage(execution: dict[str, Any], receipt: Path) -> dict[str, Any]
     }
 
 
-def _claude_usage(artifacts: Path, launch: dict[str, Any]) -> dict[str, Any]:
-    """Re-parse a Claude attempt's saved stream and transcripts with the attempt's own rules."""
+def claude_attempt_usage(artifacts: Path, launch: dict[str, Any]) -> dict[str, Any]:
+    """Parse a Claude attempt's saved stream and transcripts with the attempt's own rules.
+
+    A fresh attempt and every later reuse or report run this same function.
+    """
     agent = artifacts / "harbor/trial/agent"
     stdout = artifacts / "stdout.jsonl"
     if not stdout.is_file():

@@ -180,6 +180,9 @@ def _component(root: Path, value: object) -> Path:
     return path
 
 
+_CLAUDE_MATCHER = re.compile(r"\*|(?:\w+(?:\|\w+)*)?", re.ASCII)
+
+
 def _hooks(root: Path, value: object, harness: str) -> list[dict[str, Any]]:
     values = value if isinstance(value, list) else [value]
     configs = []
@@ -202,6 +205,16 @@ def _hooks(root: Path, value: object, harness: str) -> list[dict[str, Any]]:
             for group in groups:
                 if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
                     raise ValueError(f"invalid plugin hook group: {root}")
+                matcher = group.get("matcher", "")
+                # Claude Code reads any other matcher as a regular expression, so whether a
+                # hook runs could not be checked against the listing before the run.
+                if harness == "claude" and (
+                    not isinstance(matcher, str) or not _CLAUDE_MATCHER.fullmatch(matcher)
+                ):
+                    raise ValueError(
+                        f"Claude hook matcher {matcher!r} must be empty, *, or names of letters, "
+                        f"digits and _ separated by |: {root}"
+                    )
                 for hook in group["hooks"]:
                     if (not isinstance(hook, dict) or hook.get("type") != "command"
                             or not isinstance(hook.get("command"), str)

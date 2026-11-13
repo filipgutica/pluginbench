@@ -31,6 +31,8 @@ from pluginbench.treatments import (
     Treatment, resolve_treatment, freeze_treatment, treatment_inventory,
 )
 from pluginbench.native_treatments import NativeCapabilities, DELIVERY_POLICY, admit
+from pluginbench.claude_launch import refuse_unenforced_limits
+from pluginbench import claude_launch, claude_treatments
 from pluginbench.baselines import BaselineCache
 from pluginbench.ledger import LEDGER_NAME, Ledger
 from pluginbench.run_lock import RunMoved
@@ -66,6 +68,11 @@ def normalize_legacy_guidance(value: object) -> object:
             name: {"guidance": paths} for name, paths in guidance.items()
         }
     return value
+
+
+def delivery_policy(harness: str) -> str:
+    """The treatment delivery policy a harness's coding attempts run under."""
+    return claude_treatments.DELIVERY_POLICY if harness == "claude" else DELIVERY_POLICY
 
 
 class StudyRecipe(BaseModel):
@@ -179,6 +186,8 @@ def _text_files(path: Path) -> list[Path]:
 def load_study(path: Path) -> ResolvedStudy:
     source = path.resolve()
     recipe = StudyRecipe.model_validate(yaml.safe_load(source.read_text()))
+    if recipe.harness == "claude":
+        refuse_unenforced_limits(recipe.capabilities)
     base = source.parent
     recipe.tasks = _resolve(base, recipe.tasks)
     recipe.auth_file = _resolve(base, recipe.auth_file)
@@ -234,9 +243,9 @@ def plan_study(study: ResolvedStudy) -> dict[str, Any]:
         "source_policy": submissions.SOURCE_POLICY,
         "model": recipe.model,
         "requested_reasoning_effort": recipe.reasoning,
-        "delivery": DELIVERY_POLICY,
+        "delivery": delivery_policy(recipe.harness),
         "treatment_selection": study.treatment_selection,
-        "capabilities": recipe.capabilities.model_dump(mode="json"),
+        "capabilities": claude_launch.recorded_capabilities(recipe.capabilities, recipe.harness),
         "baseline": "no supplied custom guidance; native built-in instructions remain",
         "seed": recipe.seed,
         "jobs": recipe.jobs,
@@ -500,7 +509,7 @@ def _execute_stage(
                 "container_memory_mb": study.recipe.container_memory_mb,
                 "treatment": study.treatments.get(str(entry["arm"]), Treatment()).model_dump(mode="json"),
                 "capabilities": study.recipe.capabilities.model_dump(mode="json"),
-                "delivery": DELIVERY_POLICY,
+                "delivery": delivery_policy(study.recipe.harness),
                 **(
                     {"auth_file": str(study.recipe.auth_file)}
                     if study.recipe.harness == "codex"
@@ -1188,6 +1197,7 @@ def _run_attempts(
                 else harbor_backend.runtime_identity(
                     cpus=frozen.recipe.container_cpus,
                     memory_mb=frozen.recipe.container_memory_mb,
+                    harness=frozen.recipe.harness,
                 )
             )
             _assert_task_runtimes(frozen, expected_runtime)
@@ -1259,6 +1269,7 @@ def _run_attempts(
                 jobs=frozen.recipe.jobs,
                 cpus=frozen.recipe.container_cpus,
                 memory_mb=frozen.recipe.container_memory_mb,
+                harness=frozen.recipe.harness,
             )
             preflight["filesystem_isolation"] = expected_runtime
             preflight["harness_version"] = frozen.recipe.harness_version
@@ -1866,12 +1877,16 @@ def report_study(
                 codex.validated_claude_launch(
                     execution, plan["model"], plan["requested_reasoning_effort"]
                 )
+                or claude_launch.validated_launch(
+                    execution, plan["model"], plan["requested_reasoning_effort"]
+                )
                 for execution in executions
             )
             and executions
         ):
             attempt["provenance"].update(
                 comparison_reasoning_effort=plan["requested_reasoning_effort"],
+                capabilities=plan["capabilities"],
                 launch_harness_version=_observed_harness_version(executions),
                 effort_evidence_source="native session event"
                 if _consistent_observation(executions, "runtime_effort_evidence")

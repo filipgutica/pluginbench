@@ -36,6 +36,7 @@ FILES: dict[str, tuple[str, ...]] = {
         "claude.py",
         "claude_treatments.py",
         "claude_treatment_runtime.js",
+        "claude_launch.py",
     ),
     "analysis_observer": ("language_analysis.py",),
     "coverage_observer": ("coverage_report.py",),
@@ -90,7 +91,9 @@ def source_sha256(name: str) -> str:
 
 # Launcher files only a Claude launch runs. A Codex launcher neither hashes nor depends on
 # them, so adding or changing one leaves every Codex run and cache identity as it was.
-CLAUDE_ONLY = frozenset({"claude.py", "claude_treatments.py", "claude_treatment_runtime.js"})
+CLAUDE_ONLY = frozenset(
+    {"claude.py", "claude_treatments.py", "claude_treatment_runtime.js", "claude_launch.py"}
+)
 
 
 def launcher_files(harness: str) -> tuple[str, ...]:

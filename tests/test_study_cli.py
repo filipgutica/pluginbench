@@ -298,7 +298,9 @@ def test_harbor_plan_uses_task_resources_and_labels_the_shorter_agent_budget(
 ) -> None:
     selected = config.model_copy(deep=True)
     monkeypatch.setattr(harbor_backend, "capacity_jobs", lambda **kwargs: 16)
-    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: kwargs)
+    monkeypatch.setattr(
+        harbor_backend, "runtime_identity", lambda harness="codex", **kwargs: kwargs
+    )
     plan = evaluation.plan_evaluation(selected)
     assert plan["container_limits"] == {"cpus": 2, "memory_mb": 8192}
     comparison = plan["comparison_identity"]
@@ -1211,9 +1213,9 @@ def test_check_accepts_an_unverified_codex_version_and_warns_once(
 def test_claude_runner_version_goes_through_claude_admission(
     monkeypatch: pytest.MonkeyPatch, cli_version: str | None
 ) -> None:
-    # Called directly: native treatments still refuse Claude runners before `check` finishes.
+    # Called directly, so the check needs no Docker or task preparation.
     monkeypatch.setattr(claude, "preflight", lambda: {"harness_version": "2.1.400 (Claude Code)"})
-    monkeypatch.setattr(codex, "runtime_environment", lambda *args, **kwargs: ({}, ()))
+    monkeypatch.setattr(claude, "coding_environment", lambda *args, **kwargs: ({}, ()))
     admitted: list[str] = []
     monkeypatch.setattr(claude, "admit_version", admitted.append)
     monkeypatch.setattr(
@@ -3076,3 +3078,52 @@ def test_judging_a_run_stopped_during_coding_leaves_out_attempts_without_a_submi
     assert len(vanilla) == 2 and len(missing) == 1
     workflow, missing = judge.load_submissions(root, "workflow", [task])
     assert workflow == {} and sorted(missing) == [(task, 1), (task, 2), (task, 3)]
+
+
+CLAUDE_RUNNER = {
+    "harness": "claude", "model": "claude-opus-5-5", "reasoning": "high", "cli_version": "2.1.322",
+}
+
+
+@pytest.mark.parametrize("declared", [{}, {"subagents": False}])
+def test_a_claude_evaluation_with_default_limits_prepares_and_resumes(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch, declared: dict[str, bool]
+) -> None:
+    raw = yaml.safe_load(checkable["path"].read_text())
+    raw.update(runner=CLAUDE_RUNNER, capabilities=declared)
+    checkable["path"].write_text(yaml.safe_dump(raw))
+    monkeypatch.setattr(claude, "coding_environment", lambda *args, **kwargs: ({}, ()))
+    root = evaluation.prepare_evaluation(
+        evaluation.load_evaluation(checkable["path"]), checkable["output"]
+    )
+    # Saved as declared, so a resume and the study read no limit as set.
+    selection = evaluation._load_selection(root)
+    assert selection["capabilities"] == {"subagents": declared.get("subagents", True)}
+    evaluation._saved_evaluation(selection)
+    loaded = study.load_study(root / "inputs/study.json")
+    assert loaded.recipe.capabilities.subagents is declared.get("subagents", True)
+    comparison = evaluation.plan_evaluation(evaluation.load_evaluation(checkable["path"]))[
+        "comparison_identity"
+    ]
+    assert isinstance(comparison, dict) and comparison["delivery"] == "claude-native-v1"
+
+
+@pytest.mark.parametrize("limit", ["max_threads", "max_depth"])
+def test_a_claude_run_that_sets_a_limit_claude_ignores_is_refused(
+    config: evaluation.Evaluation, tmp_path: Path, limit: str
+) -> None:
+    raw = config.model_dump(mode="json")
+    raw.update(runner=CLAUDE_RUNNER, capabilities={limit: 1})
+    with pytest.raises(ValueError, match=f"Claude Code does not enforce {limit}"):
+        evaluation.resolve_evaluation(raw, tmp_path)
+    # Codex enforces both, so the same limits stay valid there.
+    raw["runner"] = config.runner.model_dump(mode="json")
+    evaluation.resolve_evaluation(raw, tmp_path)
+    recipe = tmp_path / "study.yaml"
+    recipe.write_text(yaml.safe_dump({
+        "schema_version": 3, "name": "claude-limits", "harness": "claude", "tasks": "tasks.json",
+        "treatments": {}, "model": "claude-opus-5-5", "reasoning": "high",
+        "capabilities": {limit: 1},
+    }))
+    with pytest.raises(ValueError, match=f"Claude Code does not enforce {limit}"):
+        study.load_study(recipe)

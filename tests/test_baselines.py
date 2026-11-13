@@ -824,8 +824,8 @@ def test_saved_claude_usage_is_revalidated_on_report_and_cache_reuse(
         }
         invocation = json.loads((artifacts / "invocation.json").read_text())
         (artifacts / "invocation.json").write_text(json.dumps({**invocation, **launch}))
-        # Cache admission still binds the Codex delivery receipt until Claude launches are
-        # wired; shape it for this model so the second run reaches the reuse boundary.
+        # Cache admission binds the Codex delivery receipt, which a real Claude attempt never
+        # has; shape it for this model so the second run reaches the reuse boundary.
         treatment = execution["native_treatment"]
         assert isinstance(treatment, dict)
         treatment["effective_config"] = treatment["effective_config"].replace(
@@ -836,7 +836,7 @@ def test_saved_claude_usage_is_revalidated_on_report_and_cache_reuse(
         return execution
 
     monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
-    # Claude coding launches are admitted in a later change; this test needs only saved runs.
+    # The treatment is shaped as Codex packages; this test needs only saved runs.
     monkeypatch.setattr(study, "admit", lambda treatment, harness: native_treatments.admit(
         treatment, "codex"
     ))
@@ -866,3 +866,55 @@ def test_saved_claude_usage_is_revalidated_on_report_and_cache_reuse(
         else:
             assert work["tokens"] is None and validation["status"] == "unavailable"
             assert "a subagent transcript has no matching Agent tool call" in validation["reasons"]
+
+
+def test_a_claude_attempt_reports_its_pinned_launch_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pluginbench import claude, claude_launch, claude_treatments
+
+    fixture = Path(__file__).parent / "fixtures/claude-2.1.322/coding/plain"
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: runtime_identity())
+    monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
+    monkeypatch.setattr(
+        harbor_backend, "regrade_native",
+        lambda **kwargs: {"verifier_result": {"rewards": {"reward": 1}}, "exception_info": None},
+    )
+    # What invoke_native records for a Claude launch; test_claude_launch.py proves it does.
+    launch = {
+        "harness": "claude-cli", "requested_model": "claude-opus-5-5", "requested_effort": "medium",
+        "harness_version": CLAUDE_RUNNER["harness_version"],
+        "delivery": claude_treatments.DELIVERY_POLICY,
+        "capabilities": claude_launch.capabilities(True),
+        "argv": claude.coding_launch(claude.CodingRun("claude-opus-5-5", "medium", True, 1800))[0],
+    }
+
+    def invoke(**kwargs: Any) -> dict[str, Any]:
+        area = kwargs["area"]
+        (area / "workspace/answer.py").write_text("answer = 1\n")
+        execution = native_execution(
+            area, kwargs["protocol"]["native_task_identity"],
+            answer_path="answer.py", timeout=1800, version=CLAUDE_RUNNER["harness_version"],
+        )
+        (area / "artifacts/stdout.jsonl").write_text((fixture / "stream.jsonl").read_text())
+        execution.update(
+            claude.parse_events((fixture / "stream.jsonl").read_text(), [], coding=True),
+            launch=launch,
+        )
+        return execution
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
+    monkeypatch.setattr(study, "admit", lambda treatment, harness: native_treatments.admit(
+        treatment, "codex"
+    ))
+    root = study.run_study(_study(tmp_path / "one", runner=CLAUDE_RUNNER), tmp_path / "run")
+    study.report_study(root)
+    report = json.loads((root / "report/assessment-report.json").read_text())
+    for row in report["attempts"]:
+        provenance = row["provenance"]
+        assert provenance["guidance_delivery"] == "claude-native-v1"
+        assert provenance["comparison_reasoning_effort"] == "medium"
+        assert provenance["launch_harness_version"] == "2.1.322"
+        assert provenance["capabilities"] == {
+            "subagents": True, "max_threads": "not_enforced", "max_depth": "not_enforced",
+        }

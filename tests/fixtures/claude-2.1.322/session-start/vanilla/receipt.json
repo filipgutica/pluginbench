@@ -1,0 +1,142 @@
+{
+ "account": {
+  "apiProvider": "firstParty",
+  "subscriptionType": "Claude API"
+ },
+ "auto_memory": {
+  "enabled": false,
+  "status": "off",
+  "toggleable": true
+ },
+ "builtins": {
+  "agents": [
+   "Explore",
+   "Plan",
+   "claude",
+   "general-purpose",
+   "statusline-setup"
+  ],
+  "commands": [
+   "__remote-workflow",
+   "agents",
+   "auto-mode-setup",
+   "autocompact",
+   "batch",
+   "claude-api",
+   "clear",
+   "code-review",
+   "color",
+   "compact",
+   "config",
+   "context",
+   "dataviz",
+   "debug",
+   "deep-research",
+   "doctor",
+   "effort",
+   "fast",
+   "fewer-permission-prompts",
+   "focus",
+   "goal",
+   "init",
+   "insights",
+   "list-agents",
+   "loop",
+   "mcp",
+   "model",
+   "output-style",
+   "plugin-authoring",
+   "recap",
+   "reload-plugins",
+   "reload-skills",
+   "rename",
+   "run",
+   "run-skill-generator",
+   "security-review",
+   "simplify",
+   "team-onboarding",
+   "update-config",
+   "usage",
+   "verify",
+   "workflow-authoring",
+   "workflow-launch-exec"
+  ]
+ },
+ "cli_version": "2.1.322",
+ "commands": [],
+ "delivery": "claude-native-v1",
+ "discovery": {
+  "argv": [
+   "claude",
+   "--verbose",
+   "--output-format=stream-json",
+   "--settings",
+   "{\"disableAllHooks\":true}",
+   "--model",
+   "claude-opus-5-5",
+   "--effort",
+   "high",
+   "--permission-mode=bypassPermissions",
+   "--setting-sources",
+   "user",
+   "--strict-mcp-config",
+   "--mcp-config",
+   "{\"mcpServers\":{}}",
+   "--include-hook-events",
+   "--no-chrome",
+   "--disallowed-tools",
+   "RemoteTrigger,CronCreate,ScheduleWakeup,SendMessage,Workflow",
+   "--input-format",
+   "stream-json",
+   "--no-session-persistence",
+   "--print"
+  ],
+  "exit_code": 0,
+  "requests": [
+   "initialize",
+   "get_context_usage",
+   "get_hooks_listing",
+   "get_settings",
+   "get_memory_dialog",
+   "get_skills_dialog",
+   "get_session_cost"
+  ],
+  "signal": null
+ },
+ "guidance": {
+  "bytes": 0,
+  "memory_files_tokens": 0,
+  "path": null,
+  "scope": "Claude user instructions",
+  "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+ },
+ "hook_execution": "suppressed in discovery by disableAllHooks; the coding stream must show it",
+ "hooks": {
+  "hooks": [],
+  "policy": {
+   "allDisabled": true,
+   "disabledByPolicy": false,
+   "managedOnly": false,
+   "pluginOnly": false,
+   "policyHookCount": 0
+  }
+ },
+ "inventory": {
+  "guidance": [],
+  "plugins": [],
+  "skills": []
+ },
+ "marketplace": {
+  "add": null,
+  "path": "/tmp/pluginbench-treatments/marketplace"
+ },
+ "plugin_installs": [],
+ "plugins": [],
+ "session_cost": "Total cost:            $0.0000\nTotal duration (API):  0s\nTotal duration (wall): 19s\nTotal code changes:    0 lines added, 0 lines removed\nUsage:                 0 input, 0 output, 0 cache read, 0 cache write",
+ "settings": {
+  "disableAllHooks": true
+ },
+ "skill_activation": "not observed by discovery; native availability is verified",
+ "skills": [],
+ "status": "verified"
+}

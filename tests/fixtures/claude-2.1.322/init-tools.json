@@ -1,0 +1,41 @@
+{
+ "offline": [
+  "Bash",
+  "CronDelete",
+  "CronList",
+  "Edit",
+  "EnterWorktree",
+  "ExitWorktree",
+  "ListAgents",
+  "Monitor",
+  "NotebookEdit",
+  "Read",
+  "ReportFindings",
+  "Skill",
+  "Task",
+  "TaskStop",
+  "ToolSearch",
+  "WebSearch",
+  "Write"
+ ],
+ "signed_in": [
+  "Bash",
+  "CronDelete",
+  "CronList",
+  "Edit",
+  "EnterWorktree",
+  "ExitWorktree",
+  "ListAgents",
+  "Monitor",
+  "NotebookEdit",
+  "Read",
+  "ReportFindings",
+  "Skill",
+  "Task",
+  "TaskStop",
+  "ToolSearch",
+  "WebFetch",
+  "WebSearch",
+  "Write"
+ ]
+}
