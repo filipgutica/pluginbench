@@ -23,10 +23,10 @@ _MODEL_USAGE = ("inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens
 _MESSAGE_USAGE = (
     "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens",
 )
-# Derived from the 2.1.322 probe's one manual `/compact` (the `compaction` fixture): the untranscribed compaction call read
-# the boundary's `preTokens` (15,343, the context before compaction) plus a 1,995-token
-# compaction prompt, and wrote the summary (421 tokens), which is part of the context the
-# boundary's `postTokens` (4,799) counts. Each compaction may therefore add at most
+# Derived from the 2.1.322 probe's one manual `/compact` (the `compaction` fixture): the
+# untranscribed compaction call read the boundary's `preTokens` (15,343, the context before
+# compaction) plus a 1,995-token compaction prompt, and wrote the summary (421 tokens), which
+# is part of the context the boundary's `postTokens` (4,799) counts. Each compaction may therefore add at most
 # `preTokens` plus this prompt allowance (about twice the observed prompt) of input and
 # `postTokens` of output. The prompt is fixed text, so the allowance is a constant rather
 # than a multiple of the context. Recalibrate when qualifying another version.
