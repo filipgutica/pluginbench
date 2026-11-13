@@ -10,7 +10,7 @@ from typing import IO, Any, Literal, TypedDict, Unpack
 import pytest
 
 import pluginbench.claude as claude
-from pluginbench import codex
+from pluginbench import codex, evaluation
 
 
 class NativeProcessArguments(TypedDict):
@@ -161,11 +161,10 @@ def test_selected_auth_file_ignores_inherited_auth_guidance_and_model_settings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "unselected-key")
+    # A refused variable, such as ANTHROPIC_API_KEY, stops the launch instead of being ignored.
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "unselected-oauth")
     monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", "max")
     monkeypatch.setenv("CLAUDE_CODE_PLUGIN_DIRS", "/host/plugins")
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://host.invalid")
     monkeypatch.setenv("ANTHROPIC_MODEL", "unselected-model")
     auth = tmp_path / "selected.json"
     auth.write_text(json.dumps({"CLAUDE_CODE_OAUTH_TOKEN": "selected-oauth"}))
@@ -175,13 +174,7 @@ def test_selected_auth_file_ignores_inherited_auth_guidance_and_model_settings(
     assert secrets == ("selected-oauth",)
     assert not any(
         key in env
-        for key in (
-            "ANTHROPIC_API_KEY",
-            "CLAUDE_CODE_EFFORT_LEVEL",
-            "CLAUDE_CODE_PLUGIN_DIRS",
-            "ANTHROPIC_BASE_URL",
-            "ANTHROPIC_MODEL",
-        )
+        for key in ("CLAUDE_CODE_EFFORT_LEVEL", "CLAUDE_CODE_PLUGIN_DIRS", "ANTHROPIC_MODEL")
     )
     assert Path(env["HOME"]).is_relative_to(private)
     assert Path(env["CLAUDE_CONFIG_DIR"]).is_relative_to(private)
@@ -195,6 +188,7 @@ def test_selected_auth_file_ignores_inherited_auth_guidance_and_model_settings(
     [
         {},
         {"CLAUDE_CODE_OAUTH_TOKEN": " "},
+        {"ANTHROPIC_API_KEY": "key"},
         {"ANTHROPIC_API_KEY": False},
         {"ANTHROPIC_API_KEY": "key", "CLAUDE_CODE_OAUTH_TOKEN": "token"},
         {"token": "unsupported"},
@@ -211,6 +205,45 @@ def test_auth_input_does_not_accept_settings_or_ambiguous_credentials(
     with pytest.raises(ValueError):
         claude.runtime_environment(tmp_path / "private", auth_file=selected)
     assert not (tmp_path / "private").exists()
+
+
+# Each refused case fails on 0.7.1: an API key alone was accepted, and a provider variable
+# beside the token was ignored.
+REFUSED_OPERATOR_ENVS = [
+    pytest.param({"ANTHROPIC_API_KEY": "sk-ant-unwanted"}, "ANTHROPIC_API_KEY", id="api-key"),
+    pytest.param(
+        {"CLAUDE_CODE_OAUTH_TOKEN": "token", "CLAUDE_CODE_USE_BEDROCK": "1"},
+        "CLAUDE_CODE_USE_BEDROCK",
+        id="provider",
+    ),
+]
+
+
+@pytest.mark.parametrize(("operator_env", "refused"), REFUSED_OPERATOR_ENVS)
+def test_claude_review_preflight_refuses_an_api_key_or_provider_before_any_model_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operator_env: dict[str, str], refused: str
+) -> None:
+    # The run's review phase and `pluginbench review` pass this check before any review call.
+    for name in (claude.TOKEN_ENV, *claude.REFUSED_ENV):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in operator_env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(claude, "preflight", lambda: {"harness_version": "fixture-version"})
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda *args, **kwargs: pytest.fail("model call started")
+    )
+    with pytest.raises(ValueError, match=f"CLAUDE_CODE_OAUTH_TOKEN only; unset {refused}$"):
+        evaluation._review_preflight({"reviewer": {"harness": "claude"}})
+
+
+def test_claude_review_preflight_accepts_the_subscription_token_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in claude.REFUSED_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(claude.TOKEN_ENV, "token")
+    monkeypatch.setattr(claude, "preflight", lambda: {"harness_version": "fixture-version"})
+    evaluation._review_preflight({"reviewer": {"harness": "claude"}})
 
 
 def test_oauth_environment_needs_no_keychain_reads(
@@ -233,8 +266,7 @@ def test_existing_keychain_auth_copies_only_access_token(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    for name in claude.AUTH_NAMES:
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv(claude.TOKEN_ENV, raising=False)
     calls = []
 
     def keychain(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -453,8 +485,7 @@ def test_keychain_unavailable_does_not_create_private_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    for name in claude.AUTH_NAMES:
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv(claude.TOKEN_ENV, raising=False)
 
     def missing(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         raise FileNotFoundError("security unavailable")
@@ -462,8 +493,8 @@ def test_keychain_unavailable_does_not_create_private_runtime(
     monkeypatch.setattr(subprocess, "run", missing)
     with pytest.raises(ValueError) as refused:
         claude.runtime_environment(tmp_path / "private")
-    # The message names both variables and the case that hides them: a service's environment.
-    assert all(name in str(refused.value) for name in claude.AUTH_NAMES)
+    # The message names the variable and the case that hides it: a service's environment.
+    assert claude.TOKEN_ENV in str(refused.value)
     assert "systemd unit" in str(refused.value)
     assert not (tmp_path / "private").exists()
 
