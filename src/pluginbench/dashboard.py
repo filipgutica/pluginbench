@@ -22,6 +22,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
+from pluginbench.attempt_rows import attempt_rows
 from pluginbench.run_status import run_status
 
 # Files a run rewrites as it moves; a change in any of them means its status may have changed.
@@ -109,12 +110,20 @@ def _fingerprint(root: Path) -> Fingerprint:
     return tuple(rows)
 
 
-def _runner(root: Path) -> dict[str, Any]:
+def _selection(root: Path) -> dict[str, Any]:
     selection = json.loads((root / "evaluation.json").read_text())
-    runner = selection.get("runner") if isinstance(selection, dict) else None
-    return {
-        key: (runner or {}).get(key) for key in ("harness", "model", "reasoning", "cli_version")
-    }
+    return selection if isinstance(selection, dict) else {}
+
+
+def _runner(root: Path) -> dict[str, Any]:
+    runner = _selection(root).get("runner") or {}
+    return {key: runner.get(key) for key in ("harness", "model", "reasoning", "cli_version")}
+
+
+def _stamp(root: Path) -> tuple[tuple[int, int], ...]:
+    """The report and settings as they stand: attempt rows change only when these do."""
+    stats = ((root / name).stat() for name in ("report/results.json", "evaluation.json"))
+    return tuple((stat.st_size, stat.st_mtime_ns) for stat in stats)
 
 
 @dataclass
@@ -145,6 +154,8 @@ class Runs:
         self._walking = threading.Lock()
         self._snapshots: dict[str, _Snapshot] = {}
         self._reading: dict[str, threading.Lock] = {}
+        self._rows_lock = threading.Lock()
+        self._rows: dict[str, tuple[tuple[tuple[int, int], ...], list[dict[str, Any]]]] = {}
 
     def paths(self) -> dict[str, Path]:
         with self._lock:
@@ -211,6 +222,40 @@ class Runs:
                 continue  # Removed between the walk and the read.
             rows.append(_summary(key, root, snapshot))
         return rows
+
+    def attempts(self) -> dict[str, Any]:
+        """Attempt rows of every run that has a report, and why any report could not be read."""
+        rows: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        with self._rows_lock:
+            for key, root in self.paths().items():
+                if not _regular_file(root / "report/results.json"):
+                    continue  # No report yet: its attempts appear once `report` writes one.
+                cached = self._rows.get(key)
+                try:
+                    stamp = _stamp(root)
+                    if cached is None or cached[0] != stamp:
+                        selection = _selection(root)
+                        report = json.loads((root / "report/results.json").read_text())
+                        named = [
+                            {"run_key": key, "run_name": selection.get("name"), **row}
+                            for row in attempt_rows(report, _runner(root))
+                        ]
+                        cached = self._rows[key] = (stamp, named)
+                except _READ_ERRORS as exc:
+                    # A report caught mid-write: keep the rows read before, and say so.
+                    name = cached[1][0]["run_name"] if cached and cached[1] else None
+                    errors.append(
+                        {
+                            "key": key,
+                            "run": name or str(root),
+                            "kept": cached is not None,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                if cached is not None:
+                    rows.extend(cached[1])
+        return {"attempts": rows, "errors": errors}
 
     def containers(self, key: str) -> dict[str, Any] | None:
         """Containers a run left running, from Docker; only when the page asks."""
@@ -317,6 +362,8 @@ def _handler(runs: Runs) -> type[BaseHTTPRequestHandler]:
                 )
             elif len(parts) == 2 and parts[0] == "static" and parts[1] in _STATIC:
                 self._send(HTTPStatus.OK, static.joinpath(parts[1]).read_bytes(), _STATIC[parts[1]])
+            elif parts == ["api", "attempts"]:
+                self._json(runs.attempts())
             elif parts == ["api", "runs"]:
                 self._json({"roots": [str(root) for root in runs.roots], "runs": runs.summaries()})
             elif len(parts) == 3 and parts[:2] == ["api", "runs"]:

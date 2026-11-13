@@ -107,8 +107,12 @@ async function getJSON(url) {
 }
 
 function setMain(...children) {
+  // A poll redraws the view; keep focus on the control the reader was using.
+  const focused = document.activeElement && document.activeElement.id;
   // replaceChildren would show a skipped (null) section as the text "null".
   document.getElementById("main").replaceChildren(...children.filter(Boolean));
+  const again = focused && document.getElementById(focused);
+  if (again && again !== document.getElementById("main")) again.focus({ preventScroll: true });
 }
 
 function markUpdated(active) {
@@ -201,7 +205,6 @@ function renderRuns(data) {
   select.addEventListener("change", () => {
     phaseFilter = select.value;
     renderRuns(latestRuns || data);
-    document.getElementById("phase-filter").focus();
   });
 
   const head = h(
@@ -568,6 +571,147 @@ async function loadRun(token, key) {
   schedule((next) => loadRun(next, key), active ? RUN_INTERVAL : LIST_INTERVAL, token);
 }
 
+
+// Results --------------------------------------------------------------------
+
+const RESULT_FILTERS = [
+  ["arm", "Arm", (row) => row.arm],
+  ["harness", "Harness", (row) => row.runner.harness],
+  ["cli", "Harness CLI version", (row) => row.runner.cli_version],
+  ["model", "Model", (row) => row.runner.model],
+  ["requested", "Requested effort", (row) => row.runner.reasoning],
+  ["effective", "Effective effort", (row) => row.reasoning_effort],
+  ["task", "Task", (row) => row.task],
+];
+const resultFilters = {};
+
+function seconds(value) {
+  if (typeof value !== "number") return "—";
+  return value < 120 ? `${Math.round(value)} s` : `${(value / 60).toFixed(1)} min`;
+}
+
+function lines(value) {
+  return typeof value === "number" ? String(value) : "—";
+}
+
+function resultRow(row) {
+  const correctness = OUTCOMES[row.correctness] || [row.correctness || "Unknown", ""];
+  const cells = [
+    ["Run", h("a", { href: `#/run/${row.run_key}` }, row.run_name || "Unnamed run")],
+    ["Harness", row.runner.harness || "—"],
+    ["Model", row.runner.model || "—"],
+    ["Effort", `${row.runner.reasoning || "—"}, effective ${row.reasoning_effort || "unknown"}`],
+    ["Task", row.task],
+    ["Repeat", row.repeat],
+    ["Arm", row.reused_vanilla ? `${row.arm} (reused)` : row.arm],
+    ["Correctness", badge(correctness)],
+    ["Input tokens", count(row.tokens.input)],
+    ["Output tokens", count(row.tokens.output)],
+    ["Coding time", seconds(row.coding_seconds)],
+    ["Source lines added", lines(row.lines.source_added)],
+    ["Test lines added", lines(row.lines.test_added)],
+  ];
+  return h(
+    "tr",
+    null,
+    cells.map(([label, value], index) =>
+      h("td", { "data-label": label, class: index >= 8 ? "num" : null }, value),
+    ),
+  );
+}
+
+function renderResults(data) {
+  const rows = data.attempts;
+  const head = h("div", { class: "page-head" }, h("h1", null, "Results"));
+  const errors = data.errors.length
+    ? h(
+        "div",
+        { class: "alert warning", role: "status" },
+        data.errors.map((error) =>
+          h(
+            "p",
+            null,
+            error.kept
+              ? `The report of ${error.run} could not be read again, so its earlier rows are shown: ${error.error}`
+              : `The report of ${error.run} could not be read yet, so it has no rows: ${error.error}`,
+          ),
+        ),
+      )
+    : null;
+  if (!rows.length) {
+    setMain(head, errors, h("p", null, "No run has a report yet. A run writes report/results.json when it finishes."));
+    return;
+  }
+  const controls = RESULT_FILTERS.map(([id, label, value]) => {
+    const options = [...new Set(rows.map(value).map((item) => item ?? "unknown"))].sort();
+    if (resultFilters[id] && !options.includes(resultFilters[id])) resultFilters[id] = "";
+    const select = h(
+      "select",
+      { class: "select", id: `filter-${id}` },
+      h("option", { value: "" }, `All (${options.length})`),
+      options.map((option) => h("option", { value: option, selected: option === resultFilters[id] }, option)),
+    );
+    select.addEventListener("change", () => {
+      resultFilters[id] = select.value;
+      renderResults(data);
+    });
+    return h("label", { class: "field" }, h("span", { class: "field-label" }, label), select);
+  });
+  const order = (row) => [row.run_name || "", row.run_key, row.task || "", row.arm || "", String(row.repeat).padStart(4, "0")].join("\u0000");
+  const shown = [...rows].sort((a, b) => order(a).localeCompare(order(b))).filter((row) =>
+    RESULT_FILTERS.every(([id, , value]) => !resultFilters[id] || (value(row) ?? "unknown") === resultFilters[id]),
+  );
+  const cells = new Set(shown.map((row) => JSON.stringify([row.runner.harness, row.runner.model, row.runner.reasoning])));
+  setMain(
+    head,
+    errors,
+    h("p", { class: "muted roots" }, "One row per attempt, copied from each run's report. Unknown values stay blank, never zero."),
+    h("div", { class: "toolbar" }, controls),
+    cells.size > 1
+      ? h("div", { class: "alert" }, h("p", null, `These rows span ${cells.size} harness, model and effort combinations. Compare arms within one combination.`))
+      : null,
+    h(
+      "div",
+      { class: "table-wrap" },
+      h(
+        "table",
+        { class: "stack results" },
+        h("caption", null, `${shown.length} of ${rows.length} attempts, by run, task, arm and repeat.`),
+        h(
+          "thead",
+          null,
+          h(
+            "tr",
+            null,
+            ["Run", "Harness", "Model", "Effort", "Task", "Repeat", "Arm", "Correctness", "Input tokens", "Output tokens", "Coding time", "Source lines added", "Test lines added"].map(
+              (label, index) => h("th", { scope: "col", class: index >= 8 ? "num" : null }, label),
+            ),
+          ),
+        ),
+        h("tbody", null, shown.map(resultRow)),
+      ),
+    ),
+  );
+}
+
+async function loadResults(token) {
+  try {
+    const data = await getJSON("/api/attempts");
+    if (token !== generation) return;
+    const signature = JSON.stringify(data);
+    if (signature !== loadResults.last) {
+      loadResults.last = signature;
+      renderResults(data);
+    }
+    markUpdated(false);
+  } catch (error) {
+    if (token !== generation) return;
+    loadResults.last = null;
+    setMain(failure(error, true));
+  }
+  schedule(loadResults, LIST_INTERVAL, token);
+}
+
 // Routing --------------------------------------------------------------------
 
 function route() {
@@ -576,14 +720,17 @@ function route() {
   // A new view always draws once, even when its data has not changed since it was last shown.
   loadRun.last = null;
   loadRuns.last = null;
+  loadResults.last = null;
   const token = generation;
   const match = location.hash.match(/^#\/run\/([0-9a-f]{16})$/);
+  const view = match ? "run" : location.hash === "#/results" ? "results" : "runs";
   for (const link of document.querySelectorAll(".nav-link")) {
-    link.toggleAttribute("aria-current", !match && link.dataset.view === "runs");
-    if (link.hasAttribute("aria-current")) link.setAttribute("aria-current", "page");
+    if (link.dataset.view === view) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
   }
-  document.title = match ? "Run · PluginBench" : "Runs · PluginBench";
-  if (match) loadRun(token, match[1]);
+  document.title = { run: "Run", results: "Results", runs: "Runs" }[view] + " · PluginBench";
+  if (view === "run") loadRun(token, match[1]);
+  else if (view === "results") loadResults(token);
   else loadRuns(token);
 }
 
