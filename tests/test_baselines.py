@@ -1145,6 +1145,15 @@ def test_claude_evidence_that_differs_from_its_identity_cannot_seed_the_cache(
     ] * 2
 
 
+def test_the_claude_vanilla_identity_binds_subagents_to_the_runner_model() -> None:
+    # A vanilla attempt coded before subagents were forced onto the runner model never hits.
+    run = claude.CodingRun(CLAUDE_RUNNER["model"], "medium", True, 1800)
+    env = baselines.claude_identity(run, CLAUDE_RUNNER["harness_version"])["coding_env"]
+    assert isinstance(env, dict)
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == CLAUDE_RUNNER["model"]
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] == "1"
+
+
 def test_a_claude_cli_version_without_pinned_built_ins_and_tools_is_never_cached(
     tmp_path: Path,
 ) -> None:

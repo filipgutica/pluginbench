@@ -199,6 +199,11 @@ def coding_launch(run: CodingRun) -> tuple[list[str], dict[str, str]]:
         # It also removes Bash's run_in_background, in every arm alike.
         "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
         "CLAUDE_CODE_SUBAGENT_MODEL": run.model,
+        # Every subagent runs on the runner model, so a cohort is one model. CLI 2.1.322 then
+        # drops an Agent call's `model` (and removes it from the Agent schema) and an agent's
+        # `model:` frontmatter, so CLAUDE_CODE_SUBAGENT_MODEL above decides. Without it, a
+        # per-call or frontmatter model outranks that variable.
+        "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1",
         "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": str(run.timeout_seconds * 1000),
     }
     return argv, env
