@@ -130,6 +130,13 @@ def _skill_name(root: Path, harness: str | None = None) -> str:
     if harness == "claude" and set(metadata) - _CLAUDE_SKILL_KEYS:
         unsupported = sorted(set(metadata) - _CLAUDE_SKILL_KEYS)
         raise ValueError(f"unsupported Claude skill frontmatter {unsupported}: {skill}")
+    # The CLI also reads some non-boolean values as flags; admission does not guess how.
+    for key in ("disable-model-invocation", "user-invocable"):
+        value = metadata.get(key, False)
+        if harness == "claude" and not isinstance(value, bool):
+            raise ValueError(
+                f"Claude skill {name} {key} must be a YAML boolean, not {value!r}: {skill}"
+            )
     agent_file = root / "agents/openai.yaml"
     if agent_file.exists():
         try:
