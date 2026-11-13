@@ -146,7 +146,7 @@ Coding authenticates only with the operator's Claude subscription token:
 - `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, Bedrock, Vertex, and Foundry routing, `DISABLE_PROMPT_CACHING`, and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` are refused in the operator environment, before any container starts, and in every container command.
 - The token reaches the container only as a credentials file in the CLI's private configuration, never in a command's environment. The file is removed before Harbor collects artifacts.
 - After the run, the saved artifacts and the exported workspace are scanned for the token. A match fails the attempt.
-- This applies to coding only. Independent reviews and judges accept `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`.
+- Independent reviews, both the run's review phase and `pluginbench review`, and `pluginbench judge run --judge claude:MODEL:EFFORT` take only the subscription token too: `CLAUDE_CODE_OAUTH_TOKEN`, or the macOS Keychain login when it is unset. They refuse the same operator-environment variables before any model call; a judge run refuses once, before it reserves any call.
 
 PluginBench runs Harbor 0.24.0's `ClaudeCode` agent and refuses to launch when the hash of its `run` source changes. It allows only Harbor's setup, the version check, and one coding command, which it replaces with the pinned launch:
 
