@@ -582,6 +582,16 @@ def test_go_malformed_populations_rejected(
         go_report(tmp_path, source, GO_REPORT.replace(old, new))
 
 
+def test_go_empty_case_block_has_no_width_and_no_statements(tmp_path: Path, source: Path) -> None:
+    # go1.25 writes `file:226.18,226.18 0 1` for an empty `case` clause.
+    report = go_report(tmp_path, source, GO_REPORT + "example.test/value/value.go:4.5,4.5 0 1\n")
+    statements = report["statements"]
+    assert isinstance(statements, dict)
+    assert statements["weights"]["value.go:4.5,4.5"] == 0
+    with pytest.raises(ValueError, match="escapes source span"):
+        go_report(tmp_path, source, GO_REPORT + "example.test/value/value.go:4.5,4.5 1 1\n")
+
+
 def test_go_duplicate_blocks_are_rejected(tmp_path: Path, source: Path) -> None:
     with pytest.raises(ValueError, match="Duplicate"):
         go_report(tmp_path, source, GO_REPORT + GO_REPORT.splitlines()[1] + "\n")

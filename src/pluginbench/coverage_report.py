@@ -667,7 +667,9 @@ def parse_go_coverage(
         if not (
             1 <= start_col <= len(lines[start - 1].encode()) + 1
             and 1 <= end_col <= len(lines[end - 1].encode()) + 1
-            and (start, start_col) < (end, end_col)
+            # Only a block without statements, such as an empty `case`, may have no width.
+            and (start, start_col) <= (end, end_col)
+            and ((start, start_col) != (end, end_col) or statements == 0)
         ):
             raise ValueError(f"Go block escapes source span: {row}")
         if rows[0] == "mode: set" and hits not in {0, 1}:
