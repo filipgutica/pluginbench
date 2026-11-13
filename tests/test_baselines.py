@@ -302,7 +302,10 @@ def test_changed_native_coding_identity_misses(tmp_path: Path, field: str) -> No
         "native-execution-receipt",
         "native-nonempty-inventory",
         "native-effective-config",
+        "native-spawn-overrides-shown",
         "native-prompt",
+        "descendant-model",
+        "descendant-effort",
     ],
 )
 def test_incomplete_or_mismatched_native_delivery_cannot_seed_cache(
@@ -338,6 +341,11 @@ def test_incomplete_or_mismatched_native_delivery_cannot_seed_cache(
         elif fault == "native-effective-config":
             treatment["effective_config"] = treatment["effective_config"].replace(
                 "multi_agent = true", "multi_agent = false"
+            )
+        elif fault == "native-spawn-overrides-shown":
+            # Launched before V2's spawn model fields were hidden: another tool schema.
+            treatment["effective_config"] = treatment["effective_config"].replace(
+                "[features.multi_agent_v2]\nexpose_spawn_agent_model_overrides = false\n", ""
             )
         else:
             (artifacts / "prompt.txt").write_text("Treatment injected into prompt")
@@ -396,6 +404,15 @@ def test_incomplete_or_mismatched_native_delivery_cannot_seed_cache(
                 }[fault]
             ] = "wrong"
         file.write_text(json.dumps(invocation))
+    elif fault in {"descendant-model", "descendant-effort"}:
+        # A child the runner could not lock ran on another model or effort.
+        file = target / "execution.json"
+        execution = json.loads(file.read_text())
+        if fault == "descendant-model":
+            execution["actual_descendant_models"] = ["another-model"]
+        else:
+            execution["actual_descendant_efforts"] = ["low"]
+        file.write_text(json.dumps(execution))
     elif fault == "private":
         file = target / "execution.json"
         execution = json.loads(file.read_text())

@@ -384,6 +384,48 @@ def test_native_failure_is_retained_even_if_workspace_checks_pass(
 
 
 @pytest.mark.parametrize(
+    "descendant",
+    [{"actual_descendant_models": ["another-model"]}, {"actual_descendant_efforts": ["low"]}],
+    ids=["model", "effort"],
+)
+def test_a_descendant_on_another_model_or_effort_loses_the_runner_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    descendant: dict[str, list[str]],
+) -> None:
+    # Codex cannot lock a subagent's model or effort; such an attempt has no single model.
+    recipe = study.load_study(_recipe(tmp_path))
+    calls = _fake_runtime(monkeypatch)
+    invoke = harbor_backend.invoke_native
+
+    def mixed(**kwargs: Any) -> dict[str, Any]:
+        execution = invoke(**kwargs)
+        if len(calls) == 1:
+            execution.update(descendant)
+        return execution
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", mixed)
+    root = study.run_study(recipe, tmp_path / "results")
+    report = json.loads((root / "report/assessment-report.json").read_text())
+    models = [attempt["model"] for attempt in report["attempts"]]
+    assert models.count(None) == 1
+    assert set(models) == {None, "gpt-6.1-sol"}
+    # An older build saved the root's model; a regenerated report still drops it.
+    run = json.loads((root / "run.json").read_text())
+    manifest_path = root / run["assessment_input"]["path"]
+    manifest = json.loads(manifest_path.read_text())
+    next(record for record in manifest["records"] if record["model"] is None)["model"] = (
+        "gpt-6.1-sol"
+    )
+    manifest_path.write_text(json.dumps(manifest))
+    run["assessment_input"] = study._reference(root, manifest_path)
+    (root / "run.json").write_text(json.dumps(run))
+    study.report_study(root)
+    report = json.loads((root / "report/assessment-report.json").read_text())
+    assert [attempt["model"] for attempt in report["attempts"]] == models
+
+
+@pytest.mark.parametrize(
     "filename", ["AGENTS.md", "AGENTS.override.md", ".claude/settings.json", ".git/config"]
 )
 def test_fixture_contamination_is_rejected(tmp_path: Path, filename: str) -> None:

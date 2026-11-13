@@ -25,8 +25,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # Measurement and regrade skip launch-only runtime fields; coding checks are unchanged.
             "harbor_backend.py": "a0279b9c8733f5097fe8160bfac1f7e125a2f82703ede84d8b5c68b6d69b34de",
             "processes.py": "0170e0a4902fc610d19b50ed5656c601474adad97b9b8d6fb5b08c6ab6ad00d1",
-            # Claude admission dispatch only; Codex admission is unchanged.
-            "native_treatments.py": "cfe17310a7f43de42af556e98fe63380493aeaf6a419ad612d51e01d671f0f19",
+            # Claude admission dispatch, and the Codex config's V2 spawn-override hide. The
+            # vanilla cache refuses a cohort saved without the hide by its config, so this stays v1.
+            "native_treatments.py": "3c9a617c292e0fbc93bc07b46e012ab79bd5589efc6a3e9267e4652c71ba89b3",
             # Admits a hook whose command Codex registers with its plugin-root placeholders
             # expanded. Such hooks were always refused, so every admitted launch stays v1.
             "native_treatment_runtime.js": (

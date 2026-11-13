@@ -154,7 +154,11 @@ def test_common_capability_limits_survive_real_harbor_option_parsing(
     assert configurations[0] == configurations[1]
     assert configurations[0]["agents"]["max_threads"] == 3
     assert configurations[0]["agents"]["enabled"] is subagents
-    assert "multi_agent_v2" not in configurations[0]["features"]
+    # Hides V2's spawn model and effort fields, a hide and not a lock; with no `enabled` key
+    # the table does not switch V2 on.
+    assert configurations[0]["features"]["multi_agent_v2"] == {
+        "expose_spawn_agent_model_overrides": False
+    }
     assert configurations[0]["features"]["remote_plugin"] is False
     assert configurations[0]["features"]["apps"] is False
 

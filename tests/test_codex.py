@@ -587,6 +587,7 @@ def test_native_descendant_usage_counts_session_totals_once_and_keeps_primary_id
     assert parsed["actual_primary_models"] == ["primary"]
     assert parsed["actual_descendant_models"] == ["child-model"]
     assert parsed["runtime_effort_evidence"] == ["high"]
+    assert parsed["actual_descendant_efforts"] == ["low"]
     assert parsed["usage_accounting"]["status"] == "complete"
     assert len(parsed["usage_accounting"]["sessions"]) == 2
     assert parsed["successful_native_completion"]

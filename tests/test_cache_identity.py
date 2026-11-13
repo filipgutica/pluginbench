@@ -11,7 +11,13 @@ from typing import Any
 import pytest
 import yaml
 
-from legacy_support import LEGACY, copy_legacy, current_runtime, legacy_json
+from legacy_support import (
+    LEGACY,
+    copy_legacy,
+    current_runtime,
+    hide_spawn_model_overrides,
+    legacy_json,
+)
 from native_support import synthetic_contract
 from pluginbench import baselines, evaluation, harbor_backend, study, submissions
 from pluginbench.assessment_metrics import inspect_snapshot
@@ -232,11 +238,13 @@ class _Vanilla:
     """A copy of the 942f12c vanilla cohort, and the identity this build gives the same run.
 
     After the upgrade the run's tasks carry the current runtime, as a reused prepared entry
-    gives them, and Docker reports 28 KiB less memory than when the cohort was cached.
+    gives them, and Docker reports 28 KiB less memory than when the cohort was cached. The
+    cohort carries this build's Codex config, which 942f12c did not launch with.
     """
 
     def __init__(self, tmp_path: Path) -> None:
         self.cache = copy_legacy("vanilla", tmp_path / "cache")
+        hide_spawn_model_overrides(self.cache)
         self.config = copy_legacy("vanilla-task", tmp_path / "config")
         self.root = tmp_path / "run"
         self.saved = legacy_json("vanilla-identity.json")
@@ -276,7 +284,7 @@ class _Vanilla:
         return cache.reserve()
 
 
-def test_a_942f12c_vanilla_cohort_is_admitted_and_imported_after_the_upgrade(
+def test_a_942f12c_vanilla_cohort_with_the_current_launch_config_is_admitted_and_imported(
     tmp_path: Path,
 ) -> None:
     vanilla = _Vanilla(tmp_path)
@@ -311,6 +319,10 @@ def _changed(vanilla: _Vanilla, change: str) -> None:
         vanilla.identity["isolation"]["resources"]["memory_mb"] = 4096
     elif change == "jobs":
         vanilla.identity["jobs"] = 3
+    elif change == "spawn-overrides-shown":
+        # The cohort as 942f12c saved it: its runs offered spawn model fields, so it is refused.
+        shutil.rmtree(vanilla.cache)
+        copy_legacy("vanilla", vanilla.cache)
     elif change in {"unknown-launcher-hash", "partial-launcher-hashes"}:
         for manifest in vanilla.cache.glob("*/*/manifest.json"):
             saved = json.loads(manifest.read_text())
@@ -335,6 +347,7 @@ def _changed(vanilla: _Vanilla, change: str) -> None:
         "harness-version",
         "limits",
         "jobs",
+        "spawn-overrides-shown",
         "unknown-launcher-hash",
         "partial-launcher-hashes",
     ],

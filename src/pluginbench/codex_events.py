@@ -476,6 +476,7 @@ def _descendant_usage(
     models: set[str] = set()
     child_models: set[str] = set()
     effort: set[str] = set()
+    child_efforts: set[str] = set()
     records = []
     for identity, session in sorted(sessions.items()):
         prior_reasons = set(reasons)
@@ -552,8 +553,11 @@ def _descendant_usage(
                         models.add(model)
                     elif session["parent_thread_id"] is not None:
                         child_models.add(model)
-                if identity == root and isinstance(payload.get("effort"), str):
-                    effort.add(payload["effort"])
+                if isinstance(payload.get("effort"), str):
+                    if identity == root:
+                        effort.add(payload["effort"])
+                    elif session["parent_thread_id"] is not None:
+                        child_efforts.add(payload["effort"])
             if kind in {"task_started", "turn_started"}:
                 complete = False
                 own_turn = (
@@ -697,6 +701,7 @@ def _descendant_usage(
         "actual_primary_models": sorted(models),
         "actual_descendant_models": sorted(child_models),
         "runtime_effort_evidence": sorted(effort),
+        "actual_descendant_efforts": sorted(child_efforts),
         "usage_accounting": {
             "status": "complete" if complete else "incomplete",
             "scope": "root_and_descendants",
