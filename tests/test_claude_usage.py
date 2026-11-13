@@ -330,6 +330,79 @@ def test_only_the_runner_model_may_have_untranscribed_usage(tmp_path: Path) -> N
     ]
 
 
+# The compaction fixture's bound: preTokens 15,343 plus the prompt allowance of input, and
+# postTokens 4,799 of output. Its untranscribed excess is 17,338 input and 421 output.
+_BOUND = {"inputTokens": 15343 + claude_usage.COMPACTION_PROMPT_TOKENS, "outputTokens": 4799}
+_EXCESS = {"inputTokens": 17338, "outputTokens": 421}
+
+
+def _add_to_model_usage(key: str, tokens: int) -> Callable[[Path], None]:
+    return _result(lambda result: result["modelUsage"][MODEL].update(
+        {key: result["modelUsage"][MODEL][key] + tokens}
+    ))
+
+
+@pytest.mark.parametrize("key", ["inputTokens", "outputTokens"])
+def test_untranscribed_usage_is_bounded_by_the_compaction(tmp_path: Path, key: str) -> None:
+    run = _copy("compaction", tmp_path / "at-bound")
+    _add_to_model_usage(key, _BOUND[key] - _EXCESS[key])(run)
+    assert _validate(run)["usage_accounting"]["reasons"] == []
+    _add_to_model_usage(key, 1)(run)
+    parsed = _validate(run)
+    assert parsed["usage"] is None
+    assert parsed["usage_accounting"]["reasons"] == [
+        f"untranscribed usage for {MODEL} exceeds its compactions' bound"
+    ]
+
+
+@pytest.mark.parametrize("key", ["inputTokens", "outputTokens"])
+def test_two_compactions_sum_their_bounds(tmp_path: Path, key: str) -> None:
+    run = _copy("compaction", tmp_path / "run")
+    _rewrite(_root(run), lambda events: [
+        *events, *(e for e in events if e.get("subtype") == "compact_boundary"),
+    ])
+    _add_to_model_usage(key, 2 * _BOUND[key] - _EXCESS[key])(run)
+    assert _validate(run)["usage_accounting"]["reasons"] == []
+    _add_to_model_usage(key, 1)(run)
+    assert _validate(run)["usage_accounting"]["reasons"] == [
+        f"untranscribed usage for {MODEL} exceeds its compactions' bound"
+    ]
+
+
+def _metadata(edit: Callable[[dict[str, Any]], None]) -> Callable[[dict[str, Any]], None]:
+    return lambda boundary: edit(boundary["compactMetadata"])
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda boundary: boundary.pop("compactMetadata"),
+        _metadata(lambda meta: meta.pop("preTokens")),
+        _metadata(lambda meta: meta.update(preTokens="15343")),
+        _metadata(lambda meta: meta.update(preTokens=True)),
+        _metadata(lambda meta: meta.update(preTokens=-1)),
+        _metadata(lambda meta: meta.pop("postTokens")),
+        _metadata(lambda meta: meta.update(postTokens=4799.0)),
+    ],
+    ids=["no-metadata", "no-pre", "string-pre", "bool-pre", "negative-pre", "no-post", "float-post"],
+)
+def test_a_compaction_without_well_typed_token_counts_is_refused(
+    tmp_path: Path, edit: Callable[[dict[str, Any]], None]
+) -> None:
+    run = _copy("compaction", tmp_path / "run")
+
+    def apply(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        edit(next(e for e in events if e.get("subtype") == "compact_boundary"))
+        return events
+
+    _rewrite(_root(run), apply)
+    parsed = _validate(run)
+    assert parsed["usage"] is None
+    assert parsed["usage_accounting"]["reasons"] == [
+        "a compact boundary's preTokens or postTokens is missing or ill-typed"
+    ]
+
+
 def test_the_stream_agent_calls_must_match_the_transcripts(tmp_path: Path) -> None:
     # Deleting a subagent and its call from the transcripts leaves the stream's call behind.
     run = _copy("one-subagent", tmp_path / "run")

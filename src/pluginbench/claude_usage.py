@@ -23,6 +23,14 @@ _MODEL_USAGE = ("inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens
 _MESSAGE_USAGE = (
     "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens",
 )
+# Calibrated on 2.1.322, from one manual `/compact`: the untranscribed compaction call read
+# the boundary's `preTokens` (15,343, the context before compaction) plus a 1,995-token
+# compaction prompt, and wrote the summary (421 tokens), which is part of the context the
+# boundary's `postTokens` (4,799) counts. Each compaction may therefore add at most
+# `preTokens` plus this prompt allowance (about twice the observed prompt) of input and
+# `postTokens` of output. The prompt is fixed text, so the allowance is a constant rather
+# than a multiple of the context. Recalibrate when qualifying another version.
+COMPACTION_PROMPT_TOKENS = 4000
 
 
 def coding_usage(
@@ -64,10 +72,13 @@ def coding_usage(
     )
     if compacted != transcripts["compacted"]:
         reasons.append("the stream and the root transcript disagree on compaction")
+    bound = transcripts["compaction_bound"]
     if cli_version not in claude.QUALIFIED_VERSIONS:
         rule = "one-sided"
     else:
         rule = "compaction" if compacted and transcripts["compacted"] else "equal"
+    if rule == "compaction" and bound is None:
+        reasons.append("a compact boundary's preTokens or postTokens is missing or ill-typed")
 
     per_model: dict[str, dict[str, int]] = {}
     untranscribed: dict[str, dict[str, int]] = {}
@@ -111,6 +122,10 @@ def coding_usage(
         if any(value > 0 for value in compared.values()):
             # Calls Claude makes but never transcribes, such as a compaction summary.
             untranscribed[model] = {key: max(value, 0) for key, value in compared.items()}
+        if rule == "compaction" and bound is not None and any(
+            compared[key] > bound[key] for key in bound
+        ):
+            reasons.append(f"untranscribed usage for {model} exceeds its compactions' bound")
 
     usage = claude._usage(result)[0] if not reasons else None
     return {
@@ -181,10 +196,28 @@ def _model_usage(value: object) -> dict[str, dict[str, int]] | None:
     return counts
 
 
+def _compaction_bound(boundaries: list[dict[str, Any]]) -> dict[str, int] | None:
+    """The most untranscribed usage these compactions explain, summed over them; None when a
+    boundary lacks well-typed token counts. See COMPACTION_PROMPT_TOKENS."""
+    bound = {"input_tokens": 0, "output_tokens": 0}
+    for boundary in boundaries:
+        meta = boundary.get("compactMetadata")
+        if not isinstance(meta, dict) or not all(
+            _count(meta.get(key)) for key in ("preTokens", "postTokens")
+        ):
+            return None
+        bound["input_tokens"] += meta["preTokens"] + COMPACTION_PROMPT_TOKENS
+        bound["output_tokens"] += meta["postTokens"]
+    return bound
+
+
 def _transcript_usage(projects: Path, session: object, reasons: list[str]) -> dict[str, Any]:
     """Per-model usage of one session's transcripts, their Agent calls, whether the root
-    transcript records a compaction, and the deepest subagent's depth."""
-    found: dict[str, Any] = {"models": {}, "calls": set(), "compacted": False, "depth": None}
+    transcript records a compaction and the bound its compactions set, and the deepest
+    subagent's depth."""
+    found: dict[str, Any] = {
+        "models": {}, "calls": set(), "compacted": False, "compaction_bound": None, "depth": None,
+    }
     files = sorted(projects.rglob("*.jsonl")) if projects.is_dir() else []
     roots = [path for path in files if len(path.relative_to(projects).parts) == 2]
     subagents = [path for path in files if path not in roots]
@@ -207,10 +240,12 @@ def _transcript_usage(projects: Path, session: object, reasons: list[str]) -> di
         events = _read_transcript(path, session, messages, reasons)
         calls[path] = _agent_calls(events)
         if path == root:
-            found["compacted"] = any(
-                e.get("type") == "system" and e.get("subtype") == "compact_boundary"
-                for e in events
-            )
+            boundaries = [
+                e for e in events
+                if e.get("type") == "system" and e.get("subtype") == "compact_boundary"
+            ]
+            found["compacted"] = bool(boundaries)
+            found["compaction_bound"] = _compaction_bound(boundaries)
             continue
         try:
             meta = json.loads(path.with_suffix(".meta.json").read_text())
