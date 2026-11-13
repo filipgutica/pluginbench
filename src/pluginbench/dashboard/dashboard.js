@@ -143,6 +143,7 @@ function schedule(render, interval, token) {
 // Runs list ------------------------------------------------------------------
 
 let phaseFilter = "";
+let latestRuns = null;
 
 const RUN_COLUMNS = ["Run", "Phase", "Complete", "Outcomes", "Tokens", "Harness, model, effort", "Last activity"];
 
@@ -199,7 +200,7 @@ function renderRuns(data) {
   );
   select.addEventListener("change", () => {
     phaseFilter = select.value;
-    renderRuns(data);
+    renderRuns(latestRuns || data);
     document.getElementById("phase-filter").focus();
   });
 
@@ -261,6 +262,7 @@ async function loadRuns(token) {
   try {
     const data = await getJSON("/api/runs");
     if (token !== generation) return;
+    latestRuns = data;
     // Redraw only when a run changed, so focus and an open filter stay put. Heartbeat ages
     // change on every read, so they are updated in place instead.
     const signature = JSON.stringify(data.runs.map((run) => ({ ...run, heartbeat: null })).concat(data.roots));
@@ -571,7 +573,9 @@ async function loadRun(token, key) {
 function route() {
   generation += 1;
   clearTimeout(timer);
+  // A new view always draws once, even when its data has not changed since it was last shown.
   loadRun.last = null;
+  loadRuns.last = null;
   const token = generation;
   const match = location.hash.match(/^#\/run\/([0-9a-f]{16})$/);
   for (const link of document.querySelectorAll(".nav-link")) {
