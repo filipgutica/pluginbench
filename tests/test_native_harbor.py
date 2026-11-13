@@ -1504,9 +1504,10 @@ def test_failed_native_build_never_removes_unqualified_or_foreign_image(
         assert any("ownership" in note for note in caught.value.__notes__)
 
 
+@pytest.mark.parametrize("spelling", ["direct", "climbs with ..", "under a linked parent"])
 @pytest.mark.parametrize("prebuilt", [True, False])
 def test_admission_reports_prebuilt_coding_image_and_the_dockerfile_it_ignores(
-    tmp_path: Path, prebuilt: bool
+    tmp_path: Path, prebuilt: bool, spelling: str
 ) -> None:
     # The pilot fixed git identity in a Dockerfile that a prebuilt image never ran.
     task = native_task(tmp_path)
@@ -1515,6 +1516,13 @@ def test_admission_reports_prebuilt_coding_image_and_the_dockerfile_it_ignores(
         (task / "task.toml").write_text(
             toml.replace("[environment]\n", '[environment]\ndocker_image="published:1"\n')
         )
+    # Harbor resolves the task directory; how the caller spells it must not matter.
+    if spelling == "climbs with ..":
+        (tmp_path / "configs").mkdir()
+        task = tmp_path / "configs/../task"
+    elif spelling == "under a linked parent":
+        (tmp_path / "linked").symlink_to(tmp_path)
+        task = tmp_path / "linked/task"
     assert harbor.validate_native_task(task)["coding_image"] == (
         {
             "source": "prebuilt",
