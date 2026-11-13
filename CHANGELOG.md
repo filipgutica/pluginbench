@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/filipgutica/pluginbench/compare/v0.7.0...v0.7.1) (2026-11-13)
+
+
+### Bug Fixes
+
+* admit Claude skills that only the user can invoke ([#77](https://github.com/filipgutica/pluginbench/issues/77)) ([23ab9d9](https://github.com/filipgutica/pluginbench/commit/23ab9d97dad3d83360b74b73ed4421ff92754c6c))
+
 ## [0.7.0](https://github.com/filipgutica/pluginbench/compare/v0.6.1...v0.7.0) (2026-11-13)
 
 
