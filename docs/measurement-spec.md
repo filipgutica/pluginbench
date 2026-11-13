@@ -75,7 +75,7 @@ Reference solutions add no tests, so R4 has no reference baseline. Compare attem
 ### R5. Cost
 
 - Report coding input, cached input, uncached input, output, and reasoning-output tokens, root plus descendants.
-- Re-validate saved Codex usage on cache reuse and report generation. Invalid or disagreeing evidence and legacy stdout-only totals are unavailable to token gates. Retain recorded figures and recording time beside the current result; preserve raw evidence and cache keys.
+- Re-validate saved Codex usage on cache reuse and report generation, and saved Claude Code usage on report generation. Invalid or disagreeing evidence and legacy stdout-only totals are unavailable to token gates. Retain recorded figures and recording time beside the current result; preserve raw evidence and cache keys.
 - Report coding elapsed time.
 - Report review tokens separately.
 - Report dollars only from an optional, dated per-model price table in `prices.json` beside the saved evaluation. It is reporting input, not a measurement setting, so it can be added to saved evaluations. Without it, dollars are unknown.

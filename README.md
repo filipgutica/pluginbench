@@ -34,11 +34,12 @@ PluginBench runs on Linux or macOS. Every run needs:
 | Python | 3.12 or later | Runs PluginBench |
 | Git | Any recent | Task sources and patches |
 | Docker | Linux containers on a local Unix socket, with Compose and Buildx | Each attempt and its verifier run in containers |
-| Codex CLI | Logged in; verified trace versions: 0.162.1, 0.167.0, 0.167.1 | Coding agent. PluginBench copies its login from `~/.codex/auth.json` to the pinned container CLI. Unverified versions warn and continue; incompatible traces or unverified inherited history leave tokens unavailable. |
+| Codex CLI | Logged in; verified trace versions: 0.162.1, 0.167.0, 0.167.1 | Coding agent for `runner.harness: codex`. PluginBench copies its login from `~/.codex/auth.json` to the pinned container CLI. Unverified versions warn and continue; incompatible traces or unverified inherited history leave tokens unavailable. |
+| Claude Code CLI | Only for `runner.harness: claude`; qualified version: 2.1.322 | Coding agent. Set `CLAUDE_CODE_OAUTH_TOKEN` to your subscription token, such as one from `claude setup-token`; API keys are refused for coding. Other versions warn and continue. The host CLI is needed only when `runner.cli_version` is omitted. |
 
-Set `runner.cli_version: "0.167.0"` to select the exact coding CLI version installed in task containers.
+Set `runner.cli_version: "0.167.0"` (Codex) or `"2.1.322"` (Claude Code) to select the exact coding CLI version installed in task containers.
 When omitted, preparation pins the host CLI's version. Resume keeps that pin across host CLI updates.
-Independent reviews use the host CLI. See [verified coding CLIs](docs/running-evaluations.md#verified-coding-clis) for credential compatibility.
+Independent reviews use the host CLI. See [verified coding CLIs](docs/running-evaluations.md#verified-coding-clis) for credential compatibility, and [Claude Code coding](docs/running-evaluations.md#claude-code-coding) for the Claude launch and token rules.
 
 Some measures and commands need more:
 
@@ -205,7 +206,7 @@ A *treatment* is the guidance you want to test. It can be instruction files, ski
 
 4. Run it with `pluginbench run evaluation.yaml`, as in the quickstart. The report compares each treatment with vanilla.
 
-Treatments need the Codex harness. Instruction files become the agent's private `AGENTS.md`; they are never added to the task prompt or to the repository. Skills and plugins are copied whole, including their scripts, except Git internals; symlinks, special files, and `.env` files are refused. Skill dependencies, MCP servers, apps, custom agents, commands, plugin dependencies, and hooks other than synchronous command hooks are not supported yet, and a treatment that declares one stops the run before any model call. Before coding, PluginBench checks that Codex found every declared skill. That proves the skill was available, not that the agent used it. [Native treatments](docs/running-evaluations.md#native-treatments).
+Treatments work with both harnesses. Instruction files become the agent's private `AGENTS.md` (Codex) or `CLAUDE.md` (Claude Code); they are never added to the task prompt or to the repository. Skills and plugins are copied whole, including their scripts, except Git internals; symlinks, special files, and `.env` files are refused. Skill dependencies, MCP servers, apps, custom agents, commands, plugin dependencies, and hooks other than synchronous command hooks are not supported yet, and a treatment that declares one stops the run before any model call. Claude Code refuses more plugin parts, such as `agents/` and `commands/`; see [Claude Code treatments](docs/running-evaluations.md#claude-code-treatments). Before coding, PluginBench checks that the coding CLI found every declared skill. That proves the skill was available, not that the agent used it. [Native treatments](docs/running-evaluations.md#native-treatments).
 
 ## Commands
 
@@ -240,7 +241,7 @@ Every setting lives in the config. Flags only control how a command runs.
 - `pluginbench stop runs/<run>` stops new attempts. Attempts already coding finish and are kept, including with `jobs: 1`. Resume never codes complete attempts again.
 - `pluginbench run runs/<run>` resumes. A run that was killed, for example by a host shutdown, shows `interrupted`, and `status` prints this command. Complete attempts are kept and never coded again. An attempt cut off mid-call is recorded as `discarded-interrupted` and a new attempt takes its slot. Containers the killed attempt left running are stopped before coding resumes, and `status` names them until then. Resume cannot repair a failing solution.
 - If Codex fails before its first model turn, for example during a network outage, the run stops instead of scoring the attempt. Resume when Codex is reachable.
-- Vanilla attempts are cached in `$XDG_CACHE_HOME/pluginbench` (default `~/.cache/pluginbench`) and reused by any later run with the same task, model, and settings. Grading and measures run again. Reports mark reused attempts. [Baselines and reports](docs/running-evaluations.md#baselines-and-reports).
+- Vanilla attempts are cached in `$XDG_CACHE_HOME/pluginbench` (default `~/.cache/pluginbench`) and reused by any later run with the same task, model, and settings. Grading and measures run again. Reports mark reused attempts. Claude Code attempts are never cached, so every Claude run codes its own vanilla arm. [Baselines and reports](docs/running-evaluations.md#baselines-and-reports).
 
 ## Compare and judge
 
@@ -254,6 +255,7 @@ Every setting lives in the config. Flags only control how a command runs.
 - Smaller numbers alone do not prove better work. Coverage does not prove that assertions are useful.
 - Unknown values are never shown as zero.
 - Reused vanilla attempts are not fresh independent samples.
+- Claude Code token rules are calibrated on CLI 2.1.322 only. Other versions get a weaker check, and a timed-out Claude attempt has no token lower bound. See [Claude Code coding](docs/running-evaluations.md#claude-code-coding).
 - A measure that is `broken` on a task is not measured for that task. `check` warns, and the report shows it as unavailable there. With `measurement_settings.require_ready: true`, the check stops instead. A measure that is ready on no task always stops the run.
 - PluginBench executes model-generated code. Use trusted tasks, images, and treatments on a trusted machine. See [Security](SECURITY.md).
 
