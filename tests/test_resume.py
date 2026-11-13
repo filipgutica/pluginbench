@@ -385,13 +385,15 @@ def test_backend_failure_before_the_first_turn_stops_the_run_unscored_and_uncach
         return execution
 
     monkeypatch.setattr(harbor_backend, "invoke_native", outage)
-    with pytest.raises(study.BackendUnavailable, match="workspace routing discovery failed"):
+    with pytest.raises(study.BackendUnavailable, match="workspace routing discovery failed") as error:
         study.run_study(
             resolved,
             root,
             baseline_cache=cache,
             baseline_identity=resume_support.vanilla_identity(resolved),
         )
+    assert " · vanilla · repeat " in str(error.value)
+    assert " · baseline · " not in str(error.value)
     [failed] = calls
     assert _json(root / "run.json")["attempt_states"][failed] == "interrupted"
     assert not (root / "records" / f"{failed}.json").exists()

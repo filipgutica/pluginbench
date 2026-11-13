@@ -566,6 +566,7 @@ def test_compare_refuses_runs_whose_saved_identities_differ(tmp_path: Path) -> N
 @pytest.mark.parametrize(
     "host,validation,expected",
     [("codex", None, "undetermined"), ("codex", "unavailable", "undetermined"),
+     ("codex", "invalid", "undetermined"),
      ("codex", "validated", "pass"), ("claude", None, "undetermined"),
      ("claude", "unavailable", "undetermined"), ("claude", "validated", "pass")],
 )
@@ -586,7 +587,9 @@ def test_saved_token_gates_require_validation_provenance(
         row["host"] = host
         status = "validated" if row["attempt_id"].startswith("vanilla-") else validation
         if status is not None:
-            row["provenance"] = {"usage_validation": {"status": status}}
+            row["provenance"] = {"usage_validation": {
+                "status": status, "reasons": ["incomplete session"] if status != "validated" else [],
+            }}
     results.write_text(json.dumps(data))
     before = results.read_bytes()
     specs = [directory + "=vanilla", directory + "=candidate"]
@@ -606,5 +609,11 @@ def test_saved_token_gates_require_validation_provenance(
                                         str(gates_path)])
     assert output.exit_code == 0, output.output
     note = f"rebuild with `pluginbench report {directory}` to re-validate token usage"
-    assert output.stdout.count(note) == (1 if expected == "undetermined" else 0)
+    assert output.stdout.count(note) == (1 if validation is None else 0)
+    if validation not in (None, "validated"):
+        assert "Missing values (not counted as 0):" in output.stdout
+        assert "Input tokens: incomplete session" in output.stdout
+        assert "Excluded tokens, task-0: Input tokens: incomplete session" in output.stdout
+        assert all(row.values["Input tokens"] is None for row in evidence.attempts
+                   if row.arm == "candidate")
     assert results.read_bytes() == before
