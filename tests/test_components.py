@@ -31,14 +31,15 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
                 "229d01b78fd893b8e502139507b74d18f0147079c58f15f90b0548b5520e67c5"
             ),
             # Claude plugin admission rules; Codex admission and every admitted launch stay v1.
-            # Claude plugin agents admit; a Codex inventory and an agent-free Claude one are
-            # unchanged.
-            "treatments.py": "33412b7f2fee49a064809a5f1113f23c5d325e5efc364cc6783b706c82af1c51",
+            # Claude plugin agents admit, and Claude plugin skills may set `paths`; a Codex
+            # inventory and an agent-free Claude one are unchanged.
+            "treatments.py": "7b3f9e19379b716c12c18ed393dc44b3ba240d5efdf8d551a7bba5e67e4097e0",
             # Claude version admission, coding launch contract and the subscription-only refusal
             # every Claude launch shares; a token-only launch is unchanged, so this stays v1.
             # The forced subagent model joins the coding env, which the Claude vanilla
             # identity binds by value, so the launcher stays v1 and Codex is untouched.
-            "claude.py": "bb4eb9656c40f86147e098aa418a2cb80aa1fab353014bdf35cd8e1133327dcc",
+            # The unqualified-version warning names plugin-skill `paths`: text only.
+            "claude.py": "551a620c3645f727102458dbe3fcda4b8a15c60585fad03b81b908326265c4f6",
             "claude_treatments.py": "0149a2dd1c0f0db6f2e29b030885bacbad2e0569e43cdf45c25764181bc9ea97",
             # Discovery proves plugin agents exactly; an agent-free receipt is unchanged and
             # verifies as before unless an agent loads, so the launcher stays v1.

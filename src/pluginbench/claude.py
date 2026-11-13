@@ -447,8 +447,9 @@ def admit_version(version: str) -> None:
     if version not in QUALIFIED_VERSIONS:
         warnings.warn(
             f"Claude Code CLI {version} is not qualified for PluginBench: its discovery control "
-            "requests, session transcript format, and token reconciliation have not been "
-            "checked against this version. Qualified versions: "
+            "requests, session transcript format, token reconciliation, and loading of plugin "
+            "skills that set `paths` have not been checked against this version. Qualified "
+            "versions: "
             + ", ".join(sorted(QUALIFIED_VERSIONS)),
             stacklevel=2,
         )
