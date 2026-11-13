@@ -23,6 +23,13 @@ class NativeProcessArguments(TypedDict):
     start_new_session: bool
 
 
+@pytest.fixture(autouse=True)
+def _clean_operator_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A developer shell may export a refused variable; tests set the ones they need.
+    for name in claude.REFUSED_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
 def stream(*events: dict[str, object]) -> str:
     return "\n".join(json.dumps(event) for event in events)
 

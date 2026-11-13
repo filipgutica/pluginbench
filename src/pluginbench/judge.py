@@ -618,6 +618,11 @@ def run(
         raise ValueError("give at least one --judge, each once")
     key_bytes = _read_key(directory)
     tasks = json.loads(key_bytes)["tasks"]
+    if any(judge.harness == "claude" for judge in panel):
+        # Refuse missing or disallowed credentials once, before any call folder is reserved:
+        # each reserved folder without evidence would count as a call with unknown usage.
+        with tempfile.TemporaryDirectory(prefix="pluginbench-auth-check-") as temporary:
+            codex.runtime_environment(Path(temporary) / "private", "claude")
     for judge in panel:
         path = directory / "judge-specs" / f"{judge.label}.json"
         if path.is_file() and json.loads(path.read_text()) != asdict(judge):

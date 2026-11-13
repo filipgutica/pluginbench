@@ -326,6 +326,10 @@ def _fake_judge(
 ) -> list[Path]:
     """Answer every pair with answers[model]; check what the judge's workspace holds."""
     calls: list[Path] = []
+    # A Claude panel checks credentials before its first call.
+    for name in claude.REFUSED_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(claude.TOKEN_ENV, "fixture-token")
 
     def invoke(
         *,
@@ -452,14 +456,12 @@ def test_a_claude_judge_refuses_an_api_key_or_provider_before_any_model_call(
     monkeypatch.setattr(
         subprocess, "Popen", lambda *args, **kwargs: pytest.fail("model call started")
     )
-    messages: list[str] = []
-    failed = judge.run(
-        directory, judges=["claude:m1:high"], timeout=60, jobs=1, progress=messages.append
-    )
-    assert failed == len(TASKS)
-    refusal = f"failed: Claude authenticates with CLAUDE_CODE_OAUTH_TOKEN only; unset {refused}"
-    assert sum(message.endswith(refusal) for message in messages) == len(TASKS)
-    assert not list(directory.glob("results/claude-m1-high/*.json"))
+    refusal = f"Claude authenticates with CLAUDE_CODE_OAUTH_TOKEN only; unset {refused}"
+    with pytest.raises(ValueError, match=refusal):
+        judge.run(directory, judges=["claude:m1:high"], timeout=60, jobs=1, progress=print)
+    # Refused once, before a spec, panel entry or call folder: no call counts as unknown usage.
+    assert not (directory / "results").exists()
+    assert not (directory / "judge-specs").exists()
 
 
 def test_a_rejected_answer_leaves_no_verdict_and_is_retried(

@@ -118,8 +118,9 @@ DISCOVERY_SETTINGS: dict[str, object] = {"disableAllHooks": True}
 DISALLOWED_TOOLS = ("RemoteTrigger", "CronCreate", "ScheduleWakeup", "SendMessage", "Workflow")
 # Routes, credentials and limits that would change which model serves the run, whose
 # account pays for it, or how it is metered. Every Claude launch, coding, review or judge,
-# authenticates with the operator's subscription token only; an API key would silently
-# outrank it in print mode.
+# authenticates with the operator's subscription token only. Coding needs the refusal because
+# Harbor reads the operator environment; a review or judge child gets an allowlisted
+# environment, so there it keeps one policy for every Claude launch.
 REFUSED_ENV = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
