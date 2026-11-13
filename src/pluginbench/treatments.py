@@ -98,7 +98,8 @@ _CLAUDE_SKILL_KEYS = {
 }
 
 
-def _skill_name(root: Path, harness: str | None = None) -> str:
+def skill_frontmatter(root: Path) -> dict[str, Any]:
+    """The YAML frontmatter object of the skill at `root`."""
     skill = root / "SKILL.md"
     try:
         text = skill.read_text(encoding="utf-8")
@@ -113,6 +114,12 @@ def _skill_name(root: Path, harness: str | None = None) -> str:
         raise ValueError(f"invalid skill frontmatter: {skill}") from error
     if not isinstance(metadata, dict):
         raise ValueError(f"skill frontmatter must be an object: {skill}")
+    return metadata
+
+
+def _skill_name(root: Path, harness: str | None = None) -> str:
+    skill = root / "SKILL.md"
+    metadata = skill_frontmatter(root)
     name = metadata.get("name")
     if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name):
         raise ValueError(f"skill requires a kebab-case name: {skill}")

@@ -19,7 +19,7 @@ import pytest
 from pluginbench import claude
 from pluginbench.claude_treatments import CONFIG_DIR, DELIVERY_POLICY, admit, install, stage
 from pluginbench.native_treatments import REMOTE_ROOT
-from pluginbench.treatments import Treatment
+from pluginbench.treatments import Treatment, skill_frontmatter
 
 FIXTURES = Path(__file__).parent / "fixtures/claude-2.1.322"
 CAPTURED = json.loads((FIXTURES / "discovery.json").read_text())
@@ -86,9 +86,11 @@ REDRAW = {
 }
 
 
-def skill(root: Path, name: str) -> Path:
+def skill(root: Path, name: str, frontmatter: str = "") -> Path:
     root.mkdir(parents=True)
-    (root / "SKILL.md").write_text(f"---\nname: {name}\ndescription: Claude fixture skill.\n---\n")
+    (root / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: Claude fixture skill.\n{frontmatter}---\n"
+    )
     (root / "check.sh").write_text("#!/bin/sh\nprintf proof\n")
     (root / "check.sh").chmod(0o755)
     return root
@@ -104,34 +106,39 @@ def responses(attempt: Attempt) -> dict[str, Any]:
     )
     treatment = attempt.treatment
     # Commands and the dialog's display_name use the frontmatter name; the dialog's name is
-    # the folder (CLI 2.1.322).
-    loose = {
-        path.name: (path / "SKILL.md").read_text().split("name: ", 1)[1].split("\n", 1)[0]
-        for path in treatment.skills
-    }
-    packaged = [
-        f"{plugin.name}:{name}"
+    # the folder. Each skill's (dialog name, display_name, source, frontmatter).
+    skills = [
+        (name, name, "plugin", skill_frontmatter(path))
         for plugin in treatment.plugins
-        for name in sorted(path.name for path in (plugin / "skills").iterdir())
+        for path in sorted((plugin / "skills").iterdir())
+        for name in [f"{plugin.name}:{path.name}"]
+    ] + [
+        (path.name, skill_frontmatter(path)["name"], "user", skill_frontmatter(path))
+        for path in treatment.skills
     ]
     initialize = captured["initialize"]
+    # CLI 2.1.322 leaves a `user-invocable: false` skill out of commands.
     initialize["commands"] = [
         *[
             {"name": name, "description": "", "argumentHint": ""}
-            for name in [*loose.values(), *packaged]
+            for _, name, _, frontmatter in skills
+            if frontmatter.get("user-invocable") is not False
         ],
         *[command for command in initialize["commands"] if command.get("builtin")],
     ]
     dialog_entry = captured["get_skills_dialog"]["skills"][1]
     captured["get_skills_dialog"]["skills"] = [
-        *[
-            {**dialog_entry, "name": name, "display_name": name, "source": "plugin"}
-            for name in packaged
-        ],
-        *[
-            {**dialog_entry, "name": folder, "display_name": name, "source": "user"}
-            for folder, name in loose.items()
-        ],
+        {
+            **dialog_entry, "name": folder, "display_name": name, "source": source,
+            "advertised": frontmatter.get("user-invocable") is not False,
+            # As CLI 2.1.322 shows a `disable-model-invocation: true` skill.
+            **(
+                {"state": "user-invocable-only", "locked_by": "author"}
+                if frontmatter.get("disable-model-invocation") is True
+                else {}
+            ),
+        }
+        for folder, name, source, frontmatter in skills
     ]
     listing = captured["get_hooks_listing"]
     listing["policy"]["allDisabled"] = True
@@ -161,7 +168,11 @@ def responses(attempt: Attempt) -> dict[str, Any]:
     return captured
 
 
-def attempt(tmp_path: Path, *, vanilla: bool = False) -> Attempt:
+def attempt(
+    tmp_path: Path, *, vanilla: bool = False, frontmatter: dict[str, str] | None = None
+) -> Attempt:
+    """An attempt whose skills `demo-skill` and `loose-skill` add `frontmatter[name]`."""
+    extra = frontmatter or {}
     if shutil.which("node") is None:
         pytest.skip("Claude installer needs Node")
     for name in ("home", "config", "workspace", "bin"):
@@ -174,7 +185,7 @@ def attempt(tmp_path: Path, *, vanilla: bool = False) -> Attempt:
         guide = tmp_path / "guide.md"
         guide.write_text("Keep the implementation in the existing module.\n")
         plugin = tmp_path / "demo"
-        skill(plugin / "skills/demo-skill", "demo-skill")
+        skill(plugin / "skills/demo-skill", "demo-skill", extra.get("demo-skill", ""))
         (plugin / ".claude-plugin").mkdir()
         (plugin / ".claude-plugin/plugin.json").write_text(
             json.dumps({"name": "demo", "version": "1.0.0"})
@@ -194,7 +205,7 @@ def attempt(tmp_path: Path, *, vanilla: bool = False) -> Attempt:
         treatment = Treatment(
             guidance=[guide],
             # A folder name that differs from the skill name, as Claude reports both.
-            skills=[skill(tmp_path / "loose-folder", "loose-skill")],
+            skills=[skill(tmp_path / "loose-folder", "loose-skill", extra.get("loose-skill", ""))],
             plugins=[plugin],
         )
         # Harbor's setup copies loose skills into the private configuration.
@@ -325,11 +336,25 @@ REFUSALS: dict[str, tuple[Callable[[Attempt], object], str]] = {
     ),
     "skill off": (
         _responses(lambda r: r["get_skills_dialog"]["skills"][0].update(state="off")),
-        "Claude skill is not on from its declared source: demo:demo-skill",
+        "Claude skill is not in its declared state from its declared source: demo:demo-skill",
+    ),
+    "skill the model may invoke shown as user-invocable-only": (
+        _responses(
+            lambda r: r["get_skills_dialog"]["skills"][0].update(
+                state="user-invocable-only", locked_by="author"
+            )
+        ),
+        "Claude skill is not in its declared state from its declared source: demo:demo-skill",
     ),
     "skill from another source": (
         _responses(lambda r: r["get_skills_dialog"]["skills"][0].update(source="user")),
-        "Claude skill is not on from its declared source: demo:demo-skill",
+        "Claude skill is not in its declared state from its declared source: demo:demo-skill",
+    ),
+    "user-invocable skill missing from commands": (
+        lambda attempt: attempt.scenario["responses"]["initialize"].update(
+            commands=[command for command in _commands(attempt) if command["name"] != "loose-skill"]
+        ),
+        "Claude commands differ from the declared user-invocable skills",
     ),
     "undeclared agent": (
         _responses(lambda r: r["initialize"]["agents"].append({"name": "rogue", "description": ""})),
@@ -502,24 +527,54 @@ def test_discovery_refuses_each_receipt_rule(tmp_path: Path, defect: str) -> Non
     assert result.stdout == ""
 
 
-def test_a_skill_hidden_from_commands_is_verified_from_the_skills_dialog(tmp_path: Path) -> None:
-    # CLI 2.1.322 shows a `user-invocable: false` skill on in the dialog, unadvertised, and
-    # leaves it out of initialize.commands.
-    treated = attempt(tmp_path)
-    responses = treated.scenario["responses"]
-    responses["initialize"]["commands"] = [
-        command for command in _commands(treated) if command["name"] != "loose-skill"
-    ]
-    for item in responses["get_skills_dialog"]["skills"]:
-        item["advertised"] = item["display_name"] != "loose-skill"
+MANUAL = "disable-model-invocation: true\n"
+HIDDEN = "user-invocable: false\n"
+
+
+@pytest.mark.parametrize(
+    "frontmatter",
+    [
+        {"demo-skill": MANUAL, "loose-skill": HIDDEN},
+        {"demo-skill": HIDDEN, "loose-skill": MANUAL},
+        {"demo-skill": MANUAL + HIDDEN},
+    ],
+)
+def test_skills_the_model_may_not_invoke_or_the_user_may_not_invoke_are_verified(
+    tmp_path: Path, frontmatter: dict[str, str]
+) -> None:
+    # CLI 2.1.322, offline, for loose and plugin skills alike: `disable-model-invocation:
+    # true` shows the skill as user-invocable-only, locked by its author; `user-invocable:
+    # false` leaves it on but out of initialize.commands.
+    treated = attempt(tmp_path, frontmatter=frontmatter)
     result = treated.run()
     assert result.returncode == 0, result.stderr
     receipt = json.loads(result.stdout)
-    assert receipt["commands"] == ["demo:demo-skill"]
-    assert {item["display_name"]: item["advertised"] for item in receipt["skills"]} == {
-        "demo:demo-skill": True,
-        "loose-skill": False,
+    names = {"demo-skill": "demo:demo-skill", "loose-skill": "loose-skill"}
+    assert receipt["commands"] == sorted(
+        names[name] for name in names if HIDDEN not in frontmatter.get(name, "")
+    )
+    assert {item["display_name"]: item["state"] for item in receipt["skills"]} == {
+        names[name]: "user-invocable-only" if MANUAL in frontmatter.get(name, "") else "on"
+        for name in names
     }
+
+
+@pytest.mark.parametrize(
+    "shown",
+    [
+        {"state": "on"},
+        {"state": "off"},
+        {"state": "user-invocable-only", "locked_by": "plugin"},
+    ],
+)
+def test_a_skill_the_model_may_not_invoke_is_refused_in_any_other_state(
+    tmp_path: Path, shown: dict[str, str]
+) -> None:
+    treated = attempt(tmp_path, frontmatter={"demo-skill": MANUAL})
+    treated.scenario["responses"]["get_skills_dialog"]["skills"][0].update(shown)
+    result = treated.run()
+    assert result.returncode != 0
+    assert "Claude skill is not in its declared state from its declared source: demo:demo-skill" in result.stderr
 
 
 class Environment:

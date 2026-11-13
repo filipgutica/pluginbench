@@ -270,7 +270,10 @@ def session_errors(
     init = inits[0]
     try:
         builtin = set(receipt["builtins"]["commands"])
-        skills = {skill["name"] for skill in receipt["skills"]}
+        # system/init names a skill as the dialog does (a loose one by its folder) and, like
+        # discovery's commands, leaves out a `user-invocable: false` one (CLI 2.1.322).
+        commands = set(receipt["commands"])
+        skills = {skill["name"] for skill in receipt["skills"] if skill["display_name"] in commands}
         plugins = sorted((item["id"], item["loaded_from"]) for item in receipt["plugin_installs"])
         listing = [(hook["event"], hook.get("matcher") or "") for hook in receipt["hooks"]["hooks"]]
         at_startup = Counter(

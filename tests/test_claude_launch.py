@@ -428,6 +428,10 @@ def test_a_claude_attempt_runs_the_pinned_command_with_the_pinned_subscription_e
         assert saved["native_session_usage"] == revalidated["usage_validation"]["validated_usage"]
         assert saved["native_session_usage"] is not None
         assert revalidated["usage"] is None
+        # Revalidation applies the launch's hook rule: the hook is the only reason.
+        assert revalidated["usage_validation"]["reasons"] == [
+            "command-hook subprocess usage is not independently metered"
+        ]
     else:
         assert saved["usage"] is not None
         assert saved["usage_accounting"]["status"] == "complete"
@@ -794,6 +798,26 @@ SESSION_CHANGES: dict[str, tuple[bool, Callable[[list[dict[str, Any]]], None], s
 @pytest.mark.parametrize("arm", ["vanilla", "treated", "superpowers", "two-hooks"])
 def test_each_captured_real_session_matches_its_real_receipt(arm: str) -> None:
     assert _errors(*_captured(arm)) == []
+
+
+def test_a_session_with_skills_the_model_or_the_user_may_not_invoke_matches_its_receipt() -> None:
+    # CLI 2.1.322, offline, for loose and plugin skills alike: the dialog lists every skill,
+    # with `disable-model-invocation: true` as user-invocable-only; commands and system/init
+    # leave out `user-invocable: false` skills. system/init names a loose skill by its folder.
+    events, receipt, transcript = _captured("treated")
+    (plugin_skill, loose_skill) = receipt["skills"]
+    shown = {"state": "user-invocable-only", "locked_by": "author"}
+    receipt["skills"] += [
+        {**plugin_skill, "name": "demo:manual", "display_name": "demo:manual", **shown},
+        {**plugin_skill, "name": "demo:hidden", "display_name": "demo:hidden", "advertised": False},
+        {**loose_skill, "name": "manual-folder", "display_name": "manual", **shown},
+        {**loose_skill, "name": "hidden-folder", "display_name": "hidden", "advertised": False},
+    ]
+    receipt["commands"] = sorted([*receipt["commands"], "demo:manual", "manual"])
+    init = _init(events)
+    for key in ("skills", "slash_commands"):
+        init[key] += ["demo:manual", "manual-folder"]
+    assert _errors(events, receipt, transcript) == []
 
 
 @pytest.mark.parametrize("change", sorted(SESSION_CHANGES))

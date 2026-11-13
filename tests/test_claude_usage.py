@@ -435,6 +435,24 @@ def test_a_saved_claude_run_is_refused_on_reuse_and_report(
     assert reason in revalidated["usage_validation"]["reasons"]
 
 
+HOOKED = {"native_treatment": {"hooks": {"hooks": [{"event": "SessionStart"}]}}}
+
+
+def test_a_hooked_saved_claude_run_checks_the_session_usage_kept_at_launch(tmp_path: Path) -> None:
+    # At launch a hooked run keeps the session usage as native_session_usage and clears usage.
+    receipt = _saved("one-subagent", tmp_path / "attempt", **HOOKED)
+    execution = json.loads(receipt.read_text())
+    execution.update(native_session_usage=execution["usage"], usage=None)
+    reasons = revalidate_usage(execution, receipt)["usage_validation"]["reasons"]
+    assert reasons == ["command-hook subprocess usage is not independently metered"]
+    execution["native_session_usage"] = {"input_tokens": 1, "output_tokens": 4}
+    reasons = revalidate_usage(execution, receipt)["usage_validation"]["reasons"]
+    assert reasons == [
+        "revalidated usage disagrees with recorded usage",
+        "command-hook subprocess usage is not independently metered",
+    ]
+
+
 def test_a_saved_claude_run_with_a_broken_transcript_set_is_refused(tmp_path: Path) -> None:
     receipt = _saved("one-subagent", tmp_path / "attempt")
     _no_subagent(tmp_path / "attempt/artifacts/harbor/trial/agent")

@@ -88,7 +88,7 @@ Before coding, a discovery run of the pinned CLI checks what loaded. It sends co
 | No model call | The session cost reports zero usage and $0. |
 | CLI | The reported version equals the pinned version. |
 | Authentication | The subscription credentials file is the only credential source. |
-| Skills and commands | The non-built-in skills and commands equal the declared skills, and each one is on from its declared source. No undeclared agent is present. |
+| Skills and commands | The skills dialog lists exactly the declared skills, each from its declared source. Each skill is on, or user-invocable-only when its frontmatter sets `disable-model-invocation: true`. The non-built-in commands equal the declared skills without `user-invocable: false`. No undeclared agent is present. |
 | Guidance | The only memory file is the declared `CLAUDE.md`, or none when the arm declares no guidance. |
 | Plugins | Only the declared plugins are installed and enabled, and their trees match the frozen inventory. |
 | Hooks | The hook listing equals the declared hooks, and no hook ran. |
