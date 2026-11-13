@@ -432,8 +432,12 @@ def test_run_uses_the_reviewer_launch_path_and_resumes(
 @pytest.mark.parametrize(
     ("operator_env", "refused"),
     [
-        ({"ANTHROPIC_API_KEY": "sk-ant-unwanted"}, "ANTHROPIC_API_KEY"),
-        ({"CLAUDE_CODE_OAUTH_TOKEN": "token", "CLAUDE_CODE_USE_BEDROCK": "1"}, "CLAUDE_CODE_USE_BEDROCK"),
+        pytest.param({"ANTHROPIC_API_KEY": "sk-ant-unwanted"}, "ANTHROPIC_API_KEY", id="api-key"),
+        pytest.param(
+            {"CLAUDE_CODE_OAUTH_TOKEN": "token", "CLAUDE_CODE_USE_BEDROCK": "1"},
+            "CLAUDE_CODE_USE_BEDROCK",
+            id="provider",
+        ),
     ],
 )
 def test_a_claude_judge_refuses_an_api_key_or_provider_before_any_model_call(
