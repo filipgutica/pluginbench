@@ -121,6 +121,7 @@ def test_public_commands_cover_evaluations_reports_and_task_selection() -> None:
         "check",
         "run",
         "status",
+        "dashboard",
         "stop",
         "compare",
         "report",
