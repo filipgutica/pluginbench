@@ -352,7 +352,12 @@ def coding_environment(
         )
     if auth_file is not None:
         raise ValueError("Claude coding takes CLAUDE_CODE_OAUTH_TOKEN, not an auth file")
-    return runtime_environment(private)
+    env, secrets = runtime_environment(private)
+    # Strip once here: Harbor and the credentials file use the stripped token, so the
+    # artifact scan and scrub must look for that same text.
+    token = env[TOKEN_ENV].strip()
+    env[TOKEN_ENV] = token
+    return env, tuple(dict.fromkeys((*secrets, token)))
 
 
 def _count(value: object) -> bool:

@@ -444,7 +444,7 @@ def test_a_token_in_a_saved_artifact_refuses_the_attempt(
         treated=False,
         after_sessions='cat "$CLAUDE_CONFIG_DIR/.credentials.json" > "$CLAUDE_CONFIG_DIR/copy.json"',
     )
-    with pytest.raises(ValueError, match="token reached saved artifacts: harbor/.*/copy.json"):
+    with pytest.raises(ValueError, match="token reached saved artifacts: artifacts/harbor/.*/copy.json"):
         made.invoke(monkeypatch)
 
 
@@ -981,3 +981,24 @@ def test_the_real_cli_starts_the_pinned_launch_as_pinned(tmp_path: Path, subagen
     assert "Permission mode forced" not in stderr.read_text()
     offered = set(INIT_TOOLS["offline"]) - (set() if subagents else {"Task"})
     assert sorted(init["tools"]) == sorted(offered)
+
+
+def test_a_padded_token_is_stripped_once_where_it_enters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Exported from a CRLF file: Harbor writes the stripped token, so scan and scrub must too.
+    for name in claude.REFUSED_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(claude.TOKEN_ENV, " fake-subscription-token\r")
+    env, secrets = claude.coding_environment(tmp_path / "private")
+    assert env[claude.TOKEN_ENV] == "fake-subscription-token"
+    assert "fake-subscription-token" in secrets
+
+
+def test_a_token_in_the_exported_workspace_refuses_the_attempt(tmp_path: Path) -> None:
+    artifacts, workspace = tmp_path / "artifacts", tmp_path / "workspace"
+    artifacts.mkdir()
+    (workspace / "ignored").mkdir(parents=True)
+    (workspace / "ignored/notes.txt").write_text("fake-subscription-token")
+    with pytest.raises(ValueError, match="token reached saved artifacts: workspace/ignored/notes.txt"):
+        claude_launch.refuse_leaked_token([artifacts, workspace], " fake-subscription-token\r")

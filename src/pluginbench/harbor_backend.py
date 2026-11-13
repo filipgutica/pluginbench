@@ -725,8 +725,9 @@ async def run_trial(config: dict[str, Any]) -> dict[str, Any]:
     if pinned_claude:
         assert isinstance(boundary, dict)
         # The host redacts it afterwards too; a token in an artifact still refuses the attempt.
+        area = Path(str(boundary["area"]))
         claude_launch.refuse_leaked_token(
-            Path(str(boundary["area"])) / "artifacts", os.environ.get(claude.TOKEN_ENV, "")
+            [area / "artifacts", area / "workspace"], os.environ.get(claude.TOKEN_ENV, "")
         )
     return {
         "result": result.model_dump(mode="json"),

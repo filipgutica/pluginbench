@@ -215,13 +215,15 @@ def pin_exec(agent: object, boundary: dict[str, Any], *, qualification: str) -> 
     setattr(agent, "exec_as_agent", pinned_exec)
 
 
-def refuse_leaked_token(artifacts: Path, token: str) -> None:
-    """Refuse an attempt whose saved artifacts hold the subscription token anywhere."""
-    if not token.strip():
+def refuse_leaked_token(saved: list[Path], token: str) -> None:
+    """Refuse an attempt whose saved artifacts or exported workspace hold the token anywhere."""
+    token = token.strip()
+    if not token:
         raise ValueError(f"no {claude.TOKEN_ENV} to check the saved artifacts against")
     leaked = sorted(
-        str(path.relative_to(artifacts))
-        for path in artifacts.rglob("*")
+        str(path.relative_to(root.parent))
+        for root in saved
+        for path in root.rglob("*")
         if path.is_file() and not path.is_symlink() and token.encode() in path.read_bytes()
     )
     if leaked:
