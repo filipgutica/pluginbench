@@ -9,12 +9,15 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 import pluginbench
 from pluginbench import cli, run_lock
+from pluginbench.isolation import RuntimeDriftError
 
 _SOURCE = str(Path(pluginbench.__file__).parents[1])
 
@@ -178,13 +181,16 @@ def test_the_background_command_runs_this_package() -> None:
 
 
 @pytest.mark.parametrize(
-    "failure,unexpected",
+    "failure,unexpected,exit_code",
     [
-        (RuntimeError("worker broke"), True),
-        (json.JSONDecodeError("empty receipt", "", 0), True),
-        (ValueError("invalid evaluation"), False),
-        (OSError("missing input"), False),
-        (KeyboardInterrupt("stop"), False),
+        (RuntimeError("worker broke"), True, 1),
+        (json.JSONDecodeError("empty receipt", "", 0), True, 2),
+        (ValueError("invalid evaluation"), False, 2),
+        (OSError("missing input"), False, 2),
+        (yaml.YAMLError("invalid YAML"), False, 2),
+        (subprocess.SubprocessError("command failed"), False, 2),
+        (RuntimeDriftError("runtime changed"), False, 2),
+        (KeyboardInterrupt("stop"), False, 130),
     ],
 )
 def test_worker_failure_logs_unexpected_tracebacks_and_keeps_terminal_short(
@@ -193,6 +199,7 @@ def test_worker_failure_logs_unexpected_tracebacks_and_keeps_terminal_short(
     planned: None,
     failure: BaseException,
     unexpected: bool,
+    exit_code: int,
 ) -> None:
     def broken_worker(
         root: Path, *, progress: Callable[[str], None], guard: Callable[[], None]
@@ -202,7 +209,7 @@ def test_worker_failure_logs_unexpected_tracebacks_and_keeps_terminal_short(
     monkeypatch.setattr(cli, "resume_evaluation", broken_worker)
     # The detached worker uses the same foreground command, with output redirected.
     result = CliRunner().invoke(cli.app, ["run", str(tmp_path), "--yes", "--foreground"])
-    assert result.exit_code == (130 if isinstance(failure, KeyboardInterrupt) else 2)
+    assert result.exit_code == exit_code
     assert "Traceback" not in result.output
     events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
     ended = events[-1]
@@ -213,7 +220,46 @@ def test_worker_failure_logs_unexpected_tracebacks_and_keeps_terminal_short(
     if unexpected:
         assert "Traceback (most recent call last):" in ended["traceback"]
         assert "broken_worker" in ended["traceback"]
-        assert f"{type(failure).__name__}: {failure}" in ended["traceback"]
+        assert type(failure).__name__ in ended["traceback"]
+        assert str(failure) not in ended["traceback"]
     else:
         assert "traceback" not in ended
     assert run_lock.owner(tmp_path) is None
+
+
+@pytest.mark.parametrize("explicit_cause", [True, False])
+def test_worker_tracebacks_keep_chain_locations_without_messages_or_notes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planned: None, explicit_cause: bool
+) -> None:
+    credential = "synthetic-credential-for-traceback-regression"
+
+    def failed_operation() -> NoReturn:
+        raise ValueError(credential)
+
+    def broken_worker(
+        root: Path, *, progress: Callable[[str], None], guard: Callable[[], None]
+    ) -> Path:
+        try:
+            failed_operation()
+        except ValueError as cause:
+            cause.add_note(credential)
+            failure = RuntimeError("worker failed")
+            failure.add_note(credential)
+            if explicit_cause:
+                raise failure from cause
+            raise failure
+
+    monkeypatch.setattr(cli, "resume_evaluation", broken_worker)
+    CliRunner().invoke(cli.app, ["run", str(tmp_path), "--yes", "--foreground"])
+    log = (tmp_path / "events.jsonl").read_text()
+    assert credential not in log
+    ended = json.loads(log.splitlines()[-1])
+    assert ended["event"] == "failed"
+    assert ended["error"] == "RuntimeError: worker failed"
+    frames = ended["traceback"]
+    for name in ("RuntimeError", "ValueError", "broken_worker", "failed_operation", "_work"):
+        assert name in frames
+    assert str(Path(__file__)) in frames
+    assert "line " in frames
+    assert "worker failed" not in frames
+    assert "raise failure" not in frames

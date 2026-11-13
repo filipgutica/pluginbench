@@ -35,6 +35,14 @@ from pluginbench.evaluation import (
 )
 from pluginbench.run_status import format_status, run_status
 
+_EXPECTED_RUN_ERRORS = (
+    OSError,
+    ValueError,
+    yaml.YAMLError,
+    subprocess.SubprocessError,
+    RuntimeDriftError,
+)
+
 app = typer.Typer(
     help="Compare native instructions, skills, and plugins with vanilla coding agents.",
     no_args_is_help=True,
@@ -83,11 +91,11 @@ def _confirm(question: str) -> bool:
         raise typer.Exit(1) from None
 
 
-def _error(exc: Exception) -> None:
+def _error(exc: Exception, *, exit_code: int = 2) -> None:
     if isinstance(exc, CheckFailed):
         typer.echo(_readiness_table(exc.report), err=True)
     typer.echo(f"Error: {exc}", err=True)
-    raise typer.Exit(2)
+    raise typer.Exit(exit_code)
 
 
 def _readiness_table(report: dict[str, object]) -> str:
@@ -205,18 +213,36 @@ def _events(root: Path) -> Iterator[Callable[..., None]]:
         yield event
 
 
+def _traceback_locations(exc: BaseException) -> str:
+    """Keep chain types and stack locations without messages, notes, source, or locals."""
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ if current.__cause__ is not None else current.__context__
+    lines: list[str] = []
+    for error in reversed(chain):
+        lines.append("Traceback (most recent call last):\n")
+        for frame, lineno in traceback.walk_tb(error.__traceback__):
+            lines.append(
+                f'  File "{frame.f_code.co_filename}", line {lineno}, in {frame.f_code.co_name}\n'
+            )
+        lines.append(f"{type(error).__name__}\n")
+    return "".join(lines)
+
+
 def _ended(event: Callable[..., None], exc: BaseException) -> None:
     """Record why work ended early: `stop` (SIGTERM) and Ctrl-C stop it; anything else fails."""
     if isinstance(exc, KeyboardInterrupt):
         event("stopped", reason=str(exc) or "interrupted")
     else:
         fields = {"error": f"{type(exc).__name__}: {exc}"}
-        expected = isinstance(
-            exc, (OSError, ValueError, yaml.YAMLError, subprocess.SubprocessError, RuntimeDriftError)
-        )
+        expected = isinstance(exc, _EXPECTED_RUN_ERRORS)
         # JSONDecodeError inherits ValueError, but a failed internal read needs its stack.
         if not expected or isinstance(exc, json.JSONDecodeError):
-            fields["traceback"] = "".join(traceback.format_exception(exc))
+            fields["traceback"] = _traceback_locations(exc)
         event("failed", **fields)
 
 
@@ -244,7 +270,7 @@ def _work(
                 outcome = "stopped" if isinstance(exc, KeyboardInterrupt) else "failed"
                 _notify(f"Run {outcome}: {str(exc) or type(exc).__name__}")
             if isinstance(exc, Exception):
-                _error(exc)  # The event log retains unexpected stacks; keep the terminal short.
+                _error(exc, exit_code=2 if isinstance(exc, _EXPECTED_RUN_ERRORS) else 1)
             raise
         event("finished", report=str(root / "report/report.html"))
     if notify:
@@ -430,13 +456,7 @@ def run(
             _work(root, lock=lock, progress=progress, notify=notify)
         else:
             _detach(root, notify=notify)
-    except (
-        OSError,
-        ValueError,
-        yaml.YAMLError,
-        subprocess.SubprocessError,
-        RuntimeDriftError,
-    ) as exc:
+    except _EXPECTED_RUN_ERRORS as exc:
         _error(exc)
     finally:
         owned.close()
