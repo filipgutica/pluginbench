@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.8.0](https://github.com/filipgutica/pluginbench/compare/v0.7.1...v0.8.0) (2026-11-13)
+
+
+### Features
+
+* accept paths on Claude plugin skills ([#93](https://github.com/filipgutica/pluginbench/issues/93)) ([7641071](https://github.com/filipgutica/pluginbench/commit/76410715384d403be93e8401ba8d8dc4ae29d889))
+* add measures to a finished run with pluginbench measure ([#86](https://github.com/filipgutica/pluginbench/issues/86)) ([b9b9d08](https://github.com/filipgutica/pluginbench/commit/b9b9d085b3364e7a9eb0de2838d6951be8592e94))
+* add pluginbench dashboard, a local read-only web view of runs ([#89](https://github.com/filipgutica/pluginbench/issues/89)) ([03a25be](https://github.com/filipgutica/pluginbench/commit/03a25be9df1c1408b69a6f21c1cfa5859b901720))
+* admit Claude plugin agents and prove their sources in discovery ([#92](https://github.com/filipgutica/pluginbench/issues/92)) ([acc8b36](https://github.com/filipgutica/pluginbench/commit/acc8b363b6554b0065c20cf95bf041c9582227f0))
+* force Claude subagents onto the runner model ([#91](https://github.com/filipgutica/pluginbench/issues/91)) ([195ee21](https://github.com/filipgutica/pluginbench/commit/195ee2190af3d99a542f8eae7f1452a9ad82b559))
+* let Claude Code vanilla attempts use the verified vanilla cache ([#84](https://github.com/filipgutica/pluginbench/issues/84)) ([511ace2](https://github.com/filipgutica/pluginbench/commit/511ace2af62c0f4586fa3a0da0ccb3b625f844d4))
+* let status observers skip the Docker container check ([#88](https://github.com/filipgutica/pluginbench/issues/88)) ([786abf9](https://github.com/filipgutica/pluginbench/commit/786abf90ab348686fb0d7cf646fb094e99f94b70))
+* list every attempt of every reported run in the dashboard ([#90](https://github.com/filipgutica/pluginbench/issues/90)) ([e9dc66f](https://github.com/filipgutica/pluginbench/commit/e9dc66fdcf9ac220a0a956bbeb9b5a06dbfcd271))
+
+
+### Bug Fixes
+
+* accept a relative tasks.source that climbs out of the config directory ([#80](https://github.com/filipgutica/pluginbench/issues/80)) ([89bc629](https://github.com/filipgutica/pluginbench/commit/89bc629aa6108962d578aee2f0129321f9902b58))
+* authenticate Claude reviews and judges with the subscription token only ([#82](https://github.com/filipgutica/pluginbench/issues/82)) ([537bcd9](https://github.com/filipgutica/pluginbench/commit/537bcd92d0b02e73a0839df4a85556eb80cc8d87))
+* bound untranscribed Claude usage by each compaction's token counts ([#83](https://github.com/filipgutica/pluginbench/issues/83)) ([fa5ce5d](https://github.com/filipgutica/pluginbench/commit/fa5ce5d90b7e3a91a84f90d8ad1492e625820474))
+* check hooked Codex usage against the kept session usage ([#81](https://github.com/filipgutica/pluginbench/issues/81)) ([e13ca57](https://github.com/filipgutica/pluginbench/commit/e13ca572a746206e02c042e4af6acf07f9edbbda))
+* let measurement of saved runs ignore Harbor and coding-transport changes ([#85](https://github.com/filipgutica/pluginbench/issues/85)) ([99e7205](https://github.com/filipgutica/pluginbench/commit/99e72057655cc00bac187bb0184f4e59ccd0d65c))
+* refuse non-boolean Claude skill invocation flags at admission ([#79](https://github.com/filipgutica/pluginbench/issues/79)) ([393422d](https://github.com/filipgutica/pluginbench/commit/393422de7f39451ccc98a930a8dcbfb5dc224c64))
+
 ## [0.7.1](https://github.com/filipgutica/pluginbench/compare/v0.7.0...v0.7.1) (2026-11-13)
 
 
