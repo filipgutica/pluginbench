@@ -962,8 +962,13 @@ def _measure(entry: str, saved: dict[str, Any], tmp_path: Path) -> None:
         )
 
 
-def _changed(saved: dict[str, Any], path: str, value: object) -> dict[str, Any]:
+def _changed(
+    saved: dict[str, Any], path: str, value: object, tmp_path: Path | None = None
+) -> dict[str, Any]:
+    """This build's runtime with one field changed, and a Docker CLI in `tmp_path` if given."""
     current = current_runtime(saved)
+    if tmp_path is not None:
+        current["docker_cli"] = docker_cli(tmp_path)
     *parents, field = path.split(".")
     node = current
     for key in parents:
@@ -995,7 +1000,7 @@ def test_measurement_of_a_saved_run_survives_a_harbor_or_transport_change(
     saved = legacy_json("runtime.json")
     if harness == "claude":
         saved = _claude_runtime(saved)
-    current = _changed(saved, path, value)
+    current = _changed(saved, path, value, tmp_path)
     monkeypatch.setattr(harbor, "runtime_identity", lambda **kwargs: current)
 
     def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -1022,7 +1027,7 @@ def test_measurement_still_refuses_a_changed_platform_or_resource(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str, path: str, value: object
 ) -> None:
     saved = legacy_json("runtime.json")
-    current = _changed(saved, path, value)
+    current = _changed(saved, path, value, tmp_path)
     monkeypatch.setattr(harbor, "runtime_identity", lambda **kwargs: current)
     with pytest.raises(isolation.RuntimeDriftError, match=f"{path} was "):
         _measure(entry, saved, tmp_path)

@@ -367,15 +367,20 @@ _RECORDED_RUNTIME = (
 )
 # Checked as a fit for the run's containers, never compared: Docker reports memory that jitters.
 _FIT_RUNTIME = (("docker_engine", "capacity"),)
+# How the coding agent was launched: compared only for work that starts one.
+_LAUNCH_RUNTIME = (("launcher_version",), ("claude_transport",), ("codex_transport",))
 
 
-def runtime_contract(identity: dict[str, object], *, launcher: bool = True) -> dict[str, Any]:
+def runtime_contract(
+    identity: dict[str, object], *, launcher: bool = True, harbor: bool = True
+) -> dict[str, Any]:
     """The part of a runtime identity that must stay equal: all but recorded and fit fields.
 
     Any field not listed above is compared, so a field added later is exact by default. A
     runtime saved before declared versions gets its launcher version from its source hash,
-    and an unknown hash raises. `launcher=False` leaves the launcher version out, for work
-    that starts no coding agent.
+    and an unknown hash raises. `launcher=False` leaves the launcher version and the coding
+    transport out, for work that starts no coding agent. `harbor=False` also leaves the
+    Harbor version out, for work that runs Docker directly instead of through Harbor.
     """
     if not isinstance(identity, dict):
         raise ValueError("a saved runtime identity is not an object")
@@ -385,11 +390,13 @@ def runtime_contract(identity: dict[str, object], *, launcher: bool = True) -> d
         version = components.saved_version(
             "launcher", {"harbor_backend.py": contract.get("implementation_sha256")}
         )
-    if launcher:
-        contract["launcher_version"] = version
-    else:
-        contract.pop("launcher_version", None)
-    for *parents, field in _RECORDED_RUNTIME + _FIT_RUNTIME:
+    contract["launcher_version"] = version
+    ignored: tuple[tuple[str, ...], ...] = _RECORDED_RUNTIME + _FIT_RUNTIME
+    if not launcher:
+        ignored += _LAUNCH_RUNTIME
+    if not harbor:
+        ignored += (("harbor_version",),)
+    for *parents, field in ignored:
         node: object = contract
         for key in parents:
             node = node.get(key) if isinstance(node, dict) else None
@@ -426,19 +433,20 @@ def _fitting_jobs(capacity: dict[str, Any], *, cpus: int, memory_mb: int) -> int
 
 
 def assert_runtime(
-    expected: dict[str, object], *, jobs: int = 1, launcher: bool = True
+    expected: dict[str, object], *, jobs: int = 1, launcher: bool = True, harbor: bool = True
 ) -> dict[str, object]:
     """Check the current runtime against a saved one, and return the current one.
 
     Exact fields must be equal, Docker capacity must hold `jobs` containers, and recorded
     fields may differ. Docker commands after this check use the returned identity, so an
-    updated Docker CLI or a restarted engine runs with what is installed now.
+    updated Docker CLI or a restarted engine runs with what is installed now. `launcher` and
+    `harbor` select the contract, as `runtime_contract` describes.
     """
     resources = _object(expected.get("resources"), "container resources")
     cpus, memory = resources.get("cpus"), resources.get("memory_mb")
     if not isinstance(cpus, int) or not isinstance(memory, int):
         raise ValueError("Frozen container resource limits are missing")
-    saved = runtime_contract(expected, launcher=launcher)
+    saved = runtime_contract(expected, launcher=launcher, harbor=harbor)
     harness = "claude" if "claude_transport" in expected else "codex"
     try:
         actual = runtime_identity(cpus=cpus, memory_mb=memory, harness=harness)
@@ -446,7 +454,9 @@ def assert_runtime(
         raise isolation.RuntimeDriftError(
             "Cannot verify the frozen Harbor and Docker runtime"
         ) from error
-    changes = runtime_changes(saved, runtime_contract(actual, launcher=launcher))
+    changes = runtime_changes(
+        saved, runtime_contract(actual, launcher=launcher, harbor=harbor)
+    )
     if changes:
         raise isolation.RuntimeDriftError(
             "Harbor or Docker runtime changed since this run was prepared: "
@@ -487,7 +497,7 @@ def assert_capacity(inputs: list[list[dict[str, object]]], *, jobs: int) -> None
     count = min(jobs, len(needs))
     cpus = sum(sorted((need[0] for need in needs), reverse=True)[:count])
     memory = sum(sorted((need[1] for need in needs), reverse=True)[:count])
-    actual = assert_runtime(inputs[0][0], launcher=False)
+    actual = assert_runtime(inputs[0][0], launcher=False, harbor=False)
     current = _object(_object(actual["docker_engine"], "Docker engine")["capacity"], "capacity")
     if cpus > int(current["cpus"]) or memory * 1024**2 > int(current["memory_bytes"]) * 0.8:
         raise isolation.RuntimeDriftError(
@@ -2680,9 +2690,12 @@ def run_native_command(
         raise ValueError(
             "Native measurement report must not overwrite original inputs or source paths"
         )
-    # Measurement starts no coding agent, so the launcher version does not bind it.
+    # Measurement starts no coding agent and runs Docker without Harbor, so neither how
+    # coding was launched nor the Harbor version binds it.
     expected = assert_runtime(
-        _native_object(task_identity["isolation"], "measurement runtime"), launcher=False
+        _native_object(task_identity["isolation"], "measurement runtime"),
+        launcher=False,
+        harbor=False,
     )
     image = _native_object(task_identity["image_identity"], "measurement image")
     workdir = str(task_identity["workdir"])
@@ -2998,7 +3011,8 @@ def regrade_native(
     if native_task_assets(task_dir) != identity["task_assets_sha256"]:
         raise ValueError("Native regrade task assets differ from the frozen task")
     validate_native_task(task_dir)
-    # Regrading replays only the verifier, so the launcher version does not bind it.
+    # Regrading replays only the verifier, so how coding was launched does not bind it. Harbor
+    # runs that verifier, so its version still does.
     expected = assert_runtime(
         _native_object(identity["isolation"], "native regrade runtime"), launcher=False
     )
