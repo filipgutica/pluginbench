@@ -2477,9 +2477,46 @@ def test_measure_refuses_to_lose_earlier_observations_only_submissions_break(
 
     assert refused.exit_code == 2
     assert "measurement revision m1 would lose" in refused.stderr, refused.stderr
-    assert "measured coverage observations that revision measurements has" in refused.stderr
+    assert "27 observations that revision measurements measured" in refused.stderr
+    assert "Line coverage %" in refused.stderr
     assert (root / "evaluation.json").read_bytes() == before
     assert evaluation._load_selection(root)["measurement_revision"] == "measurements"
+
+
+def test_measure_refuses_to_lose_a_metric_its_collector_fails_only_on_submissions(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, _, _ = _recorded_calls(config, tmp_path, monkeypatch)
+    config.measurements.remove("coverage")
+    task = config.tasks.resolve() / config.tasks.ids[0] / "task.toml"
+    task.write_text(task.read_text().replace("[agent]", "[metadata]\nlanguage='python'\n[agent]"))
+    root = tmp_path / "run"
+    evaluation.run_evaluation(config, root)
+    _python_analysis(monkeypatch)
+    arguments = ["--measurements", "cyclomatic", "--revision", "m0", "--yes"]
+    assert CliRunner().invoke(cli.app, ["measure", str(root), *arguments]).exit_code == 0
+    cyclomatic = _observations(root, {"cyclomatic"})
+    assert {row["status"] for row in cyclomatic} == {"measured"}
+    complexity = language_analysis._complexity
+
+    def starting_source_only(root: Path, *args: Any) -> list[dict[str, object]]:
+        # The analyzer still reads the starting source, then fails on every submission.
+        if (root / "src/answer.py").read_text() == "answer = 1\n":
+            raise language_analysis.AnalysisUnavailable("parser rejects the submission")
+        return complexity(root, *args)
+
+    monkeypatch.setattr(language_analysis, "_complexity", starting_source_only)
+    before = (root / "evaluation.json").read_bytes()
+
+    refused = CliRunner().invoke(
+        cli.app, ["measure", str(root), "--measurements", "dead_code", "--revision", "m1", "--yes"]
+    )
+
+    assert refused.exit_code == 2
+    assert "m1 would lose" in refused.stderr and "Net cyclomatic complexity added" in refused.stderr
+    assert (root / "evaluation.json").read_bytes() == before
+    assert evaluation._load_selection(root)["measurement_revision"] == "m0"
+    assert _observations(root, {"cyclomatic"}) == cyclomatic
 
 
 def test_measure_lists_a_new_measure_broken_on_one_task_as_not_measured(

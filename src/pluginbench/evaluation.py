@@ -49,6 +49,7 @@ from pluginbench.measurement_profiles import (
 from pluginbench.assessment_metrics import scoped_code_size, scoped_test_size
 from pluginbench.datasets import TaskCatalog, TaskEntry, load_tasks, portable_native_identity
 from pluginbench.collectors import Collector
+from pluginbench.assessment_charts import chart_data
 from pluginbench.evaluation_report import write_evaluation_report
 from pluginbench.remeasure import (
     _native_state,
@@ -1668,35 +1669,37 @@ def measure_evaluation(
 
 
 def _refuse_lost_observations(evidence: Path, current: str, proposed: str) -> None:
-    """Refuse a proposal that loses a collector observation the selected revision measured.
+    """Refuse a proposal that loses any observation the selected revision measured.
 
-    A collector can pass on a task's starting source and still fail on some submissions, so
-    this compares every attempt, stage and collector of the two revisions after collection.
+    A collector can pass on a task's starting source and still fail on some submissions, in
+    whole or for one metric, so this compares the observation records the report reads, per
+    metric, attempt and stage, after collection.
     """
 
     def measured(revision: str) -> dict[tuple[str, str, str], str]:
         path = evidence / "observer-revisions" / revision / "revision.json"
         state = study._bound_document(evidence, study._reference(evidence, path))
-        tasks = {
-            record["id"]: record["task_id"]
-            for record in study._bound_document(evidence, state["proposed_assessment"])["records"]
-        }
+        report = study._bound_document(evidence, state["proposed_report"])
+        rows = TypeAdapter(list[dict[str, object]]).validate_python(
+            chart_data(report)["observations"]
+        )
         return {
-            (kind, row["attempt_id"], row["stage"]): tasks[row["attempt_id"]]
-            for row in state["observations"]
-            for kind, outcome in row["outcomes"].items()
-            if outcome["status"] == "available"
+            (str(row["metric"]), str(row["attempt_id"]), str(row["stage"])): str(row["task"])
+            for row in rows
+            if row["status"] != "unknown"
         }
 
     before, after = measured(current), measured(proposed)
-    lost = sorted(key for key in before if key not in after)
-    if lost:
-        kinds = sorted({kind for kind, _, _ in lost})
+    if lost := sorted(key for key in before if key not in after):
+        counts = ", ".join(
+            f"{metric} ({sum(key[0] == metric for key in lost)})"
+            for metric in sorted({key[0] for key in lost})
+        )
         examples = ", ".join(f"{before[key]} {key[1]}/{key[2]}" for key in lost[:3])
         raise ValueError(
-            f"measurement revision {proposed} would lose {len(lost)} measured {'/'.join(kinds)} "
-            f"observations that revision {current} has, such as {examples}. It stays in evidence "
-            "and is not selected; the run's settings are unchanged"
+            f"measurement revision {proposed} would lose {len(lost)} observations that revision "
+            f"{current} measured: {counts}; such as {examples}. It stays in evidence and is not "
+            "selected; the run's settings are unchanged"
         )
 
 
