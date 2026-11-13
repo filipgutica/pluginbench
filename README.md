@@ -124,6 +124,7 @@ This run uses one public DeepSWE task, vanilla only, and one repeat. It needs no
    ```
 
    `status` shows the phase, attempts and outcomes per arm, tokens, vanilla reuse, and measures. It never writes.
+   For a local web page of every run under a folder, run `pluginbench dashboard runs`; it also only reads.
 
 6. Open `runs/<run>/report/report.html` when the phase is `complete`.
 
