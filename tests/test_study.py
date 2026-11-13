@@ -89,7 +89,12 @@ def test_full_study_keeps_all_twelve_attempts_and_reports_failure(
 ) -> None:
     recipe = study.load_study(_recipe(tmp_path))
     calls = _fake_runtime(monkeypatch, fail_call=1)
-    root = study.run_study(recipe, tmp_path / "results")
+    progress: list[str] = []
+    root = study.run_study(recipe, tmp_path / "results", progress=progress.append)
+    coding = [message for message in progress if message.startswith("Coding ")]
+    assert len(coding) == 12
+    assert sum(" · vanilla · repeat " in message for message in coding) == 6
+    assert all(" · baseline · " not in message for message in progress)
     manifest = json.loads((root / "assessment-input.json").read_text())
     assert len(calls) == len(manifest["records"]) == 12
     assert len({record["id"] for record in manifest["records"]}) == 12
@@ -246,8 +251,10 @@ def test_artifact_links_are_retained_without_reading_external_files(
     root = tmp_path / "results"
     # Each attempt ends with an artifact error and no submission, so the third in a row stops
     # new attempts.
-    with pytest.raises(ValueError, match="unsupported native artifact"):
+    with pytest.raises(ValueError, match="unsupported native artifact") as error:
         study.run_study(study.load_study(path), root)
+    assert " · vanilla · repeat " in str(error.value)
+    assert " · baseline · " not in str(error.value)
     assert len(calls) == 3
     for file in root.rglob("*"):
         if file.is_file() and not file.is_symlink():

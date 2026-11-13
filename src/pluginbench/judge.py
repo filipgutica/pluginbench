@@ -923,9 +923,10 @@ def tally(directory: Path, *, require_bound: bool = False) -> dict[str, Any]:
             }
             for judge in judges
         },
-        "agreement_definition": "Share of pairs where the judge's vote equals the verdict "
-        "more than half of the other judges gave; pairs without such a verdict are left out. "
-        "Side-A rate and agreement cover every pair, including correctness-decided ones.",
+        "agreement_definition": "Agreement: matching votes divided by pairs where more than "
+        "half of the other judges gave the same verdict (A, B, or tie). "
+        "Pairs without that majority are excluded. Denominators can differ by judge; "
+        "correctness-decided pairs remain eligible. No eligible pairs gives null (shown as -).",
         "side_a_definition": "A votes divided by all pairs, including ties and "
         "correctness-decided pairs. Ties add zero A votes. Unable verdicts block tally. "
         "Flag position bias outside 0.2–0.8 at 10 or more pairs; below 10 the sample "
@@ -995,6 +996,7 @@ def format_tally(result: dict[str, Any]) -> str:
             "",
             *_table(judges),
             "",
+            result["agreement_definition"],
             result["side_a_definition"],
             result["usage_definition"],
             *(

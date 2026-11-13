@@ -515,6 +515,55 @@ def test_tally_applies_correctness_first_then_a_strict_majority(tmp_path: Path) 
     assert "Weighted wins over 6 pairs: vanilla 3.5, workflow-r9 2.5" in judge.format_tally(result)
 
 
+def test_agreement_denominator_is_the_other_judges_majority_not_correctness(
+    tmp_path: Path,
+) -> None:
+    # Ten pairs: three correctness-decided, seven judged. One judge always votes B;
+    # the other two vote A on three judged pairs and B on the remaining seven.
+    attempts: list[dict[str, object]] = [
+        {"id": f"{arm[0]}{repeat}", "task": "alpha", "repeat": repeat, "guidance": arm,
+         "correctness": "fail" if (arm, repeat) in {
+             ("baseline", 1), ("workflow-r9", 3), ("baseline", 9),
+         } else "pass"}
+        for arm in ("baseline", "workflow-r9")
+        for repeat in range(1, 11)
+    ]
+    directory = _prepare(tmp_path, _run(tmp_path / "run", attempts), tasks=["alpha"])
+    key = json.loads((directory / "key.json").read_text())
+    pairs = key["tasks"]["task-1"]["pairs"]
+    votes = {
+        name: {
+            ("task-1", number): sides[
+                "A" if name != "claude" and int(number) in {2, 6, 8} else "B"
+            ]["arm"]
+            for number, sides in pairs.items()
+        }
+        for name in ("claude", "codex-1", "codex-2")
+    }
+    _votes(directory, votes)
+
+    result = tally(directory)
+
+    assert result["correctness_decided"]["pairs"] == 3
+    assert result["judged"]["pairs"] == 7
+    stats = result["judge_stats"]
+    assert stats["claude"]["agreement"] == pytest.approx(0.7)
+    assert stats["claude"]["agreement_pairs"] == 10
+    assert stats["claude"]["side_a_rate"] == 0
+    for name in ("codex-1", "codex-2"):
+        assert stats[name]["agreement"] == 1
+        assert stats[name]["agreement_pairs"] == 7
+        assert stats[name]["side_a_rate"] == 0.3
+    # Each Codex denominator includes all three correctness-decided pairs. It excludes
+    # three judged pairs because the remaining judges disagree, not because of harness.
+    assert all(len(set(pair["votes"].values())) == 1 for task in result["tasks"]
+               for pair in task["pairs"] if pair["decided_by"] == "correctness")
+    output = judge.format_tally(result)
+    assert "0.70 of 10" in output and "1.00 of 7" in output
+    assert result["agreement_definition"] in output
+    assert "Denominators can differ by judge" in output
+
+
 def test_tally_refuses_a_partial_panel(tmp_path: Path) -> None:
     directory = _prepare(tmp_path, _two_arms(tmp_path))
     _votes(directory, {"j1": {}, "j2": {}})
