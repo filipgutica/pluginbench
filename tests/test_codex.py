@@ -871,6 +871,18 @@ def test_native_spawn_override_is_descendant_evidence_without_the_child_trace() 
     assert parsed["actual_descendant_efforts"] == ["low"]
 
 
+def test_native_rejected_spawn_override_is_not_descendant_evidence() -> None:
+    spawn = named_native_spawn()
+    call, output = spawn[0]["payload"], spawn[1]["payload"]
+    assert isinstance(call, dict) and isinstance(output, dict)
+    call["arguments"] = '{"model":"other-model","reasoning_effort":"low"}'
+    output["output"] = "Unknown model `other-model` for spawn_agent. Available models: primary"
+    root = native_session("root", [{"input_tokens": 20, "output_tokens": 5}], extra=spawn)
+    parsed = codex.parse_events("", [root], "codex", include_descendants=True)
+    assert parsed["actual_descendant_models"] == []
+    assert parsed["actual_descendant_efforts"] == []
+
+
 @pytest.mark.parametrize("boundary", [None, True, -1, 0, 2, 5, 99])
 def test_native_inherited_child_rejects_missing_or_invalid_own_history_boundary(
     boundary: object,

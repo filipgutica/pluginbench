@@ -496,6 +496,7 @@ def _descendant_usage(
         failed = False
         pending_spawns: set[str] = set()
         named_spawns: dict[str, str | None] = {}
+        spawn_overrides: dict[str, dict[str, Any]] = {}
         own_turn: str | None = None
         for event in session["events"]:
             payload = event.get("payload")
@@ -519,16 +520,14 @@ def _descendant_usage(
                         named_spawns[call_id] = None
                     else:
                         reasons.add(f"unidentified named spawn for session {identity}")
-                    # A requested override is evidence even when the child's own trace is lost.
+                    # A requested override is evidence even when the child's own trace is lost,
+                    # unless the call's output shows Codex rejected the spawn.
                     try:
                         arguments = json.loads(payload.get("arguments") or "{}")
                     except (TypeError, ValueError):
                         arguments = None
-                    if isinstance(arguments, dict):
-                        if isinstance(arguments.get("model"), str):
-                            child_models.add(arguments["model"])
-                        if isinstance(arguments.get("reasoning_effort"), str):
-                            child_efforts.add(arguments["reasoning_effort"])
+                    if isinstance(arguments, dict) and isinstance(call_id, str) and call_id:
+                        spawn_overrides[call_id] = arguments
                 if (
                     payload.get("type") == "function_call_output"
                     and isinstance(call_id, str)
@@ -543,9 +542,11 @@ def _descendant_usage(
                     except ValueError:
                         output = None
                     path = output.get("task_name") if isinstance(output, dict) else None
+                    requested = spawn_overrides.pop(call_id, {})
                     if not isinstance(path, str) or not path:
                         reasons.add(f"unresolved named spawn for session {identity}")
                     else:
+                        _add_spawn_overrides(requested, child_models, child_efforts)
                         if named_spawns[call_id] not in (None, path):
                             reasons.add(f"conflicting named spawn result for session {identity}")
                         named_spawns[call_id] = path
@@ -633,6 +634,9 @@ def _descendant_usage(
                     if child in sessions and sessions[child]["parent_thread_id"] != identity:
                         reasons.add(f"spawn lineage does not match session {child}")
                         identity_safe = False
+        # A spawn whose output was never captured may still have run with its override.
+        for requested in spawn_overrides.values():
+            _add_spawn_overrides(requested, child_models, child_efforts)
         has_usage = total is not None and {"input_tokens", "output_tokens"}.issubset(total)
         if not has_usage:
             reasons.add(f"missing usage for session {identity}")
@@ -721,3 +725,12 @@ def _descendant_usage(
             "observed_usage_lower_bound": observed_usage if identity_safe else None,
         },
     }
+
+
+def _add_spawn_overrides(
+    arguments: dict[str, Any], models: set[str], efforts: set[str]
+) -> None:
+    if isinstance(arguments.get("model"), str):
+        models.add(arguments["model"])
+    if isinstance(arguments.get("reasoning_effort"), str):
+        efforts.add(arguments["reasoning_effort"])
