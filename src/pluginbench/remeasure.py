@@ -228,12 +228,16 @@ def _native_state(root: Path) -> tuple[dict[str, object], AssessmentInput, Path]
         history = origin.get("historical_evidence")
         if not isinstance(history, list):
             raise ValueError("baseline origin requires historical evidence references")
+        # Imported raw artifacts can contain empty or partial JSON from the native tools.
+        # Bind their bytes without interpreting their contents as PluginBench receipts.
+        for reference in history:
+            study._bound_path(root, reference)
         _verify_native_references(
             root,
             {
                 key: item
                 for key, item in origin.items()
-                if key not in {"original_record", "evidence"}
+                if key not in {"original_record", "evidence", "historical_evidence"}
             },
             seen,
         )

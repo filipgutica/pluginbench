@@ -175,3 +175,45 @@ def test_the_background_command_runs_this_package() -> None:
         check=True,
     )
     assert version.stdout.strip() == pluginbench.__version__
+
+
+@pytest.mark.parametrize(
+    "failure,unexpected",
+    [
+        (RuntimeError("worker broke"), True),
+        (json.JSONDecodeError("empty receipt", "", 0), True),
+        (ValueError("invalid evaluation"), False),
+        (OSError("missing input"), False),
+        (KeyboardInterrupt("stop"), False),
+    ],
+)
+def test_worker_failure_logs_unexpected_tracebacks_and_keeps_terminal_short(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    planned: None,
+    failure: BaseException,
+    unexpected: bool,
+) -> None:
+    def broken_worker(
+        root: Path, *, progress: Callable[[str], None], guard: Callable[[], None]
+    ) -> Path:
+        raise failure
+
+    monkeypatch.setattr(cli, "resume_evaluation", broken_worker)
+    # The detached worker uses the same foreground command, with output redirected.
+    result = CliRunner().invoke(cli.app, ["run", str(tmp_path), "--yes", "--foreground"])
+    assert result.exit_code == (130 if isinstance(failure, KeyboardInterrupt) else 2)
+    assert "Traceback" not in result.output
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    ended = events[-1]
+    assert ended["event"] == ("stopped" if isinstance(failure, KeyboardInterrupt) else "failed")
+    if not isinstance(failure, KeyboardInterrupt):
+        assert ended["error"] == f"{type(failure).__name__}: {failure}"
+        assert f"Error: {failure}" in result.stderr
+    if unexpected:
+        assert "Traceback (most recent call last):" in ended["traceback"]
+        assert "broken_worker" in ended["traceback"]
+        assert f"{type(failure).__name__}: {failure}" in ended["traceback"]
+    else:
+        assert "traceback" not in ended
+    assert run_lock.owner(tmp_path) is None

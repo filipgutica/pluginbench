@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import UTC, datetime
@@ -209,7 +210,14 @@ def _ended(event: Callable[..., None], exc: BaseException) -> None:
     if isinstance(exc, KeyboardInterrupt):
         event("stopped", reason=str(exc) or "interrupted")
     else:
-        event("failed", error=f"{type(exc).__name__}: {exc}")
+        fields = {"error": f"{type(exc).__name__}: {exc}"}
+        expected = isinstance(
+            exc, (OSError, ValueError, yaml.YAMLError, subprocess.SubprocessError, RuntimeDriftError)
+        )
+        # JSONDecodeError inherits ValueError, but a failed internal read needs its stack.
+        if not expected or isinstance(exc, json.JSONDecodeError):
+            fields["traceback"] = "".join(traceback.format_exception(exc))
+        event("failed", **fields)
 
 
 def _work(
@@ -235,6 +243,8 @@ def _work(
             if notify:
                 outcome = "stopped" if isinstance(exc, KeyboardInterrupt) else "failed"
                 _notify(f"Run {outcome}: {str(exc) or type(exc).__name__}")
+            if isinstance(exc, Exception):
+                _error(exc)  # The event log retains unexpected stacks; keep the terminal short.
             raise
         event("finished", report=str(root / "report/report.html"))
     if notify:
