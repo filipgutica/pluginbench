@@ -403,6 +403,17 @@ def test_a_compaction_without_well_typed_token_counts_is_refused(
     ]
 
 
+def test_an_unqualified_version_does_not_need_compaction_token_counts(tmp_path: Path) -> None:
+    # The bound is calibrated on 2.1.322 only; another version keeps the one-sided rule.
+    run = _copy("compaction", tmp_path / "run")
+    _init_version("2.1.400")(run)
+    _rewrite(_root(run), lambda events: [
+        {key: value for key, value in e.items() if key != "compactMetadata"} for e in events
+    ])
+    accounting = _validate(run, version="2.1.400")["usage_accounting"]
+    assert accounting["reasons"] == [] and accounting["rule"] == "one-sided"
+
+
 def test_the_stream_agent_calls_must_match_the_transcripts(tmp_path: Path) -> None:
     # Deleting a subagent and its call from the transcripts leaves the stream's call behind.
     run = _copy("one-subagent", tmp_path / "run")

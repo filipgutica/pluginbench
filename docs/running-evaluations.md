@@ -179,7 +179,8 @@ Known limits:
 - A timeout leaves no result event, so its usage is unknown with no lower bound. Codex keeps a lower bound.
 - Automatic compaction within a single prompt has not been observed. The compaction rule is calibrated on a manual compaction only.
 - On a 2.1.322 compaction run, each compact boundary in the root transcript bounds the runner model's untranscribed excess. Input may exceed the transcripts by at most `preTokens` plus a 4,000-token compaction-prompt allowance, and output by at most `postTokens`. Bounds of several compactions add up. A boundary without these counts, or an excess above the bound, leaves usage unavailable.
-- The bound is calibrated on one manual compaction, whose call read 1,995 tokens more than `preTokens`. An automatic compaction that exceeds it is refused, not accepted.
+- The bound is empirical, calibrated on one manual compaction whose call read 1,995 tokens more than `preTokens` and wrote 421 output tokens. `postTokens` estimates the context after compaction and does not contain the call's thinking. A genuine automatic compaction can exceed the bound, for example with a large tool result or long thinking; it is refused, not accepted.
+- On a CLI version other than 2.1.322 the one-sided rule applies, and the runner model's untranscribed excess has no upper bound.
 - Command hooks make total usage unknown, as for Codex; see [Measurements](#measurements).
 
 ### Container boundary

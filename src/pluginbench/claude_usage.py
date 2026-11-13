@@ -23,13 +23,16 @@ _MODEL_USAGE = ("inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens
 _MESSAGE_USAGE = (
     "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens",
 )
-# Derived from the 2.1.322 probe's one manual `/compact` (the `compaction` fixture): the
-# untranscribed compaction call read the boundary's `preTokens` (15,343, the context before
-# compaction) plus a 1,995-token compaction prompt, and wrote the summary (421 tokens), which
-# is part of the context the boundary's `postTokens` (4,799) counts. Each compaction may
-# therefore add at most `preTokens` plus this prompt allowance (about twice the observed
-# prompt) of input and `postTokens` of output. The prompt is fixed text, so the allowance is a
-# constant rather than a multiple of the context. Recalibrate when qualifying another version.
+# An empirical cap from the 2.1.322 probe's one manual `/compact` (the `compaction` fixture),
+# not a structural bound. The untranscribed compaction call read the boundary's `preTokens`
+# (15,343, the context before compaction) plus a 1,995-token compaction prompt, and wrote 421
+# output tokens. Each compaction may add at most `preTokens` plus this prompt allowance (about
+# twice the observed prompt) of input, and `postTokens` (4,799) of output. `postTokens` is the
+# CLI's estimate of the context after compaction, mostly re-injected listings; it does not
+# contain the call's thinking or stripped analysis. A genuine automatic compaction (a tool
+# result tail under-estimated in `preTokens`, a fallback second call, or long thinking) can
+# exceed the cap and is then refused, never accepted. Recalibrate from a real run, and when
+# qualifying another version.
 COMPACTION_PROMPT_TOKENS = 4000
 
 
