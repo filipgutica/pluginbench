@@ -134,14 +134,15 @@ def _profile(root: Path, *, broken: bool = False) -> dict[str, list[Collector]]:
     }
 
 
-def _cached_baseline_origin(root: Path) -> None:
+def _cached_baseline_origin(root: Path, *, historical_content: bytes = b'{"started": true}') -> None:
     record = json.loads((root / "assessment-input.json").read_text())["records"][0]
     record["id"] = "previous-a"
     for stage in record["stages"]:
         for key in ("snapshot", "correctness"):
             stage[key]["path"] = stage[key]["path"].replace("attempts/a/", "attempts/previous-a/")
     historical = root / "baseline-evidence/a/native-starts.json"
-    _write(historical, {"started": True})
+    historical.parent.mkdir(parents=True)
+    historical.write_bytes(historical_content)
     origin = {
         "status": "reused",
         "cache_key": "cached-cohort",
@@ -157,6 +158,23 @@ def _cached_baseline_origin(root: Path) -> None:
     run = json.loads((root / "run.json").read_text())
     run["baseline_origin"] = {"a": {**origin, "evidence": study._reference(root, path)}}
     _write(root / "run.json", run)
+
+
+@pytest.mark.parametrize("content", [b"", b'{"partial":', b'{"path":"missing","sha256":"raw"}'])
+def test_reused_raw_json_artifacts_are_hash_checked_without_parsing(
+    tmp_path: Path, content: bytes
+) -> None:
+    root = _native(tmp_path / "run")
+    _cached_baseline_origin(root, historical_content=content)
+    previous = study._inventory(root)
+
+    run, _, _ = remeasure._native_state(root)
+    assert run["status"] == "complete"
+    assert study._inventory(root) == previous
+
+    (root / "baseline-evidence/a/native-starts.json").write_bytes(content + b"changed")
+    with pytest.raises(ValueError, match="run artifact changed after the run:.*native-starts.json"):
+        remeasure._native_state(root)
 
 
 def test_remeasurement_deduplicates_repeats_and_preserves_native_fields(
