@@ -35,7 +35,7 @@ PluginBench runs on Linux or macOS. Every run needs:
 | Git | Any recent | Task sources and patches |
 | Docker | Linux containers on a local Unix socket, with Compose and Buildx | Each attempt and its verifier run in containers |
 | Codex CLI | Logged in; verified trace versions: 0.162.1, 0.167.0, 0.167.1 | Coding agent for `runner.harness: codex`. PluginBench copies its login from `~/.codex/auth.json` to the pinned container CLI. Unverified versions warn and continue; incompatible traces or unverified inherited history leave tokens unavailable. |
-| Claude Code CLI | Only for `runner.harness: claude`; qualified version: 2.1.322 | Coding agent. Set `CLAUDE_CODE_OAUTH_TOKEN` to your subscription token, such as one from `claude setup-token`; API keys are refused for coding. Other versions warn and continue. The host CLI is needed only when `runner.cli_version` is omitted. |
+| Claude Code CLI | Only for `runner.harness: claude`; qualified version: 2.1.322 | Coding agent. Set `CLAUDE_CODE_OAUTH_TOKEN` to your subscription token, such as one from `claude setup-token`; API keys are refused for coding, reviews, and judges. Other versions warn and continue. The host CLI is needed only when `runner.cli_version` is omitted. |
 
 Set `runner.cli_version: "0.167.0"` (Codex) or `"2.1.322"` (Claude Code) to select the exact coding CLI version installed in task containers.
 When omitted, preparation pins the host CLI's version. Resume keeps that pin across host CLI updates.

@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from pluginbench import cli, codex, judge
+from pluginbench import claude, cli, codex, judge
 from pluginbench.assessment_models import Attempt, Stage
 from pluginbench.judge import normalize_diff, prepare, tally
 
@@ -326,6 +326,10 @@ def _fake_judge(
 ) -> list[Path]:
     """Answer every pair with answers[model]; check what the judge's workspace holds."""
     calls: list[Path] = []
+    # A Claude panel checks credentials before its first call.
+    for name in claude.REFUSED_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(claude.TOKEN_ENV, "fixture-token")
 
     def invoke(
         *,
@@ -427,6 +431,37 @@ def test_run_uses_the_reviewer_launch_path_and_resumes(
     assert (directory / "results/codex-m1-high/task-2/call-1/stdout.jsonl").is_file()
     assert judge.run(directory, judges=judges, timeout=60, jobs=1, progress=print) == 0
     assert len(calls) == 4
+
+
+@pytest.mark.parametrize(
+    ("operator_env", "refused"),
+    [
+        pytest.param({"ANTHROPIC_API_KEY": "sk-ant-unwanted"}, "ANTHROPIC_API_KEY", id="api-key"),
+        pytest.param(
+            {"CLAUDE_CODE_OAUTH_TOKEN": "token", "CLAUDE_CODE_USE_BEDROCK": "1"},
+            "CLAUDE_CODE_USE_BEDROCK",
+            id="provider",
+        ),
+    ],
+)
+def test_a_claude_judge_refuses_an_api_key_or_provider_before_any_model_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operator_env: dict[str, str], refused: str
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    for name in (claude.TOKEN_ENV, *claude.REFUSED_ENV):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in operator_env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(claude, "preflight", lambda: {"harness_version": "fixture-version"})
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda *args, **kwargs: pytest.fail("model call started")
+    )
+    refusal = f"Claude authenticates with CLAUDE_CODE_OAUTH_TOKEN only; unset {refused}"
+    with pytest.raises(ValueError, match=refusal):
+        judge.run(directory, judges=["claude:m1:high"], timeout=60, jobs=1, progress=print)
+    # Refused once, before a spec, panel entry or call folder: no call counts as unknown usage.
+    assert not (directory / "results").exists()
+    assert not (directory / "judge-specs").exists()
 
 
 def test_a_rejected_answer_leaves_no_verdict_and_is_retried(

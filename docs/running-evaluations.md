@@ -146,7 +146,7 @@ Coding authenticates only with the operator's Claude subscription token:
 - `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, Bedrock, Vertex, and Foundry routing, `DISABLE_PROMPT_CACHING`, and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` are refused in the operator environment, before any container starts, and in every container command.
 - The token reaches the container only as a credentials file in the CLI's private configuration, never in a command's environment. The file is removed before Harbor collects artifacts.
 - After the run, the saved artifacts and the exported workspace are scanned for the token. A match fails the attempt.
-- This applies to coding only. Independent reviews and judges accept `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`.
+- Independent reviews, both the run's review phase and `pluginbench review`, and `pluginbench judge run --judge claude:MODEL:EFFORT` take only the subscription token too: `CLAUDE_CODE_OAUTH_TOKEN`, or the macOS Keychain login when it is unset. They refuse the same operator-environment variables before any model call; a judge run refuses once, before it reserves any call.
 
 PluginBench runs Harbor 0.24.0's `ClaudeCode` agent and refuses to launch when the hash of its `run` source changes. It allows only Harbor's setup, the version check, and one coding command, which it replaces with the pinned launch:
 
@@ -167,7 +167,7 @@ Claude token usage is the result event's `modelUsage`, which includes subagents.
 | CLI version | Compaction in the stream and root transcript | Rule |
 | --- | --- | --- |
 | 2.1.322 | None | Transcript input and output must equal `modelUsage` for every model. |
-| 2.1.322 | Both | Transcripts must not exceed `modelUsage`. The runner model's excess is reported as untranscribed, and other models must be equal. |
+| 2.1.322 | Both | Transcripts must not exceed `modelUsage`. The runner model's excess is reported as untranscribed and bounded by the compactions; other models must be equal. |
 | Other | Either | Only input is compared. Transcripts must not exceed `modelUsage`; the runner model's excess is untranscribed, and other models must be equal. |
 
 The stream and root transcript must agree on compaction. The stream also needs one `system/init` and one successful result for the same session, with the runner model and the launched CLI version.
@@ -180,7 +180,9 @@ Known limits:
 - The vanilla cache key binds the pinned launch environment and refused variables. Each coding command and discovery enforce them, but saved evidence records only the argv, so admission cannot confirm the environment a cached attempt ran with.
 - A timeout leaves no result event, so its usage is unknown with no lower bound. Codex keeps a lower bound.
 - Automatic compaction within a single prompt has not been observed. The compaction rule is calibrated on a manual compaction only.
-- On a compaction run, the runner model's untranscribed excess has no upper bound.
+- On a 2.1.322 compaction run, each compact boundary in the root transcript bounds the runner model's untranscribed excess. Input may exceed the transcripts by at most `preTokens` plus a 4,000-token compaction-prompt allowance, and output by at most `postTokens`. Bounds of several compactions add up. A boundary without these counts, or an excess above the bound, leaves usage unavailable.
+- The bound is empirical, calibrated on one manual compaction whose call read 1,995 tokens more than `preTokens` and wrote 421 output tokens. `postTokens` estimates the context after compaction and does not contain the call's thinking. A genuine automatic compaction can exceed the bound, for example with a large tool result or long thinking; it is refused, not accepted.
+- On a CLI version other than 2.1.322 the one-sided rule applies, and the runner model's untranscribed excess has no upper bound.
 - Command hooks make total usage unknown, as for Codex; see [Measurements](#measurements).
 
 ### Container boundary

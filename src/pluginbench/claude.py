@@ -35,11 +35,10 @@ REQUIRED_FLAGS = (
     "--permission-prompts",
     "--json-schema",
 )
-AUTH_NAMES = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
 _NO_CREDENTIAL = (
-    "Claude authentication unavailable: neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY "
-    "is set in the environment of this process. A service, such as a systemd unit, does not "
-    "inherit a variable that a shell profile exports; set one in the service's environment"
+    "Claude authentication unavailable: CLAUDE_CODE_OAUTH_TOKEN is not set in the environment "
+    "of this process. A service, such as a systemd unit, does not inherit a variable that a "
+    "shell profile exports; set it in the service's environment"
 )
 READ_TOOLS = "Read,Glob,Grep"
 
@@ -118,8 +117,10 @@ PINNED_SETTINGS: dict[str, object] = {}
 DISCOVERY_SETTINGS: dict[str, object] = {"disableAllHooks": True}
 DISALLOWED_TOOLS = ("RemoteTrigger", "CronCreate", "ScheduleWakeup", "SendMessage", "Workflow")
 # Routes, credentials and limits that would change which model serves the run, whose
-# account pays for it, or how it is metered. Coding authenticates with the operator's
-# subscription token only; an API key would silently outrank it in print mode.
+# account pays for it, or how it is metered. Every Claude launch, coding, review or judge,
+# authenticates with the operator's subscription token only. Coding needs the refusal because
+# Harbor reads the operator environment; a review or judge child gets an allowlisted
+# environment, so there it keeps one policy for every Claude launch.
 REFUSED_ENV = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
@@ -271,15 +272,20 @@ def discovery_launch(run: CodingRun) -> tuple[list[str], dict[str, str]]:
 def runtime_environment(
     private: Path, host: str = "claude", *, auth_file: Path | None = None
 ) -> tuple[dict[str, str], tuple[str, ...]]:
-    """Use a fresh config/home and pass only selected authentication scalars."""
+    """Use a fresh config/home and pass only the selected subscription token."""
     if host != "claude":
         raise ValueError(f"unsupported Claude host: {host}")
+    present = sorted(name for name in REFUSED_ENV if name in os.environ)
+    if present:
+        raise ValueError(
+            "Claude authenticates with CLAUDE_CODE_OAUTH_TOKEN only; unset " + ", ".join(present)
+        )
     if auth_file is not None:
         selected = json.loads(auth_file.read_text())
-        if not isinstance(selected, dict) or set(selected) - set(AUTH_NAMES):
-            raise ValueError("Claude auth file must contain only a supported credential variable")
+        if not isinstance(selected, dict) or set(selected) - {TOKEN_ENV}:
+            raise ValueError(f"Claude auth file must contain only {TOKEN_ENV}")
     else:
-        selected = {name: os.environ[name] for name in AUTH_NAMES if os.environ.get(name)}
+        selected = {TOKEN_ENV: os.environ[TOKEN_ENV]} if os.environ.get(TOKEN_ENV) else {}
         if not selected:
             # Retain the existing native macOS subscription-auth path, not its settings.
             try:
@@ -302,7 +308,7 @@ def runtime_environment(
     if len(selected) != 1 or not all(
         isinstance(value, str) and value.strip() for value in selected.values()
     ):
-        raise ValueError("Select exactly one nonempty Claude OAuth token or API key")
+        raise ValueError("Select exactly one nonempty Claude OAuth token")
     private.mkdir(mode=0o700)
     home, temporary, config = (private / name for name in ("home", "tmp", "claude"))
     for directory in (home, temporary, config):
@@ -341,15 +347,9 @@ def coding_environment(
 ) -> tuple[dict[str, str], tuple[str, ...]]:
     """The worker environment of a coding run: the operator's subscription token only.
 
-    Harbor forwards an API key over the token and never drops one, so a refused variable in
-    the operator's environment stops the run before any container starts.
+    Harbor forwards an API key over the token and never drops one, so runtime_environment's
+    refusal of a variable in the operator's environment stops the run before any container.
     """
-    present = sorted(name for name in REFUSED_ENV if name in os.environ)
-    if present:
-        raise ValueError(
-            "Claude coding authenticates with CLAUDE_CODE_OAUTH_TOKEN only; unset "
-            + ", ".join(present)
-        )
     if auth_file is not None:
         raise ValueError("Claude coding takes CLAUDE_CODE_OAUTH_TOKEN, not an auth file")
     env, secrets = runtime_environment(private)
