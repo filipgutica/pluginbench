@@ -46,17 +46,65 @@ capabilities:
   max_threads: 4
 ```
 
-Vanilla is included automatically. Use `treatments: {}` for a vanilla-only screen. The task prompt is identical across arms. Guidance files become the attempt's private native global `AGENTS.md`; they are never appended to the task prompt or written into the source repository. Combined guidance is limited to 32,768 bytes, including separators, to prevent native truncation.
+Vanilla is included automatically. Use `treatments: {}` for a vanilla-only screen. The task prompt is identical across arms. Guidance files become the attempt's private native global `AGENTS.md` (Codex) or `CLAUDE.md` (Claude Code); they are never appended to the task prompt or written into the source repository. Combined guidance is limited to 32,768 bytes, including separators, to prevent native truncation.
 
 Skills retain their complete directories, including scripts, references, and executable modes. Plugins retain their manifests and full package trees and install through a private local marketplace. Git internals are excluded. Symlinks, nonregular assets, and ambient dotenv files are rejected. Skill dependencies, MCP servers, apps, custom agents, commands, plugin dependencies, asynchronous hooks, and non-command hooks are currently unsupported. Admission rejects declared unsupported components.
 
 The private Codex configuration disables the remote plugin catalog and app integrations for every arm. Account-level plugin installations cannot enter the evaluation through authentication.
 
-Before coding, the pinned CLI must discover every declared skill and synchronous command hook with the expected identity and package contents. Missing or undeclared components stop the attempt. Discovery receipts prove availability; they do not prove skill activation or hook execution. Hook execution uses a per-invocation trust bypass inside the owned container for the verified frozen packages.
+Before coding, the pinned CLI must discover every declared skill and synchronous command hook with the expected identity and package contents. Missing or undeclared components stop the attempt. Discovery receipts prove availability; they do not prove skill activation or hook execution. On Codex, hook execution uses a per-invocation trust bypass inside the owned container for the verified frozen packages.
 
-The same capability policy applies to vanilla and every treatment. Subagents default to enabled, with at most four concurrently running children. `subagents: false` disables native agents explicitly. The selected model determines the native agent runtime. V2 enforces concurrency only; the optional `max_depth` setting (default one) is a V1 preference and has no effect on V2. There is no enforced depth limit for V2 runs. Children inherit the selected model and effort by default; explicit spawn settings can override them. These settings are neither model allowlists nor lifetime call or dollar limits. The attempt timeout bounds runtime, including child work. Dry runs count coding attempts, not total model requests.
+The same capability policy applies to vanilla and every treatment. Subagents default to enabled. Codex runs at most four concurrently running children. `subagents: false` disables native agents explicitly. The selected model determines the native agent runtime. V2 enforces concurrency only; the optional `max_depth` setting (default one) is a V1 preference and has no effect on V2. There is no enforced depth limit for V2 runs. Children inherit the selected model and effort by default; explicit spawn settings can override them. Claude Code has no concurrency limit, and a Claude run refuses `max_threads` or `max_depth` when either is set, as in the example above; see [Claude Code coding](#claude-code-coding). These settings are neither model allowlists nor lifetime call or dollar limits. The attempt timeout bounds runtime, including child work. Dry runs count coding attempts, not total model requests.
 
-New native treatment runs currently require Codex. Legacy file-only `guidance` maps migrate to native instructions; directory entries must move to `skills` or `plugins`. Existing single-handoff text-injection campaigns remain readable, but their delivery identity differs and their baselines cannot be reused for native treatments. Removed multi-stage standards/ledger formats are not supported by report regeneration.
+Legacy file-only `guidance` maps migrate to native instructions; directory entries must move to `skills` or `plugins`. Existing single-handoff text-injection campaigns remain readable, but their delivery identity differs and their baselines cannot be reused for native treatments. Removed multi-stage standards/ledger formats are not supported by report regeneration.
+
+### Claude Code treatments
+
+With `runner.harness: claude`, every arm, vanilla included, uses delivery policy `claude-native-v1`. Each component goes into the attempt's private Claude Code configuration directory:
+
+| Component | Delivered as |
+| --- | --- |
+| `guidance` | The private `CLAUDE.md`, under the same 32,768-byte limit. Auto-memory is off. |
+| `skills` | Skill directories in the private configuration |
+| `plugins` | Installed in user scope from the private local marketplace `pluginbench-frozen`. The CLI loads each plugin from that staged folder. |
+| Hooks | Synchronous `command` hooks from plugins only |
+
+Admission applies these Claude Code rules in addition to the shared ones. A treatment that breaks one stops the run before any model call.
+
+| Part | Rule |
+| --- | --- |
+| Plugin manifest | Only `.claude-plugin/plugin.json` is read. A root `plugin.json` is refused, because Claude Code would ignore it. `displayName` is accepted as metadata. |
+| Plugin default paths | `agents/`, `commands/`, `workflows/`, `output-styles/`, `monitors/`, `.mcp.json`, `.lsp.json`, a root `settings.json`, and a root `SKILL.md` are refused. `bin/` and `themes/` are admitted and recorded. |
+| Plugin skills | `skills/` is always scanned, even when the manifest names other skill paths. |
+| Skill frontmatter | Only `name`, `description`, `dependencies`, `license`, `metadata`, `allowed-tools`, `disable-model-invocation`, `user-invocable`, and `argument-hint`. Keys such as `model`, `effort`, `context`, `agent`, and `hooks` are refused. |
+| Hook files | Only the `hooks` and `description` keys. The default `hooks/hooks.json` is checked even when the manifest names other hook files. |
+| Hook matchers | Empty, `*`, or exact names of letters, digits, and `_` joined by `\|`. Names match exactly: `start` does not match `startup`. |
+| Duplicate hooks | Two hooks with the same event and command are refused, even in different plugins. The CLI names a hook run only by its event and command, so the session could not tell them apart. |
+
+Before coding, a discovery run of the pinned CLI checks what loaded. It sends control requests only, never a user message, so no model turn starts. Hooks are disabled during discovery. The attempt stops before coding unless every check passes:
+
+| Check | Requirement |
+| --- | --- |
+| No model call | The session cost reports zero usage and $0. |
+| CLI | The reported version equals the pinned version. |
+| Authentication | The subscription credentials file is the only credential source. |
+| Skills and commands | The non-built-in skills and commands equal the declared skills, and each one is on from its declared source. No undeclared agent is present. |
+| Guidance | The only memory file is the declared `CLAUDE.md`, or none when the arm declares no guidance. |
+| Plugins | Only the declared plugins are installed and enabled, and their trees match the frozen inventory. |
+| Hooks | The hook listing equals the declared hooks, and no hook ran. |
+| Settings | The effective settings equal the pinned settings. |
+| Environment | No refused variable is set, the pinned variables have their pinned values, and `/etc/claude-code` managed settings are absent. |
+
+The receipt is saved as `native-treatment.json`. After coding, the attempt fails unless:
+
+- its single `system/init` reports the receipt's CLI version, skills, commands, agents, and plugins, the runner model, no MCP servers, and no API key;
+- the permission mode is `bypassPermissions` and no permission denial is recorded;
+- the offered tools equal the pinned tool set for CLI 2.1.322; other versions are checked only for the disallowed tools;
+- each listed `SessionStart` hook that matches `startup` ran once before the first model reply;
+- every hook that ran is listed and responded once, with exit 0 for `SessionStart` hooks and 0 or 2 for others;
+- the delivered skill and plugin trees are unchanged at the end of the run.
+
+A failed check keeps the attempt and its verifier result. Its execution outcome is a failure, with the reason in `execution.json`.
 
 ## Execution and isolation
 
@@ -85,15 +133,59 @@ If it rejects the credentials, the failure names the pinned container and curren
 Re-authenticate with the pinned CLI, or start a new run with a compatible `runner.cli_version`.
 This check proves that the CLI can read the credentials; it does not prove that the provider will accept them.
 
-Claude Code is available for independent reviews; new native treatment coding is qualified for Codex only.
-There is no numeric Claude Code version allowlist. [`claude.preflight`](../src/pluginbench/claude.py) checks the required isolation flags and records `claude --version`.
-It does not claim compatibility with every Claude Code release.
+### Claude Code coding
+
+Set `runner.harness: claude` and an exact `claude-*` model ID. Floating aliases such as `sonnet` or `opus` are refused. Reasoning is `low`, `medium`, `high`, `xhigh`, or `max`.
+
+Claude Code coding evidence is qualified for CLI **2.1.322** in [`claude.py`](../src/pluginbench/claude.py). That covers the discovery control requests, the session transcript format, and token reconciliation. Other versions warn once and continue, with the weaker token rule below.
+`runner.cli_version` pins the container CLI as it does for Codex. When omitted, [`claude.preflight`](../src/pluginbench/claude.py) reads the host `claude --version` and checks the required isolation flags.
+
+Coding authenticates only with the operator's Claude subscription token:
+
+- Set `CLAUDE_CODE_OAUTH_TOKEN` in the environment that runs `pluginbench`. A service does not inherit a variable that a shell profile exports.
+- `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, Bedrock, Vertex, and Foundry routing, `DISABLE_PROMPT_CACHING`, and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` are refused in the operator environment, before any container starts, and in every container command.
+- The token reaches the container only as a credentials file in the CLI's private configuration, never in a command's environment. The file is removed before Harbor collects artifacts.
+- After the run, the saved artifacts and the exported workspace are scanned for the token. A match fails the attempt.
+- This applies to coding only. Independent reviews and judges accept `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`.
+
+PluginBench runs Harbor 0.24.0's `ClaudeCode` agent and refuses to launch when the hash of its `run` source changes. It allows only Harbor's setup, the version check, and one coding command, which it replaces with the pinned launch:
+
+| Setting | Value in every arm |
+| --- | --- |
+| Model and effort | `--model <runner.model> --effort <runner.reasoning>`; subagents use the runner model |
+| Permission mode | `bypassPermissions` |
+| Setting sources | `user` only, with no MCP servers (`--strict-mcp-config`) |
+| Disallowed tools | `RemoteTrigger`, `CronCreate`, `ScheduleWakeup`, `SendMessage`, and `Workflow`; `Agent` too when `subagents: false` |
+| Web tools | `WebSearch` and `WebFetch` stay available |
+| Background tasks | Disabled, so subagents and Bash commands run in the foreground |
+| Other | Auto-memory, updates, and nonessential traffic disabled; hook events included in the stream |
+
+`capabilities.max_threads` and `capabilities.max_depth` are refused on Claude runs when set, because Claude Code does not enforce them. Plans and comparison identities record both as `not_enforced`. `subagents` still applies. `usage_accounting` records the observed subagent depth without limiting it.
+
+Claude token usage is the result event's `modelUsage`, which includes subagents. Each attempt cross-checks it against the session transcripts: one root transcript and one transcript per subagent, matched to its `Agent` call. Any failed rule leaves usage unavailable, with the reasons in `usage_accounting`. The launched CLI version selects the rule:
+
+| CLI version | Compaction in the stream and root transcript | Rule |
+| --- | --- | --- |
+| 2.1.322 | None | Transcript input and output must equal `modelUsage` for every model. |
+| 2.1.322 | Both | Transcripts must not exceed `modelUsage`. The runner model's excess is reported as untranscribed, and other models must be equal. |
+| Other | Either | Only input is compared. Transcripts must not exceed `modelUsage`; the runner model's excess is untranscribed, and other models must be equal. |
+
+The stream and root transcript must agree on compaction. The stream also needs one `system/init` and one successful result for the same session, with the runner model and the launched CLI version.
+A fresh attempt and `report` run the same rule on the saved stream and transcripts, as Codex re-validation does. `status` shows a fresh Claude attempt as `unvalidated` until the report has been built. `compare` accepts the figure only when the report's validation is `validated`. Claude records no reasoning-output count.
+
+Known limits:
+
+- Claude Code attempts never enter the vanilla cache. Every Claude run codes its own vanilla arm.
+- A timeout leaves no result event, so its usage is unknown with no lower bound. Codex keeps a lower bound.
+- Automatic compaction within a single prompt has not been observed. The compaction rule is calibrated on a manual compaction only.
+- On a compaction run, the runner model's untranscribed excess has no upper bound.
+- Command hooks make total usage unknown, as for Codex; see [Measurements](#measurements).
 
 ### Container boundary
 
 The host home and sibling run directories are not mounted into coding containers.
 Hidden tests and reference solutions stay in the separate verifier environment.
-Only the selected provider credential enters a temporary private runtime; synchronous plugin hooks share the coding agent's access.
+Only the selected provider credential enters a temporary private runtime; synchronous plugin hooks share the coding agent's access. Claude Code reads its token from a private credentials file, which tool commands can also read.
 Use trusted task images and packages, and inspect saved traces before sharing them.
 
 Local collectors and reviews require macOS Seatbelt or Linux Bubblewrap; a missing boundary stops execution.
@@ -241,7 +333,7 @@ PluginBench keeps prepared task images, vanilla submissions, and oracle and nop 
 
 Cache keys bind the launcher's declared version, not the source of the modules that launch an attempt, and the runtime's exact fields. Docker memory jitter, a Docker update, and a PluginBench fix that keeps the launcher version leave those keys unchanged. Codex session parsing lives in `codex_events.py`, outside the launcher. Prepared-image and vanilla entries saved under an older key by an earlier PluginBench version are still found when their saved identity matches. A prepared entry under the current key is used when it exists. Otherwise, saved entries are scanned in name order, and the first that matches and whose images Docker still holds is used. Each vanilla repeat is read from the run's own key first, then from matching saved cohorts in name order. A cohort can therefore span old and new keys. A saved entry that is unreadable or does not match is skipped. Reuse requires matching task assets, source policy, source, prompt, harness, model, reasoning, CLI, runtime, image identities, transport and treatment-delivery policies, capability settings, resources, timeout, jobs, seed, and repeat count. Guidance, reviewer settings, and selected measurements do not change the coding cache key. Cache admission validates the diagnostic export and canonical reconstruction independently, including file modes. Older cache entries without the current source policy cannot be reused.
 
-Each vanilla repeat is its own cache entry, `<key>/<repeat>`, published as soon as that attempt finishes. A run that stops midway still caches the repeats it finished. A cached cohort includes failures and unknowns. Missing isolation receipts, corrupt entries, or a concurrent reservation stop reuse. Imported submissions retain original receipts and timing; token usage is re-validated from saved evidence. A separate `execution-current.json` holds the current usage projection and native regrade result. Current native verification, selected measurements, and reviews run again. Re-validation does not change cache identity or keys. Reports disclose reuse. Reused runs are not fresh independent samples.
+Each vanilla repeat is its own cache entry, `<key>/<repeat>`, published as soon as that attempt finishes. A run that stops midway still caches the repeats it finished. A cached cohort includes failures and unknowns. Missing isolation receipts, corrupt entries, or a concurrent reservation stop reuse. Imported submissions retain original receipts and timing; token usage is re-validated from saved evidence. A separate `execution-current.json` holds the current usage projection and native regrade result. Current native verification, selected measurements, and reviews run again. Re-validation does not change cache identity or keys. Claude Code attempts are never cached. Reports disclose reuse. Reused runs are not fresh independent samples.
 
 Open `report/report.html`. `results.json` contains raw observations, capabilities, grading evidence, vanilla deltas, reference values and ratios, and cost rows. `results.csv` contains individual measurements. Rebuild with `pluginbench report runs/<run>` without model calls.
 Public reports use `vanilla` for the no-guidance arm. See the [report format](metrics.md#report-files) for schema version 2 and compatibility with older reports.
@@ -288,7 +380,7 @@ Only the process that holds `run.lock` measures. So when a resume holds the lock
 
 ## Watch a run
 
-`pluginbench status runs/<run>` shows the run's phase, the process that owns it, its last activity, attempt states and outcomes per arm and task, coding tokens, vanilla cache reuse, discarded attempts, and the measurement and review revisions. `--watch` redraws every 2 seconds and exits when the run ends or is stopped. A redraw that catches a file mid-write is skipped. `status` only reads: it opens `evidence/ledger.sqlite` read-only and falls back to `evidence/run.json` for runs from before the ledger, or while the ledger cannot be read: busy, left with a crashed writer's journal, or not in rollback-journal mode. It works on any run directory, including stopped and old ones. For each attempt it prefers `execution-current.json` over `execution.json`, so rejected cached usage stays unavailable. It does not parse traces or re-validate historical receipts; recorded Codex figures without validation provenance are labelled `unvalidated`, with a command to rebuild the report.
+`pluginbench status runs/<run>` shows the run's phase, the process that owns it, its last activity, attempt states and outcomes per arm and task, coding tokens, vanilla cache reuse, discarded attempts, and the measurement and review revisions. `--watch` redraws every 2 seconds and exits when the run ends or is stopped. A redraw that catches a file mid-write is skipped. `status` only reads: it opens `evidence/ledger.sqlite` read-only and falls back to `evidence/run.json` for runs from before the ledger, or while the ledger cannot be read: busy, left with a crashed writer's journal, or not in rollback-journal mode. It works on any run directory, including stopped and old ones. For each attempt it prefers `execution-current.json` over `execution.json`, so rejected cached usage stays unavailable. It does not parse traces or re-validate historical receipts; recorded Codex or Claude figures without validation provenance are labelled `unvalidated`, with a command to rebuild the report.
 
 `status --json` prints one JSON object for dashboards. Fields are only added within a `schema_version`; a removed or renamed field, or a new value for an existing enum, bumps it. Version 2 adds the `unvalidated` value to `tokens_status`; nothing else changed from version 1. Version 2:
 
@@ -312,13 +404,13 @@ Only the process that holds `run.lock` measures. So when a resume holds the lock
 | `left_running` | Null while a live process owns the run. Otherwise `checked`, `error`, `containers` (`id`, `name`, `project` of each running container of this run's trials, found as resume finds them), and `stop_command` (`docker stop <ids>`, or null when there are none). When Docker cannot be queried, `checked` is false and `error` says why; the terminal view says it could not check. The next resume stops them |
 | `attempts` | One row per live slot: `id`, `slot`, `task`, `arm`, `repeat`, `state`, `outcome`, `outcome_reason`, `reused`, `tokens`, `tokens_status`, `tokens_reason` (the rejection reason or rebuild command), `minutes`, and `measures` (metric → `status`, `value`, `unit`, `reason`, from `report/results.json` once it exists) |
 
-States are `pending`, `running`, `complete`, and `interrupted`. Outcomes are `pass`, `overlap_pass`, `fail`, `empty` (the graded patch is empty), and `unknown`, with the verifier's reason in `outcome_reason`. A withheld result is classified as the report classifies it: `overlap_pass` or `fail` from the verifier's rewards, otherwise `unknown`. `tokens_status` is `exact`, `unvalidated` (a recorded Codex figure without validation provenance; once `pluginbench report` has re-validated it, status shows the report's verdict: `exact`, or `unknown` with the rejection reason), `lower_bound` (usage saved by an unfinished attempt, or only an observed floor), `unknown` (no usage saved yet), or `not_started`. A receipt without `total_tokens` gets input plus output, as Codex counts it; when either is missing the attempt is `lower_bound`. A total's `lower_bound` is true when any attempt it counts is `lower_bound` or `unknown`. A total can include unvalidated recorded figures; its separate `unvalidated` flag and the terminal note disclose them. Rebuild the report to obtain re-validated measurements for comparisons. The vanilla arm is `vanilla`, including in runs that recorded it as `baseline`. For a run that no process owns, the terminal view shows a `running` attempt as `interrupted`, in the summary line and in the table, and likewise a `collecting` measurement revision or a `running` review revision; the JSON keeps the recorded state.
+States are `pending`, `running`, `complete`, and `interrupted`. Outcomes are `pass`, `overlap_pass`, `fail`, `empty` (the graded patch is empty), and `unknown`, with the verifier's reason in `outcome_reason`. A withheld result is classified as the report classifies it: `overlap_pass` or `fail` from the verifier's rewards, otherwise `unknown`. `tokens_status` is `exact`, `unvalidated` (a recorded Codex or Claude figure without validation provenance; once `pluginbench report` has re-validated it, status shows the report's verdict: `exact`, or `unknown` with the rejection reason), `lower_bound` (usage saved by an unfinished attempt, or only an observed floor), `unknown` (no usage saved yet), or `not_started`. A receipt without `total_tokens` gets input plus output, as Codex counts it; when either is missing the attempt is `lower_bound`. A total's `lower_bound` is true when any attempt it counts is `lower_bound` or `unknown`. A total can include unvalidated recorded figures; its separate `unvalidated` flag and the terminal note disclose them. Rebuild the report to obtain re-validated measurements for comparisons. The vanilla arm is `vanilla`, including in runs that recorded it as `baseline`. For a run that no process owns, the terminal view shows a `running` attempt as `interrupted`, in the summary line and in the table, and likewise a `collecting` measurement revision or a `running` review revision; the JSON keeps the recorded state.
 
 ## Review again
 
 `pluginbench review runs/<run> --revision <name>` reviews every submission of a finished run again with the run's frozen reviewer, criteria, seed, and jobs, as review revision `<name>`. It prints the number of review calls and asks before starting unless `--yes` is set; when no answer can be read, such as an empty pipe, it exits and says to pass `--yes`. It owns `run.lock` while it works, so it refuses an active run, and it checks the reviewer's CLI, credentials, and sandbox host before the first call. Earlier revisions stay in evidence. The new revision, or `<name>-citations` when offline citation recovery repaired its formatting, becomes the selected one, and the report is rebuilt. A name that already exists is refused; choose a new one. A run with no reviewer, or whose first review has not finished, is refused.
 
-Use exact model IDs. Harbor does not support `ultra` reasoning. Requested effort is separate from effective effort when native evidence cannot verify it. Claude remains available for review configuration; new native treatment coding is qualified for Codex only.
+Use exact model IDs. Harbor does not support `ultra` reasoning. Requested effort is separate from effective effort when native evidence cannot verify it.
 
 ## Compare runs
 

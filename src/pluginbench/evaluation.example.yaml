@@ -1,6 +1,6 @@
 name: Workflow versus Superpowers
 runner:
-  harness: codex                # Native treatment coding currently requires Codex.
+  harness: codex                # codex or claude (see "Claude Code coding" in the docs).
   model: gpt-6.1-sol
   reasoning: medium
 
