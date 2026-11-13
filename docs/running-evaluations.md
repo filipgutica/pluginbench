@@ -76,7 +76,7 @@ Admission applies these Claude Code rules in addition to the shared ones. A trea
 | Plugin manifest | Only `.claude-plugin/plugin.json` is read. A root `plugin.json` is refused, because Claude Code would ignore it. `displayName` is accepted as metadata. |
 | Plugin default paths | `agents/`, `commands/`, `workflows/`, `output-styles/`, `monitors/`, `.mcp.json`, `.lsp.json`, a root `settings.json`, and a root `SKILL.md` are refused. `bin/` and `themes/` are admitted and recorded. |
 | Plugin skills | `skills/` is always scanned, even when the manifest names other skill paths. |
-| Skill frontmatter | Only `name`, `description`, `dependencies`, `license`, `metadata`, `allowed-tools`, `disable-model-invocation`, `user-invocable`, and `argument-hint`. Keys such as `model`, `effort`, `context`, `agent`, and `hooks` are refused. |
+| Skill frontmatter | Only `name`, `description`, `dependencies`, `license`, `metadata`, `allowed-tools`, `disable-model-invocation`, `user-invocable`, and `argument-hint`. Keys such as `model`, `effort`, `context`, `agent`, and `hooks` are refused. `disable-model-invocation` and `user-invocable` must be YAML booleans (`true` or `false`) when present. |
 | Hook files | Only the `hooks` and `description` keys. The default `hooks/hooks.json` is checked even when the manifest names other hook files. |
 | Hook matchers | Empty, `*`, or exact names of letters, digits, and `_` joined by `\|`. Names match exactly: `start` does not match `startup`. |
 | Duplicate hooks | Two hooks with the same event and command are refused, even in different plugins. The CLI names a hook run only by its event and command, so the session could not tell them apart. |

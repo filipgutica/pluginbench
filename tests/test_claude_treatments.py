@@ -318,6 +318,13 @@ def _user_agent(attempt: Attempt) -> None:
     (attempt.config / "agents/Explore.md").write_text("---\nname: Explore\ndescription: Other.\n---\n")
 
 
+def _undeclared_invocation(attempt: Attempt) -> None:
+    staged = attempt.staged / "treatment.json"
+    payload = json.loads(staged.read_text())
+    del payload["skill_invocation"]["loose-skill"]
+    staged.write_text(json.dumps(payload, sort_keys=True) + "\n")
+
+
 STAGED_PLUGIN = "{staged}/marketplace/plugins/demo"
 
 # Each defect and the refusal it must cause; {staged} is the attempt's canonical staged root.
@@ -355,6 +362,10 @@ REFUSALS: dict[str, tuple[Callable[[Attempt], object], str]] = {
             commands=[command for command in _commands(attempt) if command["name"] != "loose-skill"]
         ),
         "Claude commands differ from the declared user-invocable skills",
+    ),
+    "skill without a declared invocation": (
+        _undeclared_invocation,
+        "Claude skill has no declared invocation: loose-skill",
     ),
     "undeclared agent": (
         _responses(lambda r: r["initialize"]["agents"].append({"name": "rogue", "description": ""})),
@@ -575,6 +586,46 @@ def test_a_skill_the_model_may_not_invoke_is_refused_in_any_other_state(
     result = treated.run()
     assert result.returncode != 0
     assert "Claude skill is not in its declared state from its declared source: demo:demo-skill" in result.stderr
+
+
+@pytest.mark.parametrize("key", ["disable-model-invocation", "user-invocable"])
+@pytest.mark.parametrize(
+    ("value", "shown"),
+    [('"true"', "'true'"), ("1", "1"), ('"false"', "'false'"), ("0", "0"), ("", "None")],
+)
+@pytest.mark.parametrize("packaged", [False, True])
+def test_admission_refuses_an_invocation_flag_that_is_not_a_yaml_boolean(
+    tmp_path: Path, key: str, value: str, shown: str, packaged: bool
+) -> None:
+    # CLI 2.1.322 reads some of these as flags too; admission refuses them, not guesses.
+    if packaged:
+        plugin = tmp_path / "demo"
+        root = skill(plugin / "skills/demo-skill", "demo-skill", f"{key}: {value}\n")
+        (plugin / ".claude-plugin").mkdir()
+        (plugin / ".claude-plugin/plugin.json").write_text(json.dumps({"name": "demo"}))
+        treatment = Treatment(plugins=[plugin])
+    else:
+        root = skill(tmp_path / "loose", "demo-skill", f"{key}: {value}\n")
+        treatment = Treatment(skills=[root])
+    with pytest.raises(ValueError) as refused:
+        admit(treatment)
+    assert str(refused.value) == (
+        f"Claude skill demo-skill {key} must be a YAML boolean, not {shown}: {root / 'SKILL.md'}"
+    )
+
+
+def test_boolean_or_absent_invocation_flags_keep_their_declared_invocation(tmp_path: Path) -> None:
+    treatment = Treatment(skills=[
+        skill(tmp_path / "flipped", "flipped", MANUAL + HIDDEN),
+        skill(tmp_path / "explicit", "explicit", "disable-model-invocation: false\nuser-invocable: true\n"),
+        skill(tmp_path / "absent", "absent"),
+    ])
+    payload = stage(treatment, tmp_path / "staged", run=RUN, cli_version=VERSION)
+    assert payload["skill_invocation"] == {
+        "flipped": {"model": False, "user": False},
+        "explicit": {"model": True, "user": True},
+        "absent": {"model": True, "user": True},
+    }
 
 
 class Environment:
