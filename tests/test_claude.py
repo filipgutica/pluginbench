@@ -102,6 +102,7 @@ def test_unqualified_version_is_admitted_and_warns_once() -> None:
         "discovery control requests",
         "session transcript format",
         "token reconciliation",
+        "plugin skills that set `paths`",
     ):
         assert unqualified in message
     assert "Qualified versions: 2.1.322" in message

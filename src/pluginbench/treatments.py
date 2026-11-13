@@ -121,7 +121,7 @@ def _frontmatter(file: Path, kind: str) -> dict[str, Any]:
     return metadata
 
 
-def _skill_name(root: Path, harness: str | None = None) -> str:
+def _skill_name(root: Path, harness: str | None = None, *, plugin: bool = False) -> str:
     skill = root / "SKILL.md"
     metadata = skill_frontmatter(root)
     name = metadata.get("name")
@@ -131,9 +131,20 @@ def _skill_name(root: Path, harness: str | None = None) -> str:
     if not isinstance(description, str) or not description.strip():
         raise ValueError(f"skill requires a description: {skill}")
     _skill_dependencies(metadata, skill)
-    if harness == "claude" and set(metadata) - _CLAUDE_SKILL_KEYS:
-        unsupported = sorted(set(metadata) - _CLAUDE_SKILL_KEYS)
+    # CLI 2.1.322 keeps a loose skill with `paths` hidden until a matching file is touched,
+    # which discovery cannot see. A plugin skill skips that loader and is always offered, so
+    # discovery proves it loaded; `paths` then has no effect on it.
+    allowed = _CLAUDE_SKILL_KEYS | ({"paths"} if plugin else set())
+    if harness == "claude" and set(metadata) - allowed:
+        unsupported = sorted(set(metadata) - allowed)
         raise ValueError(f"unsupported Claude skill frontmatter {unsupported}: {skill}")
+    globs = metadata.get("paths")
+    if harness == "claude" and "paths" in metadata and (
+        not isinstance(globs, list)
+        or not globs
+        or not all(isinstance(glob, str) and glob.strip() for glob in globs)
+    ):
+        raise ValueError(f"Claude skill {name} paths must be a list of nonempty globs: {skill}")
     # The CLI also reads some non-boolean values as flags; admission does not guess how.
     for key in ("disable-model-invocation", "user-invocable"):
         if harness == "claude" and key in metadata and not isinstance(metadata[key], bool):
@@ -161,7 +172,7 @@ def _skill_dependencies(metadata: dict[str, Any], source: Path) -> None:
         raise ValueError(f"unsupported declared skill dependencies: {source}")
 
 
-def _skill_roots(path: Path, harness: str | None = None) -> list[Path]:
+def _skill_roots(path: Path, harness: str | None = None, *, plugin: bool = False) -> list[Path]:
     _tree(path)
     roots = [path] if (path / "SKILL.md").exists() else [
         child for child in sorted(path.iterdir())
@@ -169,7 +180,7 @@ def _skill_roots(path: Path, harness: str | None = None) -> list[Path]:
     ]
     if not roots:
         raise ValueError(f"skill directory contains no direct SKILL.md roots: {path}")
-    names = [_skill_name(root, harness) for root in roots]
+    names = [_skill_name(root, harness, plugin=plugin) for root in roots]
     if len(set(names)) != len(names):
         raise ValueError(f"duplicate skill names in collection: {path}")
     return roots
@@ -356,12 +367,12 @@ def _plugin(root: Path, harness: str) -> dict[str, Any]:
     skill_paths = settings.get("skills")
     # Claude Code scans skills/ even when the manifest declares other skill paths.
     default_skills = skill_paths is None or harness == "claude"
-    roots = (_skill_roots(root / "skills", harness)
+    roots = (_skill_roots(root / "skills", harness, plugin=True)
              if default_skills and (root / "skills").exists() else [])
     if skill_paths is not None:
         paths = skill_paths if isinstance(skill_paths, list) else [skill_paths]
         declared = [skill for value in paths
-                    for skill in _skill_roots(_component(root, value), harness)]
+                    for skill in _skill_roots(_component(root, value), harness, plugin=True)]
         roots += [skill for skill in declared if skill not in roots]
     names = [_skill_name(skill) for skill in roots]
     if len(set(names)) != len(names):

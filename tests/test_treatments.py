@@ -441,6 +441,35 @@ def test_claude_skill_frontmatter_outside_the_allowlist_is_refused(
         _claude(Treatment(plugins=[plugin]), tmp_path)
 
 
+def test_claude_admits_paths_on_a_plugin_skill_but_not_on_a_loose_one(tmp_path: Path) -> None:
+    # CLI 2.1.322 always offers a plugin skill with `paths`; a loose one stays hidden.
+    text = '---\nname: repair\ndescription: Repair.\npaths: ["**/*.ts", "**/*.tsx"]\n---\n'
+    plugin = _claude_plugin(tmp_path / "plugin")
+    (plugin / "skills/repair/SKILL.md").write_text(text)
+    resolved = _claude(Treatment(plugins=[plugin]), tmp_path)
+    assert treatment_inventory(resolved, "claude")["plugins"][0]["skills"] == [
+        {"name": "repair", "path": "skills/repair"}
+    ]
+    (plugin / ".codex-plugin").mkdir()
+    (plugin / ".codex-plugin/plugin.json").write_text(json.dumps({"name": "repairs"}))
+    codex = treatment_inventory(_resolve(Treatment(plugins=[plugin]), tmp_path), "codex")
+    assert codex["plugins"][0]["skills"] == [{"name": "repair", "path": "skills/repair"}]
+    skill = _skill(tmp_path / "skill")
+    (skill / "SKILL.md").write_text(text)
+    with pytest.raises(ValueError, match=r"Claude skill frontmatter \['paths'\]"):
+        _claude(Treatment(skills=[skill]), tmp_path)
+
+
+@pytest.mark.parametrize("value", ['"**/*.ts"', "[]", "[1]", '[""]', "{}"])
+def test_claude_plugin_skill_paths_must_be_a_list_of_globs(tmp_path: Path, value: str) -> None:
+    plugin = _claude_plugin(tmp_path / "plugin")
+    (plugin / "skills/repair/SKILL.md").write_text(
+        f"---\nname: repair\ndescription: Repair.\npaths: {value}\n---\n"
+    )
+    with pytest.raises(ValueError, match="paths must be a list of nonempty globs"):
+        _claude(Treatment(plugins=[plugin]), tmp_path)
+
+
 def test_claude_checks_default_skills_and_hooks_beside_declared_ones(tmp_path: Path) -> None:
     plugin = _claude_plugin(tmp_path / "plugin", skills="./extra", hooks={})
     _skill(plugin / "extra/other", "other")
