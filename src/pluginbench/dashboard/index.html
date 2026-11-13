@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PluginBench runs</title>
+  <link rel="stylesheet" href="/static/tokens.css">
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <script src="/static/dashboard.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="topbar">
+    <a class="brand" href="#/">PluginBench</a>
+    <nav aria-label="Views">
+      <a class="nav-link" href="#/" data-view="runs">Runs</a>
+    </nav>
+    <span class="updated" id="updated" aria-live="off"></span>
+  </header>
+  <main id="main" tabindex="-1">
+    <noscript>
+      <div class="alert">This page needs JavaScript. In a terminal, <code>pluginbench status &lt;run&gt;</code> shows the same status.</div>
+    </noscript>
+    <p class="muted" id="loading">Loading runs…</p>
+  </main>
+</body>
+</html>

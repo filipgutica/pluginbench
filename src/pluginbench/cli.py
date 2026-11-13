@@ -1,5 +1,5 @@
-"""The pluginbench command line: init, check, run, status, stop, compare, report, review, measure,
-judge."""
+"""The pluginbench command line: init, check, run, status, dashboard, stop, compare, report,
+review, measure, judge."""
 
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ from pluginbench.evaluation import (
     resume_evaluation,
     review_evaluation,
 )
+from pluginbench.dashboard import serve
 from pluginbench.run_status import format_status, run_status
 
 _EXPECTED_RUN_ERRORS = (
@@ -532,6 +533,26 @@ def status(
 
 _WATCH_INTERVAL = 2.0
 _WATCH_DECODE_RETRIES = 5
+
+
+@app.command("dashboard")
+def dashboard(
+    roots: list[Path] = typer.Argument(..., help="Directories that hold run directories."),
+    port: int = typer.Option(8765, "--port", help="Port on 127.0.0.1."),
+) -> None:
+    """Serve a local, read-only web view of the runs under ROOTS until Ctrl-C."""
+    try:
+        server = serve(roots, port=port)
+    except (OSError, ValueError) as exc:
+        _error(exc)
+        return
+    typer.echo(f"Dashboard: http://127.0.0.1:{server.server_address[1]}/  (Ctrl-C to stop)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass  # Ctrl-C is how the dashboard ends.
+    finally:
+        server.server_close()
 
 
 @app.command("stop")
