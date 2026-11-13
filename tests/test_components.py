@@ -30,7 +30,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
                 "229d01b78fd893b8e502139507b74d18f0147079c58f15f90b0548b5520e67c5"
             ),
             # Claude plugin admission rules; Codex admission and every admitted launch stay v1.
-            "treatments.py": "d47d888ba764795aa8be88fb1decd9bd69c1702e9f910d5198b1f0a4786925a4",
+            "treatments.py": "cf2f455d0da41f1795d4c28dc0fd1f0cdd9253b6648834342d454bb41ae10482",
             # Claude version admission, coding launch contract and the subscription-only refusal
             # every Claude launch shares; a token-only launch is unchanged, so this stays v1.
             "claude.py": "b9b0af1d989829f294e23166ed2e462ff405889353f578a715dc67026aafb986",
