@@ -176,6 +176,8 @@ A fresh attempt and `report` run the same rule on the saved stream and transcrip
 Known limits:
 
 - The Claude vanilla cache needs a CLI version whose built-in commands, agents and init tools PluginBench pins. Only 2.1.322 is pinned; other versions code their own vanilla arm every run.
+- A run's own built-ins are known only after its discovery, which runs after the cache has decided. A run that reuses cached vanilla attempts therefore fails each fresh Claude attempt whose discovery reports built-ins other than the pinned ones: it does not pass, its usage is unavailable, and its `treatment_error` names the reused attempts. A resumed run that already coded attempts under other built-ins reuses no cached vanilla. A run that reuses nothing is not checked, since it mixes no samples.
+- The vanilla cache key binds the pinned launch environment and refused variables. Each coding command and discovery enforce them, but saved evidence records only the argv, so admission cannot confirm the environment a cached attempt ran with.
 - A timeout leaves no result event, so its usage is unknown with no lower bound. Codex keeps a lower bound.
 - Automatic compaction within a single prompt has not been observed. The compaction rule is calibrated on a manual compaction only.
 - On a compaction run, the runner model's untranscribed excess has no upper bound.
@@ -341,7 +343,7 @@ Claude Code vanilla attempts use the same cache under their own key. A Claude en
 - The discovery receipt is verified and empty. It reports the launched CLI version, the pinned discovery argv and settings, and the pinned built-ins.
 - The session's `system/init` offered exactly the pinned tools, and the run recorded no permission denial.
 
-Timeouts and attempts with unknown usage are cached, as for Codex. A Claude session with no timeout, usage, tool call or message never reached the model and is not cached. Reuse runs the current Claude usage rules on the saved stream and transcripts.
+Timeouts and attempts with unknown usage are cached, as for Codex. A Claude session with no timeout, usage, tool call or message never reached the model and is not cached. A finished Claude vanilla attempt that is not cached prints why. Reuse runs the current Claude usage rules on the saved stream and transcripts.
 
 Open `report/report.html`. `results.json` contains raw observations, capabilities, grading evidence, vanilla deltas, reference values and ratios, and cost rows. `results.csv` contains individual measurements. Rebuild with `pluginbench report runs/<run>` without model calls.
 Public reports use `vanilla` for the no-guidance arm. See the [report format](metrics.md#report-files) for schema version 2 and compatibility with older reports.

@@ -26,8 +26,10 @@ def revalidate_usage(execution: dict[str, Any], receipt: Path) -> dict[str, Any]
     # Native session accounting cannot meter subprocesses launched by command hooks.
     hooks = execution.get("native_treatment", {}).get("hooks", {}).get("hooks")
     recorded = original["recorded_usage"]
-    if hooks:
-        # The hook rule keeps the session usage there before it clears `usage`.
+    # A fresh Claude attempt whose built-ins differ from the cached vanilla it is compared with.
+    mixed = execution.get("mixed_builtins")
+    if hooks or mixed:
+        # Both rules keep the session usage there before they clear `usage`.
         recorded = execution.get("native_session_usage")
     try:
         codex.validate_artifacts(artifacts)
@@ -57,6 +59,8 @@ def revalidate_usage(execution: dict[str, Any], receipt: Path) -> dict[str, Any]
         reasons.append(f"saved usage evidence is unreadable: {error}")
     if hooks:
         reasons.append("command-hook subprocess usage is not independently metered")
+    if mixed:
+        reasons.append(str(mixed))
     usage = parsed.get("usage") if not reasons else None
     return {
         **execution,

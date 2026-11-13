@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from pluginbench import (
     native_treatments,
     study,
     submissions,
+    trial_containers,
 )
 from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.datasets import TaskSpec, native_identity, portable_native_identity
@@ -158,11 +160,11 @@ def _cohort(
     )
 
 
-def _publish(cache: baselines.BaselineCache, records: list[dict[str, Any]]) -> None:
+def _publish(cache: baselines.BaselineCache, records: list[dict[str, Any]]) -> list[str | None]:
+    """Publish each record; returns why each one was not cached, or None."""
     try:
         cache.reserve()
-        for record in records:
-            cache.publish(record)
+        return [cache.publish(record) for record in records]
     finally:
         cache.close()
 
@@ -1129,10 +1131,17 @@ def test_claude_evidence_that_differs_from_its_identity_cannot_seed_the_cache(
         for target in cache.root.glob("attempts/*/handoff/artifacts/native-treatment.json"):
             saved = json.loads(target.read_text())
             target.write_text(json.dumps({**saved, "commands": ["undeclared"]}))
-    _publish(cache, records)
+    reasons = _publish(cache, records)
     second, _, _ = _claude_cohort(tmp_path / "second", path)
     hit = fault in {"authentic", "timeout-unknown-usage"}
     assert _statuses(second) == ["hit" if hit else "miss"] * 2
+    assert reasons == [
+        None
+        if hit
+        else "its session never reached the model"
+        if fault == "never-reached-model"
+        else "its saved evidence does not match the vanilla cache identity"
+    ] * 2
 
 
 def test_a_claude_cli_version_without_pinned_built_ins_and_tools_is_never_cached(
@@ -1150,7 +1159,7 @@ def test_a_claude_cli_version_without_pinned_built_ins_and_tools_is_never_cached
         cache.contracts["answer"] = baselines._cohort_contract(cache.contexts["answer"])
         cache.keys["answer"] = baselines._cohort_key(cache.contexts["answer"], cache.tasks["answer"])
         caches.append((cache, records))
-    _publish(*caches[0])
+    assert _publish(*caches[0]) == ["Claude Code 2.1.322 has no pinned built-ins and init tools"] * 2
     assert not any(path.glob("*/*/manifest.json"))
     assert _statuses(caches[1][0]) == ["miss", "miss"]
 
@@ -1166,6 +1175,181 @@ def test_a_vanilla_entry_never_satisfies_the_other_harness(tmp_path: Path, cache
     assert _statuses(same) == ["hit", "hit"]
     lookup, _, _ = cohorts[other](tmp_path / "other", path)
     assert _statuses(lookup) == ["miss", "miss"]
+
+
+PLAIN = CLAUDE_FIXTURES / "coding/plain"
+
+
+def _claude_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    drifted: Callable[[dict[str, Any]], bool] = lambda entry: False,
+    interrupt_at: int | None = None,
+) -> list[dict[str, Any]]:
+    """Claude attempts whose usage validates; `drifted` ones report other built-ins."""
+    stream = (PLAIN / "stream.jsonl").read_text()
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: runtime_identity())
+    monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
+    monkeypatch.setattr(
+        harbor_backend, "regrade_native",
+        lambda **kwargs: {"verifier_result": {"rewards": {"reward": 1}}, "exception_info": None},
+    )
+    # A resume looks for containers a stopped session left running; there are none.
+    monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
+    # The treatment is shaped as Codex packages; these tests need only saved runs.
+    monkeypatch.setattr(study, "admit", lambda treatment, harness: native_treatments.admit(
+        treatment, "codex"
+    ))
+    calls: list[dict[str, Any]] = []
+
+    def invoke(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs["entry"])
+        if len(calls) == interrupt_at:
+            raise KeyboardInterrupt("offline interrupt")
+        area = kwargs["area"]
+        (area / "workspace/answer.py").write_text("answer = 1\n")
+        execution = native_execution(
+            area, kwargs["protocol"]["native_task_identity"],
+            answer_path="answer.py", timeout=1800, version=CLAUDE_RUNNER["harness_version"],
+        )
+        artifacts = area / "artifacts"
+        (artifacts / "stdout.jsonl").write_text(stream)
+        shutil.copytree(PLAIN / "sessions", artifacts / "harbor/trial/agent/sessions")
+        coded: dict[str, Any] = {
+            **_claude_evidence(artifacts, execution),
+            "usage": claude.parse_events(stream, [])["usage"],
+        }
+        if drifted(kwargs["entry"]):
+            # The same CLI, as another plan or account would see it.
+            receipt = coded["native_treatment"]
+            receipt["builtins"] = {
+                **receipt["builtins"], "agents": [*receipt["builtins"]["agents"], "claude-code-guide"],
+            }
+            (artifacts / "native-treatment.json").write_text(json.dumps(receipt))
+        return coded
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
+    return calls
+
+
+def _attempt_json(root: Path, attempt_id: str, name: str) -> dict[str, Any]:
+    value = json.loads((root / "attempts" / attempt_id / "handoff" / name).read_text())
+    assert isinstance(value, dict)
+    return value
+
+
+def test_a_fresh_claude_attempt_with_other_built_ins_fails_beside_a_reused_vanilla(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _claude_backend(monkeypatch, drifted=lambda entry: entry["arm"] != "baseline")
+    cache = tmp_path / "cache"
+    one = _study(tmp_path / "one", runner=CLAUDE_RUNNER)
+    study.run_study(one, tmp_path / "first", baseline_cache=cache,
+                    baseline_identity=_claude_identity(one.tasks))
+    two = _study(tmp_path / "two", guidance="another", runner=CLAUDE_RUNNER)
+    root = study.run_study(two, tmp_path / "second", baseline_cache=cache,
+                           baseline_identity=_claude_identity(two.tasks))
+    run = json.loads((root / "run.json").read_text())
+    assert len(run["baseline_origin"]) == 2
+    report = json.loads((root / "report/assessment-report.json").read_text())
+    treated = [row for row in report["attempts"] if row["arm"] != "baseline"]
+    assert len(treated) == 2
+    for row in treated:
+        error = _attempt_json(root, row["id"], "execution.json")["treatment_error"]
+        assert "this run reuses the cached vanilla attempts" in error
+        assert "(cache/" in error
+        correctness = _attempt_json(root, row["id"], "correctness.json")
+        assert correctness["checks"]["native_completion"] is False
+        work = row["stages"][0]["work"]
+        assert work["tokens"] is None
+        assert work["usage_validation"]["status"] == "unavailable"
+        assert any("reuses the cached vanilla" in reason
+                   for reason in work["usage_validation"]["reasons"])
+
+
+def test_a_fully_fresh_claude_run_with_other_built_ins_still_scores_and_says_why_nothing_is_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Nothing cached is mixed in, so the run is comparable within itself.
+    _claude_backend(monkeypatch, drifted=lambda entry: True)
+    cache = tmp_path / "cache"
+    progress: list[str] = []
+    one = _study(tmp_path / "one", runner=CLAUDE_RUNNER)
+    root = study.run_study(one, tmp_path / "run", baseline_cache=cache, progress=progress.append,
+                           baseline_identity=_claude_identity(one.tasks))
+    report = json.loads((root / "report/assessment-report.json").read_text())
+    for row in report["attempts"]:
+        assert _attempt_json(root, row["id"], "correctness.json")["checks"]["native_completion"]
+        assert row["stages"][0]["work"]["usage_validation"]["status"] == "validated"
+    assert not list(cache.glob("*/*/manifest.json"))
+    skipped = [line for line in progress if " was not cached in " in line]
+    assert len(skipped) == 2
+    assert all(line.endswith("its saved evidence does not match the vanilla cache identity")
+               for line in skipped)
+
+
+def test_a_resumed_claude_run_with_attempts_under_other_built_ins_reuses_no_cached_vanilla(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The first session misses the cache and codes under other built-ins; it stops midway.
+    cache = tmp_path / "cache"
+    _claude_backend(monkeypatch, drifted=lambda entry: True, interrupt_at=3)
+    one = _study(tmp_path / "one", runner=CLAUDE_RUNNER)
+    root = tmp_path / "run"
+    with pytest.raises(KeyboardInterrupt):
+        study.run_study(one, root, baseline_cache=cache,
+                        baseline_identity=_claude_identity(one.tasks))
+    states = json.loads((root / "run.json").read_text())["attempt_states"]
+    arms = {entry["id"]: entry["arm"] for entry in json.loads((root / "plan.json").read_text())[
+        "entries"
+    ]}
+    assert any(state == "complete" for state in states.values())
+    assert any(arms[attempt] == "baseline" and state != "complete"
+               for attempt, state in states.items())
+    # Meanwhile another run caches both vanilla repeats under the pinned built-ins.
+    _claude_backend(monkeypatch)
+    seed = _study(tmp_path / "seed", guidance="seed", runner=CLAUDE_RUNNER)
+    study.run_study(seed, tmp_path / "seed-run", baseline_cache=cache,
+                    baseline_identity=_claude_identity(seed.tasks))
+    assert len(list(cache.glob("*/*/manifest.json"))) == 2
+    progress: list[str] = []
+    study.resume_study(root, baseline_cache=cache, progress=progress.append,
+                       baseline_identity=_claude_identity(study._frozen_study(root).tasks))
+    assert json.loads((root / "run.json").read_text())["baseline_origin"] == {}
+    assert any(line.startswith("Cached vanilla attempts are not reused") for line in progress)
+
+
+def test_a_claude_run_prepared_before_the_claude_identity_resumes_into_the_claude_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Decided: the run binds the Claude identity from its frozen recipe, as a new run does,
+    # so its vanilla repeats are cached under the key a fresh `check` computes.
+    cache = tmp_path / "cache"
+    one = _study(tmp_path / "one", runner=CLAUDE_RUNNER)
+    # inputs/vanilla-identity.json as fed4eba saved it for a Claude run, which `_code` passes
+    # to run_study and resume_study verbatim.
+    saved = _claude_identity(one.tasks)
+    saved.pop("claude")
+    saved.update(
+        delivery=native_treatments.DELIVERY_POLICY,
+        capabilities=NativeCapabilities().model_dump(mode="json"),
+    )
+    _claude_backend(monkeypatch, interrupt_at=3)
+    root = tmp_path / "run"
+    with pytest.raises(KeyboardInterrupt):
+        study.run_study(one, root, baseline_cache=cache, baseline_identity=saved)
+    _claude_backend(monkeypatch)
+    study.resume_study(root, baseline_cache=cache, baseline_identity=saved)
+    assert len(list(cache.glob("*/*/manifest.json"))) == 2
+    two = _study(tmp_path / "two", guidance="another", runner=CLAUDE_RUNNER)
+    preview = baselines.preview(
+        path=cache, tasks=two.tasks, repeats=2, identity=_claude_identity(two.tasks)
+    )
+    assert [row["status"] for row in preview] == ["hit", "hit"]
+    decisions = json.loads((root / "plan.json").read_text())["baseline_cache"]
+    assert {decision["cache_key"] for decision in decisions.values()} == {
+        row["cache_key"] for row in preview
+    }
 
 
 def test_a_claude_attempt_reports_its_pinned_launch_provenance(

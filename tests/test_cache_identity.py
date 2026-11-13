@@ -524,7 +524,11 @@ def codex_vanilla_snapshot(tmp_path: Path) -> dict[str, Any]:
     )
     # Source hashes are recorded provenance, pinned to their version by test_components.
     identity.pop("launcher_sha256")
-    _object(identity["isolation"]).pop("implementation_sha256")
+    for runtime in [
+        identity["isolation"],
+        *(_object(task)["isolation"] for task in _object(identity["task_environment"]).values()),
+    ]:
+        _object(runtime).pop("implementation_sha256")
     return {"identity": identity, "key": cache.keys["answer"]}
 
 

@@ -483,8 +483,14 @@ def _execute_stage(
     on_native_start: Callable[[], None],
     expected_runtime: dict[str, object],
     guard: Callable[[], None] = lambda: None,
+    reused_vanilla: list[str] | None = None,
+    pinned_builtins: object = None,
+    claude_version: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run one native invocation and persist its evidence under root.
+
+    `reused_vanilla` names the cached vanilla attempts a Claude run reuses; a fresh attempt
+    whose receipt lacks their pinned built-ins fails.
 
     `guard` runs before each write to root. A run moved during the call therefore writes
     nothing more to its old path; that call's evidence is lost with its temporary work area,
@@ -552,6 +558,12 @@ def _execute_stage(
             execution["submission_collected"] = False
         if isinstance(exc, KeyboardInterrupt):
             interrupted = exc
+    if (
+        reused_vanilla
+        and isinstance(execution.get("native_treatment"), dict)
+        and not _has_pinned_builtins(execution, pinned_builtins)
+    ):
+        _refuse_mixed_builtins(execution, reused_vanilla, claude_version)
     guard()
     target = root / "attempts" / entry["id"] / stage_id
     target.mkdir(parents=True)
@@ -1164,6 +1176,51 @@ def _claude_identity(
     return {"claude": baselines.claude_identity(run, str(identity["harness_version"]))}
 
 
+def _has_pinned_builtins(execution: dict[str, Any], pinned: object) -> bool:
+    """Whether a Claude attempt's discovery receipt reports the built-ins the cache pins."""
+    receipt = execution.get("native_treatment")
+    return (
+        pinned is not None and isinstance(receipt, dict) and receipt.get("builtins") == pinned
+    )
+
+
+def _reused_vanilla(plan: dict[str, Any]) -> list[str]:
+    """Each cached vanilla attempt this run reuses, by attempt and the cohort it came from."""
+    return [
+        f"{attempt_id} ({decision.get('origin_cohort')})"
+        for attempt_id, decision in sorted((plan.get("baseline_cache") or {}).items())
+        if isinstance(decision, dict) and decision.get("status") == "hit"
+    ]
+
+
+def _refuse_mixed_builtins(execution: dict[str, Any], reused: list[str], version: str) -> None:
+    """Fail a fresh Claude attempt whose built-ins differ from the reused vanilla attempts'.
+
+    As a session that differs from its receipt, it does not pass, and its session usage is
+    kept aside, never trusted: `saved_usage` keeps it unavailable on every report and reuse.
+    """
+    reason = (
+        "this run reuses the cached vanilla attempts " + ", ".join(reused) + ", coded under "
+        f"the built-in commands and agents pinned for Claude Code {version}; this attempt's "
+        "discovery reported other built-ins, so it cannot be compared with them"
+    )
+    execution["treatment_error"] = "; ".join(
+        str(error) for error in (execution.get("treatment_error"), reason) if error
+    )
+    execution.setdefault("native_session_usage", execution.get("usage"))
+    execution.update(
+        successful_native_completion=False,
+        exit_code=1,
+        mixed_builtins=reason,
+        usage=None,
+        usage_accounting={
+            "status": "incomplete",
+            "reasons": [reason],
+            "native_sessions": execution.get("usage_accounting"),
+        },
+    )
+
+
 def _run_attempts(
     run: _Run,
     *,
@@ -1187,6 +1244,13 @@ def _run_attempts(
     # the coding runtime, which may have changed since, and caches finished vanilla repeats
     # under the runtime they were coded with.
     coding = any(state != "complete" for state in states.values())
+    claude_version = str((baseline_identity or {}).get("harness_version"))
+    pinned_builtins = baselines.CLAUDE_BUILTINS.get(claude_version)
+
+    def uncached(record: dict[str, Any], reason: str | None) -> None:
+        # Claude only, so Codex runs print what they always printed.
+        if reason and progress and frozen.recipe.harness == "claude":
+            progress(f"Vanilla attempt {record['id']} was not cached in {baseline_cache}: {reason}")
 
     def skipped(error: Exception) -> None:
         if progress:
@@ -1255,6 +1319,38 @@ def _run_attempts(
                 if coding:
                     raise
                 skipped(error)
+        if (
+            cache is not None
+            and frozen.recipe.harness == "claude"
+            and not _reused_vanilla(plan)
+            and any(decision["status"] == "hit" for decision in cache.decisions().values())
+        ):
+            # Attempts coded before any reuse must have the built-ins the cached ones have.
+            unpinned = [
+                record["id"]
+                for record in records
+                if states[record["id"]] == "complete"
+                and not all(
+                    _has_pinned_builtins(
+                        json.loads(
+                            (root / "attempts" / record["id"] / stage["id"] / "execution.json")
+                            .read_text()
+                        ),
+                        pinned_builtins,
+                    )
+                    for stage in record["stages"]
+                )
+            ]
+            if unpinned:
+                cache.close()
+                cache = None
+                if progress:
+                    progress(
+                        "Cached vanilla attempts are not reused: this run's attempts "
+                        + ", ".join(unpinned)
+                        + " were coded without the built-ins pinned for Claude Code "
+                        f"{claude_version}, so cached ones could not be compared with them"
+                    )
         if cache is not None:
             # Decisions for complete attempts record what happened when they ran.
             decisions = plan.get("baseline_cache", {})
@@ -1272,7 +1368,7 @@ def _run_attempts(
             try:
                 for record in records:
                     if states[record["id"]] == "complete":
-                        cache.publish(record)
+                        uncached(record, cache.publish(record))
             except Exception as error:
                 if coding:
                     raise
@@ -1323,7 +1419,7 @@ def _run_attempts(
             _checkpoint(root, frozen, manifest, states, status="running")
             if cache is not None and status == "complete":
                 # Cached as it finishes, so a run that stops later still keeps it for reuse.
-                cache.publish(record)
+                uncached(record, cache.publish(record))
             if status == "complete" and record["id"] in called:
                 error = _failed_call(root, record)
                 if error is None:
@@ -1458,6 +1554,11 @@ def _run_attempts(
                         on_native_start=started,
                         expected_runtime=expected_runtime,
                         guard=unmoved,
+                        reused_vanilla=_reused_vanilla(plan)
+                        if frozen.recipe.harness == "claude"
+                        else None,
+                        pinned_builtins=pinned_builtins,
+                        claude_version=claude_version,
                     )
                     record.update(
                         stages=[stage],

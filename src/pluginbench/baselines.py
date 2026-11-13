@@ -841,30 +841,35 @@ class BaselineCache:
             stage.update(correctness=None, evidence=None)
         return record
 
-    def publish(self, record: dict[str, Any]) -> None:
-        """Cache one finished vanilla attempt now, unless it is a hit or not eligible."""
+    def publish(self, record: dict[str, Any]) -> str | None:
+        """Cache one finished vanilla attempt now, unless it is a hit or not eligible.
+
+        Returns why a finished vanilla attempt that is not a hit was not cached, else None.
+        """
         task_id = record["task_id"]
         if record["arm"] != "baseline" or (task_id, record["attempt"]) in self.hits:
-            return
+            return None
         key = self.keys[task_id]
         attempt = self.root / "attempts" / record["id"]
-        if not _eligible(
-            attempt=attempt,
-            record=record,
-            coding=self.contexts[task_id]["coding"],
-            task=self.tasks[task_id],
-        ):
-            return
+        coding = self.contexts[task_id]["coding"]
+        pinned = coding.get("claude")
+        if isinstance(pinned, dict) and None in (pinned.get("init_tools"), pinned.get("builtins")):
+            return (
+                f"Claude Code {coding.get('harness_version')} has no pinned built-ins and init "
+                "tools"
+            )
+        if not _eligible(attempt=attempt, record=record, coding=coding, task=self.tasks[task_id]):
+            return "its saved evidence does not match the vanilla cache identity"
         # A session that never reached the model is no baseline. Runs from before the coding
         # pass stopped on such a session recorded it as complete.
-        harness = self.contexts[task_id]["coding"]["study"]["harness"]
+        harness = coding["study"]["harness"]
         if any(
             _never_reached_model(
                 json.loads((attempt / stage["id"] / "execution.json").read_text()), harness
             )
             for stage in record["stages"]
         ):
-            return
+            return "its session never reached the model"
         cohort = self.path / key
         cohort.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=f".{record['attempt']}-", dir=cohort) as temporary:
@@ -893,3 +898,4 @@ class BaselineCache:
             )
             self._validate(task_id, staged)
             staged.rename(cohort / staged.name)
+        return None

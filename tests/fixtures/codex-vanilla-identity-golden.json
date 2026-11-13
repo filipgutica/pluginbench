@@ -33,7 +33,6 @@
               "version": "codex-stdout-stderr-v1",
               "harbor_run_sha256": "5b14fbcc889a398f80c7b5f7e2a621efc1337ba72e748fafefbab2ad09ad86bd"
             },
-            "implementation_sha256": "047825b04291900daea861498773465b950b6e101be03262e483d08f0112b8fe",
             "docker_cli": {
               "path": "/fixture/bin/docker",
               "resolved_path": "/fixture/bin/docker",
