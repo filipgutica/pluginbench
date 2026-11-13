@@ -22,7 +22,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # The optional artifact destination is judge-only; coding launch behavior stays v1.
             "codex.py": "185d0c33e1389051ddfb97a85c08978a6f65773c2378d601cdf608f4b0c17ccf",
             # The Claude launch contract; tests/test_codex_identity.py proves Codex launches equal.
-            "harbor_backend.py": "047825b04291900daea861498773465b950b6e101be03262e483d08f0112b8fe",
+            "harbor_backend.py": "91560ad9fa97234b0541731dd67aeb1a6c222c2f980c8cb6eeab9619e0deafd0",
             "processes.py": "0170e0a4902fc610d19b50ed5656c601474adad97b9b8d6fb5b08c6ab6ad00d1",
             # Claude admission dispatch only; Codex admission is unchanged.
             "native_treatments.py": "cfe17310a7f43de42af556e98fe63380493aeaf6a419ad612d51e01d671f0f19",
