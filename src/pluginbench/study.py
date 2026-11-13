@@ -22,7 +22,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from pluginbench import codex, harbor_backend, submissions, trial_containers
+from pluginbench import baselines, claude, codex, harbor_backend, submissions, trial_containers
 from pluginbench.arms import normalize_arm_name
 from pluginbench.codex_events import failed_before_first_turn
 from pluginbench.saved_usage import revalidate_usage
@@ -1152,6 +1152,18 @@ def _assert_task_runtimes(frozen: ResolvedStudy, current: dict[str, object]) -> 
             harbor_backend.assert_prepared_images(prepared, current, label=f"task {task.task_id}")
 
 
+def _claude_identity(
+    recipe: StudyRecipe, identity: dict[str, object]
+) -> dict[str, object]:
+    """A Claude run's launch contract for its vanilla cache identity, from its frozen recipe."""
+    if recipe.harness != "claude":
+        return {}
+    run = claude.CodingRun(
+        recipe.model, recipe.reasoning, recipe.capabilities.subagents, recipe.timeout_seconds
+    )
+    return {"claude": baselines.claude_identity(run, str(identity["harness_version"]))}
+
+
 def _run_attempts(
     run: _Run,
     *,
@@ -1219,8 +1231,11 @@ def _run_attempts(
                         **baseline_identity,
                         # New entries record the runtime they run with; saved ones still match.
                         "isolation": expected_runtime,
-                        "delivery": DELIVERY_POLICY,
-                        "capabilities": frozen.recipe.capabilities.model_dump(mode="json"),
+                        "delivery": delivery_policy(frozen.recipe.harness),
+                        "capabilities": claude_launch.recorded_capabilities(
+                            frozen.recipe.capabilities, frozen.recipe.harness
+                        ),
+                        **_claude_identity(frozen.recipe, baseline_identity),
                         "study": {
                             key: getattr(frozen.recipe, key)
                             for key in (

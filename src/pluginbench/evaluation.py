@@ -29,7 +29,7 @@ from pluginbench import (
     submissions,
 )
 from pluginbench.treatments import Treatment, resolve_treatment, treatment_inventory
-from pluginbench.native_treatments import NativeCapabilities, DELIVERY_POLICY, admit
+from pluginbench.native_treatments import NativeCapabilities, admit
 from pluginbench.claude_launch import UNENFORCED_LIMITS, recorded_capabilities
 from pluginbench.claude_launch import refuse_unenforced_limits
 from pluginbench.task_sources import Tasks, cache_root
@@ -474,11 +474,14 @@ def _vanilla_identity(
     harness_version: str,
     task_environment: dict[str, object],
 ) -> dict[str, object]:
-    """Everything a vanilla cohort's cache key binds; `check` previews with the run's own key."""
-    return {
-        # Cache admission checks the Codex receipt, so a Claude attempt never enters the cache.
-        "delivery": DELIVERY_POLICY,
-        "capabilities": config.capabilities.model_dump(mode="json"),
+    """Everything a vanilla cohort's cache key binds; `check` previews with the run's own key.
+
+    A Codex identity is unchanged by the Claude fields: its delivery and recorded capabilities
+    are the values it always had, and only a Claude identity has a `claude` entry.
+    """
+    identity: dict[str, object] = {
+        "delivery": comparison["delivery"],
+        "capabilities": comparison["capabilities"],
         "task_assets": comparison["tasks"],
         "task_environment": task_environment,
         "runner": comparison["runner"],
@@ -499,6 +502,17 @@ def _vanilla_identity(
             "seed": config.seed,
         },
     }
+    if config.runner.harness == "claude":
+        identity["claude"] = baselines.claude_identity(
+            claude.CodingRun(
+                config.runner.model,
+                config.runner.reasoning,
+                config.capabilities.subagents,
+                config.timeout_seconds,
+            ),
+            harness_version,
+        )
+    return identity
 
 
 def _reference_agents(

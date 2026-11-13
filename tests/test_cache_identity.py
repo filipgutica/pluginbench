@@ -13,9 +13,11 @@ import yaml
 
 from legacy_support import LEGACY, copy_legacy, current_runtime, legacy_json
 from native_support import synthetic_contract
-from pluginbench import baselines, evaluation, harbor_backend, submissions
+from pluginbench import baselines, evaluation, harbor_backend, study, submissions
 from pluginbench.assessment_metrics import inspect_snapshot
+from pluginbench.claude_launch import recorded_capabilities
 from pluginbench.datasets import TaskSpec, load_tasks, native_identity, portable_native_identity
+from pluginbench.native_treatments import NativeCapabilities
 
 PREPARED_KEY = next(path.name for path in (LEGACY / "prepared").iterdir())
 VANILLA_KEY = next(path.name for path in (LEGACY / "vanilla").iterdir())
@@ -486,3 +488,57 @@ def test_a_saved_repeat_with_malformed_evidence_is_skipped_for_the_next_one(
     assert [(row["status"], row["cache_key"]) for row in decisions.values()] == [
         ("hit", VANILLA_KEY)
     ] * 2
+
+
+# Codex identity ----------------------------------------------------------------------------
+
+CODEX_GOLDEN = Path(__file__).parent / "fixtures/codex-vanilla-identity-golden.json"
+
+
+def codex_vanilla_snapshot(tmp_path: Path) -> dict[str, Any]:
+    """The vanilla identity `check` and `run` give the 942f12c Codex run, and its cache key."""
+    vanilla = _Vanilla(tmp_path)
+    tasks = vanilla.tasks()
+    saved = vanilla.saved
+    config = evaluation.Evaluation.model_construct(
+        runner=evaluation.Runner.model_validate(saved["runner"]),
+        capabilities=NativeCapabilities.model_validate(saved["capabilities"]),
+        timeout_seconds=saved["timeout_seconds"],
+        jobs=saved["jobs"],
+        seed=saved["seed"],
+    )
+    comparison: dict[str, object] = {
+        "tasks": saved["task_assets"],
+        "runner": saved["runner"],
+        "isolation": vanilla.identity["isolation"],
+        # As plan_evaluation records them.
+        "delivery": study.delivery_policy("codex"),
+        "capabilities": recorded_capabilities(config.capabilities, "codex"),
+    }
+    identity = evaluation._vanilla_identity(
+        config, comparison, saved["harness_version"], vanilla.identity["task_environment"]
+    )
+    cache = baselines.BaselineCache(
+        path=vanilla.cache, root=vanilla.root, tasks=tasks, entries=vanilla.entries,
+        identity=identity,
+    )
+    # Source hashes are recorded provenance, pinned to their version by test_components.
+    identity.pop("launcher_sha256")
+    _object(identity["isolation"]).pop("implementation_sha256")
+    return {"identity": identity, "key": cache.keys["answer"]}
+
+
+def _object(value: object) -> dict[str, Any]:
+    assert isinstance(value, dict)
+    return value
+
+
+def test_the_codex_vanilla_identity_and_key_are_byte_identical_to_fed4eba(
+    tmp_path: Path,
+) -> None:
+    # The golden was computed by codex_vanilla_snapshot on a source tree of fed4eba (0.7.1),
+    # so saved Codex cache entries keep hitting.
+    golden = json.loads(CODEX_GOLDEN.read_text())["snapshot"]
+    current = json.loads(json.dumps(codex_vanilla_snapshot(tmp_path)))
+    # Key order too: vanilla-identity.json is written in insertion order.
+    assert json.dumps(current) == json.dumps(golden)
