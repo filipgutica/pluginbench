@@ -5,12 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import fnmatch
 import base64
+import hashlib
 import json
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 import re
 
-from pluginbench.assessment_metrics import inspect_snapshot
+from pluginbench.assessment_metrics import coverage_sources, inspect_snapshot
 
 
 class CoveragePopulationUnavailable(RuntimeError):
@@ -532,6 +533,156 @@ def _go_source(
     return _source_path(path, files, source_scope, workdir)
 
 
+def _go_cover_blocks(path: Path, files: set[str]) -> dict[str, int]:
+    """Read the block count `go tool cover` declared for each file, one `<count> <path>` line each.
+
+    The count is the `N` of `Count [N]uint32` in the file's instrumented source, so 0 means the
+    toolchain itself found nothing to measure. A file without a line has no declared count.
+    """
+    counts: dict[str, int] = {}
+    # Only "\n" ends a line: a path may hold any other character `splitlines` would split on,
+    # and reading bytes keeps text mode from turning "\r" into one.
+    lines = path.read_bytes().decode().split("\n")
+    if lines[-1] == "":
+        lines.pop()  # what follows the last line's newline
+    for line in lines:
+        match = re.fullmatch(r"(0|[1-9][0-9]*) (\S.*)", line)
+        if match is None:
+            raise ValueError(f"go cover blocks line is malformed: {line!r}")
+        count, file = int(match.group(1)), match.group(2)
+        if file not in files:
+            raise ValueError(f"go cover blocks file is absent from the frozen snapshot: {file}")
+        if file in counts:
+            raise ValueError(f"go cover blocks lists a file more than once: {file}")
+        counts[file] = count
+    return counts
+
+
+def _go_build(
+    listing: Path,
+    blocks: Path,
+    *,
+    files: set[str],
+    modules: dict[str, list[PurePosixPath]],
+    source_scope: list[str],
+    workdir: str,
+    measured: set[str],
+) -> dict[str, object]:
+    """Split scoped sources by the `go list -deps -test -json` output the coverage command wrote.
+
+    Packages outside the workdir, such as the standard library, and vendored packages are
+    skipped. Files that no listed package compiles are recorded with a reason, never as empty
+    records. Compiled files the report omits stay expected unless `go tool cover` declared them
+    zero blocks.
+    """
+    text = listing.read_text()
+    decoder = json.JSONDecoder(object_pairs_hook=_json_pairs)
+    roots = {directory for directories in modules.values() for directory in directories}
+    vendors = {root / "vendor" for root in roots}
+
+    def vendored(path: PurePosixPath) -> bool:
+        return any(path.is_relative_to(vendor) for vendor in vendors)
+
+    compiled: set[str] = set()
+    ignored: dict[str, str] = {}
+    listed: dict[str, str] = {}
+    test_mains = 0
+    index, spaces = 0, re.compile(r"\s*")
+    while True:
+        # `go list -json` writes a stream of objects, not one JSON document.
+        space = spaces.match(text, index)
+        assert space is not None
+        if (index := space.end()) == len(text):
+            break
+        value, index = decoder.raw_decode(text, index)
+        package = _json_object(value, "go list package")
+        directory, name = package.get("Dir"), package.get("ImportPath")
+        if not isinstance(name, str):
+            raise ValueError("go list package requires ImportPath")
+        # `-deps` adds packages outside the repository, and `-e` ones that failed to load
+        # without a Dir. Their files are not ours to measure.
+        if not isinstance(directory, str) or not PurePosixPath(directory).is_relative_to(
+            workdir
+        ):
+            continue
+        relative = PurePosixPath(directory).relative_to(workdir)
+        # A module's vendor/ holds its dependencies' code, not the repository's.
+        if vendored(relative):
+            continue
+        fields: dict[str, list[str]] = {}
+        for field_name in ("GoFiles", "CgoFiles", "IgnoredGoFiles"):
+            items = package.get(field_name, [])
+            if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+                raise ValueError(f"go list {field_name} must hold file names")
+            fields[field_name] = items
+        # `-test` adds each tested package's synthesized `<package>.test` main. Its one file is
+        # the generated test main in the build cache, by absolute path; a real package lists
+        # file names, so a package directory merely named `x.test` is not skipped.
+        if (
+            name.endswith(".test")
+            and " [" not in name
+            and fields["GoFiles"]
+            and all(PurePosixPath(item).is_absolute() for item in fields["GoFiles"])
+        ):
+            test_mains += 1
+            continue
+        # `-test` also lists test variants, `<package> [<tested>.test]`: the package's files
+        # again with its `_test.go` files, or a package only tests import. The set drops the
+        # repeats and the scope drops `_test.go`; reasons name the package as first listed.
+        name = name.split(" [", 1)[0]
+        listed.setdefault(relative.as_posix(), name)
+        for field_name, items in fields.items():
+            for item in items:
+                path = (relative / item).as_posix()
+                if path not in files:
+                    raise ValueError(f"go list file is absent from the frozen snapshot: {path}")
+                if field_name == "IgnoredGoFiles":
+                    ignored.setdefault(path, f"excluded from package {name} by build constraints")
+                else:
+                    compiled.add(path)
+    # Without `-test`, packages only tests import are missing and their files would read as
+    # out of scope. A list from `-test` names a test main for any tested package.
+    if not test_mains and any(
+        file.endswith("_test.go") and PurePosixPath(file).parent.as_posix() in listed
+        for file in files
+    ):
+        raise ValueError("go list must be run with -deps -test: it lists no test main")
+    expected = coverage_sources(files, source_scope)
+
+    def reason(path: str) -> str:
+        if vendored(PurePosixPath(path)):
+            return "vendored dependency"
+        if path in ignored:
+            return ignored[path]
+        parent = PurePosixPath(path).parent
+        if parent.as_posix() in listed:
+            return f"not among the files go list compiles for package {listed[parent.as_posix()]}"
+        module = next(
+            (str(p) for p in (parent, *parent.parents) if p in roots and str(p) != "."), None
+        )
+        if module is not None and not any(
+            directory == module or directory.startswith(module + "/") for directory in listed
+        ):
+            return f"in nested module {module}, which go list did not list"
+        return "in no package that go list -deps -test listed"
+
+    counts = _go_cover_blocks(blocks, files) if blocks.is_file() else {}
+    if declared_empty := sorted(path for path in measured if counts.get(path) == 0):
+        raise ValueError(f"go cover declared no blocks for measured files: {declared_empty}")
+    in_scope = compiled & expected
+    return {
+        "go_list_sha256": hashlib.sha256(listing.read_bytes()).hexdigest(),
+        "go_blocks_sha256": (
+            hashlib.sha256(blocks.read_bytes()).hexdigest() if blocks.is_file() else None
+        ),
+        "compiled_files": sorted(in_scope),
+        "not_compiled_files": {path: reason(path) for path in sorted(expected - compiled)},
+        "files_without_statements": sorted(
+            path for path in in_scope - measured if counts.get(path) == 0
+        ),
+    }
+
+
 def parse_go_coverage(
     report: Path, *, snapshot: Path, source_scope: list[str], test_scope: list[str], workdir: str
 ) -> dict[str, object]:
@@ -568,7 +719,9 @@ def parse_go_coverage(
         if not (
             1 <= start_col <= len(lines[start - 1].encode()) + 1
             and 1 <= end_col <= len(lines[end - 1].encode()) + 1
-            and (start, start_col) < (end, end_col)
+            # Only a block without statements, such as an empty `case`, may have no width.
+            and (start, start_col) <= (end, end_col)
+            and ((start, start_col) != (end, end_col) or statements == 0)
         ):
             raise ValueError(f"Go block escapes source span: {row}")
         if rows[0] == "mode: set" and hits not in {0, 1}:
@@ -586,6 +739,17 @@ def parse_go_coverage(
     population = _population(set(weights), covered, list(records), "statements")
     population["weights"] = weights
     result["statements"] = population
+    listing = report.with_name(report.name + ".go-list.json")
+    if listing.is_file():
+        result["go_build"] = _go_build(
+            listing,
+            report.with_name(report.name + ".go-blocks.txt"),
+            files=files,
+            modules=modules,
+            source_scope=source_scope,
+            workdir=workdir,
+            measured=set(records),
+        )
     return result
 
 

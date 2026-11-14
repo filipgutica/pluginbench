@@ -370,9 +370,17 @@ def _native_coverage(
         raise ValueError("native coverage requires a frozen task identity")
     assert collector.command and collector.report_path and collector.tool_version
     assert collector.report_format is not None
-    sidecar_path = Path(collector.report_path + ".per-test.json")
-    if collector.report_format == "lcov" and (root / sidecar_path).exists():
-        raise ValueError("LCOV per-test sidecar must not exist in the frozen input snapshot")
+    # LCOV may carry per-test lines; Go may carry its build list and cover's block counts.
+    sidecars = {
+        "lcov": {".per-test.json": "LCOV per-test sidecar"},
+        "go-coverprofile": {
+            ".go-list.json": "Go build list sidecar",
+            ".go-blocks.txt": "Go cover blocks sidecar",
+        },
+    }.get(collector.report_format, {})
+    for suffix, label in sidecars.items():
+        if (root / (collector.report_path + suffix)).exists():
+            raise ValueError(f"{label} must not exist in the frozen input snapshot")
     execution = run_native_command(
         snapshot=root,
         task_identity=identity,
@@ -399,11 +407,11 @@ def _native_coverage(
         or not all(isinstance(pattern, str) for pattern in test_scope)
     ):
         raise ValueError("native coverage identity requires workdir and explicit test_scope")
-    if collector.report_format == "lcov":
+    for suffix in sidecars:
         # The native source export already retains sibling report artifacts.
-        sidecar = destination / "after" / sidecar_path
+        sidecar = destination / "after" / (collector.report_path + suffix)
         if sidecar.is_file():
-            shutil.copyfile(sidecar, destination / "report.raw.per-test.json")
+            shutil.copyfile(sidecar, destination / ("report.raw" + suffix))
     try:
         report = parse_coverage(
             collector.report_format,

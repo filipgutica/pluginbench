@@ -7,9 +7,8 @@ import pytest
 
 from legacy_support import legacy_json
 from pluginbench.assessment_metrics import evaluate_evidence, inspect_snapshot
-from pluginbench import isolation
+from pluginbench import components, isolation
 from pluginbench.collectors import (
-    observer_identity,
     Collector,
     _execute,
     collect_measurements,
@@ -720,7 +719,7 @@ def test_native_lcov_dispatch_preserves_runtime_unknown_and_integrity_failure(
             {
                 "native_task_identity": identity,
                 "test_scope": ["test/**"],
-                "implementation": observer_identity(),
+                "observer_version": components.VERSIONS["coverage_observer"],
             },
         ),
         scope=["src/**"],
@@ -782,7 +781,7 @@ def test_native_lcov_dispatch_preserves_runtime_unknown_and_integrity_failure(
         reason = {
             "malformed": "summaries disagree",
             "malformed-per-test": "unexecuted",
-            "stale-per-test": "frozen input",
+            "stale-per-test": "LCOV per-test sidecar must not exist in the frozen input",
         }[outcome]
         with pytest.raises(ValueError, match=reason):
             collect_measurements(snapshot, evidence, [collector])
@@ -810,6 +809,78 @@ def test_native_lcov_dispatch_preserves_runtime_unknown_and_integrity_failure(
             failure = json.loads((evidence / "coverage/failure.json").read_text())
             assert failure["status"] == "unavailable"
     assert inspect_snapshot(snapshot) == original
+
+
+@pytest.mark.parametrize("stale", [None, ".go-list.json", ".go-blocks.txt"])
+def test_native_go_coverage_keeps_the_build_records_its_command_wrote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale: str | None
+) -> None:
+    from pluginbench import harbor_backend
+
+    snapshot = tmp_path / "source"
+    snapshot.mkdir()
+    (snapshot / "go.mod").write_text("module example.test/value\n")
+    (snapshot / "value.go").write_text("package value\nfunc Value() int { return 1 }\n")
+    (snapshot / "value_windows.go").write_text("//go:build windows\npackage value\n")
+    (snapshot / "doc.go").write_text("// Package value.\npackage value\n")
+    if stale:
+        (snapshot / ("cover.out" + stale)).write_text("{}")
+    listing = json.dumps(
+        {
+            "Dir": "/app",
+            "ImportPath": "example.test/value",
+            "GoFiles": ["doc.go", "value.go"],
+            "IgnoredGoFiles": ["value_windows.go"],
+        }
+    )
+    blocks = "0 doc.go\n1 value.go\n1 value_windows.go\n"
+
+    def execute(*, destination: Path, **_: object) -> dict[str, object]:
+        assert not stale  # Reject a build list the frozen input already holds, before running.
+        (destination / "report.raw").write_text(
+            "mode: set\nexample.test/value/value.go:2.20,2.30 1 1\n"
+        )
+        (destination / "after").mkdir()
+        (destination / "after/cover.out.go-list.json").write_text(listing)
+        (destination / "after/cover.out.go-blocks.txt").write_text(blocks)
+        receipt: dict[str, object] = {"exit_code": 0, "timed_out": False, "report_collected": True}
+        (destination / "execution.json").write_text(json.dumps(receipt))
+        return receipt
+
+    monkeypatch.setattr(harbor_backend, "run_native_command", execute)
+    identity = {"task_dir": str(tmp_path / "native"), "workdir": "/app"}
+    collector = Collector(
+        kind="coverage",
+        config=config(
+            tmp_path,
+            {
+                "native_task_identity": identity,
+                "test_scope": ["*_test.go"],
+                "observer_version": components.VERSIONS["coverage_observer"],
+            },
+        ),
+        scope=["*.go"],
+        command=["go", "test"],
+        report_format="go-coverprofile",
+        report_path="cover.out",
+        tool_version="go1.25.5",
+    )
+    evidence = tmp_path / "evidence"
+    if stale:
+        with pytest.raises(ValueError, match="frozen input"):
+            collect_measurements(snapshot, evidence, [collector])
+        return
+    result = collect_measurements(snapshot, evidence, [collector])
+    assert (evidence / "coverage/report.raw.go-list.json").read_text() == listing
+    assert (evidence / "coverage/report.raw.go-blocks.txt").read_text() == blocks
+    metrics = evaluate_evidence(snapshot, {"coverage": str(result["coverage"])}, evidence)
+    coverage = metrics["coverage"]
+    assert isinstance(coverage, dict)
+    assert coverage["metrics"]["population_complete_for_declared_scope"] is True
+    assert coverage["metrics"]["go_files_not_compiled"] == {
+        "value_windows.go": "excluded from package example.test/value by build constraints"
+    }
+    assert coverage["metrics"]["go_files_without_statements"] == ["doc.go"]
 
 
 def test_native_coverage_command_arguments_are_not_host_script_inputs(tmp_path: Path) -> None:

@@ -7,6 +7,8 @@ from typing import NotRequired, TypedDict
 
 import pytest
 
+from pluginbench import assessment_metrics
+from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.coverage_report import (
     parse_coverage,
     parse_lcov,
@@ -580,6 +582,16 @@ def test_go_malformed_populations_rejected(
         go_report(tmp_path, source, GO_REPORT.replace(old, new))
 
 
+def test_go_empty_case_block_has_no_width_and_no_statements(tmp_path: Path, source: Path) -> None:
+    # go1.25 writes `file:226.18,226.18 0 1` for an empty `case` clause.
+    report = go_report(tmp_path, source, GO_REPORT + "example.test/value/value.go:4.5,4.5 0 1\n")
+    statements = report["statements"]
+    assert isinstance(statements, dict)
+    assert statements["weights"]["value.go:4.5,4.5"] == 0
+    with pytest.raises(ValueError, match="escapes source span"):
+        go_report(tmp_path, source, GO_REPORT + "example.test/value/value.go:4.5,4.5 1 1\n")
+
+
 def test_go_duplicate_blocks_are_rejected(tmp_path: Path, source: Path) -> None:
     with pytest.raises(ValueError, match="Duplicate"):
         go_report(tmp_path, source, GO_REPORT + GO_REPORT.splitlines()[1] + "\n")
@@ -602,6 +614,261 @@ def test_go_nested_module_uses_specific_frozen_identity(tmp_path: Path, source: 
         workdir="/app",
     )
     assert result["files_measured"] == ["nested/value.go"]
+
+
+GO_LIST = """{
+\t"Dir": "/app",
+\t"ImportPath": "example.test/value",
+\t"GoFiles": ["added.go", "doc.go", "value.go"],
+\t"IgnoredGoFiles": ["value_windows.go"]
+}
+"""
+# What `go tool cover` declared per non-test file: `Count [N]uint32`, N blocks.
+GO_BLOCKS = "1 added.go\n0 doc.go\n1 testdata/fixture.go\n2 value.go\n1 value_windows.go\n"
+ADDED_BLOCK = "example.test/value/added.go:2.20,2.30 1 1\n"
+
+
+def go_build_metrics(
+    tmp_path: Path,
+    source: Path,
+    *,
+    profile: str,
+    go_list: str = GO_LIST,
+    blocks: str | None = GO_BLOCKS,
+    extra_files: dict[str, str] | None = None,
+) -> dict[str, object]:
+    """Parse a Go report beside its build sidecars, then score it as evidence does."""
+    files = {
+        "doc.go": "// Package value has a doc file, which holds no statements.\npackage value\n",
+        "added.go": "package value\nfunc Added() int { return 1 }\n",
+        "value_windows.go": "//go:build windows\n\npackage value\n\nfunc Windows() {}\n",
+        "testdata/fixture.go": "package fixture\n\nfunc Fixture() {}\n",
+        **(extra_files or {}),
+    }
+    for name, text in files.items():
+        (source / name).parent.mkdir(parents=True, exist_ok=True)
+        (source / name).write_text(text)
+    (tmp_path / "cover.out.go-list.json").write_text(go_list)
+    if blocks is not None:
+        (tmp_path / "cover.out.go-blocks.txt").write_text(blocks)
+    report = go_report(tmp_path, source, profile)
+    snapshot = inspect_snapshot(source)["files"]
+    assert isinstance(snapshot, dict)
+    return assessment_metrics._coverage(report, set(snapshot), ["*.go"])
+
+
+def test_go_files_the_build_does_not_compile_leave_the_report_complete(
+    tmp_path: Path, source: Path
+) -> None:
+    metrics = go_build_metrics(tmp_path, source, profile=GO_REPORT + ADDED_BLOCK)
+    assert metrics["population_complete_for_declared_scope"] is True
+    assert metrics["statement_population_complete"] is True
+    assert metrics["unmeasured_source_files"] == []
+    assert metrics["go_files_not_compiled"] == {
+        "testdata/fixture.go": "in no package that go list -deps -test listed",
+        "value_windows.go": "excluded from package example.test/value by build constraints",
+    }
+    # Go's cover tool declared no blocks for doc.go: nothing to measure.
+    assert metrics["go_files_without_statements"] == ["doc.go"]
+
+
+def test_a_go_file_with_only_func_types_has_nothing_to_measure(
+    tmp_path: Path, source: Path
+) -> None:
+    # expr's internal/testify/require/requirements.go: compiled, only `type X func(...)`.
+    metrics = go_build_metrics(
+        tmp_path,
+        source,
+        profile=GO_REPORT + ADDED_BLOCK,
+        go_list=GO_LIST.replace('"doc.go",', '"doc.go", "types.go",'),
+        blocks=GO_BLOCKS + "0 types.go\n",
+        extra_files={"types.go": "package value\n\ntype Check func(int) bool\n"},
+    )
+    assert metrics["population_complete_for_declared_scope"] is True
+    assert metrics["unmeasured_source_files"] == []
+    assert metrics["go_files_without_statements"] == ["doc.go", "types.go"]
+
+
+@pytest.mark.parametrize(
+    "blocks",
+    [
+        None,  # The command wrote no cover record at all.
+        GO_BLOCKS.replace("0 doc.go\n", ""),  # cover failed on doc.go, so no line.
+        GO_BLOCKS.replace("0 doc.go", "1 doc.go"),
+    ],
+    ids=["no-record", "no-line", "blocks"],
+)
+def test_go_files_cover_did_not_declare_empty_stay_expected(
+    tmp_path: Path, source: Path, blocks: str | None
+) -> None:
+    metrics = go_build_metrics(tmp_path, source, profile=GO_REPORT + ADDED_BLOCK, blocks=blocks)
+    assert metrics["population_complete_for_declared_scope"] is False
+    assert metrics["unmeasured_source_files"] == ["doc.go"]
+    assert metrics["go_files_without_statements"] == []
+
+
+def test_a_compiled_go_file_missing_from_the_report_stays_incomplete(
+    tmp_path: Path, source: Path
+) -> None:
+    # added.go stands for a file an agent adds to a compiled package and leaves untested.
+    metrics = go_build_metrics(tmp_path, source, profile=GO_REPORT)
+    assert metrics["population_complete_for_declared_scope"] is False
+    assert metrics["statement_population_complete"] is False
+    assert metrics["unmeasured_source_files"] == ["added.go"]
+
+
+@pytest.mark.parametrize(
+    ("directory", "helper"),
+    [
+        # value_test.go imports a helper that does not import the package: go lists it plain.
+        (
+            "testdata/helper",
+            '{"Dir": "/app/testdata/helper", "ImportPath": "example.test/value/testdata/helper",'
+            ' "GoFiles": ["helper.go"]}\n',
+        ),
+        # x_test.go imports a helper that imports the package: go lists only its test variant.
+        (
+            "_tools/helper",
+            '{"Dir": "/app/_tools/helper", "ImportPath":'
+            ' "example.test/value/_tools/helper [example.test/value.test]",'
+            ' "ForTest": "example.test/value", "GoFiles": ["helper.go"]}\n',
+        ),
+    ],
+    ids=["internal-test-import", "external-test-import"],
+)
+def test_go_files_only_tests_import_stay_expected(
+    tmp_path: Path, source: Path, directory: str, helper: str
+) -> None:
+    # The shape go1.25 `go list -e -deps -test -json` writes: the standard library, packages
+    # that failed to load, test variants that repeat the package's files with its `_test.go`
+    # files, and the synthesized `.test` main, whose only file is in the build cache.
+    go_list = (
+        GO_LIST
+        + '{"Dir": "/usr/local/go/src/testing", "ImportPath": "testing",'
+        ' "GoFiles": ["testing.go"]}\n'
+        '{"ImportPath": "missing.example/x"}\n'
+        + helper
+        + '{"Dir": "/app", "ImportPath": "example.test/value [example.test/value.test]",'
+        ' "ForTest": "example.test/value",'
+        ' "GoFiles": ["added.go", "doc.go", "value.go", "value_test.go"],'
+        ' "IgnoredGoFiles": ["value_windows.go"]}\n'
+        '{"Dir": "/app", "ImportPath": "example.test/value_test [example.test/value.test]",'
+        ' "ForTest": "example.test/value", "GoFiles": ["x_test.go"]}\n'
+        '{"Dir": "/app", "ImportPath": "example.test/value.test",'
+        ' "GoFiles": ["/root/.cache/go-build/16/16b6c34b-d"]}\n'
+    )
+    metrics = go_build_metrics(
+        tmp_path,
+        source,
+        profile=GO_REPORT + ADDED_BLOCK,
+        go_list=go_list,
+        blocks=GO_BLOCKS + f"1 {directory}/helper.go\n",
+        extra_files={
+            f"{directory}/helper.go": "package helper\n\nfunc Help() {}\n",
+            "value_test.go": "package value\n",
+            "x_test.go": "package value_test\n",
+        },
+    )
+    assert metrics["population_complete_for_declared_scope"] is False
+    assert metrics["unmeasured_source_files"] == [f"{directory}/helper.go"]
+    assert metrics["go_files_not_compiled"] == {
+        "testdata/fixture.go": "in no package that go list -deps -test listed",
+        "value_windows.go": "excluded from package example.test/value by build constraints",
+    }
+
+
+def test_vendored_go_packages_are_out_of_scope(tmp_path: Path, source: Path) -> None:
+    # `-deps` lists vendored packages from inside the workdir; they are not the repo's code.
+    go_list = GO_LIST + (
+        '{"Dir": "/app/vendor/example.com/dep", "ImportPath": "example.com/dep",'
+        ' "GoFiles": ["dep.go"], "IgnoredGoFiles": ["dep_windows.go"]}\n'
+    )
+    metrics = go_build_metrics(
+        tmp_path,
+        source,
+        profile=GO_REPORT + ADDED_BLOCK,
+        go_list=go_list,
+        extra_files={
+            "vendor/example.com/dep/dep.go": "package dep\n\nfunc D() int { return 2 }\n",
+            "vendor/example.com/dep/dep_windows.go": "//go:build windows\n\npackage dep\n",
+        },
+    )
+    assert metrics["population_complete_for_declared_scope"] is True
+    assert metrics["unmeasured_source_files"] == []
+    assert metrics["go_files_not_compiled"] == {
+        "testdata/fixture.go": "in no package that go list -deps -test listed",
+        "value_windows.go": "excluded from package example.test/value by build constraints",
+        "vendor/example.com/dep/dep.go": "vendored dependency",
+        "vendor/example.com/dep/dep_windows.go": "vendored dependency",
+    }
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "error"),
+    [
+        ('"/app"', '"/elsewhere"', "did not compile"),
+        ('"doc.go",', '"doc.go", "ghost.go",', "absent from the frozen snapshot"),
+        ('"added.go", ', "", "did not compile"),
+    ],
+)
+def test_go_build_lists_that_disagree_with_the_snapshot_or_report_are_rejected(
+    tmp_path: Path, source: Path, old: str, new: str, error: str
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        go_build_metrics(
+            tmp_path, source, profile=GO_REPORT + ADDED_BLOCK, go_list=GO_LIST.replace(old, new)
+        )
+
+
+@pytest.mark.parametrize(
+    ("blocks", "error"),
+    [
+        (GO_BLOCKS + "zero doc.go\n", "malformed"),
+        (GO_BLOCKS + "0 doc.go\n", "more than once"),
+        (GO_BLOCKS + "0 ghost.go\n", "absent from the frozen snapshot"),
+        (GO_BLOCKS.replace("2 value.go", "0 value.go"), "declared no blocks"),
+    ],
+    ids=["malformed", "duplicate", "absent", "measured"],
+)
+def test_go_cover_blocks_that_disagree_with_the_snapshot_or_report_are_rejected(
+    tmp_path: Path, source: Path, blocks: str, error: str
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        go_build_metrics(tmp_path, source, profile=GO_REPORT + ADDED_BLOCK, blocks=blocks)
+
+
+GO_TEST_MAIN = """{
+\t"Dir": "/app",
+\t"ImportPath": "example.test/value.test",
+\t"GoFiles": ["/root/.cache/go-build/ab/abcdef-d"]
+}
+"""
+
+
+def test_a_go_list_without_test_mains_is_refused_when_the_repo_has_tests(
+    tmp_path: Path, source: Path
+) -> None:
+    tests = {"value_test.go": "package value\n"}
+    with pytest.raises(ValueError, match="-deps -test"):
+        go_build_metrics(
+            tmp_path, source, profile=GO_REPORT + ADDED_BLOCK, extra_files=tests
+        )
+    metrics = go_build_metrics(
+        tmp_path, source, profile=GO_REPORT + ADDED_BLOCK, extra_files=tests,
+        go_list=GO_LIST + GO_TEST_MAIN,
+    )
+    assert metrics["population_complete_for_declared_scope"] is True
+
+
+@pytest.mark.parametrize("name", ["we\rird.go", "form\x0cfeed.go"])
+def test_go_cover_blocks_keep_line_breaking_characters_in_file_names(
+    tmp_path: Path, source: Path, name: str
+) -> None:
+    metrics = go_build_metrics(
+        tmp_path, source, profile=GO_REPORT + ADDED_BLOCK,
+        blocks=GO_BLOCKS + f"1 {name}\n", extra_files={name: "package value\n"},
+    )
+    assert metrics["population_complete_for_declared_scope"] is True
 
 
 def test_python_duplicate_json_keys_are_rejected(tmp_path: Path, source: Path) -> None:

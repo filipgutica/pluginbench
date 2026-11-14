@@ -412,6 +412,55 @@ def _coverage_limits(
     return limits
 
 
+def coverage_sources(files: set[str], scope: list[str]) -> set[str]:
+    """The source files a coverage report for this scope must measure to be complete."""
+    return {
+        path
+        for path in files
+        if any(fnmatch.fnmatchcase(path, pattern) for pattern in scope)
+        and _is_source_path(path)
+        and Path(path).suffix.lower() in _SOURCE_SUFFIXES
+        and not path.endswith((".d.ts", ".d.mts", ".d.cts"))
+    }
+
+
+def _go_build_scope(
+    report: dict[str, object], expected: set[str], measured: set[str]
+) -> tuple[set[str], dict[str, object]]:
+    """Narrow a Go report's expected files to those its build compiled and that hold statements.
+
+    Reports without a `go_build` record keep every scoped source file expected. The record
+    must account for each scoped file, and every file the report measures must be compiled.
+    """
+    if "go_build" not in report:
+        return expected, {}
+    build = _object(report["go_build"], "go_build")
+    keys = {
+        "go_list_sha256",
+        "go_blocks_sha256",
+        "compiled_files",
+        "not_compiled_files",
+        "files_without_statements",
+    }
+    if report.get("format") != "go-coverprofile" or set(build) != keys:
+        raise ValueError("go_build requires a Go coverprofile and its five build fields")
+    compiled = set(_strings(build["compiled_files"], "go_build.compiled_files"))
+    skipped = _object(build["not_compiled_files"], "go_build.not_compiled_files")
+    empty = set(_strings(build["files_without_statements"], "go_build.files_without_statements"))
+    if not compiled <= expected or set(skipped) != expected - compiled:
+        raise ValueError("go_build must split the scoped source files into compiled and not")
+    if not all(isinstance(reason, str) and reason for reason in skipped.values()):
+        raise ValueError("each file the Go build did not compile needs a reason")
+    if not measured & expected <= compiled:
+        raise ValueError("Go coverage measures a file its build did not compile")
+    if not empty <= compiled - measured:
+        raise ValueError("Go files without statements must be compiled and absent from the report")
+    return compiled - empty, {
+        "go_files_not_compiled": dict(sorted(skipped.items())),
+        "go_files_without_statements": sorted(empty),
+    }
+
+
 def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> dict[str, object]:
     test_scope = (
         [name.removeprefix("./") for name in _strings(report["test_scope"], "test scope")]
@@ -436,14 +485,7 @@ def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> d
     )
     for path in measured:
         _source_path(path, files, scope)
-    expected = {
-        path
-        for path in files
-        if any(fnmatch.fnmatchcase(path, pattern) for pattern in scope)
-        and _is_source_path(path)
-        and Path(path).suffix.lower() in _SOURCE_SUFFIXES
-        and not path.endswith((".d.ts", ".d.mts", ".d.cts"))
-    }
+    expected, go_build = _go_build_scope(report, coverage_sources(files, scope), measured)
     units: dict[str, object] = {}
     for kind, singular in (
         ("lines", "line"),
@@ -539,6 +581,7 @@ def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> d
         "reference_test_files": report.get("reference_test_files"),
         "selection_policy": report.get("selection_policy"),
         **({"clock": report["clock"]} if "clock" in report else {}),
+        **go_build,
     }
 
 
