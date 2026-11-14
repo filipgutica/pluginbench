@@ -250,9 +250,12 @@ Cleanup removes owned containers, networks, sidecars, temporary homes, and job c
 
 For `iterations`, a malformed shell command makes the attempt incomplete if treating any word as a command start could match the documented verification-command list. Otherwise, it cannot change the count and is ignored. Quoted operators and here-document bodies are data. Fresh evaluations and later `measure` requests both bind the counts to a saved measurement revision; reports require that revision.
 
-Verification segments recognize tools by file name, including paths such as `node_modules/.bin/jest`. Prefixes include environment assignments, `env` with options, `time`, `timeout`, and the runners `npx`, `npm exec`, `uv run`, `poetry run`, `pnpm exec`, `yarn exec`, and `python[3] -m`. `npm exec` options before `--` are skipped. `yarn` followed by a listed tool also counts, including `yarn jest`; `python -m ruff check` counts too.
+Verification segments recognize tools by file name, including paths such as `node_modules/.bin/jest`. Prefixes include environment assignments, `env` with options, `time`, `timeout`, and the runners `npx`, `npm exec`, `uv run`, `poetry run`, `pnpm exec`, `yarn exec`, and `python[3] -m`. Python interpreters also match by file name; module forms count only for `pytest`, `mypy`, `ruff check`, and `unittest`. `npm exec` options stop at the tool or `--`; a later `--` separates tool arguments. `yarn` followed by a listed tool also counts, including `yarn jest`.
 
-A command's status is masked when a verification segment is followed by a pipe, `;`, `&`, a newline with another command, or `|| true`. An earlier `set -o pipefail` removes only the pipe mask while enabled. Separators before verification segments do not mask their status.
+A command's status is masked when any separator after a verification segment is a pipe, `;`, `&`, a newline with another command, or `|| true`. An earlier `set -o pipefail`, including combined options such as `set -euo pipefail`, removes only the pipe mask while enabled. Closing shell syntax on later lines does not run another command; assignment-only lines do. Separators before verification segments do not mask their status. These counts use method `verification transcript count v2`.
+
+Limitation (S8): pipefail tracking is sequential and does not model scope through subshells or wrappers.
+Limitation (S10): Codex interruption branches have synthetic coverage but remain unverified on real interrupted traces.
 
 JS/TS analysis requires Node, Corepack, and Fallow 3.18.0. PluginBench retains real entrypoint inference and checks discovery/parse completeness. A missing or different tool version makes those measurements unavailable, without blocking tokens, lines, or review.
 

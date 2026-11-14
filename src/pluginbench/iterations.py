@@ -62,12 +62,14 @@ def _tokens(command: str) -> list[list[str] | str]:
         if operator is None:
             raw.append(match[0])
             continue
-        words = _front(shlex.split("".join(raw)))
+        # Preserve assignments for status masking; only matching strips prefixes.
+        words = shlex.split("".join(raw))
+        front = _front(words)
         raw = []
-        if len(words) >= 2 and Path(words[0]).name == "bash" and words[1] in {"-c", "-lc"}:
-            if len(words) < 3:
+        if len(front) >= 2 and Path(front[0]).name == "bash" and front[1] in {"-c", "-lc"}:
+            if len(front) < 3:
                 raise ValueError("bash wrapper has no command")
-            segments.extend(_tokens(words[2]))
+            segments.extend(_tokens(front[2]))
         else:
             segments.append(words)
         segments.append(operator)
@@ -108,20 +110,21 @@ def _front(words: list[str]) -> list[str]:
                     break
         elif words[:2] == ["npm", "exec"]:
             words = words[2:]
-            if words and words[0].startswith("-") and "--" in words:
-                words = words[words.index("--") + 1:]
-                continue
             while words and words[0].startswith("-"):
-                words = words[2:] if words[0] in {
+                option = words[0]
+                words = words[2:] if option in {
                     "-w", "--workspace", "-p", "--package", "-c", "--call",
+                    "--prefix", "--userconfig",
                 } else words[1:]
+                if option == "--":
+                    break
         elif words[0] == "timeout" and len(words) >= 2:
             words = words[2:]
         elif words[:2] in (["uv", "run"], ["poetry", "run"], ["pnpm", "exec"], ["yarn", "exec"]):
             words = words[2:]
         elif (
-            words[0] in {"python", "python3"} and words[1:2] == ["-m"]
-            and words[2:3] != ["unittest"]
+            Path(words[0]).name in {"python", "python3"} and words[1:2] == ["-m"]
+            and words[2:3] in (["pytest"], ["mypy"], ["ruff"])
         ):
             # The frozen list includes unittest only in its Python module form.
             words = words[2:]
@@ -202,22 +205,31 @@ def masked(command: str) -> bool:
     for index, token in enumerate(tokens):
         if not isinstance(token, list):
             continue
-        if token[:3] == ["set", "-o", "pipefail"]:
-            pipefail = True
-        elif token[:3] == ["set", "+o", "pipefail"]:
-            pipefail = False
+        front = _front(token)
+        if front[:1] == ["set"]:
+            for option, value in zip(front[1:], front[2:]):
+                if re.fullmatch(r"[-+][A-Za-z]*o", option) and value == "pipefail":
+                    pipefail = option.startswith("-")
         if not _matches(token):
             continue
-        following = tokens[index + 1:]
-        separator = following[0] if following else None
-        later_commands = [part for part in following if isinstance(part, list) and part]
-        if (
-            (separator == "|" and not pipefail)
-            or separator in (";", "&")
-            or (separator == "\n" and later_commands)
-            or (separator == "||" and later_commands and later_commands[0][:1] == ["true"])
-        ):
-            return True
+        for later in range(index + 1, len(tokens)):
+            separator = tokens[later]
+            if not isinstance(separator, str):
+                continue
+            following = tokens[later + 1:]
+            # Keep assignment-only lines: they also replace the shell's exit status.
+            # Closing syntax and empty continuation lines do not run another command.
+            later_commands = [
+                part for part in following if isinstance(part, list)
+                and any(word not in {")", "}", "fi", "done", "esac"} for word in part)
+            ]
+            if (
+                (separator == "|" and not pipefail)
+                or separator in (";", "&")
+                or (separator == "\n" and tokens[later - 1] and later_commands)
+                or (separator == "||" and later_commands and _front(later_commands[0])[:1] == ["true"])
+            ):
+                return True
     return False
 
 
@@ -354,15 +366,22 @@ def _claude(
                     text = "\n".join(str(_object(part).get("text", "")) for part in text)
                 if not isinstance(text, str):
                     raise ValueError("invalid Claude tool result content")
-                result = event.get("toolUseResult")
-                interrupted = isinstance(result, dict) and result.get("interrupted") is True
+                interrupted = any(
+                    isinstance(result := event.get(key), dict) and result.get("interrupted") is True
+                    for key in ("toolUseResult", "tool_use_result")
+                )
                 action.failed = False
                 if is_error:
                     action.failed = True if text.lstrip().startswith("Exit code") else None
                     action.edit = False
                     if action.failed is None and not interrupted and re.search(
                         r"(?i)^(?:Error: )?(?:Permission denied|Cancelled|Canceled|"
-                        r"Aborted|User rejected|Command rejected|Tool execution denied)", text
+                        r"Aborted|User rejected|Command rejected|Tool execution denied|"
+                        r"Permission to use [\s\S]+? has been denied\.|"
+                        r"Claude requested permissions to use [^\n]+, "
+                        r"but you haven't granted it yet\.|"
+                        r"The user doesn't want to proceed with this tool use\.|"
+                        r"Permission for this action has been denied\. Reason:)", text
                     ):
                         action.command = None  # Denied/cancelled: never executed.
                 if interrupted:
@@ -569,7 +588,7 @@ def _count(agents: dict[str, list[Action]]) -> dict[str, object]:
         "known_failed_verification_commands": failures,
         "unknown_exit_commands": unknown,
         "masked_commands": masked_count,
-        "method": "verification transcript count v1",
+        "method": "verification transcript count v2",
         "limitations": LIMITATIONS,
     }
 
@@ -777,7 +796,7 @@ def measure_attempt(artifacts: Path, *, claude: bool) -> dict[str, object]:
             "iterations": None,
             "verification_commands": None,
             "failed_verification_commands": None,
-            "method": "verification transcript count v1",
+            "method": "verification transcript count v2",
             "limitations": LIMITATIONS,
         }
 

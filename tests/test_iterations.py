@@ -756,3 +756,92 @@ def test_workspace_ancestor_test_directory_does_not_classify_docs_as_an_edit(
     assert result["status"] == "complete", result
     assert result["verification_commands"] == 2
     assert result["iterations"] == 0
+
+
+@pytest.mark.parametrize("output", [
+    "Permission to use Bash with command pytest has been denied.",
+    "Claude requested permissions to use Bash, but you haven't granted it yet.",
+    "The user doesn't want to proceed with this tool use. The tool use was rejected.",
+    "Permission for this action has been denied. Reason: user rejected the request.",
+])
+def test_claude_real_refusal_templates_are_excluded(tmp_path: Path, output: str) -> None:
+    _write(tmp_path / "stdout.jsonl", _tool(
+        "a", "Bash", {"command": "pytest"}, error=True, output=output,
+    ))
+    result = measure_attempt(tmp_path, claude=True)
+    assert result["status"] == "complete"
+    assert result["verification_commands"] == result["unknown_exit_commands"] == 0
+
+
+@pytest.mark.parametrize("options", ["-euo", "-eo", "-e -o"])
+def test_pipefail_combined_option_words(options: str) -> None:
+    assert not masked(f"set {options} pipefail; pytest | tee log")
+
+
+@pytest.mark.parametrize("command", [
+    "set -o pipefail; pytest | tee log; echo done",
+    "set -o pipefail; pytest | tee log || true",
+    "pytest && echo ok; echo done",
+    "pytest || echo x || true",
+    "pytest && echo ok | tee log",
+    "pytest && echo ok & echo done",
+    "pytest && echo ok\necho done",
+    "pytest && echo ok\nrc=$?",
+])
+def test_every_later_separator_can_mask_status(command: str) -> None:
+    assert masked(command)
+
+
+@pytest.mark.parametrize("command", [
+    "npm exec -y jest -- --ci",
+    "npm exec --yes tsc -- --noEmit",
+    "npm exec -w pkg jest -- --runInBand",
+])
+def test_npm_exec_options_stop_at_tool_or_delimiter(command: str) -> None:
+    assert verification_command(command)
+
+
+@pytest.mark.parametrize("command", [
+    ".venv/bin/python -m pytest",
+    "/usr/bin/python3 -m mypy",
+    ".venv/bin/python -m ruff check .",
+])
+def test_python_module_interpreter_paths(command: str) -> None:
+    assert verification_command(command)
+
+
+@pytest.mark.parametrize("command", ["python -m jest", "python -m make test"])
+def test_python_module_runner_only_strips_listed_python_tools(command: str) -> None:
+    assert not verification_command(command)
+
+
+@pytest.mark.parametrize("command", [
+    "(\npytest\n)",
+    "{\npytest\n}",
+    "if true; then\npytest\nfi",
+    "for x in a; do\npytest\ndone",
+    "case x in x)\npytest\nesac",
+])
+def test_closing_shell_lines_are_not_later_commands(command: str) -> None:
+    assert not masked(command)
+
+
+@pytest.mark.parametrize("error", [True, False])
+def test_claude_stream_interruption_key_keeps_started_command(
+    tmp_path: Path, error: bool,
+) -> None:
+    events = _tool("a", "Bash", {"command": "pytest"}, error=error, output="Canceled")
+    events[-1]["tool_use_result"] = {"interrupted": True}
+    _write(tmp_path / "stdout.jsonl", events)
+    result = measure_attempt(tmp_path, claude=True)
+    assert result["verification_commands"] == result["unknown_exit_commands"] == 1
+    assert result["known_failed_verification_commands"] == 0
+
+
+@pytest.mark.parametrize("claude", [True, False])
+def test_transcript_method_version_is_v2(tmp_path: Path, claude: bool) -> None:
+    assert measure_attempt(tmp_path, claude=claude)["method"] == "verification transcript count v2"
+    _write(tmp_path / "stdout.jsonl", (
+        _tool("a", "Bash", {"command": "pytest"}) if claude else _command("a", "pytest")
+    ))
+    assert measure_attempt(tmp_path, claude=claude)["method"] == "verification transcript count v2"
