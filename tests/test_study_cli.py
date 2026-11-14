@@ -2325,11 +2325,17 @@ def test_review_with_another_reviewer_records_and_reports_that_reviewer(
     monkeypatch.setattr(claude, "preflight", lambda: {"harness_version": "2.1.0 (Claude Code)"})
     override = ["--reviewer-harness", "claude", "--reviewer-model", "claude-opus-5-5"]
 
-    result = CliRunner().invoke(
-        cli.app,
-        ["review", str(root), "--revision", "second", *override, "--reviewer-effort", "high"]
-        + ["--yes"],
-    )
+    def missing_host() -> Path:
+        raise ValueError("Codex reviews need an executable codex-code-mode-host")
+
+    # Only the frozen Codex reviewer needs this host, so the Claude override's preflight passes.
+    with monkeypatch.context() as patched:
+        patched.setattr(isolation, "codex_code_mode_host", missing_host)
+        result = CliRunner().invoke(
+            cli.app,
+            ["review", str(root), "--revision", "second", *override, "--reviewer-effort", "high"]
+            + ["--yes"],
+        )
 
     assert result.exit_code == 0, result.stderr + result.stdout
     assert "9 review calls as review revision second by claude claude-opus-5-5 (high)." in (

@@ -1878,7 +1878,7 @@ def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path
     reviewed = _selected_revision(config, "review_revision")
     if config.get("reviewer") and reviewed is not None:
         reviewer = _revision_reviewer(evidence, config, reviewed)
-        if reviewer != config["reviewer"]:
+        if reviewed in _object(config.get("reviewer_overrides", {})):
             # Another reviewer's findings must not be reported, or compared, as the frozen one's.
             config["reviewer"] = reviewer
             comparison["reviewer"] = {
