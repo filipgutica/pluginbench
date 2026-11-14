@@ -148,12 +148,14 @@ def test_config_dry_run_includes_fresh_vanilla_and_every_package(
     assert result.exit_code == 0, result.stderr
     plan = json.loads(result.stdout)
     assert plan["coding_calls"] == 9 and plan["review_calls"] == 0
+    # The owner approves a batch from this plan, so it counts the source-only replays too.
+    assert plan["verifier_replays"] == 9
     assert set(plan["treatments"]) == {"superpowers", "workflow"}
     assert "fresh vanilla" in plan["vanilla"]
     summary = CliRunner().invoke(cli.app, ["run", str(path), "--dry-run"])
     assert summary.exit_code == 0, summary.stderr
     assert "Arms: vanilla, " in summary.stdout
-    assert "Coding attempts: 9   Review calls: 0" in summary.stdout
+    assert "Coding attempts: 9   Review calls: 0   Verifier replays: 9" in summary.stdout
     assert not summary.stdout.lstrip().startswith("{")
 
 
@@ -2653,12 +2655,15 @@ _SOLUTION = (
 
 
 def _finished_without_source_only_grades(
-    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    config: evaluation.Evaluation,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    solution: str = _SOLUTION,
 ) -> tuple[Path, list[str]]:
     """A run finished by an earlier build, and the patches its source-only replays grade."""
     config.jobs = 1
     (tmp_path / "deep-swe/tasks/arbitrary-native-task/solution/solution.patch").write_text(
-        _SOLUTION
+        solution
     )
     monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.167.0"})
     monkeypatch.setattr(codex, "runtime_environment", lambda *args, **kwargs: ({}, ()))
@@ -2778,13 +2783,17 @@ def test_source_only_replays_wait_for_the_frozen_grader_and_a_failed_try_is_clea
     monkeypatch.setattr(harbor_backend, "_assert_native_image", gone)
     result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
 
-    # The run and its report finish; the grades that need the grader say why they are missing.
+    # The run and its report finish; the grades that need the grader say why they wait.
     assert result.exit_code == 0, result.stderr + result.stdout
     assert graded == []
+    waiting = [line for line in result.stdout.splitlines() if "source-only" in line]
+    assert len(waiting) == 1 and str(len(packages)) in waiting[0]
+    assert "Frozen native image is unavailable" in waiting[0]
     for key, row in _rows(root).items():
         grading = row["source_only_grading"]
         if key in packages:
-            assert grading["status"] == "unavailable" and row["source_only_reward"] is None
+            # Pending, unlike a permanent `unavailable`: a later run grades it.
+            assert grading["status"] == "pending" and row["source_only_reward"] is None
             assert grading["reason"].startswith("Frozen native image is unavailable")
         else:
             assert grading["status"] == "complete" and row["source_only_reward"] == 1
@@ -2838,6 +2847,45 @@ def test_a_new_filter_revision_grades_again_beside_the_earlier_one(
     assert evaluation.plan_resume(root)["verifier_replays"] == 0
     assert runner.invoke(cli.app, ["run", str(root), "--yes", "--foreground"]).exit_code == 0
     assert len(graded) == 2 * replays
+
+
+@pytest.mark.parametrize(
+    ("solution", "reason"),
+    [
+        (
+            _SOLUTION.replace("src/test_set.py", '"src/t\\303\\251st_set.py"'),
+            "unsupported quoted native patch path",
+        ),
+        (
+            _SOLUTION.replace("new file mode 100644", "new file mode 120000"),
+            "unsupported native patch file mode",
+        ),
+    ],
+    ids=["quoted-path", "symlink-mode"],
+)
+def test_a_reference_solution_the_parser_refuses_leaves_the_grade_unavailable(
+    config: evaluation.Evaluation,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    solution: str,
+    reason: str,
+) -> None:
+    root, graded = _finished_without_source_only_grades(config, tmp_path, monkeypatch, solution)
+    runner = CliRunner()
+    dry = runner.invoke(cli.app, ["run", str(root), "--dry-run"])
+    assert dry.exit_code == 0, dry.stderr + dry.stdout
+    assert "Verifier replays: 0" in dry.stdout
+
+    result = runner.invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+
+    # The run finishes; no stage can tell its files from tests, so none is replayed.
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert graded == []
+    for row in _rows(root).values():
+        grading = row["source_only_grading"]
+        assert grading["status"] == "unavailable" and row["source_only_reward"] is None
+        assert grading["reason"] == reason
+    assert evaluation.plan_resume(root)["verifier_replays"] == 0
 
 
 class _Killed(BaseException):

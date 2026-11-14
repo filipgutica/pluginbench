@@ -388,6 +388,8 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
         "name": config.name,
         "coding_calls": coding,
         "review_calls": coding if config.reviewer else 0,
+        # Source-only verifier replays after coding, estimated as in plan_resume.
+        "verifier_replays": coding,
         "runner": config.runner.model_dump(mode="json"),
         "treatments": {
             name: treatment_inventory(item, config.runner.harness)

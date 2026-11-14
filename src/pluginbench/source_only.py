@@ -112,13 +112,14 @@ def _prepare(
     grade["native_patch_sha256"] = native_patch
     if not (task.native_task / "solution/solution.patch").is_file():
         return unavailable("task ships no solution/solution.patch to tell its files from tests")
-    hidden, reference = _task_paths(task.native_task)
     try:
+        # The path parser refuses quoted paths and link modes, in either patch.
+        hidden, reference = _task_paths(task.native_task)
         filtered, removed = _without_tests(patch_bytes.decode("utf-8"), reference)
+        kept = submissions._patch_paths(filtered)
     except ValueError as error:
         return unavailable(str(error))
     filtered_bytes = filtered.encode("utf-8")
-    kept = submissions._patch_paths(filtered)
     grade.update(
         status="complete",
         filtered_patch_sha256=hashlib.sha256(filtered_bytes).hexdigest(),
@@ -228,7 +229,7 @@ def record_source_only_grades(
 
     A stage graded by an earlier call in this filter revision keeps its saved grade. A stage
     whose replay the frozen runtime or grader image cannot run now is left pending, with its
-    reason, and graded on a later call.
+    reason, and graded on a later call; `progress` gets one line naming how many wait and why.
     """
     directory = _directory(evidence)
     records: dict[str, dict[str, dict[str, str]]] = {}
@@ -256,6 +257,12 @@ def record_source_only_grades(
                     target=target,
                 )
         records.setdefault(attempt_id, {})[stage_id] = study._reference(evidence, path)
+    if pending and progress:
+        waiting = [reason for stages in pending.values() for reason in stages.values()]
+        progress(
+            f"{len(waiting)} source-only verifier replays pending; the next run retries them: "
+            + "; ".join(sorted(set(waiting)))
+        )
     index = directory / "index.json"
     study._write(
         index,
@@ -283,9 +290,10 @@ def attach_source_only_grades(
             if reference is not None:
                 stage["source_only_grading"] = study._bound_document(evidence, reference)
             elif reason is not None:
+                # Not `unavailable`, which is final: a later run grades this stage.
                 stage["source_only_grading"] = {
                     "source_only_filter": document["source_only_filter"],
-                    "status": "unavailable",
+                    "status": "pending",
                     "reason": reason,
                     "reward": None,
                 }
