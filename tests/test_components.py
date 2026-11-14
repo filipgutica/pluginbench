@@ -62,7 +62,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         },
     ),
     "coverage_observer": (
-        1,
+        2,
         {
             # Optional Go `go list` and `go tool cover` sidecars narrow completeness to
             # compiled files with blocks, and a zero-width Go block with no statements parses
@@ -74,9 +74,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # were always refused, and every other report parses as before, so this stays v1.
             # Blocks Go names after a `//line` target that is no frozen Go file count for the
             # one file naming it instead of aborting. Only refused reports change: stays v1.
-            # Go reports add a `lines` population, with `//line` carriers listed unavailable.
-            # Every existing field and the statements population are unchanged, and evidence
-            # without `lines` reports Go line coverage unavailable, never wrong: stays v1.
+            # v2: Go reports add a `lines` population, which leaves out blank and comment-only
+            # lines and any file a line directive is in or names. A profile v1 froze would now
+            # report Go line coverage and compare executed lines across readiness repeats.
             "coverage_report.py": (
                 "7915e6742224d11a7994c3bac44042581085b44928a96ea0d95a937429796bf0"
             ),
