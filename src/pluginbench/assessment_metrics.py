@@ -1428,7 +1428,9 @@ def evaluate_evidence(
                 "language"
             ) != config.get("language"):
                 raise ValueError("mutation report differs from its snapshot or frozen profile")
-            metrics = mutation_metrics(report, report_path.parent)
+            metrics = mutation_metrics(
+                report, report_path.parent, config=config, snapshot=snapshot_root
+            )
         provenance = {
             key: envelope[key] for key in ("tool", "tool_version", "config_digest", "scope")
         }

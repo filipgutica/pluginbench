@@ -24,7 +24,8 @@ import sys
 import tempfile
 import time
 import tokenize
-from collections.abc import Callable, Iterable
+from collections import Counter
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 
@@ -48,13 +49,18 @@ GENERATED_FILES: dict[str, tuple[str, ...]] = {
     "https://github.com/mattn/anko": ("parser/parser.go",),
     "https://github.com/sql-formatter-org/sql-formatter": ("src/parser/grammar.ts",),
 }
+# csstree's profile prints no `PB-SUITE-EXIT` marker, so its suite status is the profile's own
+# process exit, the c8 Mocha run's status. Every other task must print exactly one marker.
+PROCESS_EXIT_REPOSITORIES = frozenset({"https://github.com/csstree/csstree"})
 # The invalid-mutant checks, run in the frozen task image on the mutated tree.
 GO_CHECK = ["bash", "-c", "go build ./... && go test -run '^$' ./..."]
 TSC_CHECK = ["bash", "-c", "npx --no-install tsc --noEmit --pretty false"]
+# Bash's exits for a command it could not run, such as a toolchain missing from the image.
+_NOT_RUNNABLE = frozenset({126, 127})
 TIMEOUT_FACTOR, TIMEOUT_GRACE_SECONDS = 3, 60
 SUITE_MARKER = re.compile(r"^PB-SUITE-EXIT (\d+)\r?$", re.MULTILINE)
 _TSC_ERROR = re.compile(r"^(?:(?P<file>.+)\(\d+,\d+\): )?error (?P<code>TS\d+): (?P<message>.*)$")
-_TSC_LOCATED = re.compile(r"^(?P<file>.+)\((?P<line>\d+),\d+\): error ")
+_TSC_LOCATED = re.compile(r"^(?P<file>.+)\((?P<line>\d+),(?P<column>\d+)\): error ")
 _REPLACEMENTS = {
     "relational_boundary": {"<": "<=", "<=": "<", ">": ">=", ">=": ">"},
     "equality_negation": {
@@ -67,11 +73,14 @@ _REPLACEMENTS = {
     },
     "boolean_connective": {"&&": "||", "||": "&&", "and": "or", "or": "and"},
 }
+_TS_SUFFIXES = (".ts", ".tsx", ".mts", ".cts")
 _SUFFIXES = {
     ".py": "python",
     ".go": "go",
-    **dict.fromkeys((".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"), "oxc"),
+    **dict.fromkeys((".js", ".jsx", ".mjs", ".cjs", *_TS_SUFFIXES), "oxc"),
 }
+# A docker command's own failure, as the launcher's `_docker` helper words it.
+_DOCKER_FAILURE = re.compile(r"^docker \S+ failed: ")
 METHOD = (
     "single-site mutants of changed production lines (relational boundary, equality negation, "
     "boolean connective, condition negation); at most one mutant per line, ten per attempt, "
@@ -87,6 +96,13 @@ LIMITATIONS = (
 
 class SiteError(ValueError):
     """A parser reported a span that is not the operator it names; its file stays unparsed."""
+
+
+class InfrastructureFailure(Exception):
+    """Docker or the host could not run a command: the attempt is incomplete, not the revision.
+
+    Not a ValueError, so it is never mistaken for an integrity violation, which fails closed.
+    """
 
 
 def observer_identity() -> dict[str, str]:
@@ -127,19 +143,35 @@ Executor = Callable[[Path, list[str], int, Path], Run]
 # --- Site finding -------------------------------------------------------------------------
 
 
-def _site(path: str, data: bytes, operator: str, start: int, end: int, language: str) -> Site:
-    """A finder's span as a site, refusing a span whose text is not the operator it names."""
+def _site(
+    path: str,
+    data: bytes,
+    operator: str,
+    start: int,
+    end: int,
+    language: str,
+    tokens: str | None = None,
+) -> Site:
+    """A finder's span as a site, refusing a span whose text is not the operator it names.
+
+    `tokens` is the operator as its tokens, for a Python `is not` whose span can hold a comment
+    or a line continuation between them; it is otherwise the span's text.
+    """
     if not 0 <= start < end <= len(data):
         raise SiteError(f"{path}: site span {start}-{end} is outside the file")
     original = data[start:end].decode("utf-8")
     if operator == "condition_negation":
         replacement = f"not ({original})" if language == "python" else f"!({original})"
     else:
-        text = " ".join(original.split()) if operator == "equality_negation" else original
+        text = original if tokens is None else tokens
         table = _REPLACEMENTS.get(operator, {})
         if text not in table:
             raise SiteError(f"{path}: {original!r} is not a {operator} operator")
         replacement = table[text]
+        if text == "is not" and original.split() != ["is", "not"]:
+            # A comment or line continuation sits between the tokens: only the `not` token
+            # goes, so the comment stays one and no line moves.
+            replacement = original.removesuffix("not")
     line_start = data.rfind(b"\n", 0, start) + 1
     return Site(
         path=path,
@@ -177,8 +209,9 @@ def python_sites(path: str, data: bytes) -> list[Site]:
         if token.type in (tokenize.OP, tokenize.NAME)
     ]
 
-    def between(left: ast.expr, right: ast.expr) -> tuple[int, int]:
-        """The span of the operator tokens between two operands, ignoring parentheses."""
+    def between(left: ast.expr, right: ast.expr) -> tuple[int, int, str]:
+        """The span of the operator tokens between two operands, ignoring parentheses, and the
+        operator as its tokens, without any comment or line continuation between them."""
         assert left.end_lineno is not None and left.end_col_offset is not None
         low, high = (
             offset(left.end_lineno, left.end_col_offset),
@@ -187,12 +220,16 @@ def python_sites(path: str, data: bytes) -> list[Site]:
         found = [(at, value) for at, value in tokens if low <= at < high and value not in "()"]
         if not found:
             raise SiteError(f"{path}:{left.lineno}: no operator token between operands")
-        return found[0][0], found[-1][0] + len(found[-1][1])
+        return (
+            found[0][0],
+            found[-1][0] + len(found[-1][1]),
+            " ".join(value for _, value in found),
+        )
 
     sites = []
 
-    def add(operator: str, start: int, end: int) -> None:
-        sites.append(_site(path, data, operator, start, end, "python"))
+    def add(operator: str, start: int, end: int, tokens: str | None = None) -> None:
+        sites.append(_site(path, data, operator, start, end, "python", tokens))
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Compare):
@@ -222,7 +259,7 @@ def python_sites(path: str, data: bytes) -> list[Site]:
 
 
 def find_sites(
-    root: Path, paths: Iterable[str], finder: dict[str, object], *, timeout: int = 600
+    root: Path, paths: Iterable[str], finder: Mapping[str, object], *, timeout: int = 600
 ) -> tuple[list[Site], dict[str, str]]:
     """Every candidate site in `paths`, and the paths no parser could read, with reasons."""
     sites: list[Site] = []
@@ -341,16 +378,18 @@ def sample(candidates: list[Site], after_digest: str, size: int = SAMPLE_SIZE) -
     return chosen
 
 
-def suite_status(run: Run) -> int | None:
-    """The `PB-SUITE-EXIT <n>` line the profile prints, else its exit; None when neither is sure."""
-    if run.timed_out:
+def suite_status(run: Run, process_exit: bool = False) -> int | None:
+    """The one `PB-SUITE-EXIT <n>` line the profile prints; None when the run has no status.
+
+    A run has a status only when it finished with a recorded exit. `process_exit` takes that exit
+    as the status instead, for the task whose profile prints no marker.
+    """
+    if run.timed_out or run.exit_code is None:
         return None
+    if process_exit:
+        return run.exit_code
     markers = SUITE_MARKER.findall(run.stdout)
-    if len(markers) > 1:
-        return None
-    if markers:
-        return int(markers[0])
-    return run.exit_code
+    return int(markers[0]) if len(markers) == 1 else None
 
 
 def outcome(runs: list[dict[str, object]]) -> str | None:
@@ -367,29 +406,33 @@ def outcome(runs: list[dict[str, object]]) -> str | None:
     if len(runs) == 1:
         return None
     second = runs[1]
-    # A rerun past the timeout confirms the kill: timeouts count as kills.
-    if second["timed_out"] or (second["suite_status"] not in (None, 0)):
+    # A confirmation past the timeout confirms the kill, and the mutant is reported timed out.
+    if second["timed_out"]:
+        return "timeout"
+    if second["suite_status"] not in (None, 0):
         return "killed"
     return "error" if second["suite_status"] is None else "flaky"
 
 
-def tsc_errors(stdout: str) -> set[str]:
-    """tsc diagnostics without columns, so a shifted column on a line is not a new error."""
-    errors = set()
+def tsc_errors(stdout: str, site: Site | None = None) -> Counter[str]:
+    """tsc diagnostics, counted, so a second copy of an existing error is a new error.
+
+    A mutation edits one line and adds or removes no line, so only diagnostics on the mutated
+    line can move: their column is dropped, and every other diagnostic keeps its own.
+    """
+    errors: Counter[str] = Counter()
     for line in stdout.splitlines():
         match = _TSC_ERROR.match(line.strip())
         if match:
             located = _TSC_LOCATED.match(line.strip())
-            errors.add(
-                json.dumps(
-                    [
-                        match["file"],
-                        located["line"] if located else None,
-                        match["code"],
-                        match["message"],
-                    ]
-                )
-            )
+            position = [located["line"], located["column"]] if located else []
+            if (
+                located
+                and site
+                and (located["file"], int(located["line"])) == (site.path, site.line)
+            ):
+                position = [located["line"]]
+            errors[json.dumps([match["file"], *position, match["code"], match["message"]])] += 1
     return errors
 
 
@@ -402,21 +445,32 @@ def native_executor(identity: dict[str, object], report_path: str) -> Executor:
 
     def execute(tree: Path, command: list[str], timeout: int, destination: Path) -> Run:
         started = time.monotonic()
-        receipt = run_native_command(
-            snapshot=tree,
-            task_identity=identity,
-            destination=destination,
-            command=command,
-            report_path=report_path,
-            timeout=timeout,
-        )
+        try:
+            receipt = run_native_command(
+                snapshot=tree,
+                task_identity=identity,
+                destination=destination,
+                command=command,
+                report_path=report_path,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired, ValueError) as error:
+            # The launcher, a pinned file, raises ValueError for an integrity violation and for a
+            # failed docker command alike; only the second names the docker command that
+            # failed. Anything else, or a failure that left no receipt, fails closed.
+            if (isinstance(error, ValueError) and not _DOCKER_FAILURE.match(str(error))) or not (
+                destination / "execution.json"
+            ).is_file():
+                raise
+            raise InfrastructureFailure(str(error)) from error
+        finally:
+            # execution.json keeps the digests of both exports and of the coverage report,
+            # which mutation never reads; the copies themselves are not kept.
+            for name in ("before", "after"):
+                shutil.rmtree(destination / name, ignore_errors=True)
+            for report in destination.glob("report.raw*"):
+                report.unlink()
         elapsed = time.monotonic() - started
-        # execution.json keeps the digests of both exports and of the coverage report, which
-        # mutation never reads; the copies themselves are not kept.
-        for name in ("before", "after"):
-            shutil.rmtree(destination / name, ignore_errors=True)
-        for report in destination.glob("report.raw*"):
-            report.unlink()
         exit_code = receipt.get("exit_code")
         return Run(
             exit_code=exit_code if isinstance(exit_code, int) else None,
@@ -429,14 +483,32 @@ def native_executor(identity: dict[str, object], report_path: str) -> Executor:
 
 
 def _digest(path: Path) -> str:
-    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    return _bytes_digest(path.read_bytes())
+
+
+def _bytes_digest(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _tree_digest(files: Mapping[str, object]) -> str:
+    """`inspect_snapshot`'s digest of a tree holding these file digests, without building it."""
+    return _bytes_digest(json.dumps(dict(files), sort_keys=True, separators=(",", ":")).encode())
+
+
+def _check_command(path: str) -> list[str] | None:
+    """The invalid-mutant check for a mutated file's language: Go builds, TypeScript type-checks."""
+    suffix = PurePosixPath(path).suffix.lower()
+    return GO_CHECK if suffix == ".go" else TSC_CHECK if suffix in _TS_SUFFIXES else None
 
 
 class _Runner:
     """Numbers each run's receipt directory and records what the report needs from it."""
 
-    def __init__(self, execute: Executor, destination: Path) -> None:
+    def __init__(self, execute: Executor, destination: Path, process_exit: bool) -> None:
         self.execute, self.destination, self.count = execute, destination, 0
+        self.process_exit = process_exit
+        # The receipt directory of the run in progress, named by an infrastructure failure.
+        self.current: str | None = None
 
     def __call__(
         self, tree: Path, command: list[str], timeout: int, label: str
@@ -444,16 +516,17 @@ class _Runner:
         directory = self.destination / "runs" / f"{self.count:03d}-{label}"
         self.count += 1
         directory.mkdir(parents=True)
+        self.current = directory.relative_to(self.destination).as_posix()
         run = self.execute(tree, command, timeout, directory)
-        (directory / "stdout.txt").write_text(run.stdout)
+        (directory / "stdout.txt").write_bytes(run.stdout.encode())
         return {
             "label": label,
             "exit_code": run.exit_code,
             "timed_out": run.timed_out,
-            "suite_status": suite_status(run),
+            "suite_status": suite_status(run, self.process_exit),
             "elapsed_seconds": round(run.elapsed_seconds, 3),
             "timeout_seconds": timeout,
-            "receipts": directory.relative_to(self.destination).as_posix(),
+            "receipts": self.current,
             "stdout_sha256": _digest(directory / "stdout.txt"),
         }
 
@@ -480,26 +553,41 @@ def _timeout(runs: list[dict[str, object]]) -> int:
     return math.ceil(TIMEOUT_FACTOR * slowest + TIMEOUT_GRACE_SECONDS)
 
 
-def _source_only_tree(before: Path, after: Path, reference: list[str], target: Path) -> list[str]:
-    """The after tree with each file the source-only filter leaves out restored from before."""
-    old = inspect_snapshot(before)["files"]
-    new = inspect_snapshot(after)["files"]
-    assert isinstance(old, dict) and isinstance(new, dict)
-    kept = set(reference)
+def _source_only_state(before: Path, after: Path, reference: object) -> dict[str, object]:
+    """The files the source-only filter restores from before, decided before any run."""
+    if not isinstance(reference, list):
+        return {
+            "status": "unavailable",
+            "changed_test_files": None,
+            "reason": "the task ships no reference solution to tell its files from tests",
+        }
+    old = _object(inspect_snapshot(before)["files"])
+    new = _object(inspect_snapshot(after)["files"])
+    kept = {str(item) for item in reference}
     left_out = sorted(
         path
         for path in set(old) | set(new)
         if old.get(path) != new.get(path) and source_only.left_out(path, kept)
     )
+    return {
+        "status": "measured",
+        "changed_test_files": left_out,
+        # Each left-out file's starting digest, or None for a file the attempt added.
+        "restored": {path: old.get(path) for path in left_out},
+        "baseline": [],
+    }
+
+
+def _source_only_tree(before: Path, after: Path, left_out: list[str], target: Path) -> None:
+    """The after tree with each file the source-only filter leaves out restored from before."""
     shutil.copytree(after, target, symlinks=True)
     for path in left_out:
         destination = target / path
-        if path in old:
+        if (before / path).is_file():
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(before / path, destination)
         else:
             destination.unlink()
-    return left_out
 
 
 def collect_mutation(
@@ -535,23 +623,20 @@ def _collect(
     destination: Path,
     execute: Executor | None,
 ) -> dict[str, object]:
-    language = str(config["language"])
     coverage = config["coverage"]
     identity = config["native_task_identity"]
     assert isinstance(coverage, dict) and isinstance(identity, dict)
-    command = [str(item) for item in coverage["command"]]
-    suite_timeout = int(coverage["timeout_seconds"])
     if execute is None:
         execute = native_executor(identity, str(coverage["report_path"]))
-    run = _Runner(execute, destination)
+    run = _Runner(execute, destination, _process_exit(config))
     change = compare_snapshots(before, root)
     generated = set(_strings(config["generated_files"]))
     changed = sorted(
         line for line in _added_source_lines(change) if line.rsplit(":", 1)[0] not in generated
     )
-    sites, unparsed = find_sites(
-        root, {line.rsplit(":", 1)[0] for line in changed}, _object(config["site_finders"])
-    )
+    files = {line.rsplit(":", 1)[0] for line in changed}
+    supported = {path for path in files if PurePosixPath(path).suffix.lower() in _SUFFIXES}
+    sites, unparsed = find_sites(root, supported, _object(config["site_finders"]))
     changed_set = set(changed)
     candidates = sorted(
         {site for site in sites if site.coordinate() in changed_set},
@@ -561,90 +646,96 @@ def _collect(
     selected = sample(candidates, after_digest)
     report: dict[str, object] = {
         "version": VERSION,
-        "language": language,
+        "language": str(config["language"]),
+        "suite_status": config["suite_status"],
         "before_digest": change["before_digest"],
         "after_digest": after_digest,
         "operators": list(OPERATORS),
         "sample_size": SAMPLE_SIZE,
         "generated_files": sorted(generated),
         "changed_production_lines": changed,
+        "unsupported_files": sorted(files - supported),
         "unparsed_files": unparsed,
         "candidates": [asdict(site) for site in candidates],
         "selected": [asdict(site) for site in selected],
         "baseline": [],
         "check_baseline": None,
-        "source_only": None,
+        "source_only": _source_only_state(before, root, config.get("source_only_reference_paths")),
         "mutants": [],
+        "infrastructure_failure": None,
         "python": f"{sys.version_info.major}.{sys.version_info.minor}",
     }
-    if not selected:
-        return report
+    if selected:
+        command = [str(item) for item in coverage["command"]]
+        try:
+            _run_mutants(
+                run, root, before, report, selected, command, int(coverage["timeout_seconds"])
+            )
+        except InfrastructureFailure as error:
+            report["infrastructure_failure"] = {"reason": str(error), "receipts": run.current}
+    return report
+
+
+def _run_mutants(
+    run: _Runner,
+    root: Path,
+    before: Path,
+    report: dict[str, object],
+    selected: list[Site],
+    command: list[str],
+    suite_timeout: int,
+) -> None:
+    """The baseline, then each selected mutant, recorded into `report` as each run ends."""
     baseline = [run(root, command, suite_timeout, "baseline") for _ in range(2)]
     report["baseline"] = baseline
     if not _baseline(baseline):
-        return report
+        return
     timeout = _timeout(baseline)
-    check = GO_CHECK if language == "go" else TSC_CHECK if language == "typescript" else None
-    known_errors: set[str] | None = None
-    if language == "typescript":
+    if any(_check_command(site.path) == TSC_CHECK for site in selected):
         result = run(root, TSC_CHECK, suite_timeout, "tsc-baseline")
         report["check_baseline"] = result
-        known_errors = _tsc_baseline(destination, result)
-        if known_errors is None:
-            return report
-    reference = config.get("source_only_reference_paths")
+        if not _tsc_ran(run.destination, result):
+            return
+    source_state = _object(report["source_only"])
     with tempfile.TemporaryDirectory(prefix="pluginbench-mutation-") as temporary:
         work = Path(temporary)
         source_tree = work / "source-only"
-        source_state: dict[str, object] = {"status": "unavailable", "changed_test_files": None}
-        if isinstance(reference, list):
-            left_out = _source_only_tree(
-                before, root, [str(item) for item in reference], source_tree
+        source_baseline: list[dict[str, object]] = []
+        if source_state["status"] == "measured" and source_state["changed_test_files"]:
+            _source_only_tree(
+                before, root, _strings(source_state["changed_test_files"]), source_tree
             )
-            source_state = {"status": "measured", "changed_test_files": left_out, "baseline": []}
-            if left_out:
-                source_baseline = [
-                    run(source_tree, command, suite_timeout, "source-only-baseline")
-                    for _ in range(2)
-                ]
-                source_state["baseline"] = source_baseline
-        else:
-            source_state["reason"] = (
-                "the task ships no reference solution to tell its files from tests"
-            )
-        report["source_only"] = source_state
-        source_runs = (
-            source_state["status"] == "measured"
-            and source_state["changed_test_files"]
-            and _baseline(_runs(source_state["baseline"]))
-        )
+            source_baseline = [
+                run(source_tree, command, suite_timeout, "source-only-baseline") for _ in range(2)
+            ]
+            source_state["baseline"] = source_baseline
         mutants: list[dict[str, object]] = []
         report["mutants"] = mutants
         for index, site in enumerate(selected):
             tree, mutated = _mutated(root, site, work / "mutant")
             record: dict[str, object] = {"site": index, "mutated_sha256": mutated, "check": None}
+            check = _check_command(site.path)
             if check is not None:
                 record["check"] = run(tree, check, suite_timeout, f"mutant-{index}-check")
-                if _check_state(destination, record["check"], known_errors) != "valid":
+                state = _check_state(
+                    run.destination, record["check"], report["check_baseline"], site
+                )
+                if state != "valid":
                     mutants.append(record)
                     continue
             runs: list[dict[str, object]] = []
             while outcome(runs) is None:
                 runs.append(run(tree, command, timeout, f"mutant-{index}"))
             record["runs"] = runs
-            if source_runs and outcome(runs) in ("killed", "timeout"):
+            if (
+                source_baseline
+                and _baseline(source_baseline)
+                and outcome(runs) in ("killed", "timeout")
+            ):
                 record["source_only"] = _source_only_runs(
-                    run,
-                    site,
-                    source_tree,
-                    root,
-                    work,
-                    command,
-                    _runs(source_state["baseline"]),
-                    index,
+                    run, site, source_tree, root, work, command, _timeout(source_baseline), index
                 )
             mutants.append(record)
-    return report
 
 
 def _source_only_runs(
@@ -654,7 +745,7 @@ def _source_only_runs(
     root: Path,
     work: Path,
     command: list[str],
-    baseline: list[dict[str, object]],
+    timeout: int,
     index: int,
 ) -> dict[str, object]:
     """The source-only suite on the same mutant; a site the filter changed has none."""
@@ -664,7 +755,7 @@ def _source_only_runs(
     tree, mutated = _mutated(source_tree, site, work / "source-only-mutant")
     runs: list[dict[str, object]] = []
     while outcome(runs) is None:
-        runs.append(run(tree, command, _timeout(baseline), f"mutant-{index}-source-only"))
+        runs.append(run(tree, command, timeout, f"mutant-{index}-source-only"))
     return {"placed": True, "mutated_sha256": mutated, "runs": runs}
 
 
@@ -675,31 +766,44 @@ def _stdout(destination: Path, result: dict[str, object]) -> str:
         "stdout_sha256"
     ):
         raise ValueError("a mutation run's saved output differs from its record")
-    return path.read_text()
+    return path.read_bytes().decode()
 
 
-def _tsc_baseline(destination: Path, result: dict[str, object]) -> set[str] | None:
-    """The unmutated tree's tsc diagnostics; None when tsc did not run to a known result."""
-    errors = tsc_errors(_stdout(destination, result))
-    if result["timed_out"] or result["exit_code"] is None or (result["exit_code"] and not errors):
-        return None
-    return errors
+def _tsc_ran(destination: Path, result: dict[str, object]) -> bool:
+    """Whether tsc ran on the unmutated tree to a known result: clean, or with diagnostics."""
+    exit_code = result["exit_code"]
+    if result["timed_out"] or exit_code is None or exit_code in _NOT_RUNNABLE:
+        return False
+    return exit_code == 0 or bool(tsc_errors(_stdout(destination, result)))
 
 
-def _check_state(destination: Path, check: object, known_errors: set[str] | None) -> str:
-    """valid, invalid or error for one mutant's Go build or tsc check."""
+def _check_state(destination: Path, check: object, baseline: object, site: Site) -> str:
+    """valid, invalid or error for one mutant's Go build or tsc check.
+
+    A check that could not run, such as a toolchain missing from the image, is an error, so the
+    attempt is incomplete rather than its mutant silently excluded.
+    """
     result = _object(check)
-    if result["timed_out"] or result["exit_code"] is None:
+    exit_code = result["exit_code"]
+    if result["timed_out"] or exit_code is None or exit_code in _NOT_RUNNABLE:
         return "error"
-    if known_errors is None:  # Go
-        return "valid" if result["exit_code"] == 0 else "invalid"
-    errors = tsc_errors(_stdout(destination, result))
-    if result["exit_code"] and not errors:
+    if _check_command(site.path) == GO_CHECK:
+        return "valid" if exit_code == 0 else "invalid"
+    errors = tsc_errors(_stdout(destination, result), site)
+    if exit_code and not errors:
         return "error"
-    return "invalid" if errors - known_errors else "valid"
+    known = tsc_errors(_stdout(destination, _object(baseline)), site)
+    return "invalid" if errors - known else "valid"
 
 
 # --- Metrics -------------------------------------------------------------------------------
+
+
+def _process_exit(config: Mapping[str, object]) -> bool:
+    rule = config["suite_status"]
+    if rule not in ("marker", "process_exit"):
+        raise ValueError("mutation suite status rule must be marker or process_exit")
+    return rule == "process_exit"
 
 
 def _object(value: object) -> dict[str, object]:
@@ -714,25 +818,73 @@ def _runs(value: object) -> list[dict[str, object]]:
     return [_object(item) for item in value]
 
 
-def _verified_runs(directory: Path, value: object) -> list[dict[str, object]]:
-    """Run records whose suite status re-derives from their saved output."""
-    runs = _runs(value)
-    for item in runs:
-        exit_code = item["exit_code"]
-        recorded = Run(
-            exit_code=exit_code if isinstance(exit_code, int) else None,
-            timed_out=item["timed_out"] is True,
-            stdout=_stdout(directory, item),
-            elapsed_seconds=float(str(item["elapsed_seconds"])),
-        )
-        if suite_status(recorded) != item["suite_status"]:
-            raise ValueError("a mutation run's suite status differs from its saved output")
-    return runs
+class _Receipts:
+    """Checks run records against their saved output and the launcher's execution.json."""
+
+    def __init__(self, directory: Path, config: dict[str, object]) -> None:
+        self.directory = directory
+        self.process_exit = _process_exit(config)
+        identity = _object(_object(config["native_task_identity"])["image_identity"])
+        self.image = identity["image_id"]
+        self.seen: set[str] = set()
+
+    def receipt(self, receipts: object) -> dict[str, object]:
+        """A run's launcher receipt; no two runs share one."""
+        name = str(receipts)
+        path = self.directory / name / "execution.json"
+        if name in self.seen or not path.resolve().is_relative_to(self.directory.resolve()):
+            raise ValueError("a mutation run does not have its own receipt directory")
+        self.seen.add(name)
+        return _object(json.loads(path.read_text()))
+
+    def runs(
+        self, value: object, command: list[str], tree: str, timeout: int
+    ) -> list[dict[str, object]]:
+        """Run records that re-derive from their output and match their receipts.
+
+        `tree` is the digest of the tree each run must have measured, and `timeout` its limit.
+        """
+        runs = _runs(value)
+        for item in runs:
+            stdout = _stdout(self.directory, item)
+            exit_code = item["exit_code"]
+            recorded = Run(
+                exit_code=exit_code if isinstance(exit_code, int) else None,
+                timed_out=item["timed_out"] is True,
+                stdout=stdout,
+                elapsed_seconds=float(str(item["elapsed_seconds"])),
+            )
+            if suite_status(recorded, self.process_exit) != item["suite_status"]:
+                raise ValueError("a mutation run's suite status differs from its saved output")
+            receipt = self.receipt(item["receipts"])
+            if (
+                receipt.get("command") != command
+                or receipt.get("image_id") != self.image
+                or receipt.get("before_digest") != tree
+                or receipt.get("exit_code") != exit_code
+                or receipt.get("timed_out") is not item["timed_out"]
+                or str(receipt.get("stdout") or "") != stdout
+                or item["timeout_seconds"] != timeout
+            ):
+                raise ValueError("a mutation run's record differs from its launcher receipt")
+        return runs
+
+    def infrastructure(self, value: object) -> str:
+        """An infrastructure failure's reason, as the failing run's receipt records it."""
+        record = _object(value)
+        reason = str(record["reason"])
+        receipt = self.receipt(record["receipts"])
+        cleanup = receipt.get("cleanup")
+        if reason not in (
+            receipt.get("error"),
+            cleanup.get("error") if isinstance(cleanup, dict) else None,
+        ):
+            raise ValueError("a mutation infrastructure failure differs from its launcher receipt")
+        return reason
 
 
-def _settled(directory: Path, value: object) -> str:
+def _settled(runs: list[dict[str, object]]) -> str:
     """A mutant's outcome; its runs must end exactly where the outcome became known."""
-    runs = _verified_runs(directory, value)
     state = outcome(runs)
     if state is None or any(outcome(runs[:count]) is not None for count in range(1, len(runs))):
         raise ValueError("a mutant's runs do not end where its outcome is known")
@@ -761,13 +913,40 @@ def _sites(value: object) -> list[Site]:
     return sites
 
 
-def mutation_metrics(report: dict[str, object], directory: Path) -> dict[str, object]:
+def _mutant_digest(snapshot: Path, site: Site) -> str:
+    """The digest of the site's file once mutated, from the measured snapshot's bytes."""
+    data = (snapshot / site.path).read_bytes()
+    if data[site.start : site.end] != site.original.encode():
+        raise ValueError("a mutation site is not in the measured snapshot")
+    return _bytes_digest(data[: site.start] + site.replacement.encode() + data[site.end :])
+
+
+@dataclass(frozen=True)
+class _Measured:
+    """What a report's runs are checked against: the profile, the snapshot and the receipts."""
+
+    directory: Path
+    snapshot: Path
+    files: dict[str, object]
+    after: str
+    command: list[str]
+    suite_timeout: int
+    receipts: _Receipts
+
+
+def mutation_metrics(
+    report: dict[str, object], directory: Path, *, config: dict[str, object], snapshot: Path
+) -> dict[str, object]:
     """Every outcome and count, derived from the report's raw sites and runs.
 
-    `directory` holds the report's run receipts; check outcomes are read back from them.
+    `directory` holds the report's run receipts, `config` is its frozen profile and `snapshot`
+    the measured submission. Each run must match its launcher receipt: the profile's command
+    and image, and the tree that run measured, which is rebuilt here from the snapshot.
     """
     if report.get("version") != VERSION:
         raise ValueError("mutation report version differs from this observer")
+    if report.get("suite_status") != config.get("suite_status"):
+        raise ValueError("mutation report's suite status rule differs from its frozen profile")
     candidates = _sites(report["candidates"])
     selected = _sites(report["selected"])
     if selected != sample(candidates, str(report["after_digest"])):
@@ -776,7 +955,21 @@ def mutation_metrics(report: dict[str, object], directory: Path) -> dict[str, ob
         _strings(report["changed_production_lines"])
     ):
         raise ValueError("a mutation candidate is not on a changed production line")
+    files = _object(inspect_snapshot(snapshot)["files"])
+    coverage = _object(config["coverage"])
+    measured = _Measured(
+        directory=directory,
+        snapshot=snapshot,
+        files=files,
+        after=_tree_digest(files),
+        command=_strings(coverage["command"]),
+        suite_timeout=int(str(coverage["timeout_seconds"])),
+        receipts=_Receipts(directory, config),
+    )
+    if measured.after != report["after_digest"]:
+        raise ValueError("mutation report differs from its measured snapshot")
     candidate_lines = sorted({site.coordinate() for site in candidates})
+    unsupported = _strings(report["unsupported_files"])
     result: dict[str, object] = {
         "before_digest": report["before_digest"],
         "method": METHOD,
@@ -787,80 +980,132 @@ def mutation_metrics(report: dict[str, object], directory: Path) -> dict[str, ob
         "changed_production_line_count": len(_strings(report["changed_production_lines"])),
         "selected": len(selected),
         "unparsed_files": report["unparsed_files"],
+        # Changed production files in a language with no site finder: they hold no sites.
+        "unsupported_files": unsupported,
+        "unsupported_file_count": len(unsupported),
     }
-    counts = dict.fromkeys(("killed", "timed_out", "survived", "invalid", "flaky", "errors"), 0)
     unavailable: str | None = None
     incomplete = sorted(_object(report["unparsed_files"]))
     rows: list[dict[str, object]] = []
-    share: dict[str, object] = {}
-    baseline = _verified_runs(directory, report["baseline"])
-    if not selected:
+    share = _share_state(_object(report["source_only"]))
+    if report["infrastructure_failure"] is not None:
+        # Checked first: the runs before the failure are partial, whatever they show.
+        incomplete.append(
+            "infrastructure failure: "
+            + measured.receipts.infrastructure(report["infrastructure_failure"])
+        )
+    elif not selected:
         # With an unparsed changed file the site population itself is unknown.
         if not incomplete:
             unavailable = "no candidate sites on changed production lines"
-    elif len(baseline) != 2 or not _baseline(baseline):
-        unavailable = "baseline red or unstable"
-    elif (
-        str(report["language"]) == "typescript"
-        and _tsc_baseline(directory, _object(report["check_baseline"])) is None
-    ):
-        incomplete.append("tsc did not report diagnostics on the unmutated tree")
     else:
-        mutants = _runs(report["mutants"])
-        if [item["site"] for item in mutants] != list(range(len(selected))):
-            raise ValueError("mutation report does not record every selected mutant once")
-        known = (
-            _tsc_baseline(directory, _object(report["check_baseline"]))
-            if report["language"] == "typescript"
-            else None
+        baseline = measured.receipts.runs(
+            report["baseline"], measured.command, measured.after, measured.suite_timeout
         )
-        share = _share_state(directory, _object(report["source_only"]))
-        # Source-only runs exist only for kills, in attempts that changed test files.
-        source_runs = share["status"] == "available" and bool(share["changed_test_files"])
-        for record in mutants:
-            site = selected[int(str(record["site"]))]
-            state = (
-                _check_state(directory, record["check"], known)
-                if record["check"] is not None
-                else "valid"
-            )
-            result_state = state if state != "valid" else _settled(directory, record["runs"])
-            key = {
-                "killed": "killed",
-                "timeout": "timed_out",
-                "survived": "survived",
-                "invalid": "invalid",
-                "flaky": "flaky",
-                "error": "errors",
-            }[result_state]
-            counts[key] += 1
-            row: dict[str, object] = {
-                "path": site.path,
-                "line": site.line,
-                "operator": site.operator,
-                "outcome": result_state,
-            }
-            if result_state in ("killed", "timeout") and source_runs:
-                row["source_only"] = _source_only_outcome(directory, record.get("source_only"))
-            rows.append(row)
-        if counts["errors"]:
-            incomplete.append(f"{counts['errors']} mutant runs reported no suite status")
-        share = _share(share, rows, counts)
+        if len(baseline) != 2 or not _baseline(baseline):
+            unavailable = "baseline red or unstable"
+        elif problem := _tsc_baseline_problem(measured, report["check_baseline"], selected):
+            incomplete.append(problem)
+        else:
+            share, rows = _mutant_rows(measured, report, selected, share, _timeout(baseline))
+    counts = {
+        key: sum(row["outcome"] == state for row in rows)
+        for key, state in (
+            ("killed", "killed"),
+            ("timed_out", "timeout"),
+            ("survived", "survived"),
+            ("invalid", "invalid"),
+            ("flaky", "flaky"),
+            ("errors", "error"),
+        )
+    }
+    if counts["errors"]:
+        incomplete.append(f"{counts['errors']} mutant runs reported no suite status")
     killed = counts["killed"] + counts["timed_out"]
     valid = killed + counts["survived"]
     result.update(counts)
     result.update(killed=killed, valid=valid, mutants=rows)
     if unavailable is None and not incomplete and not valid:
         unavailable = "no valid mutants"
-    result["status"] = "unavailable" if unavailable else "incomplete" if incomplete else "available"
+    status = "unavailable" if unavailable else "incomplete" if incomplete else "available"
+    result["status"] = status
     result["reason"] = unavailable or ("; ".join(incomplete) if incomplete else None)
-    result["bug_catch_percent"] = (
-        round(100 * killed / valid, 6) if result["status"] == "available" else None
-    )
-    if result["status"] != "available":
-        share = {"status": "unavailable", "reason": "the bug-catch rate is not available"}
-    result["test_change_kill_share"] = share
+    result["bug_catch_percent"] = round(100 * killed / valid, 6) if status == "available" else None
+    result["test_change_kill_share"] = _share(share, rows, valid, status)
     return result
+
+
+def _tsc_baseline_problem(measured: _Measured, tsc: object, selected: list[Site]) -> str | None:
+    """Why the TypeScript mutants cannot be checked, if so; the tsc baseline runs only for them."""
+    if any(_check_command(site.path) == TSC_CHECK for site in selected) != (tsc is not None):
+        raise ValueError("the tsc baseline run differs from the TypeScript mutants it serves")
+    if tsc is None:
+        return None
+    measured.receipts.runs([tsc], TSC_CHECK, measured.after, measured.suite_timeout)
+    if not _tsc_ran(measured.directory, _object(tsc)):
+        return "tsc did not report diagnostics on the unmutated tree"
+    return None
+
+
+def _mutant_rows(
+    measured: _Measured,
+    report: dict[str, object],
+    selected: list[Site],
+    share: dict[str, object],
+    timeout: int,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    """Each selected mutant's outcome row, and the share state after the source-only baseline."""
+    source = _object(report["source_only"])
+    restored = _object(source.get("restored") or {})
+    source_files = {path: digest for path, digest in measured.files.items() if path not in restored}
+    source_files.update({path: digest for path, digest in restored.items() if digest is not None})
+    source_timeout = 0
+    if share["status"] == "available" and share["changed_test_files"]:
+        source_baseline = measured.receipts.runs(
+            source["baseline"],
+            measured.command,
+            _tree_digest(source_files),
+            measured.suite_timeout,
+        )
+        if len(source_baseline) != 2 or not _baseline(source_baseline):
+            share = {"status": "unavailable", "reason": "source-only baseline red or unstable"}
+        else:
+            source_timeout = _timeout(source_baseline)
+    mutants = _runs(report["mutants"])
+    if [item["site"] for item in mutants] != list(range(len(selected))):
+        raise ValueError("mutation report does not record every selected mutant once")
+    rows: list[dict[str, object]] = []
+    for record in mutants:
+        site = selected[int(str(record["site"]))]
+        mutated = _mutant_digest(measured.snapshot, site)
+        if record["mutated_sha256"] != mutated:
+            raise ValueError("a mutant's recorded bytes are not its site's mutation")
+        tree = _tree_digest({**measured.files, site.path: mutated})
+        check = _check_command(site.path)
+        if (check is None) != (record["check"] is None):
+            raise ValueError("a mutant's build or tsc check is missing or unexpected")
+        state = "valid"
+        if check is not None:
+            measured.receipts.runs([record["check"]], check, tree, measured.suite_timeout)
+            state = _check_state(
+                measured.directory, record["check"], report["check_baseline"], site
+            )
+        if state == "valid":
+            runs = measured.receipts.runs(record["runs"], measured.command, tree, timeout)
+            state = _settled(runs)
+        row: dict[str, object] = {
+            "path": site.path,
+            "line": site.line,
+            "operator": site.operator,
+            "outcome": state,
+        }
+        # Source-only runs exist only for kills, in attempts that changed test files.
+        if state in ("killed", "timeout") and source_timeout:
+            row["source_only"] = _source_only_outcome(
+                measured, record.get("source_only"), site, mutated, source_files, source_timeout
+            )
+        rows.append(row)
+    return share, rows
 
 
 def _strings(value: object) -> list[str]:
@@ -869,34 +1114,50 @@ def _strings(value: object) -> list[str]:
     return value
 
 
-def _share_state(directory: Path, source: dict[str, object]) -> dict[str, object]:
-    """Whether the test-change kill share can be measured, before any mutant's outcome."""
+def _share_state(source: dict[str, object]) -> dict[str, object]:
+    """Whether the test-change kill share can be measured, decided before any run."""
     if source["status"] != "measured":
         return {"status": "unavailable", "reason": str(source.get("reason"))}
     changed = _strings(source["changed_test_files"])
-    if changed:
-        baseline = _verified_runs(directory, source["baseline"])
-        if len(baseline) != 2 or not _baseline(baseline):
-            return {"status": "unavailable", "reason": "source-only baseline red or unstable"}
+    if sorted(_object(source["restored"])) != changed:
+        raise ValueError("the source-only tree does not restore exactly the changed test files")
     return {"status": "available", "changed_test_files": changed}
 
 
-def _source_only_outcome(directory: Path, value: object) -> str:
+def _source_only_outcome(
+    measured: _Measured,
+    value: object,
+    site: Site,
+    mutated: str,
+    source_files: dict[str, object],
+    timeout: int,
+) -> str:
     record = _object(value)
-    if record.get("placed") is not True:
+    placed = source_files.get(site.path) == measured.files[site.path]
+    if record.get("placed") is not placed:
+        raise ValueError("a source-only mutant's placement differs from its source-only tree")
+    if not placed:
         return "not placed"
-    return _settled(directory, record["runs"])
+    if record["mutated_sha256"] != mutated:
+        raise ValueError("a source-only mutant's bytes are not its site's mutation")
+    tree = _tree_digest({**source_files, site.path: mutated})
+    return _settled(measured.receipts.runs(record["runs"], measured.command, tree, timeout))
 
 
 def _share(
-    state: dict[str, object], rows: list[dict[str, object]], counts: dict[str, int]
+    state: dict[str, object], rows: list[dict[str, object]], valid: int, headline: str
 ) -> dict[str, object]:
-    """Kills only the attempt's test changes made, over valid mutants."""
+    """Kills only the attempt's test changes made, over valid mutants.
+
+    Decided apart from the headline: with no changed test file no kill needed one, so the share
+    is a measured 0 even when the bug-catch rate is unavailable.
+    """
     if state["status"] != "available":
         return state
-    valid = counts["killed"] + counts["timed_out"] + counts["survived"]
     if not _strings(state["changed_test_files"]):
-        return {**state, "kills_needing_test_changes": 0, "percent": 0.0 if valid else None}
+        return {**state, "kills_needing_test_changes": 0, "percent": 0.0}
+    if headline != "available":
+        return {"status": headline, "reason": "the bug-catch rate is not available"}
     outcomes = [str(row["source_only"]) for row in rows if "source_only" in row]
     if unsure := sorted({item for item in outcomes if item in ("flaky", "error", "not placed")}):
         return {
@@ -907,7 +1168,7 @@ def _share(
     return {
         **state,
         "kills_needing_test_changes": needing,
-        "percent": round(100 * needing / valid, 6) if valid else None,
+        "percent": round(100 * needing / valid, 6),
     }
 
 
@@ -944,6 +1205,7 @@ def compare_mutation(
             "candidate_count",
             "candidate_line_count",
             "candidate_lines",
+            "unsupported_file_count",
             "test_change_kill_share",
         )
     }

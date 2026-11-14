@@ -6,6 +6,7 @@ import ast
 import hashlib
 import json
 import shutil
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from pluginbench import components, harbor_backend, mutation
-from pluginbench.assessment_metrics import compare_snapshots, evaluate_evidence
+from pluginbench.assessment_metrics import compare_snapshots, evaluate_evidence, inspect_snapshot
 from pluginbench.collectors import Collector, collect_measurements
 from pluginbench.mutation import Run, Site
 
@@ -88,6 +89,25 @@ def test_python_mutants_apply_as_byte_edits_that_still_parse() -> None:
         ast.parse(data[: site.start] + site.replacement.encode() + data[site.end :])
 
 
+@pytest.mark.parametrize(
+    "source",
+    ["ok = (x is  # a note\n      not y)\n", "ok = x is \\\n    not y\n", "ok = x is  not y\n"],
+    ids=["comment", "continuation", "spaces"],
+)
+def test_python_is_not_with_text_between_its_tokens_is_one_site(source: str) -> None:
+    data = source.encode()
+    [condition] = [
+        site for site in mutation.python_sites("a.py", data) if site.operator == "equality_negation"
+    ]
+    mutated = data[: condition.start] + condition.replacement.encode() + data[condition.end :]
+    # Only `not` goes: a comment stays a comment, and no line moves.
+    assert mutated.count(b"\n") == data.count(b"\n")
+    compare = ast.parse(mutated).body[0].value  # type: ignore[attr-defined]
+    while not isinstance(compare, ast.Compare):
+        compare = compare.value
+    assert [type(op) for op in compare.ops] == [ast.Is]
+
+
 def _site(path: str, line: int, operator: str, column: int = 1) -> Site:
     return Site(path, line, column, operator, 0, 1, "<", "<=")
 
@@ -122,23 +142,40 @@ def test_sample_stops_at_ten_and_takes_every_line_when_fewer() -> None:
     ("stdout", "exit_code", "timed_out", "status"),
     [
         ("tests\nPB-SUITE-EXIT 1\n", 0, False, 1),
-        ("no marker\n", 2, False, 2),
+        # Every task but csstree must print its marker: a bare process exit is no status.
+        ("no marker\n", 2, False, None),
         ("PB-SUITE-EXIT 0\nPB-SUITE-EXIT 1\n", 1, False, None),
+        # A marker from a run with no recorded exit is no status either.
+        ("PB-SUITE-EXIT 0\n", None, False, None),
         ("", None, False, None),
         ("PB-SUITE-EXIT 0\n", None, True, None),
     ],
 )
-def test_suite_status_reads_the_marker_then_the_exit(
+def test_suite_status_needs_exactly_one_marker_and_a_recorded_exit(
     stdout: str, exit_code: int | None, timed_out: bool, status: int | None
 ) -> None:
     assert mutation.suite_status(Run(exit_code, timed_out, stdout, 1.0)) == status
 
 
-def test_tsc_errors_ignore_columns() -> None:
-    first = mutation.tsc_errors("src/a.ts(3,5): error TS2322: Type 'x' is wrong.\n")
-    shifted = mutation.tsc_errors("src/a.ts(3,9): error TS2322: Type 'x' is wrong.\n")
-    assert first == shifted and len(first) == 1
-    assert mutation.tsc_errors("error TS5083: Cannot read file.\nFound 1 error.\n") != set()
+def test_csstree_takes_its_suite_status_from_the_process_exit() -> None:
+    assert "https://github.com/csstree/csstree" in mutation.PROCESS_EXIT_REPOSITORIES
+    assert mutation.suite_status(Run(2, False, "no marker\n", 1.0), process_exit=True) == 2
+    assert mutation.suite_status(Run(None, False, "", 1.0), process_exit=True) is None
+
+
+TSC_SITE = Site("src/a.ts", 3, 9, "relational_boundary", 0, 1, "<", "<=")
+
+
+def test_tsc_errors_drop_columns_only_on_the_mutated_line_and_keep_counts() -> None:
+    error = "src/a.ts({},{}): error TS2322: Type 'x' is wrong.\n"
+    known = mutation.tsc_errors(error.format(3, 5) + error.format(7, 2), TSC_SITE)
+    # A column shift on the mutated line is the same error.
+    assert mutation.tsc_errors(error.format(3, 9) + error.format(7, 2), TSC_SITE) == known
+    # Elsewhere, and as a second copy on the mutated line, the same text is a new error.
+    for added in (error.format(7, 8), error.format(3, 1)):
+        mutated = mutation.tsc_errors(error.format(3, 9) + error.format(7, 2) + added, TSC_SITE)
+        assert mutated - known
+    assert mutation.tsc_errors("error TS5083: Cannot read file.\nFound 1 error.\n")
 
 
 # --- Collection with a fake executor -----------------------------------------------------
@@ -151,12 +188,16 @@ def _tree(path: Path, files: dict[str, str]) -> Path:
     return path
 
 
+IMAGE = {"image_identity": {"image_id": "sha256:image"}}
+
+
 def _config(**changes: object) -> dict[str, object]:
     return {
         "language": "python",
         "coverage": {"command": ["suite"], "report_path": "cov.json", "timeout_seconds": 100},
-        "native_task_identity": {},
+        "native_task_identity": IMAGE,
         "generated_files": [],
+        "suite_status": "marker",
         "site_finders": {},
         "source_only_reference_paths": [],
         "observer_version": components.VERSIONS["mutation_observer"],
@@ -175,11 +216,27 @@ class View:
 
     @property
     def source(self) -> str:
-        return self.files["src/grade.py"]
+        return "".join(text for path, text in self.files.items() if path.startswith("src/"))
 
 
 # A run's (status, timed out, extra stdout).
 Behaviour = Callable[[View], tuple[int | None, bool, str]]
+
+
+def _receipt(destination: Path, tree: Path, command: list[str], run: Run) -> None:
+    """The launcher's execution.json for one run, as `run_native_command` writes it."""
+    (destination / "execution.json").write_text(
+        json.dumps(
+            {
+                "command": command,
+                "image_id": IMAGE["image_identity"]["image_id"],
+                "before_digest": inspect_snapshot(tree)["digest"],
+                "exit_code": run.exit_code,
+                "timed_out": run.timed_out,
+                "stdout": run.stdout,
+            }
+        )
+    )
 
 
 def _files(tree: Path) -> dict[str, str]:
@@ -207,9 +264,16 @@ class Fake:
         )
         seen = sum(1 for call in self.calls if call[1] == files and call[0] == command)
         self.calls.append((command, files, timeout))
-        status, timed_out, extra = self.behaviour(View(files, command, mutated, seen))
+        try:
+            status, timed_out, extra = self.behaviour(View(files, command, mutated, seen))
+        except mutation.InfrastructureFailure as error:
+            # The launcher writes its receipt, with the error, whatever happens.
+            (destination / "execution.json").write_text(json.dumps({"error": str(error)}))
+            raise
         marker = "" if status is None else f"PB-SUITE-EXIT {status}\n"
-        return Run(None if timed_out else status, timed_out, extra + marker, 1.0)
+        run = Run(None if timed_out else status, timed_out, extra + marker, 1.0)
+        _receipt(destination, tree, command, run)
+        return run
 
 
 def _passing(rule: Callable[[View], int]) -> Behaviour:
@@ -223,9 +287,10 @@ def _measure(
     *,
     after: dict[str, str] | None = None,
     config: dict[str, object] | None = None,
+    name: str = "src/grade.py",
 ) -> tuple[dict[str, object], Fake, Path]:
-    before = _tree(tmp_path / "before", {"src/grade.py": BEFORE, "tests/test_grade.py": "x\n"})
-    files = {"src/grade.py": AFTER, "tests/test_grade.py": "x\n", **(after or {})}
+    before = _tree(tmp_path / "before", {name: BEFORE, "tests/test_grade.py": "x\n"})
+    files = {name: AFTER, "tests/test_grade.py": "x\n", **(after or {})}
     submitted = _tree(tmp_path / "after", files)
     destination = tmp_path / "evidence"
     destination.mkdir()
@@ -236,8 +301,12 @@ def _measure(
     return json.loads(json.dumps(report)), fake, destination
 
 
-def _metrics(report: dict[str, object], destination: Path) -> dict[str, object]:
-    return mutation.mutation_metrics(report, destination)
+def _metrics(
+    report: dict[str, object], destination: Path, config: dict[str, object] | None = None
+) -> dict[str, object]:
+    return mutation.mutation_metrics(
+        report, destination, config=config or _config(), snapshot=destination.parent / "after"
+    )
 
 
 def _kills_first(view: View) -> int:
@@ -284,6 +353,117 @@ def test_a_timeout_counts_as_a_kill_without_a_rerun(tmp_path: Path) -> None:
     metrics = _metrics(report, destination)
     assert (metrics["killed"], metrics["timed_out"], metrics["survived"]) == (1, 1, 1)
     assert len(fake.calls) == 4
+
+
+def test_a_kill_whose_confirmation_times_out_is_reported_timed_out(tmp_path: Path) -> None:
+    report, _, destination = _measure(
+        tmp_path,
+        lambda view: (
+            (None, True, "")
+            if view.mutated and FIRST in view.source and view.seen
+            else ((_kills_first(view) if view.mutated else 0), False, "")
+        ),
+    )
+    metrics = _metrics(report, destination)
+    assert (metrics["killed"], metrics["timed_out"], metrics["survived"]) == (1, 1, 1)
+    assert _object(_list(metrics["mutants"])[0])["outcome"] == "timeout"
+
+
+def test_the_share_is_a_measured_zero_without_test_changes_whatever_the_headline(
+    tmp_path: Path,
+) -> None:
+    zero = {
+        "status": "available",
+        "changed_test_files": [],
+        "kills_needing_test_changes": 0,
+        "percent": 0.0,
+    }
+    none, _, none_destination = _measure(
+        tmp_path / "none", _passing(lambda view: 0), after={"src/grade.py": BEFORE + "x = 1\n"}
+    )
+    red, _, red_destination = _measure(tmp_path / "red", lambda view: (1, False, ""))
+    for report, destination, headline in (
+        (none, none_destination, "no candidate sites"),
+        (red, red_destination, "baseline red"),
+    ):
+        metrics = _metrics(report, destination)
+        assert metrics["status"] == "unavailable" and headline in str(metrics["reason"])
+        assert metrics["test_change_kill_share"] == zero
+
+
+def test_an_unsupported_language_file_holds_no_sites_and_is_counted(tmp_path: Path) -> None:
+    report, _, destination = _measure(
+        tmp_path, _passing(_kills_first), after={"src/lib.rs": "fn f(a: i32) -> bool { a < 1 }\n"}
+    )
+    metrics = _metrics(report, destination)
+    assert (metrics["unsupported_files"], metrics["unsupported_file_count"]) == (["src/lib.rs"], 1)
+    assert metrics["status"] == "available" and metrics["unparsed_files"] == {}
+
+
+def test_an_infrastructure_failure_leaves_the_attempt_incomplete(tmp_path: Path) -> None:
+    def behaviour(view: View) -> tuple[int | None, bool, str]:
+        if view.mutated and SECOND in view.source:
+            raise mutation.InfrastructureFailure("docker exec failed: daemon gone")
+        return (_kills_first(view) if view.mutated else 0), False, ""
+
+    report, _, destination = _measure(tmp_path, behaviour)
+    metrics = _metrics(report, destination)
+    assert metrics["status"] == "incomplete"
+    assert metrics["reason"] == "infrastructure failure: docker exec failed: daemon gone"
+    assert metrics["bug_catch_percent"] is None
+    assert _object(metrics["test_change_kill_share"])["percent"] == 0.0
+    # Its record must match the failing run's receipt.
+    _object(report["infrastructure_failure"])["reason"] = "docker exec failed: other"
+    with pytest.raises(ValueError, match="infrastructure failure differs"):
+        _metrics(report, destination)
+
+
+def test_an_infrastructure_failure_in_the_baseline_is_not_a_red_baseline(tmp_path: Path) -> None:
+    def behaviour(view: View) -> tuple[int | None, bool, str]:
+        if view.seen:
+            raise mutation.InfrastructureFailure("docker create failed: no space")
+        return 0, False, ""
+
+    report, _, destination = _measure(tmp_path, behaviour)
+    metrics = _metrics(report, destination)
+    assert metrics["status"] == "incomplete" and "no space" in str(metrics["reason"])
+
+
+def test_an_integrity_violation_fails_the_collection(tmp_path: Path) -> None:
+    def behaviour(view: View) -> tuple[int | None, bool, str]:
+        if view.mutated:
+            raise ValueError("Frozen measurement input changed during execution")
+        return 0, False, ""
+
+    with pytest.raises(ValueError, match="input changed"):
+        _measure(tmp_path, behaviour)
+
+
+@pytest.mark.parametrize(
+    ("error", "kind"),
+    [
+        (ValueError("docker exec failed: daemon gone"), mutation.InfrastructureFailure),
+        (subprocess.TimeoutExpired(["docker", "cp"], 300), mutation.InfrastructureFailure),
+        (ValueError("Frozen measurement input changed during execution"), ValueError),
+        (ValueError("Native measurement introduced production or test source: a.py"), ValueError),
+    ],
+    ids=["docker-command", "docker-timeout", "input-changed", "source-introduced"],
+)
+def test_the_native_executor_tells_infrastructure_failures_from_integrity_violations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception, kind: type[Exception]
+) -> None:
+    def native(**kwargs: object) -> dict[str, object]:
+        destination = kwargs["destination"]
+        assert isinstance(destination, Path)
+        destination.mkdir(parents=True)
+        (destination / "execution.json").write_text(json.dumps({"error": str(error)}))
+        raise error
+
+    monkeypatch.setattr(harbor_backend, "run_native_command", native)
+    execute = mutation.native_executor({}, "cov.json")
+    with pytest.raises(Exception) as raised:
+        execute(tmp_path, ["suite"], 10, tmp_path / "run")
+    assert type(raised.value) is kind
 
 
 @pytest.mark.parametrize(
@@ -349,32 +529,71 @@ def test_changed_test_files_give_no_sites(tmp_path: Path) -> None:
     assert not fake.calls
 
 
-def test_go_mutants_that_do_not_build_are_invalid_and_not_replaced(tmp_path: Path) -> None:
+def _as_python(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Find sites in every changed file as Python, so Go and TypeScript files need no parser."""
+
+    def find(
+        root: Path, paths: list[str], finders: object, **kwargs: object
+    ) -> tuple[list[Site], dict[str, str]]:
+        sites = [
+            site
+            for path in sorted(paths)
+            for site in mutation.python_sites(path, (root / path).read_bytes())
+        ]
+        return sites, {}
+
+    monkeypatch.setattr(mutation, "find_sites", find)
+
+
+def test_go_mutants_that_do_not_build_are_invalid_and_not_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _as_python(monkeypatch)
+
     def behaviour(view: View) -> tuple[int | None, bool, str]:
         if view.command == mutation.GO_CHECK:
             return _kills_first(view), False, ""
         return int(view.mutated), False, ""
 
-    report, fake, destination = _measure(tmp_path, behaviour, config=_config(language="go"))
+    report, fake, destination = _measure(tmp_path, behaviour, name="src/grade.go")
     metrics = _metrics(report, destination)
     assert (metrics["invalid"], metrics["killed"], metrics["valid"]) == (1, 1, 1)
     checks = [call[0] == mutation.GO_CHECK for call in fake.calls]
     assert checks == [False, False, True, True, False, False]
 
 
-def test_typescript_mutants_are_invalid_only_for_new_tsc_errors(tmp_path: Path) -> None:
-    known = "src/grade.py(2,5): error TS2322: Type 'x' is wrong.\n"
+def test_a_check_that_cannot_run_is_an_error_not_an_invalid_mutant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Bash exits 127 when the image has no `go`: the mutant's validity is unknown.
+    _as_python(monkeypatch)
+    report, _, destination = _measure(
+        tmp_path,
+        lambda view: (127, False, "") if view.command == mutation.GO_CHECK else (0, False, ""),
+        name="src/grade.go",
+    )
+    metrics = _metrics(report, destination)
+    assert (metrics["errors"], metrics["invalid"], metrics["status"]) == (2, 0, "incomplete")
+
+
+def test_typescript_mutants_are_invalid_only_for_new_tsc_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _as_python(monkeypatch)
+    known = "src/grade.ts(2,5): error TS2322: Type 'x' is wrong.\n"
 
     def behaviour(view: View) -> tuple[int | None, bool, str]:
         if view.command != mutation.TSC_CHECK:
             return int(view.mutated), False, ""
         if not view.mutated:
             return 2, False, known
-        # The first mutant shifts the known error's column; the second adds an error.
-        added = "" if FIRST in view.source else "src/grade.py(4,1): error TS1005: ';' expected.\n"
-        return 2, False, known.replace("(2,5)", "(2,9)") + added
+        # The first mutant, on line 2, shifts the known error's column; the second, on line 4,
+        # adds a second copy of it.
+        if FIRST in view.source:
+            return 2, False, known.replace("(2,5)", "(2,9)")
+        return 2, False, known + known.replace("(2,5)", "(4,1)")
 
-    report, _, destination = _measure(tmp_path, behaviour, config=_config(language="typescript"))
+    report, _, destination = _measure(tmp_path, behaviour, name="src/grade.ts")
     metrics = _metrics(report, destination)
     assert (metrics["killed"], metrics["invalid"]) == (1, 1)
 
@@ -464,6 +683,16 @@ def _object(value: object) -> dict[str, object]:
     return value
 
 
+def _list(value: object) -> list[object]:
+    assert isinstance(value, list)
+    return value
+
+
+def _edit_receipt(directory: Path, run: dict[str, object], **changes: object) -> None:
+    path = directory / str(run["receipts"]) / "execution.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), **changes}))
+
+
 # --- Binding and tampering ---------------------------------------------------------------
 
 
@@ -479,8 +708,47 @@ def _object(value: object) -> dict[str, object]:
         lambda report, directory: (
             directory / report["baseline"][0]["receipts"] / "stdout.txt"
         ).write_text("PB-SUITE-EXIT 0\n\n"),
+        lambda report, directory: _edit_receipt(directory, report["baseline"][0], command=["x"]),
+        lambda report, directory: _edit_receipt(
+            directory, report["baseline"][1], image_id="sha256:other"
+        ),
+        lambda report, directory: _edit_receipt(
+            directory, report["mutants"][0]["runs"][0], exit_code=0
+        ),
+        lambda report, directory: _edit_receipt(
+            directory, report["mutants"][0]["runs"][1], timed_out=True
+        ),
+        lambda report, directory: _edit_receipt(
+            directory, report["mutants"][1]["runs"][0], stdout="PB-SUITE-EXIT 1\n"
+        ),
+        # A mutant run that measured the unmutated tree.
+        lambda report, directory: _edit_receipt(
+            directory,
+            report["mutants"][0]["runs"][0],
+            before_digest=report["after_digest"],
+        ),
+        lambda report, directory: report["baseline"][1].update(
+            receipts=report["baseline"][0]["receipts"]
+        ),
+        lambda report, directory: report["mutants"][0].update(mutated_sha256="sha256:0"),
+        lambda report, directory: report["mutants"][0]["runs"][0].update(timeout_seconds=1),
     ],
-    ids=["sample-order", "missing-rerun", "status", "candidate-off-diff", "saved-output"],
+    ids=[
+        "sample-order",
+        "missing-rerun",
+        "status",
+        "candidate-off-diff",
+        "saved-output",
+        "receipt-command",
+        "receipt-image",
+        "receipt-exit",
+        "receipt-timeout",
+        "receipt-output",
+        "receipt-input",
+        "shared-receipts",
+        "mutant-bytes",
+        "timeout-limit",
+    ],
 )
 def test_tampered_reports_are_refused(
     tmp_path: Path, tamper: Callable[[dict[str, object], Path], object]
@@ -498,10 +766,19 @@ def test_collected_evidence_binds_its_report_and_the_attempt_diff(
     after = _tree(tmp_path / "after", {"src/grade.py": AFTER})
 
     def native(**kwargs: object) -> dict[str, object]:
-        snapshot = kwargs["snapshot"]
-        assert isinstance(snapshot, Path)
-        failing = (snapshot / "src/grade.py").read_text() != AFTER
-        return {"exit_code": int(failing), "timed_out": False, "stdout": "ran\n"}
+        snapshot, destination, command = (
+            kwargs["snapshot"],
+            kwargs["destination"],
+            kwargs["command"],
+        )
+        assert isinstance(snapshot, Path) and isinstance(destination, Path)
+        assert isinstance(command, list)
+        failing = int((snapshot / "src/grade.py").read_text() != AFTER)
+        destination.mkdir(parents=True, exist_ok=True)
+        _receipt(
+            destination, snapshot, command, Run(failing, False, f"PB-SUITE-EXIT {failing}\n", 1)
+        )
+        return dict(json.loads((destination / "execution.json").read_text()))
 
     monkeypatch.setattr(harbor_backend, "run_native_command", native)
     config = tmp_path / "mutation.json"

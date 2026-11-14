@@ -267,8 +267,7 @@ def blocking_findings(
         )
     ]
     return findings + [
-        f"{name} is ready on no task, so the run would measure nothing for it"
-        for name in nowhere
+        f"{name} is ready on no task, so the run would measure nothing for it" for name in nowhere
     ]
 
 
@@ -560,17 +559,33 @@ def _mutation_collector(
     coverage = coverage_settings(task_dir, settings)
     assert coverage is not None
     cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "pluginbench"
-    finders: dict[str, dict[str, str]] = {}
-    if language == "go":
+
+    def go_finder() -> dict[str, str]:
         binary = prepare_go_observer(
             cache / "language-tools/go-observer", mutation.GO_OBSERVER, "pluginbench-go-mutation"
         )
-        finders["go"] = {
-            "path": str(binary),
-            "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-        }
-    elif language in {"typescript", "javascript"}:
-        finders["oxc"] = prepare_observer("oxc-parser-0.126.0", cache / "observers")
+        return {"path": str(binary), "sha256": hashlib.sha256(binary.read_bytes()).hexdigest()}
+
+    # A finder for each supported language an attempt may change. The task language's finder is
+    # required; another one this host cannot prepare is left out, so a changed file in that
+    # language stays unparsed and makes its attempt incomplete.
+    finders: dict[str, dict[str, str]] = {}
+    for kind, prepare, tool, languages in (
+        ("go", go_finder, "go", {"go"}),
+        (
+            "oxc",
+            lambda: prepare_observer("oxc-parser-0.126.0", cache / "observers"),
+            "node",
+            {"typescript", "javascript"},
+        ),
+    ):
+        if language in languages:
+            finders[kind] = prepare()
+        elif shutil.which(tool) is not None:
+            try:
+                finders[kind] = prepare()
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
     try:
         # The files the source-only grade keeps although they look like tests.
         reference: list[str] | None = sorted(source_only._task_paths(task_dir)[1])
@@ -585,6 +600,9 @@ def _mutation_collector(
             "repository_url": repository,
             "coverage": coverage.model_dump(mode="json"),
             "generated_files": list(mutation.GENERATED_FILES.get(repository, ())),
+            "suite_status": "process_exit"
+            if repository in mutation.PROCESS_EXIT_REPOSITORIES
+            else "marker",
             "site_finders": finders,
             "source_only_reference_paths": reference,
             "observer_version": components.VERSIONS["mutation_observer"],

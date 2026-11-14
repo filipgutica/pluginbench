@@ -706,7 +706,8 @@ def _observation(
         comparison = _map(_map(stage.get("metric_comparison")).get("mutation"))
         share = key != "bug_catch_percent"
         detail = _map(comparison.get("test_change_kill_share")) if share else comparison
-        available = comparison.get("status") == "available" and detail.get("status") == "available"
+        # The share is decided apart from the headline: a measured 0 when no test file changed.
+        available = detail.get("status") == "available"
         value = _number(detail.get(key.rpartition(".")[2])) if available else None
         eligible = available and all(
             provenance.get(field) is not None
