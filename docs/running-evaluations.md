@@ -287,6 +287,66 @@ go list -e -deps -test -f '{{$d := .Dir}}{{range .GoFiles}}{{$d}}/{{.}}{{"\n"}}{
   done > pluginbench-coverage.out.go-blocks.txt
 ```
 
+Jest's istanbul coverage leaves out a file when its source map gives istanbul nothing to map back to it, such as a TypeScript module of types and interfaces. `collectCoverageFrom` does not help, because the file is dropped after instrumentation. To keep such files from making an LCOV report incomplete, the same command can write `<report_path>.instrumented.txt` after the test run:
+- One `<count> <path>` line per source file, where `<count>` is the number of statements, functions and branch points istanbul maps back to the file through Jest's own transform and source-map remapping. Functions and branches count too, because a file with only `export function noop() {}` has a function and no statement.
+- Write a line only when the count succeeds. A file the report omits and whose count is 0 has nothing to measure. It is recorded under `lcov_files_without_statements` and does not make the report incomplete. A file the report omits with a count above 0, or with no line, stays expected. A count of 0 for a measured file is rejected.
+- As with the other sidecars, the frozen input must not already contain it, native collection retains it as `report.raw.instrumented.txt`, and it has the same trust as the report. Its hash is recorded as `instrumented_sha256`.
+
+For example, in `bash`, after `npx jest --coverage --coverageReporters=lcovonly --coverageDirectory=coverage ...` and `status=$?`:
+
+```bash
+cat > /tmp/pluginbench-jest-instrumented.cjs <<'JS'
+// Prints `<count> <path>` for each source path read from stdin: the statements, functions and
+// branches istanbul maps back to the file through Jest's own transform and source-map remapping.
+// Jest's report drops a file whose count is 0. A file this cannot count gets no line.
+const { createRequire } = require("node:module");
+const { readFileSync } = require("node:fs");
+const { resolve } = require("node:path");
+
+const local = createRequire(resolve("package.json"));
+const fromReporters = createRequire(local.resolve("@jest/reporters"));
+const { readConfig } = local("jest-config");
+const { createScriptTransformer } = fromReporters("@jest/transform");
+const { readInitialCoverage } = fromReporters("istanbul-lib-instrument");
+const libCoverage = fromReporters("istanbul-lib-coverage");
+const libSourceMaps = fromReporters("istanbul-lib-source-maps");
+
+async function main() {
+  const { projectConfig } = await readConfig({ _: [], $0: "jest" }, process.cwd());
+  const transformer = await createScriptTransformer(projectConfig);
+  for (const file of readFileSync(0, "utf8").split("\n").filter(Boolean)) {
+    const path = resolve(file);
+    try {
+      // The options Jest uses for a file no test loaded.
+      const { code } = await transformer.transformSourceAsync(path, readFileSync(path, "utf8"), {
+        instrument: true,
+        supportsDynamicImport: true,
+        supportsExportNamespaceFrom: true,
+        supportsStaticESM: true,
+        supportsTopLevelAwait: true,
+      });
+      const extracted = readInitialCoverage(code);
+      if (!extracted) continue; // `istanbul ignore file`: Jest reports nothing, so no count.
+      const map = libCoverage.createCoverageMap({});
+      map.addFileCoverage(extracted.coverageData);
+      const mapped = await libSourceMaps.createSourceMapStore().transformCoverage(map);
+      const names = mapped.files();
+      if (names.length > 1 || (names.length === 1 && names[0] !== path)) continue;
+      const data = names.length ? mapped.fileCoverageFor(path).data : { s: {}, f: {}, b: {} };
+      const count = [data.s, data.f, data.b].reduce((n, items) => n + Object.keys(items).length, 0);
+      process.stdout.write(`${count} ${file}\n`);
+    } catch (error) {
+      console.error(`PluginBench instrumented count unavailable for ${file}: ${error.message}`);
+    }
+  }
+}
+
+main().catch((error) => console.error(`PluginBench instrumented counts unavailable: ${error.message}`));
+JS
+find src -name '*.ts' ! -name '*.d.ts' | sort | node /tmp/pluginbench-jest-instrumented.cjs > coverage/lcov.info.instrumented.txt
+exit $status
+```
+
 Coverage.py can trace lines outside its executable-statement population. A trusted reporting command can add `statement_lines` from `Coverage.analysis2` to every file, with `meta.statement_lines_source: coverage.Coverage.analysis2`. Use the same reporting configuration, retain the original JSON, and keep strict covered/missing and summary checks; without statement coordinates, an inconsistent report remains unavailable.
 
 A coverage profile's `source_scope` declares its measured package independently of repository-wide LOC and analysis.
