@@ -1445,12 +1445,19 @@ def plan_review(root: Path, revision: str) -> dict[str, object]:
 
 
 def review_evaluation(
-    root: Path, revision: str, *, progress: Callable[[str], None] | None = None
+    root: Path,
+    revision: str,
+    *,
+    reviewer: Runner | None = None,
+    select: bool = True,
+    progress: Callable[[str], None] | None = None,
 ) -> str:
-    """Review every submission again with the frozen reviewer as `revision`, then select it.
+    """Review every submission again as `revision`, then select it unless `select` is false.
 
-    Earlier revisions stay in evidence. Returns the selected revision: `<revision>-citations`
-    when offline citation recovery repaired its formatting.
+    `reviewer` replaces the frozen reviewer's harness, model and effort for this revision only;
+    the frozen criteria and timeout still apply, and the run records who reviewed. Earlier
+    revisions stay in evidence. Returns the revision: `<revision>-citations` when offline
+    citation recovery repaired its formatting.
     """
     root = root.expanduser().resolve()
     plan_review(root, revision)
@@ -1459,14 +1466,21 @@ def review_evaluation(
     if config.reviewer is None:
         raise ValueError("this run has no reviewer, so it has no review to repeat")
     guidance = _frozen_review_guidance(root, selection, config.reviewer)
-    _review_preflight(selection)
+    identity = reviewer or config.reviewer
+    _review_preflight({"reviewer": identity.model_dump(mode="json")})
+    override = None
+    if reviewer is not None:
+        override = {
+            **reviewer.model_dump(mode="json", include={"harness", "model", "reasoning"}),
+            "harness_version": _harness_version(reviewer.harness),
+        }
     if progress:
         progress(f"Reviewing all submissions again as review revision {revision}")
     review_study(
         root / "evidence",
-        harness=config.reviewer.harness,
-        model=config.reviewer.model,
-        effort=config.reviewer.reasoning,
+        harness=identity.harness,
+        model=identity.model,
+        effort=identity.reasoning,
         timeout=config.reviewer.timeout_seconds or config.timeout_seconds,
         seed=config.seed,
         revision=revision,
@@ -1474,9 +1488,16 @@ def review_evaluation(
         jobs=config.jobs,
     )
     selected = recover_review_citations(root / "evidence", revision)
-    selection["review_revision"] = selected
+    if override is not None:
+        overrides = _object(selection.get("reviewer_overrides", {}))
+        # Under both names: a report can project the revision by the name it was given.
+        overrides.update(dict.fromkeys((revision, selected), override))
+        selection["reviewer_overrides"] = overrides
+    if select:
+        selection["review_revision"] = selected
     _save_selection(root, selection)
-    regenerate_report(root)
+    if select:
+        regenerate_report(root)
     return selected
 
 
@@ -1783,6 +1804,26 @@ def _measurement_collection(root: Path, selection: dict[str, object]) -> dict[st
     }
 
 
+def _revision_reviewer(
+    evidence: Path, selection: dict[str, object], revision: str
+) -> dict[str, object]:
+    """The reviewer that ran `revision`: its recorded override, else the frozen reviewer.
+
+    Refuses a revision whose protocol names another harness, model or effort.
+    """
+    override = _object(selection.get("reviewer_overrides", {})).get(revision)
+    reviewer = {**_object(selection["reviewer"]), **(_object(override) if override else {})}
+    state = json.loads((_review_directory(evidence, revision) / "review-state.json").read_text())
+    protocol = study._bound_document(evidence, state["protocol"])
+    if (protocol.get("harness", "codex"), protocol.get("model"), protocol.get("effort")) != (
+        reviewer["harness"],
+        reviewer["model"],
+        reviewer["reasoning"],
+    ):
+        raise ValueError(f"review revision {revision} was not run by its recorded reviewer")
+    return reviewer
+
+
 def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path:
     root = root.expanduser().resolve()
     config = _load_selection(root)
@@ -1794,7 +1835,7 @@ def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path
         review_path = validate_review_revision(evidence, review_revision)
         state = study._bound_document(evidence, study._reference(evidence, review_path))
         protocol = study._bound_document(evidence, state["protocol"])
-        reviewer = _object(config["reviewer"])
+        reviewer = _revision_reviewer(evidence, config, review_revision)
         expected = {
             "harness": reviewer["harness"],
             "model": reviewer["model"],
@@ -1834,6 +1875,16 @@ def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path
         measurement_revision=_selected_revision(config, "measurement_revision"),
         review_revision=_selected_revision(config, "review_revision"),
     )
+    reviewed = _selected_revision(config, "review_revision")
+    if config.get("reviewer") and reviewed is not None:
+        reviewer = _revision_reviewer(evidence, config, reviewed)
+        if reviewer != config["reviewer"]:
+            # Another reviewer's findings must not be reported, or compared, as the frozen one's.
+            config["reviewer"] = reviewer
+            comparison["reviewer"] = {
+                **_object(comparison["reviewer"]),
+                **{key: reviewer[key] for key in ("harness", "model", "reasoning")},
+            }
     report = json.loads(report_path.read_text())
     if config.get("source_only_grades") is not None:
         attach_source_only_grades(evidence, config["source_only_grades"], report["attempts"])
