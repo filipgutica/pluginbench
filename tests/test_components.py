@@ -72,8 +72,10 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # before, so this stays v1.
             # coverage.py 7.2.x JSON, which has no meta.format, reads as format 2. Such reports
             # were always refused, and every other report parses as before, so this stays v1.
+            # Blocks Go names after a `//line` target that is no frozen Go file count for the
+            # one file naming it instead of aborting. Only refused reports change: stays v1.
             "coverage_report.py": (
-                "656ba0662d497cd43cee434167689c497cd9798de78898fdd4b4d59ea319e91c"
+                "997f704ee614f05980b6de367aa287494a018c57d5af179f206f4746f9bb2187"
             ),
         },
     ),
