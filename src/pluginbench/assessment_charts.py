@@ -307,7 +307,9 @@ METRIC_GUIDE.update(
             "% covered",
             "Share of changed production lines holding at least one M1 candidate site that the "
             "tests execute, counting each line once before mutant sampling. Go uses the line "
-            "population, not statement blocks. Unavailable with no eligible lines or no line "
+            "population, not statement blocks. Candidate lines the coverage tool does not track, "
+            "such as continuation lines of a multi-line condition, are excluded and counted. "
+            "Unavailable with no eligible lines or no line "
             "coverage; incomplete when an eligible file lacks line coverage or candidate parsing "
             "is incomplete. Measures execution, not assertion strength or branch completeness. "
             "The risky-logic catch rate is the M1 bug-catch rate.",

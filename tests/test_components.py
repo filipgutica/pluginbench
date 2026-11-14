@@ -88,7 +88,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         1,
         {
             # Only report derivation changes; collection, sites, sampling and outcomes stay v1.
-            "mutation.py": "faf510607ac0a99f95fd4aee3abe32df19d9f0179b9735b066df6f30a17981db",
+            "mutation.py": "539472b97afb941b43adca1e86ea472477600cf9c8633cf971a5a36c7d7f5efb",
             "mutation_sites.mjs": (
                 "f7a602774f3e6f2415c1745127134862a9a6f42e8e9807b4c28368e7a3c27c88"
             ),

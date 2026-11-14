@@ -989,6 +989,8 @@ def test_collected_evidence_binds_its_report_and_the_attempt_diff(
         ("unparsed candidates", "incomplete", None),
         ("unavailable catch rate", "available", (1, 2, 50.0)),
         ("unsampled lines", "available", (1, 12, 8.333333)),
+        ("continuation line", "available", (1, 1, 100.0)),
+        ("no line in population", "unavailable", None),
     ],
 )
 def test_decision_line_coverage_uses_all_unique_candidate_lines(
@@ -1031,6 +1033,13 @@ def test_decision_line_coverage_uses_all_unique_candidate_lines(
         coverage["unavailable_populations"] = {
             "lines": {"files": ["src/grade.py"], "reason": "line directives"}
         }
+    # A site on a continuation line has no coverage coordinate: it leaves the denominator.
+    if case == "continuation line":
+        coverage["coordinates"] = {
+            "line": {"total": ["src/grade.py:2", "src/grade.py:3"], "covered": ["src/grade.py:2"]}
+        }
+    if case == "no line in population":
+        coverage["coordinates"] = {"line": {"total": ["src/grade.py:3"], "covered": []}}
     if case == "unsampled lines":
         coverage["coordinates"] = {
             "line": {
@@ -1058,6 +1067,8 @@ def test_decision_line_coverage_uses_all_unique_candidate_lines(
         assert decision.get("percent") is None
     else:
         assert (decision["covered"], decision["total"], decision["percent"]) == counts
+    if case in {"continuation line", "no line in population"}:
+        assert decision["not_in_population"] == (1 if case == "continuation line" else 2)
 
 
 def test_a_profile_from_another_observer_version_is_refused(tmp_path: Path) -> None:

@@ -1266,14 +1266,25 @@ def _decision_line_coverage(
             "reason": "candidate source files missing line coverage: "
             + ", ".join(sorted(set(unmeasured + unlined))),
         }
-    covered = len(candidates & set(_strings(lines["covered"])))
+    # Coverage tools record a multi-line statement on one line, so a site on a continuation
+    # line has no coverage coordinate. It leaves the denominator rather than counting as missed.
+    eligible = candidates & set(_strings(lines["total"]))
+    not_in_population = len(candidates - eligible)
+    if not eligible:
+        return {
+            "status": "unavailable",
+            "reason": "no candidate line is in the line coverage population",
+            "not_in_population": not_in_population,
+        }
+    covered = len(eligible & set(_strings(lines["covered"])))
     return {
         "status": "available",
         "covered": covered,
-        "total": len(candidates),
-        "percent": round(100 * covered / len(candidates), 6),
-        "method": "unique changed production lines holding at least one M1 candidate site, before sampling, intersected with the submission's executed line coordinates",
-        "limitations": "execution only, not assertion strength or branch completeness; risky-logic catch rate is the M1 bug-catch rate",
+        "total": len(eligible),
+        "not_in_population": not_in_population,
+        "percent": round(100 * covered / len(eligible), 6),
+        "method": "unique changed production lines holding at least one M1 candidate site, before sampling, that the line coverage population holds, intersected with the submission's executed line coordinates",
+        "limitations": "execution only, not assertion strength or branch completeness; candidate lines without a coverage coordinate, such as continuation lines of a multi-line statement, are excluded and counted; risky-logic catch rate is the M1 bug-catch rate",
     }
 
 
