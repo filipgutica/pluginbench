@@ -370,9 +370,13 @@ def _native_coverage(
         raise ValueError("native coverage requires a frozen task identity")
     assert collector.command and collector.report_path and collector.tool_version
     assert collector.report_format is not None
-    # LCOV may carry per-test lines; Go may carry its build list and cover's block counts.
+    # LCOV may carry per-test lines and instrumented counts; Go may carry its build list and
+    # cover's block counts.
     sidecars = {
-        "lcov": {".per-test.json": "LCOV per-test sidecar"},
+        "lcov": {
+            ".per-test.json": "LCOV per-test sidecar",
+            ".instrumented.txt": "LCOV instrumented counts sidecar",
+        },
         "go-coverprofile": {
             ".go-list.json": "Go build list sidecar",
             ".go-blocks.txt": "Go cover blocks sidecar",

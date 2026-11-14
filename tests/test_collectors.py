@@ -811,6 +811,60 @@ def test_native_lcov_dispatch_preserves_runtime_unknown_and_integrity_failure(
     assert inspect_snapshot(snapshot) == original
 
 
+@pytest.mark.parametrize("stale", [False, True])
+def test_native_lcov_coverage_keeps_the_instrumented_counts_its_command_wrote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale: bool
+) -> None:
+    from pluginbench import harbor_backend
+
+    snapshot = source(tmp_path)
+    (snapshot / "src/types.ts").write_text("export type Value = number;\n")
+    if stale:
+        (snapshot / "coverage").mkdir()
+        (snapshot / "coverage/lcov.info.instrumented.txt").write_text("0 src/types.ts\n")
+    counts = "1 src/used.ts\n0 src/types.ts\n"
+
+    def execute(*, destination: Path, **_: object) -> dict[str, object]:
+        assert not stale  # Reject counts the frozen input already holds, before running.
+        (destination / "report.raw").write_text("SF:/app/src/used.ts\nDA:1,1\nend_of_record\n")
+        (destination / "after/coverage").mkdir(parents=True)
+        (destination / "after/coverage/lcov.info.instrumented.txt").write_text(counts)
+        receipt: dict[str, object] = {"exit_code": 0, "timed_out": False, "report_collected": True}
+        (destination / "execution.json").write_text(json.dumps(receipt))
+        return receipt
+
+    monkeypatch.setattr(harbor_backend, "run_native_command", execute)
+    identity = {"task_dir": str(tmp_path / "native"), "workdir": "/app"}
+    collector = Collector(
+        kind="coverage",
+        config=config(
+            tmp_path,
+            {
+                "native_task_identity": identity,
+                "test_scope": ["test/**"],
+                "observer_version": components.VERSIONS["coverage_observer"],
+            },
+        ),
+        scope=["src/**"],
+        command=["npx", "jest"],
+        report_format="lcov",
+        report_path="coverage/lcov.info",
+        tool_version="jest 30.1.3",
+    )
+    evidence = tmp_path / "evidence"
+    if stale:
+        with pytest.raises(ValueError, match="frozen input"):
+            collect_measurements(snapshot, evidence, [collector])
+        return
+    result = collect_measurements(snapshot, evidence, [collector])
+    assert (evidence / "coverage/report.raw.instrumented.txt").read_text() == counts
+    metrics = evaluate_evidence(snapshot, {"coverage": str(result["coverage"])}, evidence)
+    coverage = metrics["coverage"]
+    assert isinstance(coverage, dict)
+    assert coverage["metrics"]["population_complete_for_declared_scope"] is True
+    assert coverage["metrics"]["lcov_files_without_statements"] == ["src/types.ts"]
+
+
 @pytest.mark.parametrize("stale", [None, ".go-list.json", ".go-blocks.txt"])
 def test_native_go_coverage_keeps_the_build_records_its_command_wrote(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale: str | None

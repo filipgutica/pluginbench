@@ -315,6 +315,71 @@ def test_partial_lcov_population_keeps_measured_files(tmp_path: Path, source: Pa
     assert report["lines"]["files_measured"] == ["src/index.ts", "src/other.ts"]
 
 
+# What Jest's istanbul instrumenter mapped to each file: index.ts has code, options.ts only types.
+INSTRUMENTED = "5 src/index.ts\n0 src/options.ts\n"
+
+
+def instrumented_metrics(
+    tmp_path: Path, source: Path, counts: str | None, report: str = REPORT
+) -> dict[str, object]:
+    """Parse an LCOV report beside its instrumented counts, then score it as evidence does."""
+    (source / "src/options.ts").write_text("export interface Options {\n  width: number;\n}\n")
+    if counts is not None:
+        (tmp_path / "lcov.info.instrumented.txt").write_text(counts)
+    parsed = read_report(tmp_path, source, report)
+    snapshot = inspect_snapshot(source)["files"]
+    assert isinstance(snapshot, dict)
+    return assessment_metrics._coverage(parsed, set(snapshot), ["src/**"])
+
+
+def test_a_types_only_file_jest_leaves_out_has_nothing_to_measure(
+    tmp_path: Path, source: Path
+) -> None:
+    metrics = instrumented_metrics(tmp_path, source, INSTRUMENTED)
+    assert metrics["population_complete_for_declared_scope"] is True
+    assert metrics["line_population_complete"] is True
+    assert metrics["unmeasured_source_files"] == []
+    assert metrics["lcov_files_without_statements"] == ["src/options.ts"]
+
+
+@pytest.mark.parametrize(
+    "counts",
+    [
+        None,  # The command wrote no counts at all.
+        INSTRUMENTED.replace("0 src/options.ts\n", ""),  # It could not count options.ts.
+        INSTRUMENTED.replace("0 src/options.ts", "3 src/options.ts"),
+    ],
+    ids=["no-record", "no-line", "statements"],
+)
+def test_omitted_lcov_files_without_a_zero_count_stay_expected(
+    tmp_path: Path, source: Path, counts: str | None
+) -> None:
+    metrics = instrumented_metrics(tmp_path, source, counts)
+    assert metrics["population_complete_for_declared_scope"] is False
+    assert metrics["unmeasured_source_files"] == ["src/options.ts"]
+    if counts is None:
+        assert "lcov_files_without_statements" not in metrics
+    else:
+        assert metrics["lcov_files_without_statements"] == []
+
+
+@pytest.mark.parametrize(
+    ("counts", "error"),
+    [
+        (INSTRUMENTED.replace("5 src/index.ts", "0 src/index.ts"), "0 for measured files"),
+        (INSTRUMENTED + "0 src/ghost.ts\n", "absent from the frozen snapshot"),
+        (INSTRUMENTED + "0 src/options.ts\n", "more than once"),
+        (INSTRUMENTED + "none src/other.ts\n", "malformed"),
+    ],
+    ids=["measured", "absent", "duplicate", "malformed"],
+)
+def test_instrumented_counts_that_disagree_with_the_snapshot_or_report_are_rejected(
+    tmp_path: Path, source: Path, counts: str, error: str
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        instrumented_metrics(tmp_path, source, counts)
+
+
 @pytest.mark.parametrize("counts", [(2, 3), (0, 0), (2, 0)])
 def test_repeated_callback_names_preserve_provable_coverage(
     tmp_path: Path, source: Path, counts: tuple[int, int]

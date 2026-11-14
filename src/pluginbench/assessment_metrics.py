@@ -461,6 +461,29 @@ def _go_build_scope(
     }
 
 
+def _lcov_instrumented_scope(
+    report: dict[str, object], expected: set[str], measured: set[str]
+) -> tuple[set[str], dict[str, object]]:
+    """Drop from an LCOV report's expected files those its instrumenter found nothing in.
+
+    Reports without an `lcov_instrumented` record keep every scoped source file expected.
+    """
+    if "lcov_instrumented" not in report:
+        return expected, {}
+    record = _object(report["lcov_instrumented"], "lcov_instrumented")
+    if report.get("format") != "lcov" or set(record) != {
+        "instrumented_sha256",
+        "files_without_statements",
+    }:
+        raise ValueError("lcov_instrumented requires an LCOV report and its two fields")
+    empty = set(
+        _strings(record["files_without_statements"], "lcov_instrumented.files_without_statements")
+    )
+    if not empty <= expected - measured:
+        raise ValueError("LCOV files without statements must be scoped and absent from the report")
+    return expected - empty, {"lcov_files_without_statements": sorted(empty)}
+
+
 def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> dict[str, object]:
     test_scope = (
         [name.removeprefix("./") for name in _strings(report["test_scope"], "test scope")]
@@ -486,6 +509,7 @@ def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> d
     for path in measured:
         _source_path(path, files, scope)
     expected, go_build = _go_build_scope(report, coverage_sources(files, scope), measured)
+    expected, instrumented = _lcov_instrumented_scope(report, expected, measured)
     units: dict[str, object] = {}
     for kind, singular in (
         ("lines", "line"),
@@ -582,6 +606,7 @@ def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> d
         "selection_policy": report.get("selection_policy"),
         **({"clock": report["clock"]} if "clock" in report else {}),
         **go_build,
+        **instrumented,
     }
 
 

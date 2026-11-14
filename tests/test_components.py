@@ -66,10 +66,12 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         {
             # Optional Go `go list` and `go tool cover` sidecars narrow completeness to
             # compiled files with blocks, and a zero-width Go block with no statements parses
-            # instead of aborting. A profile that writes no sidecar and was not refused parses
-            # as before, so this stays v1.
+            # instead of aborting. An optional LCOV instrumented-counts sidecar likewise lets
+            # files Jest's istanbul found nothing in, such as TypeScript type modules, leave
+            # completeness. A profile that writes no sidecar and was not refused parses as
+            # before, so this stays v1.
             "coverage_report.py": (
-                "8d6bb2cb04dfde6f4a4711150837c89ae6cb70698c7381f62c3402e5f2492a94"
+                "6814b1a5ca50e5d635f41ec8eff4e3db25a397e3586685d36442c6142d42f46a"
             ),
         },
     ),

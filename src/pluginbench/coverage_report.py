@@ -221,6 +221,14 @@ def parse_lcov(
         result[kind] = _population(total, covered, [record.path for record in measured], kind)
     if not any(kind in result for kind in ("lines", "branches", "functions")):
         raise CoveragePopulationUnavailable("LCOV contains no explicit coverage populations")
+    counts = report.with_name(report.name + ".instrumented.txt")
+    if counts.is_file():
+        result["lcov_instrumented"] = _lcov_instrumented(
+            counts,
+            files=set(inventory),
+            measured={record.path for record in records},
+            source_scope=source_scope,
+        )
     per_test = _lcov_per_test(
         report.with_name(report.name + ".per-test.json"),
         records=records,
@@ -231,6 +239,27 @@ def parse_lcov(
     if per_test:
         result["per_test_numbits"] = per_test
     return result
+
+
+def _lcov_instrumented(
+    path: Path, *, files: set[str], measured: set[str], source_scope: list[str]
+) -> dict[str, object]:
+    """Name the scoped files the report omits because their instrumenter found nothing in them.
+
+    Jest drops a file from its report when istanbul maps no statement, function or branch to it,
+    as for a module of TypeScript types. A file the sidecar gives no count stays expected.
+    """
+    counts = _declared_counts(path, files, "instrumented counts")
+    if declared_empty := sorted(file for file in measured if counts.get(file) == 0):
+        raise ValueError(f"instrumented counts are 0 for measured files: {declared_empty}")
+    return {
+        "instrumented_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "files_without_statements": sorted(
+            file
+            for file in coverage_sources(files, source_scope) - measured
+            if counts.get(file) == 0
+        ),
+    }
 
 
 def _lcov_per_test(
@@ -533,10 +562,10 @@ def _go_source(
     return _source_path(path, files, source_scope, workdir)
 
 
-def _go_cover_blocks(path: Path, files: set[str]) -> dict[str, int]:
-    """Read the block count `go tool cover` declared for each file, one `<count> <path>` line each.
+def _declared_counts(path: Path, files: set[str], label: str) -> dict[str, int]:
+    """Read the count a coverage toolchain declared for each file, one `<count> <path>` line each.
 
-    The count is the `N` of `Count [N]uint32` in the file's instrumented source, so 0 means the
+    The count is what the toolchain's instrumenter found to measure in the file, so 0 means the
     toolchain itself found nothing to measure. A file without a line has no declared count.
     """
     counts: dict[str, int] = {}
@@ -548,12 +577,12 @@ def _go_cover_blocks(path: Path, files: set[str]) -> dict[str, int]:
     for line in lines:
         match = re.fullmatch(r"(0|[1-9][0-9]*) (\S.*)", line)
         if match is None:
-            raise ValueError(f"go cover blocks line is malformed: {line!r}")
+            raise ValueError(f"{label} line is malformed: {line!r}")
         count, file = int(match.group(1)), match.group(2)
         if file not in files:
-            raise ValueError(f"go cover blocks file is absent from the frozen snapshot: {file}")
+            raise ValueError(f"{label} file is absent from the frozen snapshot: {file}")
         if file in counts:
-            raise ValueError(f"go cover blocks lists a file more than once: {file}")
+            raise ValueError(f"{label} lists a file more than once: {file}")
         counts[file] = count
     return counts
 
@@ -666,7 +695,8 @@ def _go_build(
             return f"in nested module {module}, which go list did not list"
         return "in no package that go list -deps -test listed"
 
-    counts = _go_cover_blocks(blocks, files) if blocks.is_file() else {}
+    # The block count is the `N` of `Count [N]uint32` in the file `go tool cover` instruments.
+    counts = _declared_counts(blocks, files, "go cover blocks") if blocks.is_file() else {}
     if declared_empty := sorted(path for path in measured if counts.get(path) == 0):
         raise ValueError(f"go cover declared no blocks for measured files: {declared_empty}")
     in_scope = compiled & expected
