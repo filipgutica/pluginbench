@@ -1548,12 +1548,16 @@ def _measure_split(
 
 
 def _resumed_plan(
-    root: Path, selection: dict[str, object], measurements: list[str], revision: str
+    root: Path,
+    selection: dict[str, object],
+    measurements: list[str],
+    revision: str,
+    tasks: list[str] | None,
 ) -> dict[str, object] | None:
     """The saved plan of `revision` when this request resumes it, else None.
 
     A revision resumes when `measure` saved its plan and it was never selected; the request
-    must ask for the same measures.
+    must ask for the same measures and task selection.
     """
     path = root / "measure" / revision / "plan.json"
     history = TypeAdapter(list[dict[str, str]]).validate_python(
@@ -1572,6 +1576,11 @@ def _resumed_plan(
             f"{','.join(TypeAdapter(list[str]).validate_python(plan['measurements']))}; resume "
             "it with those --measurements, or choose a new --revision name"
         )
+    if plan.get("task_ids") != tasks:
+        raise ValueError(
+            f"measurement revision {revision} stopped with a different task selection; resume "
+            "it with the same --tasks, or choose a new --revision name"
+        )
     if plan["selected_revision"] != selection["measurement_revision"]:
         raise ValueError(
             f"the run's selected measurement revision changed since {revision} started; choose "
@@ -1586,6 +1595,7 @@ def _measure_inputs(
     measurements: list[str],
     revision: str,
     coverage_profiles: Path | None,
+    tasks: list[str] | None,
 ) -> tuple[MeasurementSettings, dict[str, object] | None]:
     """Refuse what `measure` cannot add; return the settings it measures with.
 
@@ -1601,11 +1611,19 @@ def _measure_inputs(
         raise ValueError(f"this run has not finished; finish it with `pluginbench run {root}`")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", revision):
         raise ValueError("--revision must be one name of letters, digits, '.', '_' and '-'")
+    if tasks is not None:
+        if measurements != ["mutation"]:
+            raise ValueError("--tasks is only supported with --measurements mutation")
+        if not tasks or len(set(tasks)) != len(tasks):
+            raise ValueError("give each task to measure once")
+        catalog = TaskCatalog.model_validate_json((root / "evidence/frozen/tasks.json").read_text())
+        if unknown := sorted(set(tasks) - {entry.id for entry in catalog.tasks}):
+            raise ValueError(f"unknown task ids: {', '.join(unknown)}")
     resumed = None
     if (root / "evidence/observer-revisions" / revision).exists() or (
         root / "measure" / revision
     ).exists():
-        resumed = _resumed_plan(root, selection, measurements, revision)
+        resumed = _resumed_plan(root, selection, measurements, revision, tasks)
         if resumed is None:
             raise ValueError(
                 f"measurement revision {revision} already exists; choose a new --revision name"
@@ -1663,12 +1681,17 @@ def _resumed_settings(
 
 
 def plan_measure(
-    root: Path, measurements: list[str], revision: str, coverage_profiles: Path | None = None
+    root: Path,
+    measurements: list[str],
+    revision: str,
+    coverage_profiles: Path | None = None,
+    *,
+    tasks: list[str] | None = None,
 ) -> dict[str, object]:
     """Check that a finished run can gain `measurements` as measurement revision `revision`."""
     root = root.expanduser().resolve()
     selection = _load_selection(root)
-    _, resumed = _measure_inputs(root, selection, measurements, revision, coverage_profiles)
+    _, resumed = _measure_inputs(root, selection, measurements, revision, coverage_profiles, tasks)
     collected, carried = (
         _measure_split(selection, measurements)
         if resumed is None
@@ -1682,7 +1705,10 @@ def plan_measure(
         "collected": collected,
         "carried": carried,
         "resume": resumed is not None,
-        "tasks": len(catalog.tasks),
+        "tasks": len(tasks) if tasks is not None else len(catalog.tasks),
+        "excluded_tasks": [
+            entry.id for entry in catalog.tasks if tasks is not None and entry.id not in tasks
+        ],
     }
 
 
@@ -1692,6 +1718,7 @@ def measure_evaluation(
     revision: str,
     *,
     coverage_profiles: Path | None = None,
+    tasks: list[str] | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> str:
     """Add `measurements` to a finished run as measurement revision `revision`, then select it.
@@ -1707,17 +1734,23 @@ def measure_evaluation(
     """
     root = root.expanduser().resolve()
     selection = _load_selection(root)
-    settings, plan = _measure_inputs(root, selection, measurements, revision, coverage_profiles)
+    settings, plan = _measure_inputs(
+        root, selection, measurements, revision, coverage_profiles, tasks
+    )
     evidence = root / "evidence"
     directory = evidence / "observer-revisions" / revision
     if plan is None:
         plan, profiles = _prepare_measure(
-            root, selection, measurements, revision, settings, progress
+            root, selection, measurements, revision, settings, progress, tasks
         )
         for row in TypeAdapter(list[dict[str, object]]).validate_python(plan["skipped"]):
             if progress:
+                state = (
+                    "left out by --tasks"
+                    if tasks is not None and row["task"] not in tasks else "broken"
+                )
                 progress(
-                    f"Warning: {row['task']}: {row['measure']} is broken, so it is not measured"
+                    f"Warning: {row['task']}: {row['measure']} is {state}, so it is not measured"
                 )
         propose_remeasurement(
             evidence,
@@ -1783,6 +1816,7 @@ def _prepare_measure(
     revision: str,
     settings: MeasurementSettings,
     progress: Callable[[str], None] | None,
+    tasks: list[str] | None,
 ) -> tuple[dict[str, object], dict[str, list[Collector]]]:
     """Prepare and probe the profiles of a new revision, and save its plan for a resume."""
     evidence = root / "evidence"
@@ -1794,7 +1828,22 @@ def _prepare_measure(
     catalog = TaskCatalog.model_validate_json((evidence / "frozen/tasks.json").read_text())
     profiles: dict[str, list[Collector]] = {}
     rows: dict[str, dict[str, dict[str, object]]] = {}
+    omitted: list[dict[str, object]] = []
     for entry in catalog.tasks:
+        if tasks is not None and entry.id not in tasks:
+            reason = f"measurement revision {revision} left task {entry.id} out (--tasks)"
+            # No profile or readiness probe: leaving a task out must save its suite compute.
+            profiles[entry.id] = []
+            rows[entry.id] = {
+                "mutation": {
+                    "state": "not_configured",
+                    "status": "unavailable",
+                    "reason": reason,
+                    "excluded_by_revision": revision,
+                }
+            }
+            omitted.append({"task": entry.id, "measure": "mutation", "reason": reason})
+            continue
         if progress:
             progress(f"Preparing measurement profiles for {entry.id}")
         # This run's frozen copies: saved identities name the paths of the run that coded them.
@@ -1834,12 +1883,14 @@ def _prepare_measure(
             name: {"state": row["state"], "reason": row.get("reason")} for name, row in by.items()
         }
         for task, by in rows.items()
+        if tasks is None or task in tasks
     }
     if findings := blocking_findings(matrix, require_ready=settings.require_ready):
         raise ValueError("cannot add these measurements: " + "; ".join(findings))
     current = _selected_revision(selection, "measurement_revision")
     plan: dict[str, object] = {
         "measurements": measurements,
+        "task_ids": tasks,
         "collected": collected,
         "carried": carried,
         "carried_from": current if carried else None,
@@ -1848,7 +1899,7 @@ def _prepare_measure(
         ),
         "selected_revision": current,
         "rows": rows,
-        "skipped": [] if settings.require_ready else not_measured(matrix),
+        "skipped": [*omitted, *([] if settings.require_ready else not_measured(matrix))],
         "coverage_profiles": settings.model_dump(mode="json")["coverage_profiles"],
     }
     _write(work / "plan.json", plan)

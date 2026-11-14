@@ -2698,10 +2698,79 @@ def _suite(
     return native
 
 
-def _measure_mutation(root: Path) -> Any:
+def _measure_mutation(root: Path, *options: str) -> Any:
     return CliRunner().invoke(
-        cli.app, ["measure", str(root), "--measurements", "mutation", "--revision", "m1", "--yes"]
+        cli.app,
+        ["measure", str(root), "--measurements", "mutation", "--revision", "m1", "--yes", *options],
     )
+
+
+def test_measure_limits_mutation_to_saved_tasks(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    included = config.tasks.ids[0]
+    excluded = "left-out-task"
+    task = config.tasks.resolve() / excluded
+    shutil.copytree(config.tasks.resolve() / included, task)
+    toml = task / "task.toml"
+    toml.write_text(toml.read_text().replace("[agent]", "[metadata]\nlanguage='python'\n[agent]"))
+    config.tasks.ids.append(excluded)
+    config.measurement_settings.require_ready = True
+    root, _, _ = _mutation_run(config, tmp_path, monkeypatch)
+    coverage = _observations(root, {"coverage"})
+    suites: list[tuple[str, int, str]] = []
+    native = _suite(suites)
+    catalog = json.loads((root / "evidence/frozen/tasks.json").read_text())
+    frozen_task = root / "evidence/frozen" / next(
+        entry["native_task"] for entry in catalog["tasks"] if entry["id"] == included
+    )
+
+    def selected_suite(**kwargs: Any) -> dict[str, object]:
+        assert Path(kwargs["task_identity"]["task_dir"]) == frozen_task
+        return native(**kwargs)
+
+    monkeypatch.setattr(harbor_backend, "run_native_command", selected_suite)
+    for names, tasks, message in (
+        ("iterations", included, "--tasks is only supported with --measurements mutation"),
+        ("mutation,iterations", included, "--tasks is only supported"),
+        ("mutation", "unknown-task", "unknown task ids: unknown-task"),
+        ("mutation", " , ", "give each task to measure once"),
+    ):
+        refused = _measure_mutation(root, "--measurements", names, "--tasks", tasks)
+        assert refused.exit_code == 2 and message in refused.stderr
+    assert not suites and not (root / "measure/m1").exists()
+
+    # Stop once after the plan is saved, so the same test also checks resume's task binding.
+    monkeypatch.setattr(
+        harbor_backend, "run_native_command",
+        _suite([], lambda source, destination: ValueError("Frozen measurement input changed")),
+    )
+    stopped = _measure_mutation(root, "--tasks", included)
+    assert stopped.exit_code == 2 and "input changed" in stopped.stderr
+    for options in (("--tasks", excluded), ()):
+        refused = _measure_mutation(root, *options)
+        assert refused.exit_code == 2 and "same --tasks" in refused.stderr
+    monkeypatch.setattr(harbor_backend, "run_native_command", selected_suite)
+
+    result = _measure_mutation(root, "--tasks", included)
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert f"measures tasks: {included}; leaves out: {excluded}" in result.stdout
+    assert suites and not (root / "measure/m1" / excluded).exists()
+    plan = json.loads((root / "measure/m1/plan.json").read_text())
+    assert plan["task_ids"] == [included]
+    rows = _observations(root, {"mutation"})
+    omitted = [row for row in rows if row["task"] == excluded]
+    assert omitted and {(row["status"], row["value"]) for row in omitted} == {
+        ("unavailable", None)
+    }
+    assert all("revision m1 left task left-out-task out" in str(row["reason"]) for row in omitted)
+    assert any(row["status"] == "measured" for row in rows if row["task"] == included)
+    assert _observations(root, {"coverage"}) == coverage
+    report = json.loads((root / "report/results.json").read_text())
+    rates = [row for row in report["aggregates"] if row["metric"] == "Mutation bug-catch rate %"]
+    assert rates and all(row["assigned_tasks"] == row["measured_tasks"] == 1 for row in rates)
+    assert all(row["comparison_status"] == "complete" for row in rates)
 
 
 def test_measure_adds_mutation_alone_and_carries_coverage_forward(

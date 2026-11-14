@@ -711,6 +711,9 @@ def measure(
         "--coverage-profiles",
         help="A YAML coverage_profiles mapping to add to the run's settings, with coverage.",
     ),
+    tasks: str | None = typer.Option(
+        None, "--tasks", help="Comma-separated task ids to measure; only with mutation alone."
+    ),
     yes: bool = typer.Option(False, "--yes", help="Start without confirmation."),
 ) -> None:
     """Add measures to a finished run from its saved submissions, with no model calls.
@@ -720,25 +723,44 @@ def measure(
     it keeps every submission already measured and measures only the rest.
     """
     names = [name.strip() for name in measurements.split(",") if name.strip()]
+    task_ids = (
+        sorted(task.strip() for task in tasks.split(",") if task.strip())
+        if tasks is not None else None
+    )
     try:
         with run_lock.hold(run):
-            plan = plan_measure(run, names, revision, coverage_profiles)
+            plan = plan_measure(run, names, revision, coverage_profiles, tasks=task_ids)
             collected, carried = plan["collected"], plan["carried"]
             assert isinstance(collected, list) and isinstance(carried, list)
             carries = f"; carries {', '.join(carried)} forward unchanged" if carried else ""
+            scope = ""
+            if task_ids is not None:
+                excluded = plan["excluded_tasks"]
+                assert isinstance(excluded, list)
+                scope = (
+                    f"; measures tasks: {', '.join(task_ids)}; leaves out: "
+                    f"{', '.join(excluded) or 'none'}"
+                )
             typer.echo(
                 f"{'Resumes' if plan['resume'] else 'Adds'} {', '.join(names)} on "
                 f"{plan['tasks']} tasks as measurement revision {revision}, collecting "
-                f"{', '.join(collected)} from saved submissions{carries}. 0 model calls."
+                f"{', '.join(collected)} from saved submissions{carries}{scope}. 0 model calls."
             )
             if not yes and not _confirm("Start measurement?"):
                 raise typer.Exit()
-            _measure(run, names, revision, coverage_profiles)
+            _measure(run, names, revision, coverage_profiles, tasks=task_ids)
     except (OSError, ValueError, yaml.YAMLError, subprocess.SubprocessError) as exc:
         _error(exc)
 
 
-def _measure(run: Path, names: list[str], revision: str, coverage_profiles: Path | None) -> None:
+def _measure(
+    run: Path,
+    names: list[str],
+    revision: str,
+    coverage_profiles: Path | None,
+    *,
+    tasks: list[str] | None = None,
+) -> None:
     """Run a planned measurement while this process owns the run, recording it in events.jsonl."""
     with _events(run) as event:
         event("started", command="measure", pid=os.getpid(), revision=revision)
@@ -749,7 +771,8 @@ def _measure(run: Path, names: list[str], revision: str, coverage_profiles: Path
 
         try:
             measure_evaluation(
-                run, names, revision, coverage_profiles=coverage_profiles, progress=logged
+                run, names, revision, coverage_profiles=coverage_profiles, tasks=tasks,
+                progress=logged,
             )
         except BaseException as exc:
             _ended(event, exc)

@@ -388,6 +388,13 @@ def _comparison_rows(data: dict[str, object]) -> list[dict[str, object]]:
 
 def _aggregate_groups(data: dict[str, object]) -> list[tuple[str, str | None, list[str]]]:
     tasks = sorted({str(row["task"]) for row in _rows(data["attempts"])})
+    capabilities = _map(data.get("measurement_capabilities"))
+    # Explicit revision omissions stay visible as unavailable rows, but are not dropouts
+    # from mutation's chosen population. Other missing values still count as before.
+    mutation_tasks = [
+        task for task in tasks
+        if not _map(_map(capabilities.get(task)).get("mutation")).get("excluded_by_revision")
+    ]
     observations = _rows(data["observations"])
     groups: dict[tuple[str, str | None], set[str]] = {}
     task_analyzers: dict[tuple[str, str], set[str]] = {}
@@ -442,7 +449,12 @@ def _aggregate_groups(data: dict[str, object]) -> list[tuple[str, str | None, li
         )
         groups.setdefault((metric, group), set()).add(task)
     return [
-        (metric, group, sorted(members) if group else tasks)
+        (
+            metric, group,
+            sorted(members) if group
+            else mutation_tasks if metric in MEASUREMENT_METRICS["mutation"]
+            else tasks,
+        )
         for (metric, group), members in sorted(groups.items(), key=str)
     ]
 
