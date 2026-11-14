@@ -627,3 +627,132 @@ def test_older_harbor_trial_directory_is_read(tmp_path: Path) -> None:
     result = measure_attempt(tmp_path, claude=False)
     assert result["status"] == "complete", result
     assert result["verification_commands"] == 1
+
+
+@pytest.mark.parametrize("command", [
+    "env -u EXAMPLE pytest",
+    "env --unset EXAMPLE pytest",
+    "env --unset=EXAMPLE -i X=y pytest",
+    "env -C /app -- pytest",
+    "npm exec --workspace example -- jest",
+    "npm exec --workspace=example -- vitest run",
+    "npm exec --yes --package jest -- jest",
+    "npm exec --prefix /app -- jest",
+    "npm exec --userconfig /tmp/npmrc -- jest",
+    "npm exec -- jest",
+    "npm exec jest",
+    "npm exec jest -- --runInBand",
+    "npm exec -w example jest",
+    "python -m ruff check .",
+    "python3 -m ruff check .",
+    "yarn jest",
+    "yarn mocha",
+    "yarn tsc --noEmit",
+    "yarn ruff check .",
+    "node_modules/.bin/jest",
+    "./node_modules/.bin/mocha",
+    "/app/node_modules/.bin/vitest run",
+    "./node_modules/.bin/eslint src",
+    "env -u EXAMPLE npm exec --workspace example -- ./node_modules/.bin/jest",
+])
+def test_amended_verification_prefixes(command: str) -> None:
+    assert verification_command(command)
+    assert not verification_command("python -m ruff format .")
+    assert not verification_command("env -u pytest echo ok")
+    assert not verification_command("npm exec --workspace jest -- echo ok")
+    assert not verification_command("yarn serve")
+    assert not verification_command("./tools/check.py")
+
+
+@pytest.mark.parametrize(("command", "is_masked"), [
+    ("pytest\necho done", True),
+    ("pytest\n# comment\n\necho done", True),
+    ("bash -lc 'pytest\necho done'", True),
+    ("pytest & echo done", True),
+    ("pytest &", True),
+    ("set -o pipefail; pytest; echo done", True),
+    ("set -o pipefail; pytest\necho done", True),
+    ("set -o pipefail; pytest || true", True),
+    ("pytest || true 2>/dev/null", True),
+    ("pytest | tee log; set -o pipefail", True),
+    ("echo pipefail; pytest | tee log", True),
+    ("set -o pipefail; set +o pipefail; pytest | tee log", True),
+    ("echo setup; pytest", False),
+    ("cat file | pytest", False),
+])
+def test_amended_masking_tracks_verification_segments(command: str, is_masked: bool) -> None:
+    assert masked(command) is is_masked
+    assert not masked("pytest\n# trailing comment\n")
+    assert not masked("pytest > /tmp/log 2>&1")
+    assert not masked("pytest &> /tmp/log")
+    assert not masked("pytest >& /tmp/log")
+    assert not masked("pytest &&\nruff check .")
+    assert not masked("bash -lc 'pytest' && echo done")
+
+
+@pytest.mark.parametrize("output", [
+    "Test worker: context canceled",
+    "Test worker: access denied",
+    "Test worker: operation aborted",
+])
+def test_claude_program_error_text_is_not_a_harness_refusal(tmp_path: Path, output: str) -> None:
+    _write(tmp_path / "stdout.jsonl", _tool(
+        "a", "Bash", {"command": "pytest"}, error=True, output=output,
+    ))
+    result = measure_attempt(tmp_path, claude=True)
+    assert result["verification_commands"] == result["unknown_exit_commands"] == 1
+    assert result["known_failed_verification_commands"] == 0
+
+
+@pytest.mark.parametrize("error", [True, False])
+def test_claude_started_interruption_counts_with_unknown_outcome(tmp_path: Path, error: bool) -> None:
+    events = [
+        *_tool("a", "Bash", {"command": "pytest"}),
+        *_tool("b", "Edit", {"file_path": "src/a.py"}),
+        *_tool("c", "Bash", {"command": "pytest"}, error=error, output="Interrupted"),
+    ]
+    events[-1]["toolUseResult"] = {"interrupted": True}
+    _write(tmp_path / "stdout.jsonl", events)
+    result = measure_attempt(tmp_path, claude=True)
+    assert result["verification_commands"] == 2
+    assert result["iterations"] == result["unknown_exit_commands"] == 1
+    assert result["known_failed_verification_commands"] == 0
+    assert result["failed_verification_commands"] is None
+
+
+@pytest.mark.parametrize("status", ["interrupted", "cancelled", "canceled", "aborted"])
+def test_codex_started_interruption_counts_with_unknown_outcome(tmp_path: Path, status: str) -> None:
+    _write(tmp_path / "stdout.jsonl", [
+        {"type": "item.started", "item": {
+            "id": "a", "type": "command_execution", "command": "pytest",
+        }},
+        {"type": "item.completed", "item": {
+            "id": "a", "type": "command_execution", "command": "pytest",
+            "status": status, "exit_code": 130,
+        }},
+    ])
+    result = measure_attempt(tmp_path, claude=False)
+    assert result["verification_commands"] == result["unknown_exit_commands"] == 1
+    assert result["known_failed_verification_commands"] == 0
+
+
+@pytest.mark.parametrize("claude", [True, False])
+def test_workspace_ancestor_test_directory_does_not_classify_docs_as_an_edit(
+    tmp_path: Path, claude: bool,
+) -> None:
+    workspace = "/tests/workspace"
+    events: list[dict[str, object]] = (
+        [{"type": "system", "cwd": workspace},
+         *_tool("a", "Bash", {"command": "pytest"}),
+         *_tool("b", "Edit", {"file_path": workspace + "/README.md"}),
+         *_tool("c", "Bash", {"command": "pytest"})]
+        if claude else
+        [{"type": "session_meta", "payload": {"id": "root", "cwd": workspace}},
+         *_command("a", "pytest"), *_patch("b", workspace + "/README.md"),
+         *_command("c", "pytest")]
+    )
+    _write(tmp_path / "harbor/trial/agent/sessions/root.jsonl", events)
+    result = measure_attempt(tmp_path, claude=claude)
+    assert result["status"] == "complete", result
+    assert result["verification_commands"] == 2
+    assert result["iterations"] == 0

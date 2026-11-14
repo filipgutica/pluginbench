@@ -32,8 +32,9 @@ _SHELL_PART = re.compile(
     r"'[^']*'|\"(?:\\[\s\S]|[^\"\\])*\"|\\[\s\S]"
     r"|(?P<comment>(?<!\S)\#[^\n]*)"
     r"|\$\(\(.*?\)\)|<<<"
+    r"|[<>]&[0-9-]*|&>>?"
     r"|(?P<heredoc><<-?)[ \t]*(?P<delimiter>'[^']*'|\"[^\"]*\"|[^\s;&|<>]+)"
-    r"|(?P<operator>&&|\|\||[;|\n(){}])|.",
+    r"|(?P<operator>&&|\|\||[;&|\n(){}])|.",
     re.S,
 )
 
@@ -85,23 +86,44 @@ def _tokens(command: str) -> list[list[str] | str]:
     if delimiters:
         raise ValueError("unterminated shell here-document")
     if raw:
-        # A synthetic separator flushes the final segment through the same wrapper logic.
-        segments.extend(_tokens("".join(raw) + "\n"))
+        # Flush through the wrapper logic, then discard the synthetic newline so it cannot mask.
+        segments.extend(_tokens("".join(raw) + "\n")[:-1])
     return segments
 
 
 def _front(words: list[str]) -> list[str]:
     while words:
         if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", words[0]) or words[0] in {
-            "env",
             "time",
             "npx",
             "if", "then", "elif", "else", "while", "until", "do", "!", "(", "{",
         }:
             words = words[1:]
+        elif words[0] == "env":
+            words = words[1:]
+            while words and words[0].startswith("-"):
+                option = words[0]
+                words = words[2:] if option in {"-u", "--unset", "-C", "--chdir"} else words[1:]
+                if option == "--":
+                    break
+        elif words[:2] == ["npm", "exec"]:
+            words = words[2:]
+            if words and words[0].startswith("-") and "--" in words:
+                words = words[words.index("--") + 1:]
+                continue
+            while words and words[0].startswith("-"):
+                words = words[2:] if words[0] in {
+                    "-w", "--workspace", "-p", "--package", "-c", "--call",
+                } else words[1:]
         elif words[0] == "timeout" and len(words) >= 2:
             words = words[2:]
         elif words[:2] in (["uv", "run"], ["poetry", "run"], ["pnpm", "exec"], ["yarn", "exec"]):
+            words = words[2:]
+        elif (
+            words[0] in {"python", "python3"} and words[1:2] == ["-m"]
+            and words[2:3] != ["unittest"]
+        ):
+            # The frozen list includes unittest only in its Python module form.
             words = words[2:]
         else:
             break
@@ -112,15 +134,17 @@ def _matches(words: list[str]) -> bool:
     words = _front(words)
     if not words:
         return False
-    first = words[0]
+    first = Path(words[0]).name
     if first in {"pytest", "py.test", "mypy", "jest", "mocha", "vitest", "tsc", "eslint"}:
         return True
     if first == "go" and len(words) > 1 and words[1] in {"test", "build", "vet"}:
         return True
-    if words[:2] == ["ruff", "check"]:
+    if first == "ruff" and words[1:2] == ["check"]:
         return True
-    if first in {"python", "python3"} and len(words) > 2:
-        return words[1] == "-m" and words[2] in {"pytest", "unittest", "mypy"}
+    if first in {"python", "python3"} and words[1:3] == ["-m", "unittest"]:
+        return True
+    if first == "yarn" and _matches(words[1:]):
+        return True
     if first in {"npm", "pnpm", "yarn"} and len(words) > 1:
         if words[1] == "test":
             return True
@@ -174,13 +198,27 @@ def verification_command(command: str) -> bool:
 
 def masked(command: str) -> bool:
     tokens = _tokens(command)
-    if any(isinstance(token, list) and "pipefail" in token for token in tokens):
-        return False
-    return any(
-        token in ("|", ";")
-        or (token == "||" and index + 1 < len(tokens) and tokens[index + 1] == ["true"])
-        for index, token in enumerate(tokens)
-    )
+    pipefail = False
+    for index, token in enumerate(tokens):
+        if not isinstance(token, list):
+            continue
+        if token[:3] == ["set", "-o", "pipefail"]:
+            pipefail = True
+        elif token[:3] == ["set", "+o", "pipefail"]:
+            pipefail = False
+        if not _matches(token):
+            continue
+        following = tokens[index + 1:]
+        separator = following[0] if following else None
+        later_commands = [part for part in following if isinstance(part, list) and part]
+        if (
+            (separator == "|" and not pipefail)
+            or separator in (";", "&")
+            or (separator == "\n" and later_commands)
+            or (separator == "||" and later_commands and later_commands[0][:1] == ["true"])
+        ):
+            return True
+    return False
 
 
 @dataclass
@@ -212,9 +250,10 @@ def _edit(path: object, workspace: Path) -> bool:
     if not isinstance(path, str) or not path:
         raise ValueError("edit has no file path")
     absolute = Path(posixpath.normpath(workspace / path))
-    return absolute.is_relative_to(workspace) and (
-        _is_test_path(path) or _is_source_path(path)
-    )
+    if not absolute.is_relative_to(workspace):
+        return False
+    relative = absolute.relative_to(workspace).as_posix()
+    return _is_test_path(relative) or _is_source_path(relative)
 
 
 def _claude_calls(events: list[dict[str, object]]) -> dict[str, dict[str, object]]:
@@ -315,17 +354,20 @@ def _claude(
                     text = "\n".join(str(_object(part).get("text", "")) for part in text)
                 if not isinstance(text, str):
                     raise ValueError("invalid Claude tool result content")
+                result = event.get("toolUseResult")
+                interrupted = isinstance(result, dict) and result.get("interrupted") is True
                 action.failed = False
                 if is_error:
                     action.failed = True if text.lstrip().startswith("Exit code") else None
                     action.edit = False
-                    if action.failed is None and re.search(
-                        r"(?i)\b(?:denied|cancelled|canceled|interrupted|aborted|rejected)\b", text
+                    if action.failed is None and not interrupted and re.search(
+                        r"(?i)^(?:Error: )?(?:Permission denied|Cancelled|Canceled|"
+                        r"Aborted|User rejected|Command rejected|Tool execution denied)", text
                     ):
                         action.command = None  # Denied/cancelled: never executed.
-                result = event.get("toolUseResult")
-                if isinstance(result, dict) and result.get("interrupted") is True:
-                    action.command = None
+                if interrupted:
+                    # This result describes a command that ran, not a refusal to start.
+                    action.failed = None
             elif kind not in {"text", "thinking", "redacted_thinking", "image", "document"}:
                 raise ValueError(f"unsupported Claude content block: {kind}")
     for identity in calls.keys() - results.keys():
@@ -462,6 +504,7 @@ def _codex(events: list[dict[str, object]], workspace: Path = Path("/app")) -> l
                 if not isinstance(command, str):
                     raise ValueError("Codex command item has no command")
                 stream_action = stream_commands.get(str(identity)) if identity is not None else None
+                started = stream_action is not None
                 if stream_action is None:
                     stream_action = Action(command=command)
                     actions.append(stream_action)
@@ -471,7 +514,12 @@ def _codex(events: list[dict[str, object]], workspace: Path = Path("/app")) -> l
                     raise ValueError("Codex command changed between start and completion")
                 if event["type"] == "item.completed":
                     stream_action.failed = _exit(item)
-                    if item.get("status") in {
+                    status = item.get("status")
+                    if status == "interrupted" or (
+                        started and status in {"cancelled", "canceled", "aborted"}
+                    ):
+                        stream_action.failed = None
+                    elif status in {
                         "declined", "denied", "rejected", "cancelled", "canceled", "aborted",
                     }:
                         stream_action.command = None
