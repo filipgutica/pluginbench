@@ -347,6 +347,8 @@ find src -name '*.ts' ! -name '*.d.ts' | sort | node /tmp/pluginbench-jest-instr
 exit $status
 ```
 
+`readConfig` here reads the default Jest config from the working directory. If the test command passes `--config`, `--rootDir` or uses projects, pass the same config to `readConfig` so the count uses the same transform as the run.
+
 Coverage.py can trace lines outside its executable-statement population. A trusted reporting command can add `statement_lines` from `Coverage.analysis2` to every file, with `meta.statement_lines_source: coverage.Coverage.analysis2`. Use the same reporting configuration, retain the original JSON, and keep strict covered/missing and summary checks; without statement coordinates, an inconsistent report remains unavailable.
 
 A coverage profile's `source_scope` declares its measured package independently of repository-wide LOC and analysis.
