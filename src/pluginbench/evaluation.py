@@ -1070,6 +1070,12 @@ def _code(
 
 def _saved_evaluation(selection: dict[str, object]) -> Evaluation:
     normalized = _object(study.normalize_legacy_guidance(selection))
+    # Only `measure` adds mutation. Keep it in the saved selection, outside the run config.
+    normalized["measurements"] = [
+        name
+        for name in TypeAdapter(list[str]).validate_python(normalized["measurements"])
+        if name != "mutation"
+    ]
     return Evaluation.model_validate(
         {key: normalized[key] for key in Evaluation.model_fields if key in normalized}
     )
