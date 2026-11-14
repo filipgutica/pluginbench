@@ -62,7 +62,11 @@ MEASUREMENT_METRICS = {
         "Branch coverage %",
         "Function coverage %",
     ),
-    "mutation": ("Mutation bug-catch rate %", "Test-change kill share %"),
+    "mutation": (
+        "Mutation bug-catch rate %",
+        "Test-change kill share %",
+        "Decision-line execution coverage %",
+    ),
     "review": (
         "Total review findings",
         "P0 review findings",
@@ -114,6 +118,7 @@ PROVENANCE_FIELDS = (
     "tool_version",
     "method",
     "config_digest",
+    "coverage_provenance",
     "scope",
     "token_format",
     "clock",
@@ -123,6 +128,7 @@ PROVENANCE_FIELDS = (
     "test_scope",
     "covered",
     "total",
+    "not_in_population",
     "selection_policy",
     "branch_denominator_digest",
     "function_denominator_digest",
