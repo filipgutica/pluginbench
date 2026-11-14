@@ -73,7 +73,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # coverage.py 7.2.x JSON, which has no meta.format, reads as format 2. Such reports
             # were always refused, and every other report parses as before, so this stays v1.
             "coverage_report.py": (
-                "39b00c05cad9e30a9148811c8f74387752bddb8c89754365193c8be3bfd5bfc9"
+                "656ba0662d497cd43cee434167689c497cd9798de78898fdd4b4d59ea319e91c"
             ),
         },
     ),
