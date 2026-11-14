@@ -61,6 +61,7 @@ from pluginbench.remeasure import (
 )
 from pluginbench import study
 from pluginbench.study import _text_files, load_study, report_study, resume_study, run_study
+from pluginbench.source_only import attach_source_only_grades, record_source_only_grades
 from pluginbench.study_review import (
     _criteria_digest,
     _fixed_criteria,
@@ -1116,6 +1117,9 @@ def _finish_evaluation(
         selection["review_revision"] = recover_review_citations(
             evidence, str(selection["review_revision"])
         )
+    if selection.get("source_only_grades") is None:
+        # Also backfills a run finished before this grade existed, when it is run again.
+        selection["source_only_grades"] = record_source_only_grades(evidence, progress=progress)
     _save_selection(root, selection)
     regenerate_report(root)
     return root
@@ -1821,6 +1825,8 @@ def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path
         review_revision=_selected_revision(config, "review_revision"),
     )
     report = json.loads(report_path.read_text())
+    if config.get("source_only_grades") is not None:
+        attach_source_only_grades(evidence, config["source_only_grades"], report["attempts"])
     recipe = json.loads((evidence / "frozen/resolved-recipe.json").read_text())
     packages = {}
     if "treatments" in recipe:

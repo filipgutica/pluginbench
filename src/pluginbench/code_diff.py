@@ -144,7 +144,10 @@ def _file_changes(patch: str) -> tuple[FileChange, ...]:
 TEST_DIRECTORY_NAMES = frozenset(
     {"test", "tests", "testing", "spec", "specs", "__tests", "__tests__"}
 )
-TEST_FILENAME_PATTERNS = ("test_*", "*.test.*", "*.spec.*", "*_test.py", "*_test.go")
+# conftest.py is pytest infrastructure: it is collected with the tests wherever it sits.
+TEST_FILENAME_PATTERNS = (
+    "test_*", "*.test.*", "*.spec.*", "*_test.py", "*_test.go", "conftest.py"
+)
 TEST_PATH_PATTERNS = tuple(
     pattern
     for directory in sorted(TEST_DIRECTORY_NAMES)
@@ -160,6 +163,37 @@ def _is_test_path(path: str) -> bool:
     return any(part.lower() in TEST_DIRECTORY_NAMES for part in parts[:-1]) or any(
         fnmatch.fnmatchcase(name, pattern) for pattern in TEST_FILENAME_PATTERNS
     )
+
+
+def without_test_files(patch: str) -> tuple[str, list[str]]:
+    """Drop every file section of a Git patch whose path is a test path; keep the rest verbatim.
+
+    Returns the remaining patch and the sorted test paths it dropped. Sections are cut at
+    `diff --git` headers, so each kept section keeps its exact text. A rename or copy between a
+    test path and another path is refused: dropping it would change the other file too.
+    """
+    sections: list[str] = []
+    for line in patch.splitlines(keepends=True):
+        if line.startswith("diff --git ") or not sections:
+            sections.append(line)
+        else:
+            sections[-1] += line
+    kept: list[str] = []
+    removed: set[str] = set()
+    for section in sections:
+        changes = _file_changes(section) if section.startswith("diff --git ") else ()
+        paths = {path for change in changes for path in (change.old_path, change.new_path) if path}
+        tests = {path for path in paths if _is_test_path(path)}
+        if tests and tests != paths:
+            raise ValueError(
+                "a rename or copy between a test file and another file cannot be left out "
+                "without changing the other file: " + ", ".join(sorted(paths))
+            )
+        if tests:
+            removed |= tests
+        else:
+            kept.append(section)
+    return "".join(kept), sorted(removed)
 
 
 def _is_source_path(path: str) -> bool:
