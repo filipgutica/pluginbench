@@ -78,7 +78,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # Every existing field and the statements population are unchanged, and evidence
             # without `lines` reports Go line coverage unavailable, never wrong: stays v1.
             "coverage_report.py": (
-                "bf98004a5e519b836432dfcf80a619a50e436f7fec34e818bf00ed53aff41503"
+                "7915e6742224d11a7994c3bac44042581085b44928a96ea0d95a937429796bf0"
             ),
         },
     ),
