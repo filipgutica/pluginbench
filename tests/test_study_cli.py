@@ -2274,6 +2274,210 @@ def test_review_adds_a_selected_revision_with_the_frozen_reviewer(
     assert len(reviews) == reviewed + 9
 
 
+def _reviewed_as_requested(backend: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]:
+    """`backend`, with each review reporting the harness, model and effort it was asked for."""
+
+    def invoke(**kwargs: Any) -> dict[str, Any]:
+        result = backend(**kwargs)
+        if kwargs.get("output_schema") is not None:
+            harness = kwargs["entry"]["host"]
+            model, effort = kwargs["protocol"]["models"][harness], kwargs["protocol"]["reasoning"]
+            result.update(actual_primary_models=[model], runtime_effort_evidence=[effort])
+            if harness == "claude":
+                argv = ["claude", "--model", model, "--effort", effort, "--safe-mode"]
+                result["launch"] = {
+                    "harness": "claude-cli",
+                    "requested_model": model,
+                    "requested_effort": effort,
+                    "harness_version": "2.1.0",
+                    "argv": argv,
+                }
+        return result
+
+    return invoke
+
+
+def _reviewed_run(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, list[str]]:
+    """A finished run reviewed by its frozen Codex reviewer; returns it and the review log."""
+    config = _measured_and_reviewed(config, tmp_path, monkeypatch)
+    calls: list[str] = []
+    reviews: list[str] = []
+    backend = _reviewed_as_requested(
+        _coding_and_review_backend(
+            calls, reviews, timeout=config.timeout_seconds, interrupt_at=None
+        )
+    )
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    root = tmp_path / "run"
+    evaluation.run_evaluation(config, root)
+    return root, reviews
+
+
+def test_review_with_another_reviewer_records_and_reports_that_reviewer(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, reviews = _reviewed_run(config, tmp_path, monkeypatch)
+    frozen = evaluation._load_selection(root)["reviewer"]
+    monkeypatch.setenv(claude.TOKEN_ENV, "token")
+    monkeypatch.setattr(claude, "preflight", lambda: {"harness_version": "2.1.0 (Claude Code)"})
+    override = ["--reviewer-harness", "claude", "--reviewer-model", "claude-opus-5-5"]
+
+    def missing_host() -> Path:
+        raise ValueError("Codex reviews need an executable codex-code-mode-host")
+
+    # Only the frozen Codex reviewer needs this host, so the Claude override's preflight passes.
+    with monkeypatch.context() as patched:
+        patched.setattr(isolation, "codex_code_mode_host", missing_host)
+        result = CliRunner().invoke(
+            cli.app,
+            ["review", str(root), "--revision", "second", *override, "--reviewer-effort", "high"]
+            + ["--yes"],
+        )
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert "9 review calls as review revision second by claude claude-opus-5-5 (high)." in (
+        result.stdout
+    )
+    assert len(reviews) == 18
+    second = root / "evidence/review-revisions/second"
+    protocol = json.loads((second / "protocol.json").read_text())
+    assert (protocol["harness"], protocol["model"], protocol["effort"]) == (
+        "claude",
+        "claude-opus-5-5",
+        "high",
+    )
+    assert json.loads((second / "review-state.json").read_text())["status"] == "complete"
+    saved = evaluation._load_selection(root)
+    ran = {
+        "harness": "claude",
+        "model": "claude-opus-5-5",
+        "reasoning": "high",
+        "harness_version": "2.1.0",
+    }
+    assert saved["reviewer"] == frozen
+    assert saved["review_revision"] == "second"
+    assert saved["reviewer_overrides"] == {"second": ran}
+    data = json.loads((root / "report/results.json").read_text())
+    assert {key: data["reviewer"][key] for key in ran} == ran
+    # Compare reads the reviewer from here, so it must not pool these findings with the frozen one's.
+    identity = data["comparison_identity"]["reviewer"]
+    assert {key: identity[key] for key in ("harness", "model", "reasoning")} == {
+        key: ran[key] for key in ("harness", "model", "reasoning")
+    }
+    assert data["independent_review"]["requested_model"] == "claude-opus-5-5"
+    # A projection checks each revision against the reviewer the run recorded for it.
+    evaluation.regenerate_report(root, review_revision="second")
+    evaluation.regenerate_report(root, review_revision="review")
+
+    # Attribution that disagrees with a revision's protocol is refused, in either direction.
+    tampering: tuple[dict[str, object], ...] = (
+        {"reviewer_overrides": {"second": {**ran, "model": "claude-sonnet-5-5"}}},
+        {"reviewer_overrides": {}},
+        {"review_revision": "review", "reviewer_overrides": {"review": ran}},
+    )
+    for tampered in tampering:
+        evaluation._save_selection(root, {**saved, **tampered})
+        with pytest.raises(ValueError, match="was not run by its recorded reviewer"):
+            evaluation.regenerate_report(root)
+
+
+def test_an_interrupted_review_by_another_reviewer_is_still_attributed(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = _reviewed_run(config, tmp_path, monkeypatch)
+    monkeypatch.setenv(claude.TOKEN_ENV, "token")
+    monkeypatch.setattr(claude, "preflight", lambda: {"harness_version": "2.1.0 (Claude Code)"})
+
+    def interrupted(*args: Any, **kwargs: Any) -> None:
+        raise KeyboardInterrupt
+
+    reviewer = evaluation.Runner(harness="claude", model="claude-opus-5-5", reasoning="high")
+    with monkeypatch.context() as patched:
+        patched.setattr(evaluation, "review_study", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            evaluation.review_evaluation(root, "second", reviewer=reviewer)
+
+    saved = evaluation._load_selection(root)
+    assert saved["reviewer_overrides"] == {
+        "second": {
+            "harness": "claude",
+            "model": "claude-opus-5-5",
+            "reasoning": "high",
+            "harness_version": "2.1.0",
+        }
+    }
+    assert saved["review_revision"] == "review"
+
+    # Interrupted before its revision existed, so the frozen reviewer may retry the same name,
+    # and that retry must not keep the override's attribution.
+    assert evaluation.review_evaluation(root, "second") == "second"
+    assert evaluation._load_selection(root)["reviewer_overrides"] == {}
+
+
+def test_review_with_no_select_keeps_the_selected_revision(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, reviews = _reviewed_run(config, tmp_path, monkeypatch)
+    report = (root / "report/results.json").read_bytes()
+    override = ["--reviewer-harness", "codex", "--reviewer-model", "gpt-6.1-sol"]
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["review", str(root), "--revision", "second", *override, "--reviewer-effort", "high"]
+        + ["--no-select", "--yes"],
+    )
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert "Recorded review revision second; the selected revision is unchanged." in result.stdout
+    assert len(reviews) == 18
+    saved = evaluation._load_selection(root)
+    assert saved["review_revision"] == "review"
+    assert saved["reviewer_overrides"] == {
+        "second": {
+            "harness": "codex",
+            "model": "gpt-6.1-sol",
+            "reasoning": "high",
+            "harness_version": "0.167.0",
+        }
+    }
+    assert (root / "report/results.json").read_bytes() == report
+    status = json.loads(CliRunner().invoke(cli.app, ["status", str(root), "--json"]).stdout)
+    revisions = status["measures"]["review_revisions"]
+    assert [(row["revision"], row["selected"]) for row in revisions] == [
+        ("review", True),
+        ("second", False),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        (["--reviewer-harness", "claude"], "--reviewer-effort go together"),
+        (
+            ["--reviewer-harness", "claude", "--reviewer-model", "opus"]
+            + ["--reviewer-effort", "high"],
+            "Claude requires an exact claude-* model ID",
+        ),
+        (
+            ["--reviewer-harness", "claude", "--reviewer-model", "claude-opus-5-5"]
+            + ["--reviewer-effort", "minimal"],
+            "Claude reasoning must be low, medium, high, xhigh or max",
+        ),
+    ],
+)
+def test_review_refuses_an_incomplete_or_invalid_reviewer_override(
+    tmp_path: Path, options: list[str], message: str
+) -> None:
+    # Refused before the run is even read, so no review can start.
+    result = CliRunner().invoke(
+        cli.app, ["review", str(tmp_path / "run"), "--revision", "second", *options, "--yes"]
+    )
+    assert result.exit_code == 2 and message in result.stderr
+
+
 def _python_analysis(monkeypatch: pytest.MonkeyPatch, *, vulture: bool = True) -> None:
     """Stand-ins for the pinned Python analyzers, which CI does not install."""
     tools = {
