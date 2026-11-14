@@ -780,6 +780,7 @@ def _observation(
             coverage_evidence = _map(_map(stage.get("metrics")).get("coverage"))
             coverage_provenance = _map(coverage_evidence.get("provenance"))
             provenance["coverage_provenance"] = coverage_provenance
+            provenance["not_in_population"] = detail.get("not_in_population")
             identity["coverage_provenance"] = coverage_provenance
             eligible = eligible and all(
                 coverage_provenance.get(field) is not None

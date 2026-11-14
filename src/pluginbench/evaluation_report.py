@@ -128,6 +128,7 @@ PROVENANCE_FIELDS = (
     "test_scope",
     "covered",
     "total",
+    "not_in_population",
     "selection_policy",
     "branch_denominator_digest",
     "function_denominator_digest",

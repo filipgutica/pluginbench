@@ -2784,6 +2784,30 @@ def test_the_report_shows_a_measured_zero_share_beside_an_unavailable_catch_rate
     assert not suites
 
 
+def test_the_report_shows_measured_decision_line_coverage_with_its_counts(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The bound LCOV tracks line 1, so a site on line 1 is in the population and executed.
+    root, _, _ = _mutation_run(
+        config, tmp_path, monkeypatch, source="def answer(flag): return 1 if flag < 2 else 0\n"
+    )
+    monkeypatch.setattr(harbor_backend, "run_native_command", _suite([]))
+
+    result = _measure_mutation(root)
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    decisions = [
+        row for row in _observations(root, {"mutation"})
+        if row["metric"] == "Decision-line execution coverage %"
+    ]
+    assert decisions and {(row["status"], row["value"]) for row in decisions} == {("measured", 100.0)}
+    for row in decisions:
+        counts = row["provenance"]
+        assert isinstance(counts, dict)
+        assert (counts["covered"], counts["total"], counts["not_in_population"]) == (1, 1, 0)
+        assert counts["coverage_provenance"]["tool"] == "lcov"
+
+
 def _input_files(revision: Path) -> dict[str, dict[str, str]]:
     """Each checkpointed input's files and their digests."""
     return {
