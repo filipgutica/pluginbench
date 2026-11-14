@@ -2773,6 +2773,53 @@ def test_measure_limits_mutation_to_saved_tasks(
     assert all(row["comparison_status"] == "complete" for row in rates)
 
 
+def test_mutation_selection_allows_later_review_and_measurement(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, calls, reviews = _mutation_run(config, tmp_path, monkeypatch)
+    coded, reviewed = len(calls), len(reviews)
+    suites: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(harbor_backend, "run_native_command", _suite(suites))
+    result = _measure_mutation(root)
+    assert result.exit_code == 0, result.stderr + result.stdout
+    observed = _observations(root, {"mutation"})
+    assert observed
+    mutation_suites = list(suites)
+
+    result = CliRunner().invoke(
+        cli.app, ["review", str(root), "--revision", "review-2", "--yes"]
+    )
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert len(reviews) == 2 * reviewed
+    assert _observations(root, {"mutation"}) == observed
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["measure", str(root), "--measurements", "iterations", "--revision", "m2", "--yes"],
+    )
+    assert result.exit_code == 0, result.stderr + result.stdout
+    selection = evaluation._load_selection(root)
+    assert selection["measurement_revision"] == "m2"
+    assert selection["review_revision"] == "review-2"
+    measures = selection["measurements"]
+    assert isinstance(measures, list) and "mutation" in measures
+    # Coverage is collected again under m2, changing its provenance on derived metrics.
+    result_fields = ("attempt_id", "metric", "status", "value")
+    assert [
+        {key: row[key] for key in result_fields} for row in _observations(root, {"mutation"})
+    ] == [{key: row[key] for key in result_fields} for row in observed]
+    assert [run for run in suites if "/mutation/runs/" in run[2]] == mutation_suites
+    assert len(calls) == coded
+    assert len(reviews) == 2 * reviewed
+
+    path = tmp_path / "mutation.yaml"
+    path.write_text(yaml.safe_dump({
+        **config.model_dump(mode="json"), "measurements": [*config.measurements, "mutation"]
+    }))
+    with pytest.raises(ValueError, match="input_value='mutation'"):
+        evaluation.load_evaluation(path)
+
+
 def test_measure_adds_mutation_alone_and_carries_coverage_forward(
     config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
