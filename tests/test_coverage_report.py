@@ -899,6 +899,142 @@ def test_vendored_go_packages_are_out_of_scope(tmp_path: Path, source: Path) -> 
     }
 
 
+# anko's goyacc output: Go names each function's blocks after the `//line` target its position
+# falls in, with that target's line numbers and no columns, so the two targets' lines collide.
+LINE_DIRECTED_PARSER = """package value
+func Own() int { return 1 }
+
+//line parser.go.y:2
+import "strconv"
+
+//line yaccpar:1
+func Parse(text string) int {
+\tvalue, err := strconv.Atoi(text)
+\tif err != nil {
+//line parser.go.y:3
+\t\treturn 0
+\t}
+\treturn value
+}
+"""
+LINE_DIRECTED_BLOCKS = (
+    "example.test/value/parser.go:2.16,2.28 1 1\n"
+    "example.test/value/yaccpar:2.0,4.0 2 1\n"
+    "example.test/value/yaccpar:3.0,4.0 1 0\n"
+    "example.test/value/yaccpar:3.0,4.0 1 1\n"
+    "example.test/value/parser.go.y:5.0,6.0 1 0\n"
+)
+LINE_DIRECTED_FILES = {"parser.go": LINE_DIRECTED_PARSER, "parser.go.y": "%%\n"}
+
+
+def test_go_blocks_named_after_a_line_directive_target_count_for_the_file_naming_it(
+    tmp_path: Path, source: Path
+) -> None:
+    for name, text in LINE_DIRECTED_FILES.items():
+        (source / name).write_text(text)
+    report = go_report(tmp_path, source, GO_REPORT + LINE_DIRECTED_BLOCKS)
+    assert report["files_measured"] == ["parser.go", "value.go"]
+    statements = report["statements"]
+    assert isinstance(statements, dict)
+    # Keyed by target and Go's coordinates, repeats numbered in profile order, beside the
+    # file's own block, each with Go's weight.
+    assert {
+        key: weight for key, weight in statements["weights"].items() if key.startswith("parser.go")
+    } == {
+        "parser.go:2.16,2.28": 1,
+        "parser.go:yaccpar:2.0,4.0": 2,
+        "parser.go:yaccpar:3.0,4.0": 1,
+        "parser.go:yaccpar:3.0,4.0#2": 1,
+        "parser.go:parser.go.y:5.0,6.0": 1,
+    }
+    assert [key for key in statements["covered"] if key.startswith("parser.go")] == [
+        "parser.go:2.16,2.28",
+        "parser.go:yaccpar:2.0,4.0",
+        "parser.go:yaccpar:3.0,4.0#2",
+    ]
+
+
+def test_a_go_file_whose_blocks_go_names_after_a_line_directive_target_is_measured(
+    tmp_path: Path, source: Path
+) -> None:
+    metrics = go_build_metrics(
+        tmp_path,
+        source,
+        profile=GO_REPORT + ADDED_BLOCK + LINE_DIRECTED_BLOCKS,
+        go_list=GO_LIST.replace('"added.go",', '"added.go", "parser.go",'),
+        blocks=GO_BLOCKS + "5 parser.go\n",
+        extra_files=LINE_DIRECTED_FILES,
+    )
+    assert metrics["population_complete_for_declared_scope"] is True
+    assert metrics["unmeasured_source_files"] == []
+    # value.go 3, added.go 1, parser.go 6 statements, of which 2 + 1 + 4 are covered.
+    assert (metrics["statement_total"], metrics["statement_covered"]) == (10, 7)
+
+
+@pytest.mark.parametrize(
+    ("files", "error"),
+    [
+        ({}, "absent from the frozen snapshot: .*yaccpar"),
+        # cover never instruments test files, and another package's directive is not this one's
+        ({"parser_test.go": LINE_DIRECTED_PARSER}, "absent from the frozen snapshot: .*yaccpar"),
+        ({"other/parser.go": LINE_DIRECTED_PARSER}, "absent from the frozen snapshot: .*yaccpar"),
+        # A second file naming the target, if only in a comment, leaves the blocks no one owner.
+        (
+            {"parser.go": LINE_DIRECTED_PARSER, "notes.go": "package value\n// /*line yaccpar:1*/\n"},
+            "named by more than one file",
+        ),
+    ],
+    ids=["no-directive", "test-file", "other-package", "two-files"],
+)
+def test_go_blocks_no_single_line_directive_explains_are_refused(
+    tmp_path: Path, source: Path, files: dict[str, str], error: str
+) -> None:
+    for name, text in files.items():
+        (source / name).parent.mkdir(parents=True, exist_ok=True)
+        (source / name).write_text(text)
+    with pytest.raises(ValueError, match=error):
+        go_report(tmp_path, source, GO_REPORT + LINE_DIRECTED_BLOCKS.split("\n", 1)[1])
+
+
+def test_a_line_directive_naming_a_frozen_go_file_keeps_its_blocks_there(
+    tmp_path: Path, source: Path
+) -> None:
+    # As cgo's generated files do: the blocks belong to the file the directive names.
+    (source / "generated.go").write_text("package value\n//line value.go:2\nfunc G() {}\n")
+    report = go_report(tmp_path, source, GO_REPORT)
+    assert report["files_measured"] == ["value.go"]
+
+
+@pytest.mark.parametrize(
+    ("go_list", "blocks", "error"),
+    [
+        (
+            GO_LIST.replace('"value_windows.go"', '"value_windows.go", "parser.go"'),
+            GO_BLOCKS,
+            "did not compile",
+        ),
+        (
+            GO_LIST.replace('"added.go",', '"added.go", "parser.go",'),
+            GO_BLOCKS + "0 parser.go\n",
+            "declared no blocks for measured files: \\['parser.go'\\]",
+        ),
+    ],
+    ids=["not-compiled", "no-blocks"],
+)
+def test_go_line_directive_blocks_the_build_disowns_are_rejected(
+    tmp_path: Path, source: Path, go_list: str, blocks: str, error: str
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        go_build_metrics(
+            tmp_path,
+            source,
+            profile=GO_REPORT + ADDED_BLOCK + LINE_DIRECTED_BLOCKS,
+            go_list=go_list,
+            blocks=blocks,
+            extra_files=LINE_DIRECTED_FILES,
+        )
+
+
 @pytest.mark.parametrize(
     ("old", "new", "error"),
     [

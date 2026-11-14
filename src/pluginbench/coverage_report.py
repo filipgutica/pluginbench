@@ -563,6 +563,11 @@ def _go_source(
 ) -> str:
     if raw_path in files or raw_path.startswith(("/", "./", "../")):
         return _source_path(raw_path, files, source_scope, workdir)
+    return _source_path(_go_module_path(raw_path, modules), files, source_scope, workdir)
+
+
+def _go_module_path(raw_path: str, modules: dict[str, list[PurePosixPath]]) -> str:
+    """Map a coverprofile's `<module>/<path>` name to its repository path."""
     matches = [module for module in modules if raw_path.startswith(module + "/")]
     if not matches:
         raise ValueError(f"Go source cannot be mapped to a frozen module: {raw_path}")
@@ -570,8 +575,50 @@ def _go_source(
     directories = modules[module]
     if len(directories) != 1:
         raise ValueError(f"Go source cannot be mapped to one frozen module: {raw_path}")
-    path = (directories[0] / raw_path[len(module) + 1 :]).as_posix()
-    return _source_path(path, files, source_scope, workdir)
+    return (directories[0] / raw_path[len(module) + 1 :]).as_posix()
+
+
+# A `//line` comment must start its line; a `/*line` one may sit anywhere. Either names a
+# file, then a line and optionally a column. Text that only quotes one also matches, so a
+# second file that does makes the target ambiguous and refused.
+_GO_LINE_DIRECTIVE = re.compile(
+    r"^//line (.+?):[0-9]+(?::[0-9]+)?\r?$|/\*line (.+?):[0-9]+(?::[0-9]+)?\*/", re.M
+)
+
+
+def _go_line_carrier(
+    raw_path: str, *, files: set[str], modules: dict[str, list[PurePosixPath]], snapshot: Path
+) -> str | None:
+    """The Go file whose `//line` directives name the file a coverprofile row names, if any.
+
+    Go's cover tool names a function's blocks `<package path>/<base name>` of the file the
+    function starts in once `//line` directives apply, and gives each block the line numbers
+    and columns those directives set. When that name is no frozen Go file, the blocks belong
+    to the one non-test Go file in the package whose directive names it. A row naming a frozen
+    Go file, as cgo's directives make, is not this case.
+    """
+    if raw_path in files or raw_path.startswith(("/", "./", "../")):
+        return None
+    try:
+        path = PurePosixPath(_go_module_path(raw_path, modules))
+    except ValueError:
+        return None
+    if path.as_posix() in files and path.suffix == ".go":
+        return None
+    carriers = sorted(
+        name
+        for name in files
+        if PurePosixPath(name).parent == path.parent
+        and name.endswith(".go")
+        and not name.endswith("_test.go")
+        and any(
+            PurePosixPath(match.group(1) or match.group(2)).name == path.name
+            for match in _GO_LINE_DIRECTIVE.finditer((snapshot / name).read_text())
+        )
+    )
+    if len(carriers) > 1:
+        raise ValueError(f"Go //line target {raw_path} is named by more than one file: {carriers}")
+    return carriers[0] if carriers else None
 
 
 def _declared_counts(path: Path, files: set[str], label: str) -> dict[str, int]:
@@ -740,13 +787,23 @@ def parse_go_coverage(
     records: dict[str, _Record] = {}
     weights: dict[str, int] = {}
     covered: set[str] = set()
+    carriers: dict[str, str | None] = {}
     for row in rows[1:]:
         match = re.fullmatch(r"(.+):([0-9]+)\.([0-9]+),([0-9]+)\.([0-9]+) ([0-9]+) ([0-9]+)", row)
         if not match:
             raise ValueError(f"Malformed Go coverprofile block: {row}")
         raw_path, *values = match.groups()
+        if raw_path not in carriers:
+            carriers[raw_path] = _go_line_carrier(
+                raw_path, files=files, modules=modules, snapshot=snapshot
+            )
+        carrier = carriers[raw_path]
         path = _go_source(
-            raw_path, files=files, modules=modules, source_scope=source_scope, workdir=workdir
+            carrier or raw_path,
+            files=files,
+            modules=modules,
+            source_scope=source_scope,
+            workdir=workdir,
         )
         if not path.endswith(".go"):
             raise ValueError(f"Go coverage source is not Go: {path}")
@@ -756,6 +813,21 @@ def parse_go_coverage(
         lines = source_lines[path]
         record = records[path]
         start, start_col, end, end_col, statements, hits = map(_integer, values)
+        if rows[0] == "mode: set" and hits not in {0, 1}:
+            raise ValueError("Go set-mode hit count must be zero or one")
+        if carrier is not None:
+            # The block's lines are the //line target's, and two targets' lines can coincide,
+            # so it is keyed by the target and numbered by order in the profile when repeated.
+            target = PurePosixPath(raw_path).name
+            key = f"{path}:{target}:{start}.{start_col},{end}.{end_col}"
+            coordinate, repeat = key, 1
+            while coordinate in weights:
+                repeat += 1
+                coordinate = f"{key}#{repeat}"
+            weights[coordinate] = statements
+            if hits:
+                covered.add(coordinate)
+            continue
         record.line(str(start))
         record.line(str(end))
         if not (
@@ -766,8 +838,6 @@ def parse_go_coverage(
             and ((start, start_col) != (end, end_col) or statements == 0)
         ):
             raise ValueError(f"Go block escapes source span: {row}")
-        if rows[0] == "mode: set" and hits not in {0, 1}:
-            raise ValueError("Go set-mode hit count must be zero or one")
         coordinate = f"{path}:{start}.{start_col},{end}.{end_col}"
         if coordinate in weights:
             raise ValueError(f"Duplicate Go coverage block: {coordinate}")
