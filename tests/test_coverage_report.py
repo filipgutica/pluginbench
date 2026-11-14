@@ -7,7 +7,7 @@ from typing import NotRequired, TypedDict
 
 import pytest
 
-from pluginbench import assessment_metrics, coverage_report
+from pluginbench import assessment_metrics
 from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.coverage_report import (
     parse_coverage,
@@ -623,23 +623,34 @@ GO_LIST = """{
 \t"IgnoredGoFiles": ["value_windows.go"]
 }
 """
+# What `go tool cover` declared per non-test file: `Count [N]uint32`, N blocks.
+GO_BLOCKS = "1 added.go\n0 doc.go\n1 testdata/fixture.go\n2 value.go\n1 value_windows.go\n"
 ADDED_BLOCK = "example.test/value/added.go:2.20,2.30 1 1\n"
 
 
 def go_build_metrics(
-    tmp_path: Path, source: Path, *, profile: str, go_list: str = GO_LIST
+    tmp_path: Path,
+    source: Path,
+    *,
+    profile: str,
+    go_list: str = GO_LIST,
+    blocks: str | None = GO_BLOCKS,
+    extra_files: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    """Parse a Go report beside its `go list` sidecar, then score it as evidence does."""
+    """Parse a Go report beside its build sidecars, then score it as evidence does."""
     files = {
         "doc.go": "// Package value has a doc file, which holds no statements.\npackage value\n",
         "added.go": "package value\nfunc Added() int { return 1 }\n",
         "value_windows.go": "//go:build windows\n\npackage value\n\nfunc Windows() {}\n",
         "testdata/fixture.go": "package fixture\n\nfunc Fixture() {}\n",
+        **(extra_files or {}),
     }
     for name, text in files.items():
         (source / name).parent.mkdir(parents=True, exist_ok=True)
         (source / name).write_text(text)
     (tmp_path / "cover.out.go-list.json").write_text(go_list)
+    if blocks is not None:
+        (tmp_path / "cover.out.go-blocks.txt").write_text(blocks)
     report = go_report(tmp_path, source, profile)
     snapshot = inspect_snapshot(source)["files"]
     assert isinstance(snapshot, dict)
@@ -657,8 +668,43 @@ def test_go_files_the_build_does_not_compile_leave_the_report_complete(
         "testdata/fixture.go": "in no package that go list listed",
         "value_windows.go": "excluded from package example.test/value by build constraints",
     }
-    # Go's cover tool writes no block for a file without functions: nothing to measure.
+    # Go's cover tool declared no blocks for doc.go: nothing to measure.
     assert metrics["go_files_without_statements"] == ["doc.go"]
+
+
+def test_a_go_file_with_only_func_types_has_nothing_to_measure(
+    tmp_path: Path, source: Path
+) -> None:
+    # expr's internal/testify/require/requirements.go: compiled, only `type X func(...)`.
+    metrics = go_build_metrics(
+        tmp_path,
+        source,
+        profile=GO_REPORT + ADDED_BLOCK,
+        go_list=GO_LIST.replace('"doc.go",', '"doc.go", "types.go",'),
+        blocks=GO_BLOCKS + "0 types.go\n",
+        extra_files={"types.go": "package value\n\ntype Check func(int) bool\n"},
+    )
+    assert metrics["population_complete_for_declared_scope"] is True
+    assert metrics["unmeasured_source_files"] == []
+    assert metrics["go_files_without_statements"] == ["doc.go", "types.go"]
+
+
+@pytest.mark.parametrize(
+    "blocks",
+    [
+        None,  # The command wrote no cover record at all.
+        GO_BLOCKS.replace("0 doc.go\n", ""),  # cover failed on doc.go, so no line.
+        GO_BLOCKS.replace("0 doc.go", "1 doc.go"),
+    ],
+    ids=["no-record", "no-line", "blocks"],
+)
+def test_go_files_cover_did_not_declare_empty_stay_expected(
+    tmp_path: Path, source: Path, blocks: str | None
+) -> None:
+    metrics = go_build_metrics(tmp_path, source, profile=GO_REPORT + ADDED_BLOCK, blocks=blocks)
+    assert metrics["population_complete_for_declared_scope"] is False
+    assert metrics["unmeasured_source_files"] == ["doc.go"]
+    assert metrics["go_files_without_statements"] == []
 
 
 def test_a_compiled_go_file_missing_from_the_report_stays_incomplete(
@@ -671,10 +717,33 @@ def test_a_compiled_go_file_missing_from_the_report_stays_incomplete(
     assert metrics["unmeasured_source_files"] == ["added.go"]
 
 
+@pytest.mark.parametrize("directory", ["testdata/helper", "_tools/helper"])
+def test_go_files_compiled_only_as_imports_stay_expected(
+    tmp_path: Path, source: Path, directory: str
+) -> None:
+    # `go list -deps` also lists the standard library and packages that failed to load.
+    go_list = GO_LIST + (
+        '{"Dir": "/usr/local/go/src/fmt", "ImportPath": "fmt", "GoFiles": ["print.go"]}\n'
+        '{"ImportPath": "missing.example/x"}\n'
+        f'{{"Dir": "/app/{directory}", "ImportPath": "example.test/value/{directory}",'
+        ' "GoFiles": ["helper.go"]}\n'
+    )
+    metrics = go_build_metrics(
+        tmp_path,
+        source,
+        profile=GO_REPORT + ADDED_BLOCK,
+        go_list=go_list,
+        blocks=GO_BLOCKS + f"1 {directory}/helper.go\n",
+        extra_files={f"{directory}/helper.go": "package helper\n\nfunc Help() {}\n"},
+    )
+    assert metrics["population_complete_for_declared_scope"] is False
+    assert metrics["unmeasured_source_files"] == [f"{directory}/helper.go"]
+
+
 @pytest.mark.parametrize(
     ("old", "new", "error"),
     [
-        ('"/app"', '"/elsewhere"', "escapes the measured repository"),
+        ('"/app"', '"/elsewhere"', "did not compile"),
         ('"doc.go",', '"doc.go", "ghost.go",', "absent from the frozen snapshot"),
         ('"added.go", ', "", "did not compile"),
     ],
@@ -689,23 +758,20 @@ def test_go_build_lists_that_disagree_with_the_snapshot_or_report_are_rejected(
 
 
 @pytest.mark.parametrize(
-    ("text", "func_free"),
+    ("blocks", "error"),
     [
-        ('package p\n// func f() {}\n/* func */\nconst s = "func"\n', True),
-        ("package p\nconst s = `\nfunc f() {}\n`\n", True),
-        ('package p\nvar funcs, myfunc = map[string]int{"func": 1}, 2\n', True),
-        ('package p\nconst s = "a\\""; func f() {}\n', False),
-        ('package p\nconst s = "/*"\nfunc f() {}\n', False),
-        ("package p\nconst r = '\"'\nfunc f() {}\n", False),
-        ("package p\nconst r = '\\''\nfunc f() {}\n", False),
-        # A func type has no statements, but the check stays conservative: the file is expected.
-        ("package p\ntype F func()\n", False),
+        (GO_BLOCKS + "zero doc.go\n", "malformed"),
+        (GO_BLOCKS + "0 doc.go\n", "more than once"),
+        (GO_BLOCKS + "0 ghost.go\n", "absent from the frozen snapshot"),
+        (GO_BLOCKS.replace("2 value.go", "0 value.go"), "declared no blocks"),
     ],
+    ids=["malformed", "duplicate", "absent", "measured"],
 )
-def test_go_func_keyword_hides_only_in_comments_strings_and_runes(
-    text: str, func_free: bool
+def test_go_cover_blocks_that_disagree_with_the_snapshot_or_report_are_rejected(
+    tmp_path: Path, source: Path, blocks: str, error: str
 ) -> None:
-    assert coverage_report._go_func_free(text) is func_free
+    with pytest.raises(ValueError, match=error):
+        go_build_metrics(tmp_path, source, profile=GO_REPORT + ADDED_BLOCK, blocks=blocks)
 
 
 def test_python_duplicate_json_keys_are_rejected(tmp_path: Path, source: Path) -> None:

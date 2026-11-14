@@ -64,11 +64,12 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
     "coverage_observer": (
         1,
         {
-            # An optional Go `go list` sidecar narrows completeness to compiled files, and a
-            # zero-width Go block with no statements parses instead of aborting. A profile
-            # that writes no sidecar and was not refused parses as before, so this stays v1.
+            # Optional Go `go list` and `go tool cover` sidecars narrow completeness to
+            # compiled files with blocks, and a zero-width Go block with no statements parses
+            # instead of aborting. A profile that writes no sidecar and was not refused parses
+            # as before, so this stays v1.
             "coverage_report.py": (
-                "2bfa11c789e40d37915fd1ea1829290e81eec90aad66603f13b87cc3a305c32e"
+                "0b975d40f2cc5d4328e1b7ef659ded82e4c45dd1a069642b8d330e710ab93b08"
             ),
         },
     ),

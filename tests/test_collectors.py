@@ -781,7 +781,7 @@ def test_native_lcov_dispatch_preserves_runtime_unknown_and_integrity_failure(
         reason = {
             "malformed": "summaries disagree",
             "malformed-per-test": "unexecuted",
-            "stale-per-test": "frozen input",
+            "stale-per-test": "LCOV per-test sidecar must not exist in the frozen input",
         }[outcome]
         with pytest.raises(ValueError, match=reason):
             collect_measurements(snapshot, evidence, [collector])
@@ -811,9 +811,9 @@ def test_native_lcov_dispatch_preserves_runtime_unknown_and_integrity_failure(
     assert inspect_snapshot(snapshot) == original
 
 
-@pytest.mark.parametrize("stale", [False, True])
-def test_native_go_coverage_keeps_the_build_list_its_command_wrote(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale: bool
+@pytest.mark.parametrize("stale", [None, ".go-list.json", ".go-blocks.txt"])
+def test_native_go_coverage_keeps_the_build_records_its_command_wrote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale: str | None
 ) -> None:
     from pluginbench import harbor_backend
 
@@ -822,16 +822,18 @@ def test_native_go_coverage_keeps_the_build_list_its_command_wrote(
     (snapshot / "go.mod").write_text("module example.test/value\n")
     (snapshot / "value.go").write_text("package value\nfunc Value() int { return 1 }\n")
     (snapshot / "value_windows.go").write_text("//go:build windows\npackage value\n")
+    (snapshot / "doc.go").write_text("// Package value.\npackage value\n")
     if stale:
-        (snapshot / "cover.out.go-list.json").write_text("{}")
+        (snapshot / ("cover.out" + stale)).write_text("{}")
     listing = json.dumps(
         {
             "Dir": "/app",
             "ImportPath": "example.test/value",
-            "GoFiles": ["value.go"],
+            "GoFiles": ["doc.go", "value.go"],
             "IgnoredGoFiles": ["value_windows.go"],
         }
     )
+    blocks = "0 doc.go\n1 value.go\n1 value_windows.go\n"
 
     def execute(*, destination: Path, **_: object) -> dict[str, object]:
         assert not stale  # Reject a build list the frozen input already holds, before running.
@@ -840,6 +842,7 @@ def test_native_go_coverage_keeps_the_build_list_its_command_wrote(
         )
         (destination / "after").mkdir()
         (destination / "after/cover.out.go-list.json").write_text(listing)
+        (destination / "after/cover.out.go-blocks.txt").write_text(blocks)
         receipt: dict[str, object] = {"exit_code": 0, "timed_out": False, "report_collected": True}
         (destination / "execution.json").write_text(json.dumps(receipt))
         return receipt
@@ -869,6 +872,7 @@ def test_native_go_coverage_keeps_the_build_list_its_command_wrote(
         return
     result = collect_measurements(snapshot, evidence, [collector])
     assert (evidence / "coverage/report.raw.go-list.json").read_text() == listing
+    assert (evidence / "coverage/report.raw.go-blocks.txt").read_text() == blocks
     metrics = evaluate_evidence(snapshot, {"coverage": str(result["coverage"])}, evidence)
     coverage = metrics["coverage"]
     assert isinstance(coverage, dict)
@@ -876,6 +880,7 @@ def test_native_go_coverage_keeps_the_build_list_its_command_wrote(
     assert coverage["metrics"]["go_files_not_compiled"] == {
         "value_windows.go": "excluded from package example.test/value by build constraints"
     }
+    assert coverage["metrics"]["go_files_without_statements"] == ["doc.go"]
 
 
 def test_native_coverage_command_arguments_are_not_host_script_inputs(tmp_path: Path) -> None:

@@ -435,9 +435,15 @@ def _go_build_scope(
     if "go_build" not in report:
         return expected, {}
     build = _object(report["go_build"], "go_build")
-    keys = {"go_list_sha256", "compiled_files", "not_compiled_files", "files_without_statements"}
+    keys = {
+        "go_list_sha256",
+        "go_blocks_sha256",
+        "compiled_files",
+        "not_compiled_files",
+        "files_without_statements",
+    }
     if report.get("format") != "go-coverprofile" or set(build) != keys:
-        raise ValueError("go_build requires a Go coverprofile and its four build fields")
+        raise ValueError("go_build requires a Go coverprofile and its five build fields")
     compiled = set(_strings(build["compiled_files"], "go_build.compiled_files"))
     skipped = _object(build["not_compiled_files"], "go_build.not_compiled_files")
     empty = set(_strings(build["files_without_statements"], "go_build.files_without_statements"))

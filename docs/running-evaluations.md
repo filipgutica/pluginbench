@@ -249,11 +249,27 @@ The command runs without model credentials in a fresh copy of the frozen task im
 
 Use `format: coverage-py-json` for coverage.py JSON, or `format: go-coverprofile` for Go. `coverage_profiles` maps a language or exact task metadata `repository_url` to the same command/format settings; repository entries override language entries and the shared `coverage` default.
 
-A Go coverprofile lists only files the test build compiled, and only those with a function. To keep other `.go` files from making the report incomplete, the same command can write `go list -e -json=Dir,ImportPath,GoFiles,CgoFiles,IgnoredGoFiles ./...` to `<report_path>.go-list.json`, before `go test` so the test status stays the exit code:
-- The completeness check then expects only the `GoFiles` and `CgoFiles` in scope. An untested compiled file, including one an agent adds, still makes the report incomplete.
-- Each scoped file the build does not compile is recorded under `go_files_not_compiled` with a reason, such as build constraints, `testdata/`, or a nested module. It gets no coverage record.
-- A compiled file the report omits and that has no `func` keyword outside comments, strings and runes has no statements to measure. It is recorded under `go_files_without_statements` and does not make the report incomplete.
-- As with the LCOV sidecar, the frozen input must not already contain it. Native collection retains it as `report.raw.go-list.json`. Without it, every scoped source file stays expected.
+A Go coverprofile lists only files the test build compiled, and only those with a block. To keep other `.go` files from making the report incomplete, the same command can write two sidecars before `go test`, so the test status stays the exit code:
+- `<report_path>.go-list.json`: the output of `go list -e -deps -json=Dir,ImportPath,GoFiles,CgoFiles,IgnoredGoFiles ./...`. The completeness check then expects only the `GoFiles` and `CgoFiles` of packages in the repository, including ones compiled only as imports, such as a `testdata/` package. Packages outside the repository, and ones `go list -e` could not locate, are skipped. An untested compiled file, including one an agent adds, still makes the report incomplete.
+- `<report_path>.go-blocks.txt`: one `<count> <path>` line per compiled file, where `<count>` is the `N` that `go tool cover -mode=set` declares as `Count [N]uint32` in the instrumented file. Write a line only when `cover` succeeds. A compiled file the report omits and whose count is 0 has no statements to measure, such as a `doc.go` or a file of func types. It is recorded under `go_files_without_statements` and does not make the report incomplete. A count of 0 for a measured file is rejected.
+- Each scoped file the build does not compile is recorded under `go_files_not_compiled` with a reason, such as build constraints or a nested module. It gets no coverage record.
+- As with the LCOV sidecar, the frozen input must not already contain either sidecar. Native collection retains them as `report.raw.go-list.json` and `report.raw.go-blocks.txt`. Without the build list, every scoped source file stays expected; without the block counts, every compiled file does.
+- The sidecars have the same trust as the coverprofile: test code runs after they are written and could rewrite them before PluginBench reads them, and their recorded hashes (`go_list_sha256`, `go_blocks_sha256`) do not detect that.
+
+For example, in `bash`, before `go test`:
+
+```bash
+set -o pipefail
+go list -e -deps -json=Dir,ImportPath,GoFiles,CgoFiles,IgnoredGoFiles ./... > pluginbench-coverage.out.go-list.json
+cover="$(go env GOTOOLDIR)/cover"
+go list -e -deps -f '{{$d := .Dir}}{{range .GoFiles}}{{$d}}/{{.}}{{"\n"}}{{end}}{{range .CgoFiles}}{{$d}}/{{.}}{{"\n"}}{{end}}' ./... |
+  sed -n "s|^$PWD/||p" | while IFS= read -r file; do
+    count=$("$cover" -mode=set -var=PluginBenchBlocks "$file" | awk '
+      declared { if ($1 == "Count" && $2 ~ /^\[[0-9]+\]uint32$/) n = substr($2, 2, index($2, "]") - 2); declared = 0 }
+      $0 == "var PluginBenchBlocks = struct {" { declared = 1 }
+      END { if (n == "") exit 1; print n }') && printf '%s %s\n' "$count" "$file"
+  done > pluginbench-coverage.out.go-blocks.txt
+```
 
 Coverage.py can trace lines outside its executable-statement population. A trusted reporting command can add `statement_lines` from `Coverage.analysis2` to every file, with `meta.statement_lines_source: coverage.Coverage.analysis2`. Use the same reporting configuration, retain the original JSON, and keep strict covered/missing and summary checks; without statement coordinates, an inconsistent report remains unavailable.
 

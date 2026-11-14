@@ -533,36 +533,41 @@ def _go_source(
     return _source_path(path, files, source_scope, workdir)
 
 
-def _go_func_free(text: str) -> bool:
-    """Whether Go source has no `func` keyword outside comments, strings and runes.
+def _go_cover_blocks(path: Path, files: set[str]) -> dict[str, int]:
+    """Read the block count `go tool cover` declared for each file, one `<count> <path>` line each.
 
-    Go's cover tool counts statements only inside function declarations and literals, and
-    both need the keyword, so such a file has none to measure. A file with only a func type
-    keeps the keyword: it stays expected, so the check never makes a report falsely complete.
+    The count is the `N` of `Count [N]uint32` in the file's instrumented source, so 0 means the
+    toolchain itself found nothing to measure. A file without a line has no declared count.
     """
-    code = re.sub(
-        r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|`[^`]*`|\'(?:\\.|[^\'\\\n])*\'',
-        " ",
-        text,
-        flags=re.S,
-    )
-    return re.search(r"\bfunc\b", code) is None
+    counts: dict[str, int] = {}
+    for line in path.read_text().splitlines():
+        match = re.fullmatch(r"(0|[1-9][0-9]*) (\S.*)", line)
+        if match is None:
+            raise ValueError(f"go cover blocks line is malformed: {line!r}")
+        count, file = int(match.group(1)), match.group(2)
+        if file not in files:
+            raise ValueError(f"go cover blocks file is absent from the frozen snapshot: {file}")
+        if file in counts:
+            raise ValueError(f"go cover blocks lists a file more than once: {file}")
+        counts[file] = count
+    return counts
 
 
 def _go_build(
     listing: Path,
+    blocks: Path,
     *,
-    snapshot: Path,
     files: set[str],
     modules: dict[str, list[PurePosixPath]],
     source_scope: list[str],
     workdir: str,
     measured: set[str],
 ) -> dict[str, object]:
-    """Split scoped sources by the `go list -json` output the coverage command wrote.
+    """Split scoped sources by the `go list -deps -json` output the coverage command wrote.
 
-    Files that no listed package compiles are recorded with a reason, never as empty
-    records. Compiled files the report omits stay expected unless they hold no statements.
+    Packages outside the workdir, such as the standard library, are skipped. Files that no
+    listed package compiles are recorded with a reason, never as empty records. Compiled files
+    the report omits stay expected unless `go tool cover` declared them zero blocks.
     """
     text = listing.read_text()
     decoder = json.JSONDecoder(object_pairs_hook=_json_pairs)
@@ -579,14 +584,15 @@ def _go_build(
         value, index = decoder.raw_decode(text, index)
         package = _json_object(value, "go list package")
         directory, name = package.get("Dir"), package.get("ImportPath")
-        if not isinstance(directory, str) or not isinstance(name, str):
-            raise ValueError("go list package requires Dir and ImportPath")
-        try:
-            relative = PurePosixPath(directory).relative_to(PurePosixPath(workdir))
-        except ValueError as exc:
-            raise ValueError(
-                f"go list package escapes the measured repository: {directory}"
-            ) from exc
+        if not isinstance(name, str):
+            raise ValueError("go list package requires ImportPath")
+        # `-deps` adds packages outside the repository, and `-e` ones that failed to load
+        # without a Dir. Their files are not ours to measure.
+        if not isinstance(directory, str) or not PurePosixPath(directory).is_relative_to(
+            workdir
+        ):
+            continue
+        relative = PurePosixPath(directory).relative_to(workdir)
         listed[relative.as_posix()] = name
         for field_name in ("GoFiles", "CgoFiles", "IgnoredGoFiles"):
             items = package.get(field_name, [])
@@ -618,15 +624,19 @@ def _go_build(
             return f"in nested module {module}, which go list did not list"
         return "in no package that go list listed"
 
+    counts = _go_cover_blocks(blocks, files) if blocks.is_file() else {}
+    if declared_empty := sorted(path for path in measured if counts.get(path) == 0):
+        raise ValueError(f"go cover declared no blocks for measured files: {declared_empty}")
     in_scope = compiled & expected
     return {
         "go_list_sha256": hashlib.sha256(listing.read_bytes()).hexdigest(),
+        "go_blocks_sha256": (
+            hashlib.sha256(blocks.read_bytes()).hexdigest() if blocks.is_file() else None
+        ),
         "compiled_files": sorted(in_scope),
         "not_compiled_files": {path: reason(path) for path in sorted(expected - compiled)},
         "files_without_statements": sorted(
-            path
-            for path in in_scope - measured
-            if _go_func_free((snapshot / path).read_text())
+            path for path in in_scope - measured if counts.get(path) == 0
         ),
     }
 
@@ -691,7 +701,7 @@ def parse_go_coverage(
     if listing.is_file():
         result["go_build"] = _go_build(
             listing,
-            snapshot=snapshot,
+            report.with_name(report.name + ".go-blocks.txt"),
             files=files,
             modules=modules,
             source_scope=source_scope,
