@@ -2384,6 +2384,26 @@ def test_review_with_another_reviewer_records_and_reports_that_reviewer(
             evaluation.regenerate_report(root)
 
 
+def test_an_interrupted_review_by_another_reviewer_is_still_attributed(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = _reviewed_run(config, tmp_path, monkeypatch)
+    monkeypatch.setenv(claude.TOKEN_ENV, "token")
+    monkeypatch.setattr(claude, "preflight", lambda: {"harness_version": "2.1.0 (Claude Code)"})
+
+    def interrupted(*args: Any, **kwargs: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(evaluation, "review_study", interrupted)
+    reviewer = evaluation.Runner(harness="claude", model="claude-opus-5-5", reasoning="high")
+    with pytest.raises(KeyboardInterrupt):
+        evaluation.review_evaluation(root, "second", reviewer=reviewer)
+
+    saved = evaluation._load_selection(root)
+    assert saved["reviewer_overrides"]["second"]["model"] == "claude-opus-5-5"
+    assert saved["review_revision"] == "review"
+
+
 def test_review_with_no_select_keeps_the_selected_revision(
     config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

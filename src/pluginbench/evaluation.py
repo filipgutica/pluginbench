@@ -1474,6 +1474,8 @@ def review_evaluation(
             **reviewer.model_dump(mode="json", include={"harness", "model", "reasoning"}),
             "harness_version": _harness_version(reviewer.harness),
         }
+        # Saved before any review call, so an interrupted revision is still attributed.
+        _record_override(root, selection, revision, override)
     if progress:
         progress(f"Reviewing all submissions again as review revision {revision}")
     review_study(
@@ -1489,10 +1491,8 @@ def review_evaluation(
     )
     selected = recover_review_citations(root / "evidence", revision)
     if override is not None:
-        overrides = _object(selection.get("reviewer_overrides", {}))
-        # Under both names: a report can project the revision by the name it was given.
-        overrides.update(dict.fromkeys((revision, selected), override))
-        selection["reviewer_overrides"] = overrides
+        # Also under the recovered name: a report can project the revision by either name.
+        _record_override(root, selection, selected, override)
     if select:
         selection["review_revision"] = selected
     _save_selection(root, selection)
@@ -1802,6 +1802,15 @@ def _measurement_collection(root: Path, selection: dict[str, object]) -> dict[st
         "revision_receipt": study._reference(evidence, path),
         "history": history,
     }
+
+
+def _record_override(
+    root: Path, selection: dict[str, object], revision: str, override: dict[str, object]
+) -> None:
+    overrides = _object(selection.get("reviewer_overrides", {}))
+    overrides[revision] = override
+    selection["reviewer_overrides"] = overrides
+    _save_selection(root, selection)
 
 
 def _revision_reviewer(
