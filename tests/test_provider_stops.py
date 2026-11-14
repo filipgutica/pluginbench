@@ -270,6 +270,17 @@ def test_a_codex_turn_that_failed_after_exhausted_reconnects_is_a_provider_stop(
     )
 
 
+def test_a_transport_fallback_notice_is_no_work_between_retries_and_failure() -> None:
+    fallback: dict[str, object] = {"type": "item.completed", "item": {
+        "id": "item_3", "type": "error",
+        "message": f"Falling back from WebSockets to HTTPS transport. {_DISCONNECTED}",
+    }}
+    stdout = _lines(*_CODEX_WORK, *(_reconnect(attempt) for attempt in range(1, 6)), fallback,
+                    *_turn_failed())
+    stop = provider_stops.codex_stop(stdout, [codex_rollout("other", _DISCONNECTED)])
+    assert stop is not None and "other after 5/5 reconnects" in stop
+
+
 @pytest.mark.parametrize(
     ("stdout", "traces"),
     [
@@ -284,9 +295,16 @@ def test_a_codex_turn_that_failed_after_exhausted_reconnects_is_a_provider_stop(
          [codex_rollout("other", _DISCONNECTED)]),
         # Reconnected and back at work when the session ended.
         (_lines(*_CODEX_WORK, _reconnect(2), _WAITING, _CODEX_COMMAND), [CODEX_OPEN_ROLLOUT]),
+        # The retries ran out, but the turn then failed on an unrelated, agent-side request.
+        (_lines(*_CODEX_WORK, *(_reconnect(attempt) for attempt in range(1, 6)),
+                *_turn_failed()),
+         [codex_rollout("other", "unexpected status 400: invalid_request_error")]),
+        # A failed turn right after a notice, on a code that is no stop.
+        (_lines(*_CODEX_WORK, _reconnect(2), *_turn_failed()),
+         [codex_rollout("context_window_exceeded", _DISCONNECTED)]),
     ],
     ids=["other-before-exhausted", "work-after-exhausted", "waiting-then-failed",
-         "work-after-reconnect"],
+         "work-after-reconnect", "unrelated-error-after-exhausted", "no-stop-code"],
 )
 def test_a_codex_session_that_reconnected_or_failed_otherwise_is_no_provider_stop(
     stdout: str, traces: list[str]

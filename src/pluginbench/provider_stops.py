@@ -41,7 +41,8 @@ _CLAUDE_ERRORS = {
     "server_error": PROVIDER,
 }
 
-# Codex `codex_error_info` codes. Others, `other` included, keep the existing handling.
+# Codex `codex_error_info` codes. `other` is a stop only after exhausted reconnects; any other
+# code keeps the existing handling.
 _CODEX_ERRORS = {
     "usage_limit_exceeded": LIMIT,
     "rate_limit_exceeded": LIMIT,
@@ -187,11 +188,17 @@ def _codex_retries(events: list[dict[str, Any]]) -> list[str]:
     return messages
 
 
-def _exhausted(messages: list[str]) -> str | None:
-    """The "n/n" of the last retry notice, when it used up its retries, else None."""
+def _exhausted(messages: list[str], error: object) -> str | None:
+    """The "n/n" of the last retry notice when it used up its retries on this turn error.
+
+    The error's message must appear in that notice, so a later, unrelated failure (an
+    invalid request, say) is not read as the end of the retries.
+    """
     notices = [message for message in messages if message.startswith(_RECONNECTING)]
     count = _RECONNECT_COUNT.match(notices[-1]) if notices else None
     if count is None or count[1] != count[2]:
+        return None
+    if not isinstance(error, str) or not error.strip() or error.strip() not in notices[-1]:
         return None
     return f"{count[1]}/{count[2]}"
 
@@ -222,7 +229,9 @@ def codex_stop(stdout: str, traces: list[str]) -> str | None:
                 continue
             code = _codex_code(payload["error"].get("codex_error_info"))
             kind = _CODEX_ERRORS.get(code) if code else None
-            exhausted = _exhausted(retries) if code == "other" else None
+            exhausted = (
+                _exhausted(retries, payload["error"].get("message")) if code == "other" else None
+            )
             if exhausted is not None:
                 kind, code = PROVIDER, f"other after {exhausted} reconnects"
             if kind is not None:
