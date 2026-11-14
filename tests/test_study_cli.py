@@ -2704,13 +2704,16 @@ def _measure_mutation(root: Path) -> Any:
     )
 
 
+@pytest.mark.parametrize("tamper", [None, "candidate_lines", "coverage"])
 def test_measure_adds_mutation_alone_and_carries_coverage_forward(
-    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tamper: str | None,
 ) -> None:
     root, calls, reviews = _mutation_run(config, tmp_path, monkeypatch)
     coded, reviewed = len(calls), len(reviews)
     coverage = _observations(root, {"coverage"})
     assert {row["status"] for row in coverage} >= {"measured"}
+    assert not _observations(root, {"mutation"})
     suites: list[tuple[str, int, str]] = []
     monkeypatch.setattr(harbor_backend, "run_native_command", _suite(suites))
     # Runs take no measured time, so each timeout is exactly the one-minute allowance.
@@ -2726,6 +2729,16 @@ def test_measure_adds_mutation_alone_and_carries_coverage_forward(
     shares = [row for (metric, _), row in rows.items() if metric == "Test-change kill share %"]
     assert rates and {(row["status"], row["value"]) for row in rates} == {("measured", 100.0)}
     assert {row["value"] for row in shares} == {0.0}
+    decisions = [
+        row for (metric, _), row in rows.items() if metric == "Decision-line execution coverage %"
+    ]
+    # This fixture's bound LCOV executes only line 1; the candidate sites are on line 2.
+    assert decisions and {(row["status"], row["value"]) for row in decisions} == {("measured", 0.0)}
+    for row in decisions:
+        counts = row["provenance"]
+        assert isinstance(counts, dict)
+        assert (counts["covered"], counts["total"]) == (0, 1)
+        assert counts["coverage_provenance"]["tool"] == "lcov"
     provenance = [row["provenance"] for row in rates]
     assert [item["covered"] for item in provenance if isinstance(item, dict)] == [1] * len(rates)
     # Every attempt submitted the same source, so it is measured once: the mutant and its
@@ -2745,6 +2758,40 @@ def test_measure_adds_mutation_alone_and_carries_coverage_forward(
         "measurements",
         ["coverage"],
     )
+    monkeypatch.setattr(
+        harbor_backend, "run_native_command",
+        lambda **kwargs: pytest.fail("report regeneration must not run containers"),
+    )
+    evaluation.regenerate_report(root)
+    assert [
+        row for row in _observations(root, {"mutation"})
+        if row["metric"] == "Decision-line execution coverage %"
+    ] == decisions
+    if tamper == "candidate_lines":
+        report = root / "evidence" / revision["proposed_report"]["path"]
+        data = json.loads(report.read_text())
+        changed = 0
+        for attempt in data["attempts"]:
+            for stage in attempt["stages"]:
+                measured = stage.get("metrics", {}).get("mutation", {}).get("metrics")
+                if measured is not None:
+                    assert measured["candidate_lines"]
+                    measured["candidate_lines"] = []
+                    changed += 1
+        assert changed
+        report.write_text(json.dumps(data))
+    elif tamper == "coverage":
+        report = next(
+            (root / "evidence/observer-revisions/measurements/measurements")
+            .glob("*/0/coverage/report.json")
+        )
+        data = json.loads(report.read_text())
+        assert data["lines"]["covered"]
+        data["lines"]["covered"] = []
+        report.write_text(json.dumps(data))
+    if tamper is not None:
+        with pytest.raises(ValueError):
+            evaluation.regenerate_report(root)
 
 
 def test_the_report_shows_a_measured_zero_share_beside_an_unavailable_catch_rate(
@@ -2763,6 +2810,8 @@ def test_the_report_shows_a_measured_zero_share_beside_an_unavailable_catch_rate
     shares = [row for row in rows if row["metric"] == "Test-change kill share %"]
     assert rates and {(row["status"], row["value"]) for row in rates} == {("unknown", None)}
     assert shares and {(row["status"], row["value"]) for row in shares} == {("measured", 0.0)}
+    decisions = [row for row in rows if row["metric"] == "Decision-line execution coverage %"]
+    assert decisions and {(row["status"], row["value"]) for row in decisions} == {("unknown", None)}
     assert not suites
 
 
@@ -2966,6 +3015,12 @@ def test_adding_mutation_carries_the_bound_iteration_counts_unchanged(
     state = json.loads((evidence / "observer-revisions/m2/revision.json").read_text())
     assert state["carried_from"]["kinds"] == ["iterations"]
     assert state["iterations"] == counted["iterations"]
+    decisions = [
+        row for row in _observations(root, {"mutation"})
+        if row["metric"] == "Decision-line execution coverage %"
+    ]
+    assert decisions and {(row["status"], row["value"]) for row in decisions} == {("unknown", None)}
+    assert all("no line coverage" in str(row["reason"]) for row in decisions)
     assert {
         row["value"]
         for row in _observations(root, {"iterations"})

@@ -102,6 +102,12 @@ METRICS = (
     ("Tests added", "Mutation bug-catch rate %", "mutation_change", "bug_catch_percent"),
     (
         "Tests added",
+        "Decision-line execution coverage %",
+        "mutation_change",
+        "decision_line_coverage.percent",
+    ),
+    (
+        "Tests added",
         "Test-change kill share %",
         "mutation_change",
         "test_change_kill_share.percent",
@@ -295,6 +301,16 @@ METRIC_GUIDE.update(
             "% of valid mutants",
             "Share of valid mutants killed only because of the agent's test changes: the suite "
             "without them does not fail. Zero when the agent changed no test file.",
+        ),
+        "Decision-line execution coverage %": (
+            "Decision-line execution coverage",
+            "% covered",
+            "Share of changed production lines holding at least one M1 candidate site that the "
+            "tests execute, counting each line once before mutant sampling. Go uses the line "
+            "population, not statement blocks. Unavailable with no eligible lines or no line "
+            "coverage; incomplete when an eligible file lacks line coverage or candidate parsing "
+            "is incomplete. Measures execution, not assertion strength or branch completeness. "
+            "The risky-logic catch rate is the M1 bug-catch rate.",
         ),
         "Duplicated added test lines": (
             "Duplicated added test lines",
@@ -736,26 +752,39 @@ def _observation(
         reason = str(detail.get("method") or "bound source diff unavailable")
     elif kind == "mutation_change":
         comparison = _map(_map(stage.get("metric_comparison")).get("mutation"))
-        share = key != "bug_catch_percent"
-        detail = _map(comparison.get("test_change_kill_share")) if share else comparison
-        # The share is decided apart from the headline: a measured 0 when no test file changed.
+        section, _, field = key.rpartition(".")
+        detail = _map(comparison.get(section)) if section else comparison
+        decision = section == "decision_line_coverage"
+        # Derived values have their own availability, apart from the mutation headline.
         available = detail.get("status") == "available"
-        value = _number(detail.get(key.rpartition(".")[2])) if available else None
+        value = _number(detail.get(field)) if available else None
         eligible = available and all(
             provenance.get(field) is not None
             for field in ("tool", "tool_version", "config_digest", "scope")
         )
         identity.update(provenance)
-        identity["method"] = comparison.get("method")
+        method = detail.get("method", comparison.get("method"))
+        identity["method"] = method
         provenance = {
             **provenance,
-            "method": comparison.get("method"),
-            "limitations": comparison.get("limitations"),
-            "covered": detail.get("kills_needing_test_changes" if share else "killed"),
-            "total": comparison.get("valid"),
+            "method": method,
+            "limitations": detail.get("limitations", comparison.get("limitations")),
+            "covered": detail.get(
+                "covered" if decision else "kills_needing_test_changes" if section else "killed"
+            ),
+            "total": detail.get("total") if decision else comparison.get("valid"),
         }
+        if decision:
+            coverage_evidence = _map(_map(stage.get("metrics")).get("coverage"))
+            coverage_provenance = _map(coverage_evidence.get("provenance"))
+            provenance["coverage_provenance"] = coverage_provenance
+            identity["coverage_provenance"] = coverage_provenance
+            eligible = eligible and all(
+                coverage_provenance.get(field) is not None
+                for field in ("tool", "tool_version", "config_digest", "scope")
+            )
         reason = str(
-            (comparison.get("method") if available else None)
+            (method if available else None)
             or detail.get("reason")
             or comparison.get("reason")
             or "bound mutation result unavailable"

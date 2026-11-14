@@ -7,7 +7,7 @@ from typing import NotRequired, TypedDict
 
 import pytest
 
-from pluginbench import assessment_metrics
+from pluginbench import assessment_metrics, mutation
 from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.coverage_report import (
     parse_coverage,
@@ -682,6 +682,16 @@ def test_go_lines_are_the_code_lines_blocks_with_statements_span(
     }
     assert "unavailable_populations" not in report
 
+    files = inspect_snapshot(source)["files"]
+    assert isinstance(files, dict)
+    metrics = assessment_metrics._coverage(report, set(files), ["*.go"])
+    decision = mutation._decision_line_coverage(
+        {"candidate_lines": ["value.go:3", "value.go:4", "value.go:5"]}, metrics
+    )
+    # Overlapping executed/unexecuted blocks cover line 3 once; statement weights do not
+    # determine whether lines 4 and 5 ran. No Go tool or container is needed to derive this.
+    assert (decision["covered"], decision["total"], decision["percent"]) == (1, 3, 33.333333)
+
 
 LEXED = """package value
 func Lexed() string {
@@ -1068,10 +1078,16 @@ def test_changed_lines_in_a_go_file_with_line_directive_blocks_are_incomplete(
     metrics = assessment_metrics._coverage(report, set(snapshot), ["*.go"])
     changed = assessment_metrics._changed_line_coverage({}, metrics, change)
     assert changed["status"] == status
+    decision = mutation._decision_line_coverage(
+        {"candidate_lines": [f"{edited}:2"]}, metrics
+    )
+    assert decision["status"] == status
     if status == "incomplete":
         assert "parser.go" in str(changed["reason"])
+        assert "parser.go" in str(decision["reason"])
     else:
         assert (changed["added_executable_lines"], changed["added_lines_covered"]) == (1, 1)
+        assert (decision["covered"], decision["total"], decision["percent"]) == (1, 1, 100.0)
 
 
 # The directive names this frozen file, so Go names the blocks after it as its own, but at lines

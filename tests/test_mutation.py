@@ -14,7 +14,12 @@ from pathlib import Path
 import pytest
 
 from pluginbench import components, harbor_backend, isolation, mutation
-from pluginbench.assessment_metrics import compare_snapshots, evaluate_evidence, inspect_snapshot
+from pluginbench.assessment_metrics import (
+    compare_evidence,
+    compare_snapshots,
+    evaluate_evidence,
+    inspect_snapshot,
+)
 from pluginbench.collectors import Collector, collect_measurements
 from pluginbench.mutation import Run, Site
 
@@ -967,6 +972,92 @@ def test_collected_evidence_binds_its_report_and_the_attempt_diff(
     report.write_text(report.read_text() + "\n")
     with pytest.raises(ValueError, match="digest mismatch"):
         evaluate_evidence(after, refs, evidence)
+
+
+@pytest.mark.parametrize(
+    ("case", "status", "counts"),
+    [
+        ("available", "available", (1, 2, 50.0)),
+        ("zero covered", "available", (0, 2, 0.0)),
+        ("no candidates", "unavailable", None),
+        ("no coverage", "unavailable", None),
+        ("no mutation", "unavailable", None),
+        ("no lines", "unavailable", None),
+        ("missing eligible file", "incomplete", None),
+        ("mapped eligible file", "incomplete", None),
+        ("unrelated missing file", "available", (1, 2, 50.0)),
+        ("unparsed candidates", "incomplete", None),
+        ("unavailable catch rate", "available", (1, 2, 50.0)),
+        ("unsampled lines", "available", (1, 12, 8.333333)),
+    ],
+)
+def test_decision_line_coverage_uses_all_unique_candidate_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    case: str, status: str, counts: tuple[int, int, float] | None,
+) -> None:
+    source = AFTER
+    if case == "no candidates":
+        source = "answer = 2\n"
+    elif case == "unsampled lines":
+        source = "\n".join(f"value_{i} = flag < {i}" for i in range(12)) + "\n"
+    behaviour = _passing(_kills_first)
+    if case == "unavailable catch rate":
+        def behaviour(view: View) -> tuple[int | None, bool, str]:
+            return 1, False, ""
+    report, _, destination = _measure(tmp_path, behaviour, after={"src/grade.py": source})
+    if case == "unparsed candidates":
+        report["unparsed_files"] = {"src/other.py": "parse failed"}
+    metrics = _metrics(report, destination)
+    if case == "unavailable catch rate":
+        assert metrics["status"] == "unavailable"
+    # Five sites on two lines, or twelve lines before the ten-mutant sample.
+    if case == "unsampled lines":
+        assert metrics["selected"] == 10 and metrics["candidate_line_count"] == 12
+    coverage: dict[str, object] = {
+        "coordinates": {
+            "line": {
+                "total": ["src/grade.py:2", "src/grade.py:3", "src/grade.py:4"],
+                "covered": [] if case == "zero covered" else ["src/grade.py:2", "src/grade.py:3"],
+            }
+        }
+    }
+    if case == "no lines":
+        coverage["coordinates"] = {}
+    if case in {"missing eligible file", "unrelated missing file"}:
+        coverage["unmeasured_source_files"] = [
+            "src/other.py" if case == "unrelated missing file" else "src/grade.py"
+        ]
+    if case == "mapped eligible file":
+        coverage["unavailable_populations"] = {
+            "lines": {"files": ["src/grade.py"], "reason": "line directives"}
+        }
+    if case == "unsampled lines":
+        coverage["coordinates"] = {
+            "line": {
+                "total": [f"src/grade.py:{i}" for i in range(1, 13)],
+                "covered": ["src/grade.py:12"],
+            }
+        }
+    change = compare_snapshots(tmp_path / "before", tmp_path / "after")
+    before: dict[str, object] = {"snapshot_digest": change["before_digest"]}
+    after: dict[str, object] = {
+        "snapshot_digest": change["after_digest"], "mutation": {"metrics": metrics},
+    }
+    if case != "no coverage":
+        after["coverage"] = {"metrics": coverage}
+    if case == "no mutation":
+        del after["mutation"]
+    monkeypatch.setattr(
+        harbor_backend, "run_native_command",
+        lambda **kwargs: pytest.fail("deriving decision-line coverage must not run containers"),
+    )
+    compared = _object(compare_evidence(before, after, change=change)["mutation"])
+    decision = _object(compared["decision_line_coverage"]) if case != "no mutation" else compared
+    assert decision["status"] == status
+    if counts is None:
+        assert decision.get("percent") is None
+    else:
+        assert (decision["covered"], decision["total"], decision["percent"]) == counts
 
 
 def test_a_profile_from_another_observer_version_is_refused(tmp_path: Path) -> None:

@@ -1243,6 +1243,40 @@ def _share(
     }
 
 
+def _decision_line_coverage(
+    metrics: dict[str, object], coverage: dict[str, object]
+) -> dict[str, object]:
+    """Execution of all candidate lines before sampling, independent of mutant outcomes."""
+    if _object(metrics.get("unparsed_files", {})):
+        return {"status": "incomplete", "reason": "mutation candidate population is incomplete"}
+    candidates = set(_strings(metrics["candidate_lines"]))
+    if not candidates:
+        return {"status": "unavailable", "reason": "no candidate lines on changed production lines"}
+    lines = _object(coverage.get("coordinates") or {}).get("line")
+    if not isinstance(lines, dict):
+        return {"status": "unavailable", "reason": "the submission has no line coverage"}
+    files = {line.rsplit(":", 1)[0] for line in candidates}
+    unmeasured = sorted(set(_strings(coverage.get("unmeasured_source_files", []))) & files)
+    limits = _object(coverage.get("unavailable_populations", {}))
+    line_limit = _object(limits.get("lines", {}))
+    unlined = sorted(set(_strings(line_limit.get("files", []))) & files)
+    if unmeasured or unlined:
+        return {
+            "status": "incomplete",
+            "reason": "candidate source files missing line coverage: "
+            + ", ".join(sorted(set(unmeasured + unlined))),
+        }
+    covered = len(candidates & set(_strings(lines["covered"])))
+    return {
+        "status": "available",
+        "covered": covered,
+        "total": len(candidates),
+        "percent": round(100 * covered / len(candidates), 6),
+        "method": "unique changed production lines holding at least one M1 candidate site, before sampling, intersected with the submission's executed line coordinates",
+        "limitations": "execution only, not assertion strength or branch completeness; risky-logic catch rate is the M1 bug-catch rate",
+    }
+
+
 def compare_mutation(
     mutation: dict[str, object],
     coverage: dict[str, object] | None,
@@ -1280,7 +1314,9 @@ def compare_mutation(
             "test_change_kill_share",
         )
     }
-    coordinates = _object(_object((coverage or {}).get("metrics") or {}).get("coordinates") or {})
+    coverage_metrics = _object((coverage or {}).get("metrics") or {})
+    result["decision_line_coverage"] = _decision_line_coverage(metrics, coverage_metrics)
+    coordinates = _object(coverage_metrics.get("coordinates") or {})
     lines = coordinates.get("line")
     if not isinstance(lines, dict):
         result["execution_split"] = {
