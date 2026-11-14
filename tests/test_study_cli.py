@@ -2394,14 +2394,27 @@ def test_an_interrupted_review_by_another_reviewer_is_still_attributed(
     def interrupted(*args: Any, **kwargs: Any) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(evaluation, "review_study", interrupted)
     reviewer = evaluation.Runner(harness="claude", model="claude-opus-5-5", reasoning="high")
-    with pytest.raises(KeyboardInterrupt):
-        evaluation.review_evaluation(root, "second", reviewer=reviewer)
+    with monkeypatch.context() as patched:
+        patched.setattr(evaluation, "review_study", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            evaluation.review_evaluation(root, "second", reviewer=reviewer)
 
     saved = evaluation._load_selection(root)
-    assert saved["reviewer_overrides"]["second"]["model"] == "claude-opus-5-5"
+    assert saved["reviewer_overrides"] == {
+        "second": {
+            "harness": "claude",
+            "model": "claude-opus-5-5",
+            "reasoning": "high",
+            "harness_version": "2.1.0",
+        }
+    }
     assert saved["review_revision"] == "review"
+
+    # Interrupted before its revision existed, so the frozen reviewer may retry the same name,
+    # and that retry must not keep the override's attribution.
+    assert evaluation.review_evaluation(root, "second") == "second"
+    assert evaluation._load_selection(root)["reviewer_overrides"] == {}
 
 
 def test_review_with_no_select_keeps_the_selected_revision(

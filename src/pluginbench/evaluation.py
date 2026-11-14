@@ -1476,6 +1476,11 @@ def review_evaluation(
         }
         # Saved before any review call, so an interrupted revision is still attributed.
         _record_override(root, selection, revision, override)
+    elif revision in (overrides := _object(selection.get("reviewer_overrides", {}))):
+        # An override interrupted before its revision existed must not claim this retry.
+        del overrides[revision]
+        selection["reviewer_overrides"] = overrides
+        _save_selection(root, selection)
     if progress:
         progress(f"Reviewing all submissions again as review revision {revision}")
     review_study(
