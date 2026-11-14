@@ -978,9 +978,10 @@ def test_native_observer_drift_is_rejected_before_command(
 @pytest.mark.parametrize(
     ("saved", "message"),
     [
-        # A profile 942f12c froze records the observer's source hash, and is measured.
-        ("942f12c", None),
-        ({"observer_version": 2}, "coverage observer version 2 froze this profile"),
+        # A profile 942f12c froze records the observer's source hash, which is version 1.
+        ("942f12c", "coverage observer version 1 froze this profile"),
+        ({"observer_version": 1}, "coverage observer version 1 froze this profile"),
+        ({"observer_version": 2}, None),
         ({"implementation": "broken"}, "source hashes are not a mapping"),
         ([], "it is not a JSON object"),
     ],

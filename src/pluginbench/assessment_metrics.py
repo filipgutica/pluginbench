@@ -1864,9 +1864,10 @@ def _changed_line_coverage(
     if change is None or not isinstance(coordinates, dict) or "line" not in coordinates:
         return {"status": "unavailable", "reason": "bound source diff or line coordinates missing"}
     added = _added_source_lines(change)
+    added_files = {line.rsplit(":", 1)[0] for line in added}
     unmeasured = sorted(
         set(_strings(right.get("unmeasured_source_files", []), "unmeasured source files"))
-        & {line.rsplit(":", 1)[0] for line in added}
+        & added_files
     )
     if unmeasured:
         # Dropping an untested added file from the report would otherwise raise the rate.
@@ -1874,6 +1875,16 @@ def _changed_line_coverage(
             "status": "incomplete",
             "reason": "added source files missing from the coverage report: "
             + ", ".join(unmeasured),
+        }
+    limits = _object(right.get("unavailable_populations", {}), "unavailable populations")
+    line_limit = _object(limits.get("lines", {}), "line population limit")
+    unlined = sorted(set(_strings(line_limit.get("files", []), "line limit files")) & added_files)
+    if unlined:
+        # Their added lines are absent from the line coordinates, not unexecuted.
+        return {
+            "status": "incomplete",
+            "reason": f"added source files have no line population ({line_limit.get('reason')}): "
+            + ", ".join(unlined),
         }
     result: dict[str, object] = {
         "status": "available",

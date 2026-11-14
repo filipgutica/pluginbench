@@ -777,10 +777,60 @@ def _go_build(
     }
 
 
+# One Go token at a time: a comment, whitespace, a string or rune literal (a raw string may span
+# lines), or a run of other source. Only the first two leave a line without code.
+_GO_TOKEN = re.compile(
+    r"(?P<comment>//[^\n]*|/\*.*?\*/)|(?P<space>\s+)"
+    r"|`[^`]*`|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'|[^\s/`\"']+|.",
+    re.S,
+)
+
+
+def _go_code_lines(text: str) -> set[int]:
+    """The 1-based lines, counted by "\\n" as Go counts them, holding more than comments."""
+    code: set[int] = set()
+    line = 1
+    for match in _GO_TOKEN.finditer(text):
+        breaks = match.group().count("\n")
+        if match.lastgroup is None:
+            code.update(range(line, line + breaks + 1))
+        line += breaks
+    # A raw string's blank lines are inside a token but hold no code.
+    blank = {number for number, row in enumerate(text.split("\n"), 1) if not row.strip(" \t\r")}
+    return code - blank
+
+
+def _go_line_directives(text: str) -> list[str]:
+    """The file names of the line directives Go honors in a file; "" when one names no file.
+
+    Go honors a `//line ` comment that starts its line and a `/*line ` comment anywhere, when
+    it ends in `:line` or `:line:col`. Each sets the line numbers of the code after it.
+    """
+    names = []
+    for match in _GO_TOKEN.finditer(text):
+        comment = match.group("comment")
+        if comment is None:
+            continue
+        if comment.startswith("//"):
+            if match.start() and text[match.start() - 1] != "\n":
+                continue
+            body = comment[2:].removesuffix("\r")
+        else:
+            body = comment[2:-2]
+        if directive := re.fullmatch(r"line (.*?)(?::[0-9]+)?:[0-9]+", body, re.S):
+            names.append(directive.group(1))
+    return names
+
+
 def parse_go_coverage(
     report: Path, *, snapshot: Path, source_scope: list[str], test_scope: list[str], workdir: str
 ) -> dict[str, object]:
-    """Keep basic-block coordinates and numStmt weights; Go measures statements."""
+    """Keep basic-block coordinates and numStmt weights; Go measures statements.
+
+    A line is executable when a block with statements spans it and it holds more than blank
+    space and comments; it is covered when any such block ran. A file a line directive is in or
+    names has no line coordinates, so its line population is unavailable.
+    """
     rows = report.read_text().splitlines()
     if not rows or rows[0] not in {"mode: set", "mode: count", "mode: atomic"}:
         raise ValueError("Invalid Go coverprofile mode")
@@ -789,9 +839,12 @@ def parse_go_coverage(
     files = set(inventory)
     modules = _go_modules(snapshot, files)
     source_lines: dict[str, list[str]] = {}
+    code_lines: dict[str, set[int]] = {}
     records: dict[str, _Record] = {}
     weights: dict[str, int] = {}
     covered: set[str] = set()
+    executable_lines: set[str] = set()
+    executed_lines: set[str] = set()
     carriers: dict[str, str | None] = {}
     row_counts: dict[str, int] = {}
     carrier_paths: set[str] = set()  # files whose //line directive names a target
@@ -815,7 +868,10 @@ def parse_go_coverage(
         if not path.endswith(".go"):
             raise ValueError(f"Go coverage source is not Go: {path}")
         if path not in records:
-            source_lines[path] = (snapshot / path).read_text().splitlines()
+            # Bytes keep a lone "\r", so code lines are numbered by "\n" alone, as Go does.
+            text = (snapshot / path).read_bytes().decode()
+            source_lines[path] = text.splitlines()
+            code_lines[path] = _go_code_lines(text)
             records[path] = _Record(path, len(source_lines[path]))
         lines = source_lines[path]
         record = records[path]
@@ -853,6 +909,13 @@ def parse_go_coverage(
         weights[coordinate] = statements
         if hits:
             covered.add(coordinate)
+        if statements:
+            spanned = {
+                f"{path}:{line}" for line in range(start, end + 1) if line in code_lines[path]
+            }
+            executable_lines.update(spanned)
+            if hits:
+                executed_lines.update(spanned)
     if not records:
         raise CoveragePopulationUnavailable("Go report contains no measured source blocks")
     result = _metadata("go-coverprofile", list(records.values()), source_scope, test_scope)
@@ -860,6 +923,38 @@ def parse_go_coverage(
     population = _population(set(weights), covered, list(records), "statements")
     population["weights"] = weights
     result["statements"] = population
+    # Go gives the blocks after a line directive the directive's line numbers, under the file it
+    # names: neither that file nor the one holding the directive has blocks on its own lines.
+    # Every non-test Go file in a measured package may hold one, in scope or not.
+    directed = set(carrier_paths)
+    packages = {PurePosixPath(path).parent for path in records}
+    for name in sorted(files):
+        package = PurePosixPath(name).parent
+        if package not in packages or not name.endswith(".go") or name.endswith("_test.go"):
+            continue
+        if targets := _go_line_directives((snapshot / name).read_bytes().decode()):
+            directed.add(name)
+            directed.update(
+                (package / PurePosixPath(target).name).as_posix()
+                for target in targets
+                if target.endswith(".go")
+            )
+    directed &= coverage_sources(files, source_scope)
+    # Such a file leaves the line population whole, even its own blocks' lines.
+    lined = {path for path in records if path not in directed}
+    result["lines"] = _population(
+        {line for line in executable_lines if line.rsplit(":", 1)[0] in lined},
+        {line for line in executed_lines if line.rsplit(":", 1)[0] in lined},
+        list(lined),
+        "lines",
+    )
+    if directed:
+        result["unavailable_populations"] = {
+            "lines": {
+                "files": sorted(directed),
+                "reason": "a Go line directive in or naming the file sets its blocks' line numbers, not the file's own",
+            }
+        }
     listing = report.with_name(report.name + ".go-list.json")
     if listing.is_file():
         result["go_build"] = _go_build(
