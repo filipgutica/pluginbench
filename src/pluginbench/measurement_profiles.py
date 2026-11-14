@@ -30,6 +30,7 @@ MEASUREMENT_NAMES = frozenset(
     {
         "tokens",
         "lines",
+        "iterations",
         "cyclomatic",
         "cognitive",
         "dead_code",

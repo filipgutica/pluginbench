@@ -240,12 +240,15 @@ Cleanup removes owned containers, networks, sidecars, temporary homes, and job c
 | Measurement | Meaning and current support |
 | --- | --- |
 | Tokens and time | Native root and reachable descendant input, cached input, uncached input, output and reasoning-output totals, plus coding time, deduplicated by session. Missing final totals or child logs make totals unknown; observed usage remains a lower bound. Arbitrary hook subprocess usage is unmetered, so hook treatments retain native-session usage separately and report total usage as unknown. Reviewer usage is separate. |
+| Verification iterations (transcript count) | `iterations`: verification commands and command → production/test edit → next command sequences, counted within each root/subagent trace and summed per attempt. Only workspace edits count; denied or cancelled commands and ad-hoc scripts are excluded. Missing traces or parse ambiguity that could change a count are incomplete, never zero. Failed commands are descriptive and exclude masked statuses; missing exit codes and unresolved final commands stay unknown. Shell-command edits and hook-run tests are unseen. |
 | Lines | Source/test lines added and removed, and added test lines that repeat in six-line blocks. Default scope covers the repository, with tests classified separately. |
 | Complexity | Net cognitive/cyclomatic complexity the submission added to source code, functions and source files added, and new or grown functions with a cognitive score above 15. Fallow covers JS/TS; pinned language analyzers cover Python, Go, and Rust. |
 | Dead code | Static unused-code warnings and (JS/TS) duplicate-code groups introduced since the starting scan. Fallow covers JS/TS; Python, Go, and native Rust analyzers report unused candidates. Warnings can include required public APIs. |
 | Coverage | Changed-line and changed-branch coverage: the share of the submission's added source lines its own tests run. Redundant added tests come from per-test coverage. Whole-suite line/statement/branch/function rates stay in JSON/CSV as diagnostics. Inputs: LCOV, coverage.py JSON, or Go coverprofiles. Go coverprofiles supply statements only, so Go changed-line rates are unknown. |
 | Review | Independent AI findings by severity/category, with fixed criteria across vanilla and guidance. |
 | Reference | When a task ships `solution/solution.patch`, each measurement revision applies it to the starting source and measures it with the same complexity, unused-code and line collectors. Reports show code measures as a ratio to the reference. |
+
+For `iterations`, a malformed shell command makes the attempt incomplete if treating any word as a command start could match the documented verification-command list. Otherwise, it cannot change the count and is ignored. Quoted operators and here-document bodies are data. Fresh evaluations and later `measure` requests both bind the counts to a saved measurement revision; reports require that revision.
 
 JS/TS analysis requires Node, Corepack, and Fallow 3.18.0. PluginBench retains real entrypoint inference and checks discovery/parse completeness. A missing or different tool version makes those measurements unavailable, without blocking tokens, lines, or review.
 
@@ -567,7 +570,7 @@ To review with another reviewer, for example to compare two reviewers or to try 
 
 ## Measure again
 
-`pluginbench measure runs/<run> --measurements cyclomatic,cognitive --revision <name>` adds measures to a finished run from its saved submissions, as measurement revision `<name>`. It makes no model calls and codes nothing again. It adds only measures that a collector takes from saved submissions: `cyclomatic`, `cognitive`, `dead_code`, and `coverage`. It prints what it will measure and asks before starting unless `--yes` is set. It owns `run.lock` while it works, so it refuses an active run.
+`pluginbench measure runs/<run> --measurements cyclomatic,cognitive --revision <name>` adds measures to a finished run from its saved submissions, as measurement revision `<name>`. It makes no model calls and codes nothing again. It adds `cyclomatic`, `cognitive`, `dead_code`, and `coverage` from saved submissions, and `iterations` from saved agent traces. For example, `pluginbench measure runs/<run> --measurements iterations --revision transcript-counts --yes` backfills the transcript counts with zero model calls. An `iterations`-only revision needs no collector or Docker runtime. It prints what it will measure and asks before starting unless `--yes` is set. It owns `run.lock` while it works, so it refuses an active run.
 
 It refuses:
 
@@ -585,7 +588,7 @@ The steps:
 3. A new measure that is broken on one task while other tasks can measure it is added to `not_measured` for that task, as `check` does. With `require_ready`, any new measure that is not ready refuses the request.
 4. It collects the revision, and then selects it and rebuilds the report.
 
-A revision is built from the run's saved submissions, not from an earlier revision. So the new revision collects every collector measure the run selects, the earlier ones included: measuring a run that already has coverage again needs its task images again. The earlier selected revision stays in evidence and in `measurement_history`. Coding evidence, correctness, tokens, lines, and reviews are not changed. The working files of each request stay in `measure/<name>/`: profiles, readiness checks, and `evaluation-before.json`, the settings as they were before.
+A revision is built from the run's saved submissions, not from an earlier revision. So the new revision collects every collector measure the run selects and recounts selected transcript measures, the earlier ones included: measuring a run that already has coverage again needs its task images again. The earlier selected revision stays in evidence and in `measurement_history`. Coding evidence, correctness, tokens, lines, and reviews are not changed. The working files of each request stay in `measure/<name>/`: profiles, readiness checks, and `evaluation-before.json`, the settings as they were before.
 
 The run's saved settings change only through this command, as `review` changes the selected review. The command adds the new measures to `measurements` and `comparison_identity.measurements`. It adds their readiness rows to `measurement_capabilities`, `measurement_readiness`, and `comparison_identity.measurement_capabilities`, and it updates `comparison_identity.effective_observer_scripts`. It then writes `evaluation.json` and its binding again. `compare` checks these identity fields, so measure every run in a batch with the same build and the same request.
 

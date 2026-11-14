@@ -34,7 +34,7 @@ See [report format](metrics.md#report-files) for schema versions and legacy repo
 | `tasks.version` | `str \| None` | `null` | no | Selects the dataset version, which resolves to an immutable content hash. |
 | `tasks.ids` | `list[str]` | `[]` | no | Selects unique task IDs from the local source or dataset. |
 | `tasks.urls` | `list[str]` | `[]` | no | Selects unique GitHub task-folder URLs whose refs resolve to commits. |
-| `measurements` | `list[Literal['tokens', 'lines', 'cyclomatic', 'cognitive', 'dead_code', 'coverage', 'review']]` | `—` | yes | Selects unique measurements, with review requiring reviewer settings. |
+| `measurements` | `list[Literal['tokens', 'lines', 'cyclomatic', 'cognitive', 'dead_code', 'coverage', 'review', 'iterations']]` | `—` | yes | Selects unique measurements, with review requiring reviewer settings. |
 | `measurement_settings` | `MeasurementSettings` | `{"source_scope":null,"test_scope":null,"fallow_config":null,"coverage":null,"coverage_profiles":{},"test_contribution":null,"require_ready":false}` | no | Configures measurement scopes, tools, coverage profiles, and readiness requirements. |
 | `measurement_settings.source_scope` | `list[str] \| None` | `null` | no | Selects repository-relative source patterns for measurements. |
 | `measurement_settings.test_scope` | `list[str] \| None` | `null` | no | Selects repository-relative test patterns for measurements. |
