@@ -612,8 +612,10 @@ def test_a_parse_failure_outranks_a_red_baseline(tmp_path: Path) -> None:
         subprocess.CompletedProcess(["finder"], 2, "", "panic: crashed"),
         subprocess.CompletedProcess(["finder"], 0, "not json", ""),
         subprocess.CompletedProcess(["finder"], 0, '{"sites": []}', ""),
+        subprocess.CompletedProcess(["finder"], 0, '{"sites": [{}], "failures": []}', ""),
+        subprocess.CompletedProcess(["finder"], 0, '{"sites": [], "failures": [null]}', ""),
     ],
-    ids=["timeout", "os-error", "crash", "not-json", "no-failure-list"],
+    ids=["timeout", "os-error", "crash", "not-json", "no-failure-list", "bad-site", "bad-failure"],
 )
 def test_a_site_finder_that_fails_leaves_its_files_unparsed_and_the_attempt_incomplete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, finder: object

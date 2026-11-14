@@ -359,6 +359,16 @@ def _observer_output(
         or not isinstance(output.get("failures"), list)
     ):
         raise SiteFinderFailure("output has no site and failure lists")
+    for row in output["sites"]:
+        if not (
+            isinstance(row, dict)
+            and all(isinstance(row.get(key), str) for key in ("path", "operator"))
+            and all(type(row.get(key)) is int for key in ("start", "end"))
+        ):
+            raise SiteFinderFailure("output has a malformed site row")
+    for row in output["failures"]:
+        if not (isinstance(row, dict) and all(isinstance(row.get(k), str) for k in ("path", "reason"))):
+            raise SiteFinderFailure("output has a malformed failure row")
     return output
 
 

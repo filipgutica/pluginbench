@@ -10,6 +10,7 @@ import json
 import hashlib
 import os
 import signal
+from types import SimpleNamespace
 import shutil
 import subprocess
 import sys
@@ -36,6 +37,7 @@ from pluginbench import (
     harbor_backend,
     isolation,
     language_analysis,
+    mutation,
     parallel,
     remeasure,
     run_lock,
@@ -2711,6 +2713,8 @@ def test_measure_adds_mutation_alone_and_carries_coverage_forward(
     assert {row["status"] for row in coverage} >= {"measured"}
     suites: list[tuple[str, int, str]] = []
     monkeypatch.setattr(harbor_backend, "run_native_command", _suite(suites))
+    # Runs take no measured time, so each timeout is exactly the one-minute allowance.
+    monkeypatch.setattr(mutation, "time", SimpleNamespace(monotonic=lambda: 0.0))
 
     result = _measure_mutation(root)
 
