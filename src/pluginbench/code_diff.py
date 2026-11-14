@@ -144,10 +144,7 @@ def _file_changes(patch: str) -> tuple[FileChange, ...]:
 TEST_DIRECTORY_NAMES = frozenset(
     {"test", "tests", "testing", "spec", "specs", "__tests", "__tests__"}
 )
-# conftest.py is pytest infrastructure: it is collected with the tests wherever it sits.
-TEST_FILENAME_PATTERNS = (
-    "test_*", "*.test.*", "*.spec.*", "*_test.py", "*_test.go", "conftest.py"
-)
+TEST_FILENAME_PATTERNS = ("test_*", "*.test.*", "*.spec.*", "*_test.py", "*_test.go")
 TEST_PATH_PATTERNS = tuple(
     pattern
     for directory in sorted(TEST_DIRECTORY_NAMES)

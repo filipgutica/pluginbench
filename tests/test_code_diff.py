@@ -100,9 +100,6 @@ def test_plain_unified_diff_is_not_silently_measured_as_zero() -> None:
         ("lib/__tests__/lexer-match.js", 1),
         ("lib/__tests/lexer-match-atrule-prelude.js", 1),
         ("src/example.test.dir/value.ts", 0),
-        # pytest collects conftest.py with the tests wherever it sits.
-        ("conftest.py", 1),
-        ("src/pkg/conftest.py", 1),
     ],
 )
 def test_shared_classifier_recognizes_go_tests_without_matching_parent_filename(
@@ -132,7 +129,7 @@ def test_leaving_out_test_files_keeps_every_production_change_byte_for_byte(
         "etree.go": b"package etree\n\nfunc Diff() {}\n",
         "diff_test.go": b"package etree\n\nfunc mustDoc() {}\n",
         "path_test.go": b"package etree\n",
-        "pkg/conftest.py": b"import pytest\n",
+        "tests/conftest.py": b"import pytest\n",
         "pkg/core.py": b"value = 0\n",
         "web/app.ts": b"export const a = 0;\n",
         "logo.png": bytes(range(256)),
@@ -144,7 +141,7 @@ def test_leaving_out_test_files_keeps_every_production_change_byte_for_byte(
     (work / "diff_test.go").write_text("package etree\n\nfunc mustDoc() int { return 2 }\n")
     (work / "path_test.go").unlink()
     (work / "diff_edge_test.go").write_text("package etree\n\nvar _ = mustDoc()\n")
-    (work / "pkg/conftest.py").write_text("import pytest\n\nfixture = 1\n")
+    (work / "tests/conftest.py").write_text("import pytest\n\nfixture = 1\n")
     (work / "pkg/test_core.py").write_text("def test_value(): pass\n")
     (work / "pkg/core.py").write_text("value = 1\n")
     (work / "web/app.test.ts").write_text("test('a', () => {});\n")
@@ -159,8 +156,8 @@ def test_leaving_out_test_files_keeps_every_production_change_byte_for_byte(
 
     # Added, changed and deleted test files of every language leave together.
     assert removed == [
-        "diff_edge_test.go", "diff_test.go", "path_test.go", "pkg/conftest.py",
-        "pkg/test_core.py", "web/app.test.ts",
+        "diff_edge_test.go", "diff_test.go", "path_test.go", "pkg/test_core.py",
+        "tests/conftest.py", "web/app.test.ts",
     ]
     graded = tmp_path / "graded"
     graded.mkdir()
@@ -169,7 +166,7 @@ def test_leaving_out_test_files_keeps_every_production_change_byte_for_byte(
     _git("apply", "--binary", str(tmp_path / "filtered.patch"), cwd=graded)
     for name in ("etree.go", "pkg/core.py", "web/app.ts", "logo.png"):
         assert (graded / name).read_bytes() == (work / name).read_bytes(), name
-    for name in ("diff_test.go", "path_test.go", "pkg/conftest.py"):
+    for name in ("diff_test.go", "path_test.go", "tests/conftest.py"):
         assert (graded / name).read_bytes() == base[name], name
     assert not (graded / "diff_edge_test.go").exists()
     assert not (graded / "pkg/test_core.py").exists()
@@ -183,6 +180,17 @@ def test_a_patch_without_test_files_is_returned_unchanged() -> None:
 
     assert without_test_files(patch) == (patch, [])
     assert without_test_files("") == ("", [])
+
+
+def test_a_conftest_outside_a_test_directory_stays_production() -> None:
+    # The shared classifier, which saved analysis reports are checked against, does not treat
+    # it as a test, and the source-only grade follows that classifier exactly.
+    patch = (
+        "diff --git a/conftest.py b/conftest.py\n"
+        "--- a/conftest.py\n+++ b/conftest.py\n@@ -1 +1 @@\n-old\n+new\n"
+    )
+
+    assert without_test_files(patch) == (patch, [])
 
 
 def test_a_rename_between_a_test_file_and_production_is_refused() -> None:
