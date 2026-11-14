@@ -424,6 +424,25 @@ def _consistent_observation(executions: list[dict[str, Any]], key: str) -> str |
     return next(iter(values)) if len(values) == 1 else None
 
 
+def _model_identity(executions: list[dict[str, Any]]) -> str | None:
+    """The one model an attempt ran on, or None when it is not a single-model attempt.
+
+    Codex cannot lock a subagent's model or effort, so a descendant on another model or
+    reasoning effort than the root makes the attempt ineligible, as a mixed Claude stream does.
+    """
+    model = _consistent_observation(executions, "actual_primary_models")
+    effort = _consistent_observation(executions, "runtime_effort_evidence")
+    for execution in executions:
+        for key, runner in (
+            ("actual_descendant_models", model),
+            ("actual_descendant_efforts", effort),
+        ):
+            observed = execution.get(key, [])
+            if not isinstance(observed, list) or any(value != runner for value in observed):
+                return None
+    return model
+
+
 def _observed_harness_version(executions: list[dict[str, Any]]) -> str | None:
     versions = [
         codex.observed_cli_version(
@@ -1610,7 +1629,7 @@ def _run_attempts(
                     )
                     record.update(
                         stages=[stage],
-                        model=_consistent_observation([execution], "actual_primary_models"),
+                        model=_model_identity([execution]),
                         runtime={
                             "harness": f"{frozen.recipe.harness}-cli",
                             "harness_version": _observed_harness_version([execution]),
@@ -1656,7 +1675,7 @@ def _run_attempts(
                 observed.append(
                     json.loads(execution_path.read_text()) if execution_path.is_file() else {}
                 )
-            record["model"] = _consistent_observation(observed, "actual_primary_models")
+            record["model"] = _model_identity(observed)
         _checkpoint(
             root,
             frozen,
@@ -2003,6 +2022,7 @@ def report_study(
                         "usage_accounting",
                         "usage_validation",
                         "actual_descendant_models",
+                        "actual_descendant_efforts",
                         "native_treatment",
                         "native_session_usage",
                         "stream_errors",
@@ -2015,8 +2035,13 @@ def report_study(
                 stage["submission_error"] = _bound_document(
                     root, run["submission_errors"][attempt["id"]][stage["id"]]
                 )
-        if attempt["model"] != _consistent_observation(executions, "actual_primary_models"):
+        identity = _model_identity(executions)
+        # A run saved before descendants were checked recorded the root's model.
+        if attempt["model"] not in (
+            identity, _consistent_observation(executions, "actual_primary_models")
+        ):
             raise ValueError("assessment model differs from its bound execution evidence")
+        attempt["model"] = identity
         attempt["provenance"].update(
             {
                 "input": f"{plan.get('host', 'codex')}-study",

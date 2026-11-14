@@ -275,6 +275,8 @@ max_threads = 4
 max_depth = 1
 default_subagent_model = "gpt-6.1-sol"
 default_subagent_reasoning_effort = "medium"
+[features.multi_agent_v2]
+expose_spawn_agent_model_overrides = false
 ''',
     }
     (artifacts / "native-treatment.json").write_text(json.dumps(treatment))

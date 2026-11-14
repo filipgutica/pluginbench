@@ -1,5 +1,5 @@
 {
- "_source": "codex_launch_snapshot() run on origin/main 315540a; regenerate only with a launcher version decision",
+ "_source": "codex_launch_snapshot() run on origin/main 315540a, then features.multi_agent_v2 added by hand with the launcher kept at version 1; regenerate only with a launcher version decision",
  "snapshot": {
   "runtime_identity": {
    "protocol": "harbor-docker-v1",
@@ -54,7 +54,10 @@
        "remote_plugin": false,
        "apps": false,
        "hooks": true,
-       "multi_agent": true
+       "multi_agent": true,
+       "multi_agent_v2": {
+        "expose_spawn_agent_model_overrides": false
+       }
       },
       "project_doc_max_bytes": 32768,
       "agents": {

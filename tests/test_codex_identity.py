@@ -2,6 +2,8 @@
 
 `tests/fixtures/codex-launch-golden.json` was computed by `codex_launch_snapshot` with the
 source tree of origin/main at 315540a, so this test compares against main, not this branch.
+The only later change is the vanilla config's `features.multi_agent_v2` table, which hides
+V2's spawn model and effort fields; it was added to the golden by hand.
 """
 
 from __future__ import annotations

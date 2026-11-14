@@ -47,6 +47,10 @@ class NativeCapabilities(BaseModel):
                 "apps": False,
                 "hooks": True,
                 "multi_agent": self.subagents,
+                # A table without `enabled` leaves the version's model-selected V2 switch alone.
+                # It hides spawn_agent's model and effort fields on V2; it does not lock them,
+                # because V2 still honours them if sent and V1 always offers them.
+                "multi_agent_v2": {"expose_spawn_agent_model_overrides": False},
             },
             "project_doc_max_bytes": MAX_GUIDANCE_BYTES,
             "agents": {

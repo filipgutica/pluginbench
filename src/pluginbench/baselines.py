@@ -324,6 +324,8 @@ def _matches_native_stage(
     for key, requested in (
         ("actual_primary_models", settings.get("model")),
         ("runtime_effort_evidence", settings.get("reasoning")),
+        ("actual_descendant_models", settings.get("model")),
+        ("actual_descendant_efforts", settings.get("reasoning")),
     ):
         values = execution.get(key, [])
         if not isinstance(values, list) or any(value != requested for value in values):

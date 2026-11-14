@@ -587,6 +587,7 @@ def test_native_descendant_usage_counts_session_totals_once_and_keeps_primary_id
     assert parsed["actual_primary_models"] == ["primary"]
     assert parsed["actual_descendant_models"] == ["child-model"]
     assert parsed["runtime_effort_evidence"] == ["high"]
+    assert parsed["actual_descendant_efforts"] == ["low"]
     assert parsed["usage_accounting"]["status"] == "complete"
     assert len(parsed["usage_accounting"]["sessions"]) == 2
     assert parsed["successful_native_completion"]
@@ -857,6 +858,40 @@ def test_native_named_spawn_requires_captured_child_even_without_legacy_spawn_ev
         "missing descendant agent /root/check from session root"
         in parsed["usage_accounting"]["reasons"]
     )
+
+
+def test_native_spawn_override_is_descendant_evidence_without_the_child_trace() -> None:
+    spawn = named_native_spawn()
+    call = spawn[0]["payload"]
+    assert isinstance(call, dict)
+    call["arguments"] = '{"model":"other-model","reasoning_effort":"low"}'
+    root = native_session("root", [{"input_tokens": 20, "output_tokens": 5}], extra=spawn)
+    parsed = codex.parse_events("", [root], "codex", include_descendants=True)
+    assert parsed["actual_descendant_models"] == ["other-model"]
+    assert parsed["actual_descendant_efforts"] == ["low"]
+
+
+def test_native_spawn_override_without_captured_output_is_descendant_evidence() -> None:
+    spawn = named_native_spawn()[:1]
+    call = spawn[0]["payload"]
+    assert isinstance(call, dict)
+    call["arguments"] = '{"model":"other-model","reasoning_effort":"low"}'
+    root = native_session("root", [{"input_tokens": 20, "output_tokens": 5}], extra=spawn)
+    parsed = codex.parse_events("", [root], "codex", include_descendants=True)
+    assert parsed["actual_descendant_models"] == ["other-model"]
+    assert parsed["actual_descendant_efforts"] == ["low"]
+
+
+def test_native_rejected_spawn_override_is_not_descendant_evidence() -> None:
+    spawn = named_native_spawn()
+    call, output = spawn[0]["payload"], spawn[1]["payload"]
+    assert isinstance(call, dict) and isinstance(output, dict)
+    call["arguments"] = '{"model":"other-model","reasoning_effort":"low"}'
+    output["output"] = "Unknown model `other-model` for spawn_agent. Available models: primary"
+    root = native_session("root", [{"input_tokens": 20, "output_tokens": 5}], extra=spawn)
+    parsed = codex.parse_events("", [root], "codex", include_descendants=True)
+    assert parsed["actual_descendant_models"] == []
+    assert parsed["actual_descendant_efforts"] == []
 
 
 @pytest.mark.parametrize("boundary", [None, True, -1, 0, 2, 5, 99])
