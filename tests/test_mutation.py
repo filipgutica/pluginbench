@@ -332,7 +332,21 @@ def test_generated_and_unparsable_files_give_no_sites(tmp_path: Path) -> None:
     metrics = _metrics(report, destination)
     assert metrics["candidate_count"] == 0 and not fake.calls
     assert set(_object(metrics["unparsed_files"])) == {"src/broken.py", "src/table.go"}
-    assert metrics["status"] == "unavailable"
+    assert metrics["status"] == "incomplete" and "src/broken.py" in str(metrics["reason"])
+
+
+def test_changed_test_files_give_no_sites(tmp_path: Path) -> None:
+    test = "if a < b:\n    pass\n"
+    assert mutation.python_sites("tests/test_grade.py", test.encode())
+    report, fake, destination = _measure(
+        tmp_path,
+        _passing(lambda view: 0),
+        after={"tests/test_grade.py": test, "src/grade.py": BEFORE + "x\n"},
+    )
+    metrics = _metrics(report, destination)
+    assert report["changed_production_lines"] == ["src/grade.py:3"]
+    assert metrics["candidate_lines"] == [] and metrics["status"] == "unavailable"
+    assert not fake.calls
 
 
 def test_go_mutants_that_do_not_build_are_invalid_and_not_replaced(tmp_path: Path) -> None:

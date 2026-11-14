@@ -411,9 +411,12 @@ def native_executor(identity: dict[str, object], report_path: str) -> Executor:
             timeout=timeout,
         )
         elapsed = time.monotonic() - started
-        # execution.json keeps both exports' digests; the tree copies themselves are not kept.
+        # execution.json keeps the digests of both exports and of the coverage report, which
+        # mutation never reads; the copies themselves are not kept.
         for name in ("before", "after"):
             shutil.rmtree(destination / name, ignore_errors=True)
+        for report in destination.glob("report.raw*"):
+            report.unlink()
         exit_code = receipt.get("exit_code")
         return Run(
             exit_code=exit_code if isinstance(exit_code, int) else None,
@@ -792,7 +795,9 @@ def mutation_metrics(report: dict[str, object], directory: Path) -> dict[str, ob
     share: dict[str, object] = {}
     baseline = _verified_runs(directory, report["baseline"])
     if not selected:
-        unavailable = "no candidate sites on changed production lines"
+        # With an unparsed changed file the site population itself is unknown.
+        if not incomplete:
+            unavailable = "no candidate sites on changed production lines"
     elif len(baseline) != 2 or not _baseline(baseline):
         unavailable = "baseline red or unstable"
     elif (
