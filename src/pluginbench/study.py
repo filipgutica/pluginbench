@@ -22,7 +22,8 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from pluginbench import baselines, claude, codex, harbor_backend, submissions, trial_containers
+from pluginbench import baselines, claude, codex, harbor_backend, provider_stops, submissions
+from pluginbench import trial_containers
 from pluginbench.arms import normalize_arm_name
 from pluginbench.codex_events import failed_before_first_turn
 from pluginbench.saved_usage import revalidate_usage
@@ -458,7 +459,9 @@ def _observed_harness_version(executions: list[dict[str, Any]]) -> str | None:
 
 
 class BackendUnavailable(ValueError):
-    """A coding session failed before its first model turn; the run stops instead of scoring it."""
+    """A coding session failed before its first model turn, or stopped at its provider or
+    account (a limit, an authentication failure, or an unrecovered server error); the run stops
+    instead of scoring it."""
 
 
 class BuiltinsDiffer(ValueError):
@@ -598,6 +601,7 @@ def _execute_stage(
             artifacts.unlink()
         else:
             shutil.rmtree(artifacts)
+    provider_stop = None
     if artifact_error:
         execution = {
             **codex.parse_events("", [], study.recipe.harness),
@@ -605,6 +609,16 @@ def _execute_stage(
             "submission_collected": False,
             "error": artifact_error,
         }
+    else:
+        stdout = target / "artifacts" / "stdout.jsonl"
+        if study.recipe.harness == "claude" and stdout.is_file():
+            # Retry waits count toward coding time; this lets it be read with them in mind.
+            execution["api_retries"] = provider_stops.claude_api_retries(
+                stdout.read_text(errors="replace")
+            )
+        provider_stop = provider_stops.saved_stop(target / "artifacts", study.recipe.harness)
+        if provider_stop is not None:
+            execution["provider_stop"] = provider_stop
     _write(target / "execution.json", execution)
     if interrupted is not None:
         shutil.copytree(
@@ -640,6 +654,14 @@ def _execute_stage(
             f"repeat {entry['attempt']}): {backend_error}. "
             "The attempt is not scored and the run stops. Resume the run once the backend is "
             "reachable; this attempt is coded again"
+        )
+    if provider_stop is not None:
+        # As above: never complete, never graded, never cached; a resume codes it again.
+        raise BackendUnavailable(
+            f"{study.recipe.harness} stopped on {provider_stop} in attempt {entry['id']} "
+            f"({entry['task_id']} · {normalize_arm_name(entry['arm'])} · "
+            f"repeat {entry['attempt']}). The attempt is not scored and the run stops. Resume "
+            "the run once the limit resets or the provider recovers; this attempt is coded again"
         )
     if artifact_error or execution.get("submission_collected") is not True:
         exported_digest = execution.get("submission_export_digest")

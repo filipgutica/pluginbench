@@ -31,6 +31,7 @@ from native_support import (
     execution as native_execution,
     synthetic_contract,
 )
+from test_provider_stops import claude_rate_limited, claude_retried
 
 
 @pytest.fixture(autouse=True)
@@ -1213,13 +1214,15 @@ def _claude_backend(
     drifted: Callable[[dict[str, Any]], bool] = lambda entry: False,
     interrupt_at: int | None = None,
     session_mismatch: bool = False,
+    stream_for: Callable[[dict[str, Any]], str] | None = None,
 ) -> list[dict[str, Any]]:
     """Claude attempts whose usage validates; `drifted` ones report other built-ins.
 
     With `session_mismatch`, an attempt is recorded as invoke_native records a session that
-    differs from its receipt: failed, with the receipt file only.
+    differs from its receipt: failed, with the receipt file only. `stream_for` gives an
+    attempt another stdout.
     """
-    stream = (PLAIN / "stream.jsonl").read_text()
+    plain = (PLAIN / "stream.jsonl").read_text()
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: runtime_identity())
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
     monkeypatch.setattr(
@@ -1245,6 +1248,7 @@ def _claude_backend(
             answer_path="answer.py", timeout=1800, version=CLAUDE_RUNNER["harness_version"],
         )
         artifacts = area / "artifacts"
+        stream = stream_for(kwargs["entry"]) if stream_for else plain
         (artifacts / "stdout.jsonl").write_text(stream)
         shutil.copytree(PLAIN / "sessions", artifacts / "harbor/trial/agent/sessions")
         coded: dict[str, Any] = {
@@ -1314,6 +1318,83 @@ def test_a_fresh_claude_attempt_with_other_built_ins_stops_a_run_that_reuses_van
     assert revalidated["usage_validation"]["status"] == "unavailable"
     assert any("reuses the cached vanilla" in reason
                for reason in revalidated["usage_validation"]["reasons"])
+
+
+def test_a_claude_rate_limit_mid_session_stops_the_run_and_its_vanilla_is_coded_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = tmp_path / "cache"
+    limited, plain = claude_rate_limited(), (PLAIN / "stream.jsonl").read_text()
+    calls = _claude_backend(
+        monkeypatch, stream_for=lambda entry: limited if entry["arm"] == "baseline" else plain
+    )
+    one = _study(tmp_path / "one", runner=CLAUDE_RUNNER)
+    root = tmp_path / "run"
+    with pytest.raises(study.BackendUnavailable) as raised:
+        study.run_study(one, root, baseline_cache=cache,
+                        baseline_identity=_claude_identity(one.tasks))
+    assert "claude stopped on a usage or rate limit (Claude seven_day window, resets " in str(
+        raised.value
+    )
+    run = json.loads((root / "run.json").read_text())
+    # With two jobs, both vanilla repeats may be in flight when the first one stops.
+    stopped = {entry["id"] for entry in calls if entry["arm"] == "baseline"}
+    assert stopped and all(run["attempt_states"][attempt] == "interrupted" for attempt in stopped)
+    assert "You've hit your limit" in run["error"]
+    assert not any((root / "attempts" / attempt / "handoff/correctness.json").exists()
+                   for attempt in stopped)
+    assert not list(cache.glob("*/*/manifest.json"))
+
+    _claude_backend(monkeypatch)
+    study.resume_study(root, baseline_cache=cache,
+                       baseline_identity=_claude_identity(study._frozen_study(root).tasks))
+    run = json.loads((root / "run.json").read_text())
+    assert set(run["discarded_attempts"]) == stopped
+    assert set(run["attempt_states"].values()) == {"complete"}
+    assert len(list(cache.glob("*/*/manifest.json"))) == 2
+
+
+def test_a_claude_attempt_that_recovered_from_api_retries_is_scored_and_records_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _claude_backend(monkeypatch, stream_for=lambda entry: claude_retried())
+    cache = tmp_path / "cache"
+    one = _study(tmp_path / "one", runner=CLAUDE_RUNNER)
+    root = study.run_study(one, tmp_path / "run", baseline_cache=cache,
+                           baseline_identity=_claude_identity(one.tasks))
+    report = json.loads((root / "report/assessment-report.json").read_text())
+    for row in report["attempts"]:
+        assert _attempt_json(root, row["id"], "correctness.json")["checks"]["behavior"] is True
+        execution = _attempt_json(root, row["id"], "execution.json")
+        assert execution["api_retries"] == {
+            "count": 2, "announced_wait_ms": 1500, "errors": {"overloaded": 2},
+        }
+        assert "provider_stop" not in execution
+    assert len(list(cache.glob("*/*/manifest.json"))) == 2
+
+
+def test_a_cached_claude_vanilla_that_stopped_at_its_limit_is_not_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A build that did not detect provider stops cached a session a limit cut short.
+    cache = tmp_path / "cache"
+    _claude_backend(monkeypatch)
+    one = _study(tmp_path / "one", runner=CLAUDE_RUNNER)
+    study.run_study(one, tmp_path / "first", baseline_cache=cache,
+                    baseline_identity=_claude_identity(one.tasks))
+    [entry] = [path.parent for path in cache.glob("*/1/manifest.json")]
+    [stdout] = entry.glob("attempts/*/handoff/artifacts/stdout.jsonl")
+    stdout.write_text(claude_rate_limited())
+    manifest = json.loads((entry / "manifest.json").read_text())
+    manifest["inventory"] = baselines._inventory(entry)
+    (entry / "manifest.json").write_text(json.dumps(manifest))
+
+    two = _study(tmp_path / "two", guidance="another", runner=CLAUDE_RUNNER)
+    with pytest.raises(ValueError, match=(
+        f"baseline cache entry {entry.parent.name}/1 stopped on a usage or rate limit"
+    )):
+        study.run_study(two, tmp_path / "second", baseline_cache=cache,
+                        baseline_identity=_claude_identity(two.tasks))
 
 
 def test_a_fully_fresh_claude_run_with_other_built_ins_still_scores_and_says_why_nothing_is_cached(

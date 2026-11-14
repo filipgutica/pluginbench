@@ -15,7 +15,8 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
-from pluginbench import claude, claude_treatments, components, harbor_backend, submissions
+from pluginbench import claude, claude_treatments, components, harbor_backend, provider_stops
+from pluginbench import submissions
 from pluginbench.codex_events import failed_before_first_turn
 from pluginbench.native_treatments import DELIVERY_POLICY, NativeCapabilities
 from pluginbench.assessment_metrics import inspect_snapshot
@@ -397,6 +398,15 @@ def _never_reached_model(execution: dict[str, Any], harness: object) -> bool:
     )
 
 
+def _provider_stop(attempt: Path, record: dict[str, Any], harness: object) -> str | None:
+    """The provider stop a vanilla attempt's saved stages record, which makes it no baseline."""
+    for stage in record["stages"]:
+        stop = provider_stops.saved_stop(attempt / stage["id"] / "artifacts", harness)
+        if stop is not None:
+            return stop
+    return None
+
+
 def _native_grader_matches(verifier: object, identity: dict[str, Any]) -> bool:
     if not isinstance(verifier, dict):
         return False
@@ -752,6 +762,15 @@ class BaselineCache:
             raise ValueError(
                 "baseline cache cohort lacks complete isolated native baseline evidence"
             )
+        # Entries cached before provider stops were detected may hold one.
+        harness = manifest["context"]["coding"]["study"]["harness"]
+        for record in records:
+            stop = _provider_stop(cached / "attempts" / record["id"], record, harness)
+            if stop is not None:
+                raise ValueError(
+                    f"baseline cache entry {cached.parent.name}/{cached.name} stopped on {stop}. "
+                    "Move it out of the PluginBench cache root; its repeat is then coded again"
+                )
         return manifest
 
     def decisions(self) -> dict[str, dict[str, Any]]:
@@ -872,6 +891,9 @@ class BaselineCache:
             for stage in record["stages"]
         ):
             return "its session never reached the model"
+        stop = _provider_stop(attempt, record, harness)
+        if stop is not None:
+            return f"its session stopped on {stop}"
         cohort = self.path / key
         cohort.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=f".{record['attempt']}-", dir=cohort) as temporary:
