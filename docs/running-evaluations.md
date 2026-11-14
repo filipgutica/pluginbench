@@ -254,8 +254,8 @@ Verification segments recognize tools by file name, including paths such as `nod
 
 A command's status is masked when any separator after a verification segment is a pipe, `;`, `&`, a newline with another command, or `|| true`. An earlier `set -o pipefail`, including combined options such as `set -euo pipefail`, removes only the pipe mask while enabled. Closing shell syntax on later lines does not run another command; assignment-only lines do. Separators before verification segments do not mask their status. These counts use method `verification transcript count v2`.
 
-Limitation (S8): pipefail tracking is sequential and does not model scope through subshells or wrappers.
-Limitation (S10): Codex interruption branches have synthetic coverage but remain unverified on real interrupted traces.
+Limitation: pipefail tracking is sequential and does not model scope through subshells or wrappers.
+Limitation: Codex interruption branches have synthetic coverage but remain unverified on real interrupted traces.
 
 JS/TS analysis requires Node, Corepack, and Fallow 3.18.0. PluginBench retains real entrypoint inference and checks discovery/parse completeness. A missing or different tool version makes those measurements unavailable, without blocking tokens, lines, or review.
 
