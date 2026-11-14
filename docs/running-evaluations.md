@@ -374,11 +374,17 @@ A session that stops at its provider or account is not an outcome either, at any
 
 For Claude Code, the signals are:
 
-- a `rate_limit_event` with `status: "rejected"`, even when the session then ends with a success, because a limit can cut work short and leave a brief wrap-up;
+- a `rate_limit_event` with `status: "rejected"`, even when the session then ends with a success, because a limit can cut work short and leave a brief wrap-up. A rejected window that the session goes on past on extra usage (`isUsingOverage: true`) is not a stop;
 - a failed `result` whose last main-loop API error, or `api_error_status`, is a limit (429), an authentication failure (401 or 403), or a server error (5xx);
 - a session cut off, as by a timeout, while it was still retrying an API call (`system/api_retry`).
 
-For Codex, the signal is a turn that never completed, whose rollout ends with a `codex_error_info` code for a limit, an authorization failure, or a server, connection or retry failure. Codex's `error` events alone are not a stop: they include its "Reconnecting..." retries. The error names Claude's limit window and reset time, or carries Codex's own message. `status` shows it. The attempt stays `interrupted`, is not graded, and never enters the vanilla cache. A cached vanilla attempt that stopped this way is not reused: in a saved cohort it is skipped, and under the run's own key the run stops and names the entry to move out of the cache. Resume once the limit resets or the provider recovers: the attempt is discarded and its slot is coded again. Invalid requests, unknown errors, and output, turn, or context limits stay the agent's attempt.
+For Codex, the signals are a turn that never completed and:
+
+- a rollout that ends with a `codex_error_info` code for a limit, an authorization failure, or a server, connection or retry failure;
+- a rollout that ends with the `other` code right after Codex used up its "Reconnecting... n/n" retries, with no work between them and the failed turn. `other` alone stays the agent's attempt, because it also covers the agent's own failed requests;
+- a session cut off, as by a timeout, while it was still reconnecting. Codex 0.167.2 retries a failed connection without limit ("Reconnecting... waiting for network"), so such a turn writes no error.
+
+A reconnect that work follows is not a stop. The error names Claude's limit window and reset time, or carries Codex's own message. `status` shows it. The attempt stays `interrupted`, is not graded, and never enters the vanilla cache. A cached vanilla attempt that stopped this way is not reused: in a saved cohort it is skipped, and under the run's own key the run stops and names the entry to move out of the cache. Resume once the limit resets or the provider recovers: the attempt is discarded and its slot is coded again. Invalid requests, unknown errors, and output, turn, or context limits stay the agent's attempt.
 
 Each Claude attempt's `execution.json` records `api_retries`: how many API calls Claude Code retried, by error, and `announced_wait_ms`, the sum of the waits it announced before each retry. Coding time includes those waits. The sum is announced, not measured, and it can count a long background rate-limit wait more than once, because Claude Code repeats that announcement while it waits.
 

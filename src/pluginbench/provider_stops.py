@@ -7,9 +7,10 @@ Each rule reads only the evidence its CLI writes:
   `assistant` event with an `error` category and a `result` with `is_error: true` and
   `api_error_status`. Each retry is a `system/api_retry` event, and each limit update a
   `rate_limit_event`.
-- Codex 0.167.2 rollout. A failed turn ends with an `event_msg` `task_complete` whose `error`
-  holds a `codex_error_info` code. A stdout `error` event alone is no stop: Codex also uses it
-  for each "Reconnecting... n/5" retry.
+- Codex 0.167.2 rollout and stdout. A failed turn ends with an `event_msg` `task_complete` whose
+  `error` holds a `codex_error_info` code. Each retry is a stdout `error` event that starts
+  "Reconnecting...": "n/5" while retries last, and "waiting for network", without limit, while
+  the connection fails.
 
 Kept out of the launcher files (`components.FILES`), like `codex_events.py`: these rules read
 saved evidence and do not change how a model is called.
@@ -18,6 +19,7 @@ saved evidence and do not change how a model is called.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -50,8 +52,11 @@ _CODEX_ERRORS = {
     "response_too_many_failed_attempts": PROVIDER,
     "http_connection_failed": PROVIDER,
     "response_stream_connection_failed": PROVIDER,
-    "response_stream_disconnected": PROVIDER,
 }
+
+# A Codex retry notice: "Reconnecting... 3/5 (...)" or "Reconnecting... waiting for network".
+_RECONNECTING = "Reconnecting..."
+_RECONNECT_COUNT = re.compile(r"Reconnecting\.\.\. (\d+)/(\d+)")
 
 _DETAIL_LIMIT = 300
 
@@ -98,7 +103,8 @@ def claude_stop(stdout: str) -> str | None:
 
     A `rate_limit_event` with `status: "rejected"` is a stop even when the session then
     succeeds: a limit hit mid-response can leave a short wrap-up, so a success there may still
-    be work the limit cut short. Otherwise only a session without a successful result can be
+    be work the limit cut short. A rejected window the session goes on past on extra usage
+    (`isUsingOverage`) is no stop. Otherwise only a session without a successful result can be
     a stop: one whose last main-loop API error, or failed result status, names a limit, an
     authentication failure, or a server error, or one cut off while an API call was still being
     retried. Invalid requests, unknown errors and max-output stops stay the agent's attempt.
@@ -110,6 +116,7 @@ def claude_stop(stdout: str) -> str | None:
         if event.get("type") == "rate_limit_event"
         and isinstance(event.get("rate_limit_info"), dict)
         and event["rate_limit_info"].get("status") == "rejected"
+        and event["rate_limit_info"].get("isUsingOverage") is not True
     ]
     results = [event for event in events if event.get("type") == "result"]
     result = results[-1] if results else None
@@ -161,14 +168,47 @@ def _codex_code(info: object) -> str | None:
     return None
 
 
+def _codex_retries(events: list[dict[str, Any]]) -> list[str]:
+    """The stdout `error` messages since the session's last item of work.
+
+    Warnings are `error` items, as is the one for a transport fallback, so they are no work.
+    """
+    messages: list[str] = []
+    for event in events:
+        item = event.get("item")
+        if (
+            event.get("type") in {"item.started", "item.updated", "item.completed"}
+            and isinstance(item, dict)
+            and item.get("type") != "error"
+        ):
+            messages = []
+        elif event.get("type") == "error" and isinstance(event.get("message"), str):
+            messages.append(event["message"])
+    return messages
+
+
+def _exhausted(messages: list[str]) -> str | None:
+    """The "n/n" of the last retry notice, when it used up its retries, else None."""
+    notices = [message for message in messages if message.startswith(_RECONNECTING)]
+    count = _RECONNECT_COUNT.match(notices[-1]) if notices else None
+    if count is None or count[1] != count[2]:
+        return None
+    return f"{count[1]}/{count[2]}"
+
+
 def codex_stop(stdout: str, traces: list[str]) -> str | None:
     """Why a Codex session stopped at its provider or account, else None.
 
     Only a session whose turn never completed can be a stop. Its rollout's last turn error
-    must carry a limit, authorization or server code.
+    must carry a limit, authorization or server code, or be `other` right after the stdout
+    retries ran out: `other` alone also covers the agent's own failed requests. A session cut
+    off, as by a timeout, while still reconnecting is a stop too. Codex retries a failed
+    connection without limit, so such a turn writes no error.
     """
-    if any(event.get("type") == "turn.completed" for event in _events(stdout)):
+    events = _events(stdout)
+    if any(event.get("type") == "turn.completed" for event in events):
         return None
+    retries = _codex_retries(events)
     stop = None
     for trace in traces:
         for event in _events(trace):
@@ -176,15 +216,25 @@ def codex_stop(stdout: str, traces: list[str]) -> str | None:
             if (
                 event.get("type") != "event_msg"
                 or not isinstance(payload, dict)
-                or payload.get("type") not in {"task_complete", "turn_complete"}
+                or payload.get("type") != "task_complete"
                 or not isinstance(payload.get("error"), dict)
             ):
                 continue
             code = _codex_code(payload["error"].get("codex_error_info"))
             kind = _CODEX_ERRORS.get(code) if code else None
+            exhausted = _exhausted(retries) if code == "other" else None
+            if exhausted is not None:
+                kind, code = PROVIDER, f"other after {exhausted} reconnects"
             if kind is not None:
                 message = _detail(payload["error"].get("message"))
                 stop = f"{kind} ({code})" + (f": {message}" if message else "")
+    if (
+        stop is None
+        and retries
+        and retries[-1].startswith(_RECONNECTING)
+        and not any(event.get("type") == "turn.failed" for event in events)
+    ):
+        stop = f"{PROVIDER}: the session ended while reconnecting ({_detail(retries[-1])})"
     return stop
 
 

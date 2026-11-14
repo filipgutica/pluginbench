@@ -46,12 +46,14 @@ def _api_error(category: str, status: int | None, text: str) -> list[dict[str, o
     ]
 
 
-def _rejected(window: str = "seven_day") -> dict[str, object]:
+def _rejected(window: str = "seven_day", *, overage: bool = False) -> dict[str, object]:
+    """A rejected window; with `overage`, the session goes on drawing on extra usage."""
     return {
         "type": "rate_limit_event", "session_id": _SESSION,
         "rate_limit_info": {
             "status": "rejected", "resetsAt": 1794758400, "rateLimitType": window,
-            "utilization": 1.0, "overageStatus": "rejected", "isUsingOverage": False,
+            "utilization": 1.0, "overageStatus": "allowed" if overage else "rejected",
+            "isUsingOverage": overage,
         },
     }
 
@@ -87,6 +89,59 @@ CODEX_LIMITED_STDOUT = _lines(
     }},
     {"type": "error", "message": CODEX_LIMIT_TEXT},
     {"type": "turn.failed", "error": {"message": CODEX_LIMIT_TEXT}},
+)
+
+
+# Warnings are `error` items; Codex writes them at startup and when it changes transport.
+_Event = dict[str, object]
+_CODEX_WARNING: _Event = {
+    "type": "item.completed", "item": {"id": "item_0", "type": "error", "message": "warning"},
+}
+_CODEX_COMMAND: _Event = {"type": "item.completed", "item": {
+    "id": "item_1", "type": "command_execution", "command": "ls", "exit_code": 0,
+    "status": "completed", "aggregated_output": "src\n",
+}}
+_CODEX_WORK: tuple[_Event, ...] = (
+    {"type": "thread.started", "thread_id": "01a1b94e-9994-7cd0-8426-bf37e4a00687"},
+    _CODEX_WARNING,
+    {"type": "turn.started"},
+    {"type": "item.started", "item": {"id": "item_1", "type": "command_execution",
+                                      "command": "ls", "status": "in_progress"}},
+    _CODEX_COMMAND,
+    {"type": "item.completed", "item": {"id": "item_2", "type": "agent_message",
+                                        "text": "Next I run the tests."}},
+)
+_DISCONNECTED = "stream disconnected before completion: failed to lookup address information"
+_WAITING: _Event = {"type": "error", "message":
+            "Reconnecting... waiting for network (Connection failed: error sending request)"}
+
+
+def _reconnect(attempt: int) -> dict[str, object]:
+    return {"type": "error", "message": f"Reconnecting... {attempt}/5 ({_DISCONNECTED})"}
+
+
+def _turn_failed() -> tuple[dict[str, object], ...]:
+    return (
+        {"type": "error", "message": _DISCONNECTED},
+        {"type": "turn.failed", "error": {"message": _DISCONNECTED}},
+    )
+
+
+# The provider went away mid-session: Codex retried, fell back to HTTPS, then waited for the
+# network without limit until the attempt timed out. No turn ended, so no rollout error.
+CODEX_RECONNECTING_STDOUT = _lines(
+    *_CODEX_WORK,
+    *(_reconnect(attempt) for attempt in range(2, 6)),
+    {"type": "item.completed", "item": {
+        "id": "item_3", "type": "error",
+        "message": f"Falling back from WebSockets to HTTPS transport. {_DISCONNECTED}",
+    }},
+    _WAITING, _WAITING, _WAITING,
+)
+CODEX_OPEN_ROLLOUT = _lines(
+    {"type": "session_meta", "payload": {"cli_version": "0.167.2", "source": "exec"}},
+    {"type": "turn_context", "payload": {"model": "gpt-6.1-sol", "effort": "medium"}},
+    {"type": "event_msg", "payload": {"type": "token_count", "info": None}},
 )
 
 
@@ -143,8 +198,13 @@ def test_a_claude_session_that_stopped_at_its_provider_is_named(
         _lines(*_plain()[:2], {
             **_api_error("rate_limit", 429, _LIMIT_TEXT)[2], "parent_tool_use_id": "toolu_01",
         }, _plain()[2]),
+        # A rejected window the session went on past, on extra usage.
+        _lines(*_plain()[:2], _rejected(overage=True), _plain()[2]),
     ],
-    ids=["retried-then-recovered", "invalid-request", "max-output", "max-turns", "subagent"],
+    ids=[
+        "retried-then-recovered", "invalid-request", "max-output", "max-turns", "subagent",
+        "overage",
+    ],
 )
 def test_a_claude_session_that_ended_on_its_own_is_no_provider_stop(stream: str) -> None:
     assert provider_stops.claude_stop(stream) is None
@@ -188,3 +248,47 @@ def test_a_codex_turn_that_failed_otherwise_or_completed_is_no_provider_stop() -
     assert provider_stops.codex_stop(
         recovered, [codex_rollout("usage_limit_exceeded")]
     ) is None
+
+
+def test_a_codex_session_cut_off_while_reconnecting_is_a_provider_stop() -> None:
+    expected = (
+        "a provider error that retries did not recover: the session ended while reconnecting "
+        "(Reconnecting... waiting for network"
+    )
+    for traces in ([CODEX_OPEN_ROLLOUT], []):
+        stop = provider_stops.codex_stop(CODEX_RECONNECTING_STDOUT, traces)
+        assert stop is not None and stop.startswith(expected)
+
+
+def test_a_codex_turn_that_failed_after_exhausted_reconnects_is_a_provider_stop() -> None:
+    stdout = _lines(*_CODEX_WORK, *(_reconnect(attempt) for attempt in range(1, 6)),
+                    *_turn_failed())
+    stop = provider_stops.codex_stop(stdout, [codex_rollout("other", _DISCONNECTED)])
+    assert stop == (
+        f"a provider error that retries did not recover (other after 5/5 reconnects): "
+        f"{_DISCONNECTED}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("stdout", "traces"),
+    [
+        # `other` also covers agent-side failures; retries that were not used up name none.
+        (_lines(*_CODEX_WORK, _reconnect(2), *_turn_failed()),
+         [codex_rollout("other", _DISCONNECTED)]),
+        # Work after the exhausted retries means the session recovered from them.
+        (_lines(*_CODEX_WORK, _reconnect(5), _CODEX_COMMAND, *_turn_failed()),
+         [codex_rollout("other", _DISCONNECTED)]),
+        # After the exhausted retries Codex waited for the network; another error failed the turn.
+        (_lines(*_CODEX_WORK, _reconnect(5), _WAITING, *_turn_failed()),
+         [codex_rollout("other", _DISCONNECTED)]),
+        # Reconnected and back at work when the session ended.
+        (_lines(*_CODEX_WORK, _reconnect(2), _WAITING, _CODEX_COMMAND), [CODEX_OPEN_ROLLOUT]),
+    ],
+    ids=["other-before-exhausted", "work-after-exhausted", "waiting-then-failed",
+         "work-after-reconnect"],
+)
+def test_a_codex_session_that_reconnected_or_failed_otherwise_is_no_provider_stop(
+    stdout: str, traces: list[str]
+) -> None:
+    assert provider_stops.codex_stop(stdout, traces) is None
