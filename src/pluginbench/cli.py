@@ -698,7 +698,10 @@ def measure(
     measurements: str = typer.Option(
         ...,
         "--measurements",
-        help="Comma-separated measures to add: cyclomatic, cognitive, dead_code, coverage, mutation.",
+        help=(
+            "Comma-separated measures to add: cyclomatic, cognitive, dead_code, coverage, "
+            "mutation, iterations."
+        ),
     ),
     revision: str = typer.Option(
         ..., "--revision", help="Name for the new measurement revision, such as measurements-2."

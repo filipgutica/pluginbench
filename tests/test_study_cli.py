@@ -44,6 +44,7 @@ from pluginbench import (
     submissions,
     trial_containers,
 )
+from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.compare import Gate, Gates, check_gate, load_evidence
 from pluginbench.harbor_backend import assert_runtime as checked_runtime
 from pluginbench.ledger import Ledger
@@ -2055,7 +2056,9 @@ def _coding_and_review_backend(
     timeout: int,
     interrupt_at: int | None,
     source: str = "answer = 1\n",
+    vary: bool = False,
 ) -> Callable[..., dict[str, Any]]:
+    """`vary` gives each coding call its own submission, so each is measured on its own."""
     usage = {"input_tokens": 10, "output_tokens": 5}
 
     def invoke(**kwargs: Any) -> dict[str, Any]:
@@ -2086,7 +2089,9 @@ def _coding_and_review_backend(
             (area / "artifacts").mkdir()
             (area / "artifacts/execution.json").write_text(json.dumps({"usage": usage}))
             raise KeyboardInterrupt("stopped by SIGTERM")
-        (area / "workspace/src/answer.py").write_text(source)
+        (area / "workspace/src/answer.py").write_text(
+            source + (f"VALUE = {len(calls)}\n" if vary else "")
+        )
         result = native_execution(
             area,
             kwargs["protocol"]["native_task_identity"],
@@ -2613,22 +2618,24 @@ def test_measure_adds_a_selected_measurement_revision_from_saved_submissions(
     assert not (root / "evidence/observer-revisions/m3").exists()
 
 
-def test_measure_adds_mutation_from_saved_submissions_offline(
-    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _mutation_run(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **backend: Any
+) -> tuple[Path, list[str], list[str]]:
+    """A finished run with coverage and review, whose submissions each hold one mutant line."""
     config = _measured_and_reviewed(config, tmp_path, monkeypatch)
     calls: list[str] = []
     reviews: list[str] = []
     # Line 2 holds a relational and a condition site; one mutant per line takes the first.
-    backend = _coding_and_review_backend(
+    coding = _coding_and_review_backend(
         calls,
         reviews,
         timeout=config.timeout_seconds,
         interrupt_at=None,
         source="def answer(flag):\n    return 1 if flag < 2 else 0\n",
+        **backend,
     )
-    monkeypatch.setattr(codex, "invoke", backend)
-    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    monkeypatch.setattr(codex, "invoke", coding)
+    monkeypatch.setattr(harbor_backend, "invoke_native", coding)
     task = config.tasks.resolve() / config.tasks.ids[0]
     toml = (task / "task.toml").read_text()
     (task / "task.toml").write_text(
@@ -2637,36 +2644,204 @@ def test_measure_adds_mutation_from_saved_submissions_offline(
     (task / "solution/solution.patch").write_text("")
     root = tmp_path / "run"
     evaluation.run_evaluation(config, root)
-    coded, reviewed = len(calls), len(reviews)
-    suites: list[tuple[str, int]] = []
+    return root, calls, reviews
+
+
+def _suite(
+    runs: list[tuple[str, int, str]],
+    fail: Callable[[str, Path], BaseException | None] = lambda source, destination: None,
+) -> Callable[..., dict[str, object]]:
+    """The coverage profile's suite as the launcher runs it, failing only on a `<=` mutant.
+
+    `fail` names an error the launcher raises instead, after writing its receipt as it does.
+    """
 
     def native(**kwargs: Any) -> dict[str, object]:
-        # The coverage profile's suite fails only on a mutant, which `<=` marks here.
+        destination = kwargs["destination"]
+        destination.mkdir(parents=True, exist_ok=True)
         source = (kwargs["snapshot"] / "src/answer.py").read_text()
+        runs.append((source, kwargs["timeout"], str(destination)))
+        if error := fail(source, destination):
+            (destination / "execution.json").write_text(json.dumps({"error": str(error)}))
+            raise error
         status = int("flag <= 2" in source)
-        suites.append((source, kwargs["timeout"]))
-        return {**_lcov(**kwargs), "stdout": f"tests ran\nPB-SUITE-EXIT {status}\n"}
+        receipt = {
+            "command": kwargs["command"],
+            "image_id": kwargs["task_identity"]["image_identity"]["image_id"],
+            "before_digest": inspect_snapshot(kwargs["snapshot"])["digest"],
+            "exit_code": status,
+            "timed_out": False,
+            "stdout": f"tests ran\nPB-SUITE-EXIT {status}\n",
+        }
+        (destination / "execution.json").write_text(json.dumps(receipt))
+        return {**_lcov(**kwargs), **receipt}
 
-    monkeypatch.setattr(harbor_backend, "run_native_command", native)
-    result = CliRunner().invoke(
+    return native
+
+
+def _measure_mutation(root: Path) -> Any:
+    return CliRunner().invoke(
         cli.app, ["measure", str(root), "--measurements", "mutation", "--revision", "m1", "--yes"]
     )
 
+
+def test_measure_adds_mutation_alone_and_carries_coverage_forward(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, calls, reviews = _mutation_run(config, tmp_path, monkeypatch)
+    coded, reviewed = len(calls), len(reviews)
+    coverage = _observations(root, {"coverage"})
+    assert {row["status"] for row in coverage} >= {"measured"}
+    suites: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(harbor_backend, "run_native_command", _suite(suites))
+
+    result = _measure_mutation(root)
+
     assert result.exit_code == 0, result.stderr + result.stdout
+    assert "carries coverage forward unchanged" in result.stdout
     assert "0 model calls" in result.stdout and (len(calls), len(reviews)) == (coded, reviewed)
     rows = {(row["metric"], row["attempt_id"]): row for row in _observations(root, {"mutation"})}
     rates = [row for (metric, _), row in rows.items() if metric == "Mutation bug-catch rate %"]
     shares = [row for (metric, _), row in rows.items() if metric == "Test-change kill share %"]
     assert rates and {(row["status"], row["value"]) for row in rates} == {("measured", 100.0)}
     assert {row["value"] for row in shares} == {0.0}
-    assert {row["provenance"]["covered"] for row in rates} == {1}
+    provenance = [row["provenance"] for row in rates]
+    assert [item["covered"] for item in provenance if isinstance(item, dict)] == [1] * len(rates)
     # Every attempt submitted the same source, so it is measured once: the mutant and its
     # confirming rerun, each with three times the slower baseline plus a minute.
-    assert [timeout for source, timeout in suites if "flag <= 2" in source] == [60, 60]
+    assert [timeout for source, timeout, _ in suites if "flag <= 2" in source] == [60, 60]
+    # Only mutation ran: coverage was neither probed nor collected again, and its evidence is
+    # the earlier revision's, so the report reads the same coverage.
+    assert all("/mutation/runs/" in destination for _, _, destination in suites)
+    assert _observations(root, {"coverage"}) == coverage
     selection = evaluation._load_selection(root)
-    assert selection["measurement_revision"] == "m1" and "mutation" in selection["measurements"]
+    measures = selection["measurements"]
+    assert selection["measurement_revision"] == "m1"
+    assert isinstance(measures, list) and "mutation" in measures
     revision = json.loads((root / "evidence/observer-revisions/m1/revision.json").read_text())
     assert revision["single_run_families"] == ["mutation"]
+    assert (revision["carried_from"]["revision"], revision["carried_from"]["kinds"]) == (
+        "measurements",
+        ["coverage"],
+    )
+
+
+def _input_files(revision: Path) -> dict[str, dict[str, str]]:
+    """Each checkpointed input's files and their digests."""
+    return {
+        path.parent.name: study._inventory(path.parent)
+        for path in sorted(revision.glob("measurements/*/collected.json"))
+    }
+
+
+def test_measure_resumes_a_stopped_backfill_without_measuring_finished_inputs_again(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _, _ = _mutation_run(config, tmp_path, monkeypatch, vary=True)
+    revision = root / "evidence/observer-revisions/m1"
+    selection = (root / "evaluation.json").read_bytes()
+    first: list[tuple[str, int, str]] = []
+    # An integrity violation on the third submission fails the revision closed.
+    monkeypatch.setattr(
+        harbor_backend,
+        "run_native_command",
+        _suite(
+            first,
+            lambda source, destination: (
+                ValueError("Frozen measurement input changed during execution")
+                if "VALUE = 3" in source
+                else None
+            ),
+        ),
+    )
+
+    stopped = _measure_mutation(root)
+
+    assert stopped.exit_code == 2 and "input changed during execution" in stopped.stderr
+    state = json.loads((revision / "revision.json").read_text())
+    assert state["status"] == "failed" and "input changed" in state["error"]
+    assert (root / "evaluation.json").read_bytes() == selection
+    finished = _input_files(revision)
+    finished_sources = {source for source, _, _ in first if "VALUE = 3" not in source}
+    assert finished and finished_sources
+    second: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(harbor_backend, "run_native_command", _suite(second))
+
+    resumed = _measure_mutation(root)
+
+    assert resumed.exit_code == 0, resumed.stderr + resumed.stdout
+    assert "Resumes mutation" in resumed.stdout
+    # Finished inputs are kept byte for byte and never reach the suite again.
+    assert {source for source, _, _ in second}.isdisjoint(finished_sources)
+    assert any("VALUE = 3" in source for source, _, _ in second)
+    assert {name: files for name, files in _input_files(revision).items() if name in finished} == (
+        finished
+    )
+    state = json.loads((revision / "revision.json").read_text())
+    assert (state["status"], state["resumes"]) == ("complete", 1)
+    # The stopped input's partial files are kept aside, named by the resume that moved them.
+    assert list((revision / "abandoned/1").iterdir())
+    assert evaluation._load_selection(root)["measurement_revision"] == "m1"
+    rates = [
+        row
+        for row in _observations(root, {"mutation"})
+        if row["metric"] == "Mutation bug-catch rate %"
+    ]
+    assert rates and {row["status"] for row in rates} == {"measured"}
+    refused = CliRunner().invoke(
+        cli.app, ["measure", str(root), "--measurements", "coverage", "--revision", "m1"]
+    )
+    assert refused.exit_code == 2 and "choose a new --revision name" in refused.stderr
+
+
+def test_an_infrastructure_failure_leaves_one_attempt_incomplete_not_the_revision(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _, _ = _mutation_run(config, tmp_path, monkeypatch, vary=True)
+    suites: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        harbor_backend,
+        "run_native_command",
+        _suite(
+            suites,
+            lambda source, destination: (
+                ValueError("docker exec failed: daemon gone")
+                if "VALUE = 2" in source and "flag <= 2" in source
+                else None
+            ),
+        ),
+    )
+
+    result = _measure_mutation(root)
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    rates = [
+        row
+        for row in _observations(root, {"mutation"})
+        if row["metric"] == "Mutation bug-catch rate %"
+    ]
+    failed = [row for row in rates if "infrastructure failure" in str(row["reason"])]
+    assert len(failed) == 1 and failed[0]["value"] is None
+    assert "docker exec failed: daemon gone" in str(failed[0]["reason"])
+    assert {row["status"] for row in rates if row not in failed} == {"measured"}
+
+
+def test_measure_refuses_to_resume_with_other_measures(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _, _ = _mutation_run(config, tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        harbor_backend,
+        "run_native_command",
+        _suite([], lambda source, destination: KeyboardInterrupt()),
+    )
+    assert _measure_mutation(root).exit_code != 0
+    refused = CliRunner().invoke(
+        cli.app,
+        ["measure", str(root), "--measurements", "cyclomatic", "--revision", "m1", "--yes"],
+    )
+    assert refused.exit_code == 2
+    assert "stopped while adding mutation; resume it with those --measurements" in refused.stderr
 
 
 def test_measure_refuses_a_measure_no_task_can_collect(
@@ -3931,3 +4106,104 @@ def test_a_claude_run_that_sets_a_limit_claude_ignores_is_refused(
     }))
     with pytest.raises(ValueError, match=f"Claude Code does not enforce {limit}"):
         study.load_study(recipe)
+
+
+def test_measure_backfills_iterations_without_collectors_or_model_calls(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from test_iterations import _command, _patch, _write
+
+    config, calls, reviews = _recorded_calls(config, tmp_path, monkeypatch)
+    config.measurements.remove("coverage")
+    root = tmp_path / "run"
+    evaluation.run_evaluation(config, root)
+    evidence = root / "evidence"
+    native = json.loads((evidence / "run.json").read_text())
+    for stages in native["executions"].values():
+        for reference in stages.values():
+            receipt = evidence / reference["path"]
+            _write(receipt.parent / "artifacts/harbor/trial/agent/sessions/root.jsonl", [
+                {"type": "session_meta", "payload": {"id": "root"}},
+                *_command("a", "pytest", 1), *_patch("b", "tests/test_a.py"),
+                *_command("c", "env X=y uv run pytest"),
+            ])
+    evaluation.regenerate_report(root)
+    kept = {"tokens", "lines", "review"}
+    previous = _observations(root, kept)
+    saved = _evidence_digests(root)
+    before_calls = len(calls), len(reviews)
+    result = CliRunner().invoke(cli.app, [
+        "measure", str(root), "--measurements", "iterations", "--revision", "m4", "--yes",
+    ])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "0 model calls" in result.stdout
+    assert (len(calls), len(reviews)) == before_calls
+    assert _evidence_digests(root) == saved
+    assert _observations(root, kept) == previous
+    assert evaluation._load_selection(root)["measurement_revision"] == "m4"
+    rows = _observations(root, {"iterations"})
+    assert rows
+    assert {row["value"] for row in rows if row["metric"] == "Verification iterations (transcript count)"} == {1}
+    assert {row["value"] for row in rows if row["metric"] == "Verification commands"} == {2}
+    assert {row["value"] for row in rows if str(row["metric"]).startswith("Failed verification")} == {1}
+    revision = evidence / "observer-revisions/m4"
+    state = json.loads((revision / "revision.json").read_text())
+    assert state["schema_version"] == 4
+    assert state["unique_inputs"] == 0
+    assert remeasure.validate_remeasurement(evidence, revision).is_file()
+    trace = receipt.parent / "artifacts/harbor/trial/agent/sessions/root.jsonl"
+    original_trace = trace.read_text()
+    trace.write_text(original_trace.replace("pytest", "pytest -q"))
+    with pytest.raises(ValueError, match="verification iteration evidence changed"):
+        remeasure.validate_remeasurement(evidence, revision)
+    trace.write_text(original_trace)
+    counts = study._bound_path(evidence, state["iterations"])
+    counts.write_text("{}")
+    with pytest.raises(ValueError):
+        remeasure.validate_remeasurement(evidence, revision)
+
+
+def test_fresh_iterations_only_evaluation_binds_saved_trace_counts(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from test_iterations import _command, _patch, _write
+
+    config, calls, reviews = _recorded_calls(config, tmp_path, monkeypatch)
+    config.measurements = ["iterations"]
+    config.reviewer = None
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=config.timeout_seconds, interrupt_at=None,
+    )
+
+    def invoke(**kwargs: Any) -> dict[str, Any]:
+        result = backend(**kwargs)
+        _write(kwargs["area"] / "artifacts/harbor/trial/agent/sessions/root.jsonl", [
+            {"type": "session_meta", "payload": {"id": "root", "cwd": "/app"}},
+            *_command("a", "pytest"), *_patch("b", "src/a.py"), *_command("c", "pytest"),
+        ])
+        return result
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
+    progress: list[str] = []
+    root = tmp_path / "run"
+    evaluation.run_evaluation(config, root, progress=progress.append)
+    selection = evaluation._load_selection(root)
+    assert selection["measurement_required"] is True
+    assert selection["measurement_revision"] == "measurements"
+    evidence = root / "evidence"
+    revision = evidence / "observer-revisions/measurements"
+    state = json.loads((revision / "revision.json").read_text())
+    assert state["schema_version"] == 4
+    assert state["unique_inputs"] == 0
+    counts = study._bound_document(evidence, state["iterations"])
+    assert counts
+    assert all(stage["iterations"] == 1 for stages in counts.values() for stage in stages.values())
+    assert "Counting verification iterations from saved traces" in progress
+    assert calls and not reviews
+    rows = _observations(root, {"iterations"})
+    assert {row["value"] for row in rows if row["metric"] == "Verification commands"} == {2}
+    # Reporting refuses changed source traces rather than silently measuring new values.
+    trace = next((evidence / "attempts").glob("*/handoff/artifacts/harbor/trial/agent/sessions/root.jsonl"))
+    trace.write_text(trace.read_text().replace("pytest", "pytest -q"))
+    with pytest.raises(ValueError, match="verification iteration evidence changed"):
+        evaluation.regenerate_report(root)

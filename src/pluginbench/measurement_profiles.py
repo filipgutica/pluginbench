@@ -30,6 +30,7 @@ MEASUREMENT_NAMES = frozenset(
     {
         "tokens",
         "lines",
+        "iterations",
         "cyclomatic",
         "cognitive",
         "dead_code",
@@ -267,7 +268,8 @@ def blocking_findings(
         )
     ]
     return findings + [
-        f"{name} is ready on no task, so the run would measure nothing for it" for name in nowhere
+        f"{name} is ready on no task, so the run would measure nothing for it"
+        for name in nowhere
     ]
 
 

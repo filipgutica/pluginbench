@@ -664,6 +664,7 @@ def propose_remeasurement(
     progress: Callable[[str], None] | None = None,
     jobs: int = 1,
     masks_listed_pairs: bool = False,
+    iterations: bool = False,
     carried_from: str | None = None,
     carried_kinds: frozenset[str] = frozenset(),
 ) -> Path:
@@ -690,7 +691,7 @@ def propose_remeasurement(
         )
     # A task may have no collector, such as one without a coverage tool when only coverage needs
     # one; its measures stay not configured. At least one task must have something to collect.
-    if not any(profiles.values()) or any(
+    if (not iterations and not any(profiles.values())) or any(
         len({item.kind for item in collectors}) != len(collectors)
         for collectors in profiles.values()
     ):
@@ -702,7 +703,7 @@ def propose_remeasurement(
     directory = parent / revision
     directory.mkdir(parents=True, exist_ok=False)
     state: dict[str, object] = {
-        "schema_version": 3 if masks_listed_pairs else 2,
+        "schema_version": 4 if iterations else (3 if masks_listed_pairs else 2),
         "status": "collecting",
         "jobs": jobs,
         "revision": revision,
@@ -829,6 +830,8 @@ def _collect_revision(
     """
     run, manifest, original, protected = native
     jobs = int(str(state["jobs"]))
+    # Protocol 4 is the one that also counts verification iterations from saved traces.
+    iterations = state["schema_version"] == 4
     profile_path = directory / "profiles.json"
     profile_inventory = state["profile_inventory"]
     previous = directory / "previous"
@@ -1060,7 +1063,19 @@ def _collect_revision(
         )
         proposed_path = directory / "assessment-input.json"
         study._write(proposed_path, revised.model_dump(mode="json"))
+        if iterations:
+            from pluginbench.iterations import measure_run
+
+            if progress:
+                progress("Counting verification iterations from saved traces")
+            count_path = directory / "iterations.json"
+            study._write(count_path, measure_run(root))
+            state["iterations"] = study._reference(root, count_path)
         assessment = build_assessment(proposed_path)
+        if iterations:
+            from pluginbench.iterations import attach
+
+            attach(assessment, study._bound_document(root, state["iterations"]))
         report_path = directory / "assessment-report.json"
         study._write(report_path, assessment)
         state.pop("current_input", None)
@@ -1116,9 +1131,14 @@ def validate_remeasurement(root: Path, directory: Path) -> Path:
     ):
         raise ValueError("measurement revision is incomplete")
     validate_jobs(protocol.get("jobs"))
-    if protocol.get("schema_version") not in {2, 3}:
+    if protocol.get("schema_version") not in {2, 3, 4}:
         raise ValueError("unsupported measurement revision protocol")
     run, original, original_path = _native_state(root)
+    if protocol["schema_version"] == 4:
+        from pluginbench.iterations import measure_run
+
+        if study._bound_document(root, protocol["iterations"]) != measure_run(root):
+            raise ValueError("verification iteration evidence changed after measurement")
     if _preserved_inventory(root, original, original_path.parent) != protocol.get("preserved"):
         raise ValueError("native evidence changed after observer collection")
     if study._bound_document(root, protocol["original_run"]) != run:

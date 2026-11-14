@@ -316,7 +316,7 @@ def _kills_first(view: View) -> int:
 def test_kills_are_confirmed_by_one_rerun_and_survivors_run_once(tmp_path: Path) -> None:
     report, fake, destination = _measure(tmp_path, _passing(_kills_first))
     metrics = _metrics(report, destination)
-    assert [site["original"] for site in report["selected"]] == [">=", "=="]  # type: ignore[index]
+    assert [_object(site)["original"] for site in _list(report["selected"])] == [">=", "=="]
     assert metrics["status"] == "available"
     assert (metrics["killed"], metrics["survived"], metrics["valid"]) == (1, 1, 2)
     assert metrics["bug_catch_percent"] == 50.0

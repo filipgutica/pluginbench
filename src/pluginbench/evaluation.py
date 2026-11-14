@@ -74,7 +74,7 @@ from pluginbench.study_review import (
 )
 
 Measurement = Literal[
-    "tokens", "lines", "cyclomatic", "cognitive", "dead_code", "coverage", "review"
+    "tokens", "lines", "cyclomatic", "cognitive", "dead_code", "coverage", "review", "iterations"
 ]
 
 
@@ -957,7 +957,7 @@ def prepare_evaluation(
         "measurement_readiness": capabilities,
         "not_measured": checked.report["not_measured"],
         "artifact_base": "evidence",
-        "measurement_required": any(profiles.values()),
+        "measurement_required": any(profiles.values()) or "iterations" in config.measurements,
         "measurement_revision": None,
         "review_revision": None,
     }
@@ -1085,7 +1085,7 @@ def _finish_evaluation(
 ) -> Path:
     evidence = root / "evidence"
     config = _saved_evaluation(selection)
-    if profiles and selection["measurement_revision"] is None:
+    if (profiles or "iterations" in config.measurements) and selection["measurement_revision"] is None:
         revision = _next_measurement_revision(evidence)
         if selection.get("pending_measurement_revision") is not None:
             selection["recovery_measurement_revision"] = selection["pending_measurement_revision"]
@@ -1097,6 +1097,7 @@ def _finish_evaluation(
             revision=revision,
             progress=progress,
             jobs=config.jobs,
+            iterations="iterations" in config.measurements,
             masks_listed_pairs=bool(selection.get("not_measured")),
         )
         _adopt_measurement_revision(root, selection, revision)
@@ -1508,7 +1509,7 @@ def review_evaluation(
 
 
 # The measures `measure` can add: each is collected from saved submissions, with no model call.
-_COLLECTED = FALLOW_MEASUREMENTS | {"coverage", "mutation"}
+_COLLECTED = FALLOW_MEASUREMENTS | {"coverage", "mutation", "iterations"}
 # The collector kinds of each group of measures; a group is collected again, or carried, whole.
 _GROUP_KINDS = {
     "code": frozenset({"fallow", "analysis"}),
@@ -1539,7 +1540,10 @@ def _measure_split(
         return sorted({*saved, *measurements}), []
     asked = {_measure_group(name) for name in measurements}
     groups = {_measure_group(name) for name in saved} if "mutation" in asked else {"mutation"}
-    carried = sorted(name for name in saved if _measure_group(name) in groups - asked)
+    # Iterations are counted again from saved traces: cheap, and bound to each revision.
+    carried = sorted(
+        name for name in saved if _measure_group(name) in groups - asked - {"iterations"}
+    )
     return sorted({*saved, *measurements} - set(carried)), carried
 
 
@@ -1692,7 +1696,7 @@ def measure_evaluation(
 ) -> str:
     """Add `measurements` to a finished run as measurement revision `revision`, then select it.
 
-    No model call. A revision is built from the run's own saved submissions. It collects the
+    No model call. A revision is built from saved traces and submissions. It collects the
     measures `_measure_split` names and carries the others forward unchanged from the selected
     revision. Earlier revisions stay in evidence and measurement history; coding, correctness,
     token and review evidence is unchanged. Profiles, readiness probes, the plan and the replaced
@@ -1722,6 +1726,7 @@ def measure_evaluation(
             progress=progress,
             jobs=_saved_evaluation(selection).jobs,
             masks_listed_pairs=bool(selection.get("not_measured")) or bool(plan["skipped"]),
+            iterations="iterations" in TypeAdapter(list[str]).validate_python(plan["collected"]),
             carried_from=_selected_revision(plan, "carried_from"),
             carried_kinds=frozenset(TypeAdapter(list[str]).validate_python(plan["carried_kinds"])),
         )
@@ -1925,6 +1930,19 @@ def _measurement_collection(root: Path, selection: dict[str, object]) -> dict[st
                     "diagnostics": diagnostics,
                 }
             )
+    if "iterations" in state:
+        counts = study._bound_document(evidence, state["iterations"])
+        for attempt_id, stages in counts.items():
+            for stage, counted in stages.items():
+                if counted["status"] == "complete":
+                    available += 1
+                else:
+                    failures.append({
+                        "attempt_id": attempt_id, "task": tasks[attempt_id],
+                        "stage": stage, "family": "iterations", **counted,
+                        "receipts": [state["iterations"]],
+                        "diagnostics": [counted["reason"]],
+                    })
     history = []
     saved_history = selection.get("measurement_history", [])
     if not isinstance(saved_history, list):
@@ -2038,6 +2056,18 @@ def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path
                 **{key: reviewer[key] for key in ("harness", "model", "reasoning")},
             }
     report = json.loads(report_path.read_text())
+    if "iterations" in TypeAdapter(list[str]).validate_python(config["measurements"]):
+        from pluginbench import iterations
+
+        revision = _selected_revision(config, "measurement_revision")
+        state = (
+            json.loads((evidence / "observer-revisions" / revision / "revision.json").read_text())
+            if revision else {}
+        )
+        if "iterations" not in state:
+            raise ValueError("iterations requires a bound measurement revision")
+        measured = study._bound_document(evidence, state["iterations"])
+        iterations.attach(report, measured)
     if config.get("source_only_grades") is not None:
         attach_source_only_grades(evidence, config["source_only_grades"], report["attempts"])
     recipe = json.loads((evidence / "frozen/resolved-recipe.json").read_text())

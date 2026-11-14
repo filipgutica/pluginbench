@@ -64,7 +64,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         },
     ),
     "coverage_observer": (
-        1,
+        2,
         {
             # Optional Go `go list` and `go tool cover` sidecars narrow completeness to
             # compiled files with blocks, and a zero-width Go block with no statements parses
@@ -76,15 +76,18 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # were always refused, and every other report parses as before, so this stays v1.
             # Blocks Go names after a `//line` target that is no frozen Go file count for the
             # one file naming it instead of aborting. Only refused reports change: stays v1.
+            # v2: Go reports add a `lines` population, which leaves out blank and comment-only
+            # lines and any file a line directive is in or names. A profile v1 froze would now
+            # report Go line coverage and compare executed lines across readiness repeats.
             "coverage_report.py": (
-                "997f704ee614f05980b6de367aa287494a018c57d5af179f206f4746f9bb2187"
+                "7915e6742224d11a7994c3bac44042581085b44928a96ea0d95a937429796bf0"
             ),
         },
     ),
     "mutation_observer": (
         1,
         {
-            "mutation.py": "589e0819024a98e6e73655be4b24bacf573f219ac32d45347a2b2670c6ef794f",
+            "mutation.py": "ae953976544e5df3716bb872e2e790b5e0606f80fee16f19498fa89ee99ec1eb",
             "mutation_sites.mjs": (
                 "f7a602774f3e6f2415c1745127134862a9a6f42e8e9807b4c28368e7a3c27c88"
             ),

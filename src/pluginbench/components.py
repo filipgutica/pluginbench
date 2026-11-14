@@ -16,7 +16,8 @@ from pathlib import Path
 VERSIONS: dict[str, int] = {
     "launcher": 1,
     "analysis_observer": 1,
-    "coverage_observer": 1,
+    # Version 2 adds Go line populations, so a profile version 1 froze reads differently.
+    "coverage_observer": 2,
     "mutation_observer": 1,
     # Version 3 resolves Codex launches and grants its selected release and helper binaries.
     "local_sandbox": 3,

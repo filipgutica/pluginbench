@@ -656,7 +656,76 @@ def test_go_statement_weights_and_frozen_module_mapping(tmp_path: Path, source: 
         "unit": "statement",
         "files_measured": ["value.go"],
     }
-    assert not {"lines", "branches", "functions"} & report.keys()
+    assert not {"branches", "functions"} & report.keys()
+
+
+def test_go_lines_are_the_code_lines_blocks_with_statements_span(
+    tmp_path: Path, source: Path
+) -> None:
+    report = go_report(
+        tmp_path,
+        source,
+        "mode: set\n"
+        # Lines 2-3 run; the unrun block on line 3 overlaps it, so line 3 stays covered.
+        "example.test/value/value.go:2.23,3.9 2 1\n"
+        "example.test/value/value.go:3.9,3.21 1 0\n"
+        # An unrun block spanning lines 3-5 leaves only lines 4 and 5 uncovered.
+        "example.test/value/value.go:3.21,5.2 1 0\n"
+        # A block without statements adds no line, even when it runs.
+        "example.test/value/value.go:4.5,4.5 0 1\n",
+    )
+    assert report["lines"] == {
+        "total": ["value.go:2", "value.go:3", "value.go:4", "value.go:5"],
+        "covered": ["value.go:2", "value.go:3"],
+        "unit": "line",
+        "files_measured": ["value.go"],
+    }
+    assert "unavailable_populations" not in report
+
+
+LEXED = """package value
+func Lexed() string {
+
+\t// only a comment, with a lone \r inside it
+\t/* a */ /* b */
+\t/* spans
+\t   // still comment
+\t*/
+\turl := "http://x" // a trailing comment
+\traw := `first
+// inside a raw string`
+\tslash := '/'
+\t// see /* here
+\treturn url + raw + string(slash)
+}
+"""
+
+
+def test_go_blank_and_comment_only_lines_are_not_executable(tmp_path: Path, source: Path) -> None:
+    (source / "lexed.go").write_text(LEXED)
+    report = go_report(tmp_path, source, GO_REPORT + "example.test/value/lexed.go:2.21,15.2 4 1\n")
+    lines = report["lines"]
+    assert isinstance(lines, dict)
+    # Strings, raw strings and runes holding `//` or `/` are code; `/*` inside a line comment
+    # opens no block comment, so line 14 is code. A lone "\r" ends no Go line.
+    assert {line for line in lines["total"] if line.startswith("lexed.go")} == {
+        f"lexed.go:{line}" for line in (2, 9, 10, 11, 12, 14, 15)
+    }
+
+
+def test_go_blank_lines_inside_a_raw_string_are_not_executable(
+    tmp_path: Path, source: Path
+) -> None:
+    (source / "raw.go").write_text(
+        "package value\nfunc Raw() string {\n\treturn `first\n\n  \t\n// kept\n`\n}\n"
+    )
+    report = go_report(tmp_path, source, GO_REPORT + "example.test/value/raw.go:2.19,8.2 1 1\n")
+    lines = report["lines"]
+    assert isinstance(lines, dict)
+    # Lines 4 and 5 are blank inside the raw string; line 6 is raw-string text, so it is code.
+    assert {line for line in lines["total"] if line.startswith("raw.go")} == {
+        f"raw.go:{line}" for line in (2, 3, 6, 7, 8)
+    }
 
 
 @pytest.mark.parametrize(
@@ -969,6 +1038,107 @@ def test_a_go_file_whose_blocks_go_names_after_a_line_directive_target_is_measur
     assert metrics["unmeasured_source_files"] == []
     # value.go 3, added.go 1, parser.go 6 statements, of which 2 + 1 + 4 are covered.
     assert (metrics["statement_total"], metrics["statement_covered"]) == (10, 7)
+
+
+@pytest.mark.parametrize(
+    ("edited", "status"), [("parser.go", "incomplete"), ("value.go", "available")]
+)
+def test_changed_lines_in_a_go_file_with_line_directive_blocks_are_incomplete(
+    tmp_path: Path, source: Path, edited: str, status: str
+) -> None:
+    for name, text in LINE_DIRECTED_FILES.items():
+        (source / name).write_text(text)
+    report = go_report(tmp_path, source, GO_REPORT + LINE_DIRECTED_BLOCKS)
+    lines = report["lines"]
+    assert isinstance(lines, dict)
+    # parser.go's own block on line 2 joins neither the total nor the covered lines.
+    assert lines["files_measured"] == ["value.go"]
+    assert not any(line.startswith("parser.go") for line in lines["total"])
+    limits = report["unavailable_populations"]
+    assert isinstance(limits, dict)
+    assert limits["lines"]["files"] == ["parser.go"]
+    # The edited file's line 2, a covered line in either file, is the submission's one addition.
+    before = tmp_path / "before"
+    shutil.copytree(source, before)
+    rows = (before / edited).read_text().splitlines(keepends=True)
+    (before / edited).write_text("".join(rows[:1] + rows[2:]))
+    change = assessment_metrics.compare_snapshots(before, source)
+    snapshot = inspect_snapshot(source)["files"]
+    assert isinstance(snapshot, dict)
+    metrics = assessment_metrics._coverage(report, set(snapshot), ["*.go"])
+    changed = assessment_metrics._changed_line_coverage({}, metrics, change)
+    assert changed["status"] == status
+    if status == "incomplete":
+        assert "parser.go" in str(changed["reason"])
+    else:
+        assert (changed["added_executable_lines"], changed["added_lines_covered"]) == (1, 1)
+
+
+# The directive names this frozen file, so Go names the blocks after it as its own, but at lines
+# 2-4, which are comments; the function's real lines are 5-7.
+SELF_DIRECTED = """package value
+// Directed is numbered from line 2 by the directive below,
+// so its blocks land on these comment lines.
+//line directed.go:2:1
+func Directed() int {
+\treturn 1
+}
+"""
+
+
+def test_changed_lines_in_a_go_file_whose_line_directive_names_a_frozen_file_are_incomplete(
+    tmp_path: Path, source: Path
+) -> None:
+    (source / "directed.go").write_text(SELF_DIRECTED)
+    report = go_report(
+        tmp_path, source, GO_REPORT + "example.test/value/directed.go:2.21,4.2 1 1\n"
+    )
+    lines = report["lines"]
+    assert isinstance(lines, dict)
+    assert lines["files_measured"] == ["value.go"]
+    limits = report["unavailable_populations"]
+    assert isinstance(limits, dict)
+    assert limits["lines"]["files"] == ["directed.go"]
+    # The submission added the `return` on line 6.
+    before = tmp_path / "before"
+    shutil.copytree(source, before)
+    (before / "directed.go").write_text(SELF_DIRECTED.replace("\treturn 1\n", ""))
+    change = assessment_metrics.compare_snapshots(before, source)
+    snapshot = inspect_snapshot(source)["files"]
+    assert isinstance(snapshot, dict)
+    metrics = assessment_metrics._coverage(report, set(snapshot), ["*.go"])
+    changed = assessment_metrics._changed_line_coverage({}, metrics, change)
+    assert changed["status"] == "incomplete"
+    assert "directed.go" in str(changed["reason"])
+
+
+def test_go_line_directives_count_only_where_go_honors_them(tmp_path: Path, source: Path) -> None:
+    honored = {
+        # A block-form directive may sit anywhere in a line.
+        "block.go": "package value\nfunc B() int { /*line block.go:9:1*/ return 1 }\n",
+        # A directive without a file name still renumbers the file holding it.
+        "unnamed.go": "package value\n//line :9\nfunc U() {}\n",
+        # A directive naming another frozen Go file renumbers both.
+        "naming.go": "package value\n//line named.go:9\nfunc N() {}\n",
+        "named.go": "package value\nfunc Named() {}\n",
+    }
+    ignored = {
+        "indented.go": "package value\n\t//line indented.go:9\nfunc I() {}\n",
+        "commented.go": "package value\n/*\n//line commented.go:9\n*/\nfunc C() {}\n",
+        "quoted.go": (
+            "package value\nconst Q = `\n//line quoted.go:9\n/*line quoted.go:9*/`\n"
+        ),
+        "nonumber.go": "package value\n//line nonumber.go\nfunc X() {}\n",
+        "spaceless.go": "package value\n//line:9\nfunc S() {}\n",
+    }
+    for name, text in {**honored, **ignored}.items():
+        (source / name).write_text(text)
+    # A test file's directive renumbers no measured block.
+    (source / "value_test.go").write_text("package value\n//line value.go:9\n")
+    report = go_report(tmp_path, source, GO_REPORT)
+    limits = report["unavailable_populations"]
+    assert isinstance(limits, dict)
+    assert limits["lines"]["files"] == sorted(honored)
 
 
 @pytest.mark.parametrize(
