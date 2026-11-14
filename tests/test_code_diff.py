@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from pluginbench.code_diff import analyze_patch, without_test_files
+from pluginbench.code_diff import _is_test_path, analyze_patch, without_test_files
 
 
 def _git(*args: str, cwd: Path) -> str:
@@ -152,7 +152,7 @@ def test_leaving_out_test_files_keeps_every_production_change_byte_for_byte(
         ["git", "diff", "--binary", "--cached"], cwd=work, capture_output=True, check=True
     ).stdout.decode()
 
-    filtered, removed = without_test_files(patch)
+    filtered, removed = without_test_files(patch, is_test=_is_test_path)
 
     # Added, changed and deleted test files of every language leave together.
     assert removed == [
@@ -178,19 +178,19 @@ def test_a_patch_without_test_files_is_returned_unchanged() -> None:
         "--- a/src/app.py\n+++ b/src/app.py\n@@ -1 +1 @@\n-old\n+new\n"
     )
 
-    assert without_test_files(patch) == (patch, [])
-    assert without_test_files("") == ("", [])
+    assert without_test_files(patch, is_test=_is_test_path) == (patch, [])
+    assert without_test_files("", is_test=_is_test_path) == ("", [])
 
 
-def test_a_conftest_outside_a_test_directory_stays_production() -> None:
-    # The shared classifier, which saved analysis reports are checked against, does not treat
-    # it as a test, and the source-only grade follows that classifier exactly.
+def test_a_line_break_inside_file_content_neither_splits_nor_names_a_section() -> None:
+    # Git ends patch lines with "\n" only. A file with old Mac "\r" line ends is one patch line,
+    # and text in it that looks like a diff header is still that file's content.
     patch = (
-        "diff --git a/conftest.py b/conftest.py\n"
-        "--- a/conftest.py\n+++ b/conftest.py\n@@ -1 +1 @@\n-old\n+new\n"
+        "diff --git a/notes.md b/notes.md\n--- a/notes.md\n+++ b/notes.md\n@@ -1 +1 @@\n"
+        "-old\r\n+see\rdiff --git a/x_test.go b/x_test.go\rend\r\n"
     )
 
-    assert without_test_files(patch) == (patch, [])
+    assert without_test_files(patch, is_test=_is_test_path) == (patch, [])
 
 
 def test_a_rename_between_a_test_file_and_production_is_refused() -> None:
@@ -200,4 +200,4 @@ def test_a_rename_between_a_test_file_and_production_is_refused() -> None:
     )
 
     with pytest.raises(ValueError, match="src/helpers.py, tests/helpers.py"):
-        without_test_files(patch)
+        without_test_files(patch, is_test=_is_test_path)

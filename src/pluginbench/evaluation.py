@@ -61,6 +61,7 @@ from pluginbench.remeasure import (
 )
 from pluginbench import study
 from pluginbench.study import _text_files, load_study, report_study, resume_study, run_study
+from pluginbench import source_only
 from pluginbench.source_only import attach_source_only_grades, record_source_only_grades
 from pluginbench.study_review import (
     _criteria_digest,
@@ -1117,8 +1118,9 @@ def _finish_evaluation(
         selection["review_revision"] = recover_review_citations(
             evidence, str(selection["review_revision"])
         )
-    if selection.get("source_only_grades") is None:
-        # Also backfills a run finished before this grade existed, when it is run again.
+    if source_only.needs_grading(evidence, selection.get("source_only_grades")):
+        # Also backfills a run finished before this grade or its current filter existed, and
+        # retries stages the frozen runtime could not replay last time.
         selection["source_only_grades"] = record_source_only_grades(evidence, progress=progress)
     _save_selection(root, selection)
     regenerate_report(root)
@@ -1364,6 +1366,9 @@ def plan_resume(root: Path) -> dict[str, object]:
             "coding_calls": _coding_left(root, selection),
             # At most one review per assigned attempt; only submitted attempts are reviewed.
             "review_calls": _assigned(selection) if reviewer else 0,
+            # Source-only verifier replays after coding, estimated as one per assigned attempt;
+            # the exact count, one per graded stage with test files left out, needs the patches.
+            "verifier_replays": _assigned(selection),
             "collect_measurements": bool(selection["measurement_required"]),
             "jobs": selection["jobs"],
             "vanilla": "keep complete attempts; code pending slots and replace interrupted ones",
@@ -1373,6 +1378,9 @@ def plan_resume(root: Path) -> dict[str, object]:
         "name": selection["name"],
         "coding_calls": 0,
         "review_calls": calls,
+        "verifier_replays": source_only.pending_replays(
+            root / "evidence", selection.get("source_only_grades")
+        ),
         "collect_measurements": bool(profiles),
         "jobs": selection["jobs"],
         "vanilla": "reuse immutable saved submissions; no coding replay",
