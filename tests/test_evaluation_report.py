@@ -1661,3 +1661,27 @@ def test_whole_suite_coverage_is_a_diagnostic_kept_out_of_charts() -> None:
     assert any(row["panel"] == "Whole-suite coverage" for row in _rows(data, "observations"))
     template = Path("src/pluginbench/assessment-charts.html").read_text()
     assert "data.diagnostic_panels" in template
+
+
+def test_iteration_rows_preserve_incomplete_and_diagnostic_failures() -> None:
+    report = _report()
+    stage = _stage(report, 0)
+    stage["iterations"] = {
+        "status": "incomplete", "reason": "malformed JSON event", "iterations": None,
+        "verification_commands": None, "failed_verification_commands": None,
+    }
+    data = evaluation_data(report, _config("iterations"))
+    rows = [row for row in _rows(data, "observations") if row["attempt_id"] == _attempt(report, 0)["id"]]
+    assert len(rows) == 3
+    assert all(row["status"] == "incomplete" and row["value"] is None for row in rows)
+    assert all("malformed JSON event" in str(row["reason"]) for row in rows)
+    stage["iterations"] = {
+        "status": "complete", "iterations": 0, "verification_commands": 2,
+        "failed_verification_commands": 1, "method": "M4 transcript count v1",
+    }
+    data = evaluation_data(report, _config("iterations"))
+    rows = [row for row in _rows(data, "observations") if row["attempt_id"] == _attempt(report, 0)["id"]]
+    assert {row["value"] for row in rows} == {0, 1, 2}
+    failure = next(row for row in rows if str(row["metric"]).startswith("Failed verification"))
+    assert failure["compatibility"] is None
+    assert not any(str(row["metric"]).startswith("Failed verification") for row in _rows(data, "aggregates"))

@@ -28,8 +28,14 @@ REVIEW_CATEGORIES = {
 
 # Panel, subtype, canonical evidence kind, canonical metric key.
 # Panels marked diagnostic stay in results JSON/CSV but out of report charts and summaries.
-DIAGNOSTIC_PANELS = frozenset({"Whole-suite coverage"})
+DIAGNOSTIC_PANELS = frozenset({"Whole-suite coverage", "Verification diagnostics"})
 METRICS = (
+    ("Verification", "Verification iterations (transcript count)", "iterations", "iterations"),
+    ("Verification", "Verification commands", "iterations", "verification_commands"),
+    (
+        "Verification diagnostics", "Failed verification commands (unmasked; descriptive)",
+        "iterations", "failed_verification_commands",
+    ),
     ("Tokens", "Input tokens", "work", "input_tokens"),
     ("Tokens", "Cached input tokens", "work", "cached_input_tokens"),
     ("Tokens", "Uncached input tokens", "work", "uncached_input_tokens"),
@@ -108,6 +114,22 @@ METRICS = (
 # Display copy stays separate from the metric identities used in evidence and CSVs.
 # Each entry supplies a title, axis unit, and a brief explanation beside the plot.
 METRIC_GUIDE = {
+    "Verification iterations (transcript count)": (
+        "Verification iterations (transcript count)",
+        "iterations",
+        "A verification command, a production or test edit by that agent, then its next "
+        "verification command. Counted within each agent and summed. Shell edits and "
+        "hook-run tests are unseen.",
+    ),
+    "Verification commands": (
+        "Verification commands", "commands",
+        "Shell commands matching the frozen M4 list; ad-hoc scripts are excluded.",
+    ),
+    "Failed verification commands (unmasked; descriptive)": (
+        "Failed verification commands (unmasked; descriptive)", "commands",
+        "Descriptive failures only for unmasked commands. Missing exit statuses stay unknown; "
+        "permission denials and cancellations are not failures.",
+    ),
     "Line coverage %": (
         "Line coverage",
         "% covered",
@@ -611,6 +633,16 @@ def _observation(
                 if value is not None
                 else "valid fixed-criteria review, runtime identity, or explicit finding counts unavailable"
             )
+    elif kind == "iterations":
+        counted = _map(stage.get("iterations"))
+        value = _number(counted.get(key)) if counted.get("status") == "complete" else None
+        provenance = {
+            "method": counted.get("method"), "limitations": counted.get("limitations"),
+        }
+        identity.update(provenance)
+        eligible = key != "failed_verification_commands"
+        reason = str(counted.get("reason") or counted.get("limitations") or "trace unavailable")
+        evidence = {"reason": reason}
     elif kind == "work":
         tokens = _map(work.get("tokens"))
         if key == "uncached_input_tokens":
@@ -909,6 +941,8 @@ def _observation(
                 reason += "; " + "; ".join(str(item) for item in validation_reasons)
     else:
         status = "measured" if compatibility else "not comparable"
+    if kind == "iterations" and _map(stage.get("iterations")).get("status") == "incomplete":
+        status = "incomplete"
     change = _map(stage.get("change"))
     line_changes: dict[str, float | None] = {}
     change_provenance: dict[str, object] = {}

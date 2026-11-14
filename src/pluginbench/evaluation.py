@@ -73,7 +73,7 @@ from pluginbench.study_review import (
 )
 
 Measurement = Literal[
-    "tokens", "lines", "cyclomatic", "cognitive", "dead_code", "coverage", "review"
+    "tokens", "lines", "cyclomatic", "cognitive", "dead_code", "coverage", "review", "iterations"
 ]
 
 
@@ -1096,6 +1096,7 @@ def _finish_evaluation(
             revision=revision,
             progress=progress,
             jobs=config.jobs,
+            iterations="iterations" in config.measurements,
             masks_listed_pairs=bool(selection.get("not_measured")),
         )
         _adopt_measurement_revision(root, selection, revision)
@@ -1481,7 +1482,7 @@ def review_evaluation(
 
 
 # The measures `measure` can add: each is collected from saved submissions, with no model call.
-_COLLECTED = FALLOW_MEASUREMENTS | {"coverage"}
+_COLLECTED = FALLOW_MEASUREMENTS | {"coverage", "iterations"}
 
 
 def _measure_inputs(
@@ -1648,6 +1649,7 @@ def measure_evaluation(
         revision=revision,
         progress=progress,
         jobs=_saved_evaluation(selection).jobs,
+        iterations="iterations" in collected,
         masks_listed_pairs=bool(listed),
     )
     current = _selected_revision(selection, "measurement_revision")
@@ -1761,6 +1763,19 @@ def _measurement_collection(root: Path, selection: dict[str, object]) -> dict[st
                     "diagnostics": diagnostics,
                 }
             )
+    if "iterations" in state:
+        counts = study._bound_document(evidence, state["iterations"])
+        for attempt_id, stages in counts.items():
+            for stage, counted in stages.items():
+                if counted["status"] == "complete":
+                    available += 1
+                else:
+                    failures.append({
+                        "attempt_id": attempt_id, "task": tasks[attempt_id],
+                        "stage": stage, "family": "iterations", **counted,
+                        "receipts": [state["iterations"]],
+                        "diagnostics": [counted["reason"]],
+                    })
     history = []
     saved_history = selection.get("measurement_history", [])
     if not isinstance(saved_history, list):
@@ -1835,6 +1850,19 @@ def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path
         review_revision=_selected_revision(config, "review_revision"),
     )
     report = json.loads(report_path.read_text())
+    if "iterations" in TypeAdapter(list[str]).validate_python(config["measurements"]):
+        from pluginbench import iterations
+
+        revision = _selected_revision(config, "measurement_revision")
+        state = (
+            json.loads((evidence / "observer-revisions" / revision / "revision.json").read_text())
+            if revision else {}
+        )
+        measured = (
+            study._bound_document(evidence, state["iterations"])
+            if "iterations" in state else iterations.measure_run(evidence)
+        )
+        iterations.attach(report, measured)
     if config.get("source_only_grades") is not None:
         attach_source_only_grades(evidence, config["source_only_grades"], report["attempts"])
     recipe = json.loads((evidence / "frozen/resolved-recipe.json").read_text())

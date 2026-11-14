@@ -30,6 +30,11 @@ MEASUREMENT_METRICS = {
         "Reasoning output tokens",
         "Coding time",
     ),
+    "iterations": (
+        "Verification iterations (transcript count)",
+        "Verification commands",
+        "Failed verification commands (unmasked; descriptive)",
+    ),
     "lines": (
         "Source lines added",
         "Source lines removed",
@@ -171,6 +176,7 @@ def correctness_state(status: object, grading: object) -> str:
 
 
 COMPLETENESS_COUNTS = {
+    "iterations": "Verification transcript counts",
     "tokens": "Input/output tokens",
     "lines": "Source/test lines added/removed",
     "cognitive": "Complexity population",
@@ -223,6 +229,8 @@ def _selected_completeness(
         if complexity_metrics:
             # Code-added sums are defined (zero) for complete empty populations; unknown stays None.
             counts["Complexity population"] = captured(tuple(complexity_metrics))
+        if "iterations" in selected:
+            counts[COMPLETENESS_COUNTS["iterations"]] = captured(MEASUREMENT_METRICS["iterations"][:2])
         if "review" in selected:
             counts["Review findings"] = captured(
                 tuple(
@@ -313,6 +321,7 @@ def _comparison_rows(data: dict[str, object]) -> list[dict[str, object]]:
         (row.get("task"), row.get("metric"), row.get("arm"), row.get("compatibility"))
         for row in observations
         if row.get("arm") not in {"baseline", "unknown"}
+        and row.get("panel") != "Verification diagnostics"
     }
     results = []
     for task, metric, arm, compatibility in sorted(profiles, key=str):
@@ -376,6 +385,8 @@ def _aggregate_groups(data: dict[str, object]) -> list[tuple[str, str | None, li
     task_analyzers: dict[tuple[str, str], set[str]] = {}
     unbound_values: set[tuple[str, str]] = set()
     for row in observations:
+        if row.get("panel") == "Verification diagnostics":
+            continue
         group = None
         if row.get("family") in {"cognitive", "cyclomatic", "dead_code"}:
             known = task_analyzers.setdefault((str(row["metric"]), str(row["task"])), set())
@@ -962,7 +973,10 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         else None,
         "review_findings": projection.get("review_findings") if "review" in selected else [],
         "download_csv": "results.csv",
-        "diagnostic_panels": sorted(DIAGNOSTIC_PANELS),
+        "diagnostic_panels": sorted(
+            DIAGNOSTIC_PANELS if "iterations" in selected
+            else DIAGNOSTIC_PANELS - {"Verification diagnostics"}
+        ),
         "limitations": limitations,
     }
     if unfinished:
