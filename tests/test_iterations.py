@@ -1,4 +1,4 @@
-"""Synthetic M4 traces; no real prompts or sessions."""
+"""Synthetic verification-iteration traces; no real prompts or sessions."""
 
 from __future__ import annotations
 

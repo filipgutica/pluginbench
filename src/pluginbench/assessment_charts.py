@@ -123,7 +123,7 @@ METRIC_GUIDE = {
     ),
     "Verification commands": (
         "Verification commands", "commands",
-        "Shell commands matching the frozen M4 list; ad-hoc scripts are excluded.",
+        "Shell commands matching the documented verification-command list; ad-hoc scripts are excluded.",
     ),
     "Failed verification commands (unmasked; descriptive)": (
         "Failed verification commands (unmasked; descriptive)", "commands",

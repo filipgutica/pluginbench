@@ -248,7 +248,7 @@ Cleanup removes owned containers, networks, sidecars, temporary homes, and job c
 | Review | Independent AI findings by severity/category, with fixed criteria across vanilla and guidance. |
 | Reference | When a task ships `solution/solution.patch`, each measurement revision applies it to the starting source and measures it with the same complexity, unused-code and line collectors. Reports show code measures as a ratio to the reference. |
 
-For `iterations`, a malformed shell command makes the attempt incomplete if treating any word as a command start could match the frozen M4 list. Otherwise, it cannot change the count and is ignored. Quoted operators and here-document bodies are data. Fresh evaluations and later `measure` requests both bind the counts to a saved measurement revision; reports require that revision.
+For `iterations`, a malformed shell command makes the attempt incomplete if treating any word as a command start could match the documented verification-command list. Otherwise, it cannot change the count and is ignored. Quoted operators and here-document bodies are data. Fresh evaluations and later `measure` requests both bind the counts to a saved measurement revision; reports require that revision.
 
 JS/TS analysis requires Node, Corepack, and Fallow 3.18.0. PluginBench retains real entrypoint inference and checks discovery/parse completeness. A missing or different tool version makes those measurements unavailable, without blocking tokens, lines, or review.
 

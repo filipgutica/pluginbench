@@ -1,4 +1,4 @@
-"""Frozen M4 transcript counts. No models, shell execution, or inferred shell edits."""
+"""Verification-iteration transcript counts. No models, shell execution, or inferred shell edits."""
 
 from __future__ import annotations
 
@@ -163,7 +163,7 @@ def verification_command(command: str) -> bool:
         segments = _tokens(command)
     except ValueError:
         # Fail closed only if ambiguity could affect a count. If even treating every
-        # word as a command start cannot match M4, malformed non-verification data is safe.
+        # word as a command start cannot match a verification command, malformed non-verification data is safe.
         unquoted = command.translate(str.maketrans("", "", "'\"\\"))
         words = re.findall(r"[A-Za-z0-9_./:=+-]+", unquoted)
         if any(_matches(words[index:]) for index in range(len(words))):
@@ -521,7 +521,7 @@ def _count(agents: dict[str, list[Action]]) -> dict[str, object]:
         "known_failed_verification_commands": failures,
         "unknown_exit_commands": unknown,
         "masked_commands": masked_count,
-        "method": "M4 transcript count v1",
+        "method": "verification transcript count v1",
         "limitations": LIMITATIONS,
     }
 
@@ -729,7 +729,7 @@ def measure_attempt(artifacts: Path, *, claude: bool) -> dict[str, object]:
             "iterations": None,
             "verification_commands": None,
             "failed_verification_commands": None,
-            "method": "M4 transcript count v1",
+            "method": "verification transcript count v1",
             "limitations": LIMITATIONS,
         }
 
