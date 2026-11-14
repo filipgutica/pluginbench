@@ -35,6 +35,7 @@ MEASUREMENT_NAMES = frozenset(
         "cognitive",
         "dead_code",
         "coverage",
+        "mutation",
         "review",
     }
 )
@@ -198,6 +199,9 @@ def capability_plan(
             if coverage is None:
                 reason = "Coverage requires an explicit test command, report format/path and tool version"
                 configured = False
+        elif name == "mutation":
+            collector = "mutation"
+            reason, configured = _mutation_capability(language, coverage)
         result[name] = {
             "status": "unavailable" if reason else "available",
             "reason": reason,
@@ -206,6 +210,22 @@ def capability_plan(
             **({} if configured else {"configured": False}),
         }
     return result
+
+
+def _mutation_capability(
+    language: str, coverage: CoverageSettings | None
+) -> tuple[str | None, bool]:
+    """Why mutation cannot run on this task, if so, and whether it is configured at all."""
+    from pluginbench.mutation import LANGUAGES
+
+    if language not in LANGUAGES:
+        return "Mutation supports Python, Go, TypeScript and JavaScript tasks", False
+    if coverage is None:
+        return "Mutation runs the task's coverage profile command; configure one", False
+    tool = "go" if language == "go" else "node" if language != "python" else None
+    if tool and shutil.which(tool) is None:
+        return f"Mutation sites in {language} need {tool} to run the pinned site finder", True
+    return None, True
 
 
 def readiness_state(row: dict[str, object]) -> str:
@@ -493,6 +513,10 @@ def prepare_profiles(
                 timeout_seconds=coverage.timeout_seconds,
             )
         )
+    if "mutation" in selected and capabilities["mutation"]["status"] == "available":
+        collectors.append(
+            _mutation_collector(Path(task_dir), output, settings, native_task_identity)
+        )
     inventory = inspect_snapshot(snapshot)["files"]
     assert isinstance(inventory, dict)
     _json(output / "measurement-capabilities.json", capabilities)
@@ -521,6 +545,81 @@ def prepare_profiles(
     return collectors
 
 
+def _mutation_collector(
+    task_dir: Path,
+    output: Path,
+    settings: MeasurementSettings,
+    native_task_identity: dict[str, object],
+) -> Collector:
+    """Freeze the coverage command, site finder and source-only file split mutation uses."""
+    from pluginbench import mutation, source_only
+    from pluginbench.language_analysis import prepare_go_observer
+
+    metadata = tomllib.loads((task_dir / "task.toml").read_text()).get("metadata", {})
+    language = str(metadata.get("language", "")).strip().lower()
+    repository = str(metadata.get("repository_url", ""))
+    coverage = coverage_settings(task_dir, settings)
+    assert coverage is not None
+    cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "pluginbench"
+
+    def go_finder() -> dict[str, str]:
+        binary = prepare_go_observer(
+            cache / "language-tools/go-observer", mutation.GO_OBSERVER, "pluginbench-go-mutation"
+        )
+        return {"path": str(binary), "sha256": hashlib.sha256(binary.read_bytes()).hexdigest()}
+
+    # A finder for each supported language an attempt may change. The task language's finder is
+    # required; another one this host cannot prepare is left out, so a changed file in that
+    # language stays unparsed and makes its attempt incomplete.
+    finders: dict[str, dict[str, str]] = {}
+    for kind, prepare, tool, languages in (
+        ("go", go_finder, "go", {"go"}),
+        (
+            "oxc",
+            lambda: prepare_observer("oxc-parser-0.126.0", cache / "observers"),
+            "node",
+            {"typescript", "javascript"},
+        ),
+    ):
+        if language in languages:
+            finders[kind] = prepare()
+        elif shutil.which(tool) is not None:
+            try:
+                finders[kind] = prepare()
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+    try:
+        # The files the source-only grade keeps although they look like tests.
+        reference: list[str] | None = sorted(source_only._task_paths(task_dir)[1])
+    except (OSError, ValueError):
+        reference = None
+    config = output / "mutation.json"
+    _json(
+        config,
+        {
+            "native_task_identity": native_task_identity,
+            "language": language,
+            "repository_url": repository,
+            "coverage": coverage.model_dump(mode="json"),
+            "generated_files": list(mutation.GENERATED_FILES.get(repository, ())),
+            "suite_status": "process_exit"
+            if repository in mutation.PROCESS_EXIT_REPOSITORIES
+            else "marker",
+            "site_finders": finders,
+            "source_only_reference_paths": reference,
+            "observer_version": components.VERSIONS["mutation_observer"],
+            "implementation": mutation.observer_identity(),
+        },
+    )
+    return Collector(
+        kind="mutation",
+        config=config,
+        scope=["*"],
+        tool_version=mutation.VERSION,
+        timeout_seconds=coverage.timeout_seconds,
+    )
+
+
 def _metric_readiness(metric: str, first: dict[str, object]) -> tuple[bool, object]:
     ready, reason = True, None
     if metric in {"cognitive", "cyclomatic", "dead_code"}:
@@ -543,6 +642,10 @@ def _metric_readiness(metric: str, first: dict[str, object]) -> tuple[bool, obje
             comparison = _dead_changes(first, first)
             ready = comparison["status"] == "available"
             reason = comparison.get("reason")
+    elif metric == "mutation":
+        # The starting source changes no line, so a report with no candidates is ready.
+        ready = first.get("status") == "available" or first.get("candidate_count") == 0
+        reason = None if ready else first.get("reason")
     elif metric == "coverage":
         ready = any(
             first.get(f"{unit}_population_complete") is True

@@ -63,11 +63,14 @@ def _task_paths(native_task: Path) -> tuple[set[str], set[str]]:
     return hidden, reference - hidden
 
 
+def left_out(path: str, reference: set[str]) -> bool:
+    """Whether this grade leaves `path` out: it looks like a test and `reference` lacks it."""
+    return path not in reference and _looks_like_test(path)
+
+
 def _without_tests(patch: str, reference: set[str]) -> tuple[str, list[str]]:
     """Leave out each test-looking file but those in `reference`; see `without_test_files`."""
-    return without_test_files(
-        patch, is_test=lambda path: path not in reference and _looks_like_test(path)
-    )
+    return without_test_files(patch, is_test=lambda path: left_out(path, reference))
 
 
 def _is_test_setup(path: str) -> bool:

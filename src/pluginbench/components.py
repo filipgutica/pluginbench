@@ -18,6 +18,7 @@ VERSIONS: dict[str, int] = {
     "analysis_observer": 1,
     # Version 2 adds Go line populations, so a profile version 1 froze reads differently.
     "coverage_observer": 2,
+    "mutation_observer": 1,
     # Version 3 resolves Codex launches and grants its selected release and helper binaries.
     "local_sandbox": 3,
 }
@@ -41,6 +42,12 @@ FILES: dict[str, tuple[str, ...]] = {
     ),
     "analysis_observer": ("language_analysis.py",),
     "coverage_observer": ("coverage_report.py",),
+    # Site finding, sampling, run classification and the Go and Oxc site finders.
+    "mutation_observer": (
+        "mutation.py",
+        "mutation_sites.mjs",
+        "observer_data/go-mutation-v1/main.go",
+    ),
     "local_sandbox": ("isolation.py",),
 }
 

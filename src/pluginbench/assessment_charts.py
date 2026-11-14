@@ -99,6 +99,13 @@ METRICS = (
         "change",
         "test_duplication.duplicated_added_test_lines",
     ),
+    ("Tests added", "Mutation bug-catch rate %", "mutation_change", "bug_catch_percent"),
+    (
+        "Tests added",
+        "Test-change kill share %",
+        "mutation_change",
+        "test_change_kill_share.percent",
+    ),
     ("Whole-suite coverage", "Line coverage %", "coverage", "line_percent"),
     ("Whole-suite coverage", "Statement coverage %", "coverage", "statement_percent"),
     ("Whole-suite coverage", "Branch coverage %", "coverage", "branch_percent"),
@@ -276,6 +283,18 @@ METRIC_GUIDE.update(
             "tests",
             "Added tests whose covered added lines are all covered by other tests. "
             "Candidates only: equal coverage does not mean equal assertions.",
+        ),
+        "Mutation bug-catch rate %": (
+            "Mutation bug-catch rate",
+            "% killed",
+            "Share of valid mutants on the agent's changed decision logic that its submitted test "
+            "suite fails on. Each arm mutates its own code, so populations differ.",
+        ),
+        "Test-change kill share %": (
+            "Test-change kill share",
+            "% of valid mutants",
+            "Share of valid mutants killed only because of the agent's test changes: the suite "
+            "without them does not fail. Zero when the agent changed no test file.",
         ),
         "Duplicated added test lines": (
             "Duplicated added test lines",
@@ -528,6 +547,7 @@ def _observation(
                 "fallow": static_kind,
                 "fallow_change": static_kind,
                 "coverage_change": "coverage",
+                "mutation_change": "mutation",
             }.get(kind, kind)
         )
     )
@@ -714,6 +734,33 @@ def _observation(
         eligible = bool(detail)
         identity.update(provenance)
         reason = str(detail.get("method") or "bound source diff unavailable")
+    elif kind == "mutation_change":
+        comparison = _map(_map(stage.get("metric_comparison")).get("mutation"))
+        share = key != "bug_catch_percent"
+        detail = _map(comparison.get("test_change_kill_share")) if share else comparison
+        # The share is decided apart from the headline: a measured 0 when no test file changed.
+        available = detail.get("status") == "available"
+        value = _number(detail.get(key.rpartition(".")[2])) if available else None
+        eligible = available and all(
+            provenance.get(field) is not None
+            for field in ("tool", "tool_version", "config_digest", "scope")
+        )
+        identity.update(provenance)
+        identity["method"] = comparison.get("method")
+        provenance = {
+            **provenance,
+            "method": comparison.get("method"),
+            "limitations": comparison.get("limitations"),
+            "covered": detail.get("kills_needing_test_changes" if share else "killed"),
+            "total": comparison.get("valid"),
+        }
+        reason = str(
+            (comparison.get("method") if available else None)
+            or detail.get("reason")
+            or comparison.get("reason")
+            or "bound mutation result unavailable"
+        )
+        population = None
     elif kind in {"fallow_change", "coverage_change"}:
         comparison = _map(
             _map(stage.get("metric_comparison")).get(
@@ -925,6 +972,7 @@ def _observation(
                 in {
                     "fallow_change",
                     "coverage_change",
+                    "mutation_change",
                     "change",
                     "loc",
                     "loc_change",
@@ -1145,7 +1193,7 @@ def _measurement_completeness(attempts: list[dict[str, object]]) -> list[dict[st
         for attempt in attempts
         if (
             isinstance(configured := attempt.get("configured_metrics"), list)
-            and any(kind in configured for kind in ("coverage", "fallow", "analysis"))
+            and any(kind in configured for kind in ("coverage", "fallow", "analysis", "mutation"))
         )
         or any(
             _map(evidence.get(kind)).get("metrics")
@@ -1153,7 +1201,7 @@ def _measurement_completeness(attempts: list[dict[str, object]]) -> list[dict[st
                 _map(attempt.get("before_metrics")),
                 *(_map(stage.get("metrics")) for stage in _rows(attempt.get("stages"))),
             )
-            for kind in ("coverage", "fallow", "analysis")
+            for kind in ("coverage", "fallow", "analysis", "mutation")
         )
     }
     rows = []
@@ -1213,6 +1261,13 @@ def _measurement_completeness(attempts: list[dict[str, object]]) -> list[dict[st
             == "available"
             and _number(_map(comparison.get("clone_findings")).get("introduced_count")) is not None,
         }
+        # Counted only where configured, so runs from before mutation keep their completeness.
+        configured = attempt.get("configured_metrics")
+        if isinstance(configured, list) and "mutation" in configured:
+            captured["Mutation killed/valid counts"] = (
+                _map(_map(stage.get("metric_comparison")).get("mutation")).get("status")
+                == "available"
+            )
         rows.append(
             {
                 "attempt_id": attempt["id"],

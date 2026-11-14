@@ -579,12 +579,12 @@ To review with another reviewer, for example to compare two reviewers or to try 
 
 ## Measure again
 
-`pluginbench measure runs/<run> --measurements cyclomatic,cognitive --revision <name>` adds measures to a finished run from its saved submissions, as measurement revision `<name>`. It makes no model calls and codes nothing again. It adds `cyclomatic`, `cognitive`, `dead_code`, and `coverage` from saved submissions, and `iterations` from saved agent traces. For example, `pluginbench measure runs/<run> --measurements iterations --revision transcript-counts --yes` backfills the transcript counts with zero model calls. An `iterations`-only revision needs no collector or Docker runtime. It prints what it will measure and asks before starting unless `--yes` is set. It owns `run.lock` while it works, so it refuses an active run.
+`pluginbench measure runs/<run> --measurements cyclomatic,cognitive --revision <name>` adds measures to a finished run from its saved submissions, as measurement revision `<name>`. It makes no model calls and codes nothing again. It adds `cyclomatic`, `cognitive`, `dead_code`, `coverage`, and `mutation` from saved submissions, and `iterations` from saved agent traces. For example, `pluginbench measure runs/<run> --measurements iterations --revision transcript-counts --yes` backfills the transcript counts with zero model calls. An `iterations`-only revision needs no collector or Docker runtime. It prints what it will measure and asks before starting unless `--yes` is set. It owns `run.lock` while it works, so it refuses an active run.
 
 It refuses:
 
 - A run whose coding, measurement, or first review has not finished. Finish it with `pluginbench run runs/<run>`.
-- A revision name that already exists. Choose a new one.
+- A revision name that already exists, unless the request resumes it (see below). Choose a new one.
 - An unknown measure, or one the run already measures.
 - A requested measure that no task can measure.
 - A measure the run measures now that no longer passes its readiness check, such as coverage whose task image is gone. The new revision would replace its values with unknown ones.
@@ -593,17 +593,35 @@ It refuses:
 The steps:
 
 1. For each task, it prepares profiles in the run's own frozen copy of the task.
-2. It checks each measure it collects twice on the task's starting source, as `check` does. This includes the earlier ones, because it collects them again.
+2. It checks each measure it collects twice on the task's starting source, as `check` does. This includes the earlier ones it collects again.
 3. A new measure that is broken on one task while other tasks can measure it is added to `not_measured` for that task, as `check` does. With `require_ready`, any new measure that is not ready refuses the request.
 4. It collects the revision, and then selects it and rebuilds the report.
 
-A revision is built from the run's saved submissions, not from an earlier revision. So the new revision collects every collector measure the run selects and recounts selected transcript measures, the earlier ones included: measuring a run that already has coverage again needs its task images again. The earlier selected revision stays in evidence and in `measurement_history`. Coding evidence, correctness, tokens, lines, and reviews are not changed. The working files of each request stay in `measure/<name>/`: profiles, readiness checks, and `evaluation-before.json`, the settings as they were before.
+A revision is built from the run's saved submissions. It collects the requested measures and recounts selected transcript measures. Earlier collector measures are collected again, except in two cases, where they are carried forward instead: their frozen collectors and measured files come unchanged from the selected revision, which must still validate.
+
+- Adding `mutation` collects only mutation, and carries every earlier measure, coverage and verification iteration counts included. The reference-solution measurements are carried too, and are not measured again.
+- An earlier `mutation` is always carried, so a later request never runs its test suites again.
+
+Otherwise, measuring a run that already has coverage again needs its task images again. The plan line says what the request collects and what it carries. The earlier selected revision stays in evidence and in `measurement_history`. Coding evidence, correctness, tokens, lines, and reviews are not changed. The working files of each request stay in `measure/<name>/`: profiles, readiness checks, `plan.json`, and `evaluation-before.json`, the settings as they were before.
+
+If collection stops, for example on an integrity failure, a lost Docker daemon or Ctrl-C, the revision is recorded as failed and not selected. Run the same command again, with the same `--measurements`, `--revision` and `--coverage-profiles`, to resume it. The plan line then starts with `Resumes`. Each submission's measurement saves a checkpoint when it finishes. A resume checks each checkpointed submission against its files and keeps it, and measures only the others. It moves the partial files of an unfinished submission to `abandoned/<n>/` in the revision directory. A resume refuses when the native evidence, the frozen profiles or the selected revision changed since the revision started. It also refuses when the PluginBench release, the Python version, or the version or source bytes of any observer, the mutation site finders included, changed since then, so one revision never mixes two implementations.
 
 The run's saved settings change only through this command, as `review` changes the selected review. The command adds the new measures to `measurements` and `comparison_identity.measurements`. It adds their readiness rows to `measurement_capabilities`, `measurement_readiness`, and `comparison_identity.measurement_capabilities`, and it updates `comparison_identity.effective_observer_scripts`. It then writes `evaluation.json` and its binding again. `compare` checks these identity fields, so measure every run in a batch with the same build and the same request.
 
 Coverage needs a coverage profile for the task. If the run's settings have none, pass `--coverage-profiles <file>`, a YAML `coverage_profiles` mapping such as the files in [coverage profiles](coverage-profiles/README.md). The command adds the mapping to `measurement_settings.coverage_profiles`. It refuses a key that the run already saved with a different profile. Pass the same file for every run in a batch.
 
 Use exact model IDs. Harbor does not support `ultra` reasoning. Requested effort is separate from effective effort when native evidence cannot verify it.
+
+### Mutation
+
+`mutation` measures how many small bugs in an attempt's own changed code its test suite catches. It needs the task's coverage profile, whose command it runs, and a Python, Go, TypeScript or JavaScript task. Each submission is measured once, not twice like other collectors:
+
+- **Sites:** relational boundary, equality negation, boolean connective and condition negation operators on the production lines the attempt added or changed. Python sites come from `ast`, Go sites from a standard-library observer built like the analysis observer, and JavaScript/TypeScript sites from the pinned oxc parser. A site finder runs for each of these languages among the changed files, whatever the task's language. Test files, and anko's `parser/parser.go` and sql-formatter's `src/parser/grammar.ts`, give no sites. A changed production file in another language gives no sites; the result counts these files. A Go, Python, JavaScript or TypeScript file that does not parse, whose finder this host could not prepare, or whose finder crashed or timed out, leaves the result incomplete.
+- **Sample:** at most one mutant per line and ten per attempt, ordered by sha256 of the submission digest, path, line, column and operator, round-robin over the operators. The report keeps every candidate and the changed lines that hold one.
+- **Runs:** the unmutated submission runs the coverage-profile command twice in the frozen image, offline. Its suite status is the one `PB-SUITE-EXIT <n>` line the command prints, from a run with a recorded exit. Only csstree, named by repository, prints no marker and uses its command's exit. Any other run has no status: its mutant is an error and the attempt incomplete. A red or unstable baseline makes the attempt unavailable, unless it is also incomplete: incompleteness takes precedence. Each mutant then runs the same command. A non-zero status, confirmed by one rerun, is a kill; one that does not reproduce is flaky and excluded. A run past three times the slower baseline plus 60 seconds is a timeout, counted as a kill. A mutant is reported as timed out when its first run or its confirmation run timed out. Mutants in `.go` files that fail `go build ./... && go test -run '^$' ./...`, and mutants in TypeScript files with a `tsc --noEmit` error the unmutated tree lacks, are invalid and excluded. tsc diagnostics are compared with their counts, so a second copy of an existing error is new. A check that cannot run, such as one whose toolchain the image lacks, is an error.
+- **Failures:** a Docker command that fails, or times out, makes only that attempt incomplete. So does a Docker daemon that stops answering the launcher's runtime check before a run starts. A runtime that Docker reports and the check refuses, such as another platform or Harbor version, is not such a failure. Any other failure, such as a measured tree that changed, stops the revision, which `measure` can then resume.
+- **Checks:** every run's record must match the launcher's `execution.json`: the frozen command and image, the tree it measured, its exit, its timeout and its output.
+- **Results:** the bug-catch rate is kills over kills plus survivors. The test-change kill share is the kills that the suite without the attempt's test changes misses, over valid mutants, using the source-only grade's filter. It is a measured 0 when the attempt changed no test file, even when the bug-catch rate is unavailable. The report also splits mutants by whether line coverage marks their line executed.
 
 ## Compare runs
 

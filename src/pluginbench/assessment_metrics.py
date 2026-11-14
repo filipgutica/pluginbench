@@ -1316,7 +1316,7 @@ def _fallow(
     }
 
 
-_EVIDENCE_KINDS = ("fallow", "analysis", "coverage")
+_EVIDENCE_KINDS = ("fallow", "analysis", "coverage", "mutation")
 
 
 def evaluate_evidence(
@@ -1419,6 +1419,18 @@ def evaluate_evidence(
             ) != sorted(scope):
                 raise ValueError("coverage source scope differs from its bound envelope")
             metrics = _coverage(report, files, scope)
+        elif kind == "mutation":
+            from pluginbench.mutation import mutation_metrics
+
+            if envelope["tool"] != "mutation" or envelope["tool_version"] != report.get("version"):
+                raise ValueError("mutation envelope disagrees with report")
+            if report.get("after_digest") != snapshot["digest"] or report.get(
+                "language"
+            ) != config.get("language"):
+                raise ValueError("mutation report differs from its snapshot or frozen profile")
+            metrics = mutation_metrics(
+                report, report_path.parent, config=config, snapshot=snapshot_root
+            )
         provenance = {
             key: envelope[key] for key in ("tool", "tool_version", "config_digest", "scope")
         }
@@ -1959,6 +1971,16 @@ def compare_evidence(
     for kind in _EVIDENCE_KINDS:
         left = _object(before.get(kind, {}), f"before.{kind}")
         right = _object(after.get(kind, {}), f"after.{kind}")
+        if kind == "mutation":
+            # A submission's own mutants; the starting source has no changed lines to mutate.
+            if not isinstance(right.get("metrics"), dict):
+                result[kind] = {"status": "unavailable", "reason": "no mutation measurement"}
+                continue
+            from pluginbench.mutation import compare_mutation
+
+            coverage = _object(after.get("coverage", {}), "after.coverage")
+            result[kind] = compare_mutation(right, coverage, change)
+            continue
         if not isinstance(left.get("metrics"), dict) or not isinstance(right.get("metrics"), dict):
             result[kind] = {
                 "status": "unavailable",

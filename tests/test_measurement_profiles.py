@@ -618,3 +618,44 @@ def test_a_measure_ready_on_no_task_blocks(require_ready: bool) -> None:
     # A measure that no task configures is ready nowhere too.
     matrix["rust"]["coverage"] = {"state": "not_configured", "reason": "no coverage tool"}
     assert blocking_findings(matrix, require_ready=require_ready)[-1] == findings[-1]
+
+
+@pytest.mark.parametrize(
+    ("repository", "rule"),
+    [("https://github.com/csstree/csstree", "process_exit"), ("https://example.invalid/x", "marker")],
+)
+def test_mutation_profile_freezes_every_finder_the_host_prepares_and_the_status_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repository: str, rule: str
+) -> None:
+    from pluginbench import language_analysis
+
+    native = tmp_path / "native"
+    native.mkdir()
+    (native / "task.toml").write_text(
+        f'[metadata]\nlanguage = "python"\nrepository_url = "{repository}"\n'
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "main.py").write_text("print(1)\n")
+    oxc = {"path": "/cache/oxc/node_modules", "sha256": "oxc"}
+    monkeypatch.setattr(shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(profiles, "prepare_observer", lambda *args: oxc)
+
+    def no_go(*args: object) -> Path:
+        raise subprocess.CalledProcessError(1, ["go", "build"])
+
+    monkeypatch.setattr(language_analysis, "prepare_go_observer", no_go)
+    settings = MeasurementSettings(
+        coverage=CoverageSettings(
+            command=["bash", "-c", "pytest; echo PB-SUITE-EXIT $?"],
+            report_path="coverage.info",
+            tool_version="pytest-cov 7.0",
+        )
+    )
+    identity: dict[str, object] = {"task_dir": str(native), "workdir": "/app"}
+    [collector] = prepare_profiles(source, tmp_path / "profiles", ["mutation"], settings, identity)
+    frozen = json.loads(collector.config.read_text())
+    # A Python task still parses changed JavaScript and TypeScript; this host cannot build the
+    # Go finder, so a changed Go file would leave its attempt incomplete.
+    assert frozen["site_finders"] == {"oxc": oxc}
+    assert frozen["suite_status"] == rule

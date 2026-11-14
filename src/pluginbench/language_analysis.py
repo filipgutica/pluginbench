@@ -246,17 +246,20 @@ def probe_language_tools(
     return result
 
 
-def prepare_go_observer(cache: Path) -> Path:
-    """Build only shipped observer source, with locked libraries, outside submissions."""
-    source = Path(__file__).parent / "observer_data/go-analysis-v1"
-    identity = hashlib.sha256(
-        b"".join((source / name).read_bytes() for name in ("go.mod", "go.sum", "main.go"))
-    ).hexdigest()
+def prepare_go_observer(
+    cache: Path, name: str = "go-analysis-v1", executable: str = "pluginbench-go-analysis"
+) -> Path:
+    """Build only shipped observer source, with locked libraries, outside submissions.
+
+    A standard-library-only observer, such as mutation's site finder, ships no go.sum.
+    """
+    source = Path(__file__).parent / "observer_data" / name
+    files = tuple(item for item in ("go.mod", "go.sum", "main.go") if (source / item).is_file())
+    identity = hashlib.sha256(b"".join((source / item).read_bytes() for item in files)).hexdigest()
     destination = cache.expanduser().resolve() / identity
-    binary = destination / "pluginbench-go-analysis"
+    binary = destination / executable
     if destination.resolve() != destination or any(
-        (destination / name).is_symlink()
-        for name in ("pluginbench-go-analysis", "receipt.json", "go.mod", "go.sum", "main.go")
+        (destination / item).is_symlink() for item in (executable, "receipt.json", *files)
     ):
         raise ValueError("Go observer cache cannot redirect outside its owned directory")
     receipt = destination / "receipt.json"
@@ -269,15 +272,14 @@ def prepare_go_observer(cache: Path) -> Path:
                 "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
             }
             or any(
-                (destination / name).read_bytes() != (source / name).read_bytes()
-                for name in ("go.mod", "go.sum", "main.go")
+                (destination / item).read_bytes() != (source / item).read_bytes() for item in files
             )
         ):
             raise ValueError("Go observer cache bytes changed")
         return binary
     destination.mkdir(parents=True, exist_ok=True)
-    for name in ("go.mod", "go.sum", "main.go"):
-        shutil.copy2(source / name, destination / name)
+    for item in files:
+        shutil.copy2(source / item, destination / item)
     subprocess.run(
         ["go", "build", "-mod=readonly", "-trimpath", "-o", str(binary), "."],
         cwd=destination,

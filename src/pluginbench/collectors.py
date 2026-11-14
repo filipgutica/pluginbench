@@ -25,7 +25,7 @@ from pluginbench import components, isolation
 class Collector(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["fallow", "analysis", "coverage"]
+    kind: Literal["fallow", "analysis", "coverage", "mutation"]
     config: Path
     scope: list[str] = Field(default_factory=lambda: ["src/**"], min_length=1)
     command: list[str] | None = None
@@ -40,7 +40,7 @@ class Collector(BaseModel):
     def supported_command(self) -> Collector:
         if self.kind == "coverage" and self.command is None:
             raise ValueError("coverage requires an adapter command")
-        if self.kind in {"fallow", "analysis"} and self.command is not None:
+        if self.kind in {"fallow", "analysis", "mutation"} and self.command is not None:
             raise ValueError("Source analysis uses the built-in collector, not a custom command")
         if self.syntax_command is not None and (self.kind != "fallow" or not self.syntax_command):
             raise ValueError("syntax_command is an optional Fallow parser validator")
@@ -485,6 +485,13 @@ def _collect(
             timeout=collector.timeout_seconds,
         )
         return report, version, "language-analysis"
+    if collector.kind == "mutation":
+        from pluginbench.mutation import VERSION, collect_mutation
+
+        if baseline is None:
+            raise ValueError("mutation requires a bound before snapshot")
+        config = json.loads(collector.config.read_text())
+        return collect_mutation(root, baseline, config, destination), VERSION, "mutation"
     if collector.report_format is not None:
         report, version = _native_coverage(root, collector, destination)
         return report, version, str(collector.report_format)
@@ -535,7 +542,7 @@ def collect_measurements(
                 root = (Path(temporary) / "source").resolve()
                 shutil.copytree(snapshot, root)
                 baseline = None
-                if (
+                if collector.kind == "mutation" or (
                     collector.report_format is None
                     and collector.command
                     and any("{before}" in item for item in collector.command)
