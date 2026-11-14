@@ -28,6 +28,7 @@ from pluginbench import harbor_backend, ledger, parallel, run_status, study, tri
 from pluginbench.ledger import Ledger
 from pluginbench import codex
 from test_codex import _OUTAGE, outage_trace, stream
+from test_provider_stops import CODEX_LIMITED_STDOUT, codex_rollout
 
 _REAL_RUNNING = trial_containers.running
 _PATH = os.pathsep.join([str(Path(pluginbench.__file__).parents[1]), str(Path(__file__).parent)])
@@ -410,6 +411,66 @@ def test_backend_failure_before_the_first_turn_stops_the_run_unscored_and_uncach
     assert list(run["discarded_attempts"]) == [failed]
     assert run["discarded_attempts"][failed]["replaced_by"] in calls
     assert len(calls) == 12 and failed not in calls
+    assert Counter(run["attempt_states"].values()) == {"complete": 12}
+    assert len(list(cache.glob("*/*/manifest.json"))) == 6
+
+
+def test_a_codex_usage_limit_mid_session_stops_the_run_unscored_and_uncached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = _vanilla_first(tmp_path)
+    cache, root = tmp_path / "cache", tmp_path / "run"
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+
+    def limited(**kwargs: Any) -> dict[str, Any]:
+        # The agent ran a command and changed a file before the limit cut the turn off.
+        calls.append(kwargs["entry"]["id"])
+        area = kwargs["area"]
+        (area / "workspace/src/answer.py").write_text("answer = 1\n")
+        execution = native_execution(
+            area, kwargs["protocol"]["native_task_identity"], reward=0
+        )
+        trace = codex_rollout("usage_limit_exceeded")
+        (area / "artifacts/stdout.jsonl").write_text(CODEX_LIMITED_STDOUT)
+        (area / "artifacts/host-trace-0.jsonl").write_text(trace)
+        execution.update(codex.parse_events(CODEX_LIMITED_STDOUT, [trace], "codex"))
+        execution["timed_out"] = False
+        return execution
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", limited)
+    with pytest.raises(
+        study.BackendUnavailable,
+        match=r"codex stopped on a usage or rate limit \(usage_limit_exceeded\): You’ve hit",
+    ) as error:
+        study.run_study(
+            resolved,
+            root,
+            baseline_cache=cache,
+            baseline_identity=resume_support.vanilla_identity(resolved),
+        )
+    assert " · vanilla · repeat " in str(error.value)
+    [failed] = calls
+    run = _json(root / "run.json")
+    assert run["attempt_states"][failed] == "interrupted"
+    # `pluginbench run` records the same error as its `failed` event, which `status` prints.
+    assert "usage or rate limit (usage_limit_exceeded)" in run["error"]
+    execution = _json(root / "attempts" / failed / "handoff/execution.json")
+    assert execution["command_items"] and execution["provider_stop"].startswith("a usage")
+    assert not (root / "attempts" / failed / "handoff/correctness.json").exists()
+    assert not (root / "records" / f"{failed}.json").exists()
+    assert not list(cache.glob("*/*/manifest.json"))
+
+    calls.clear()
+    resume_support.install(monkeypatch, calls)
+    study.resume_study(
+        root,
+        baseline_cache=cache,
+        baseline_identity=resume_support.vanilla_identity(study._frozen_study(root)),
+    )
+    run = _json(root / "run.json")
+    assert list(run["discarded_attempts"]) == [failed]
+    assert run["discarded_attempts"][failed]["replaced_by"] in calls
     assert Counter(run["attempt_states"].values()) == {"complete": 12}
     assert len(list(cache.glob("*/*/manifest.json"))) == 6
 

@@ -366,6 +366,22 @@ On interruption or fatal failure, new jobs stop. Active jobs finish or time out;
 
 A Codex session that fails before its first model turn is a fatal failure, not an outcome. This is a `turn.failed` event with no usage, commands, or agent messages, as when a network or backend outage cuts the container off from Codex. The run stops after the first one with an error that names the attempt and Codex's message. The attempt stays `interrupted` and never enters the vanilla cache. Resume once Codex is reachable: the attempt is discarded and its slot is coded again. Timeouts, and failures after the agent has used tokens, run a command, or sent a message, stay scored.
 
+A session that stops at its provider or account is not an outcome either, at any point in the session. The run stops after the first one with an error that names the attempt and the cause:
+
+- a usage or rate limit;
+- an authentication failure;
+- a provider error that retries did not recover.
+
+For Claude Code, the signals are:
+
+- a `rate_limit_event` with `status: "rejected"`, even when the session then ends with a success, because a limit can cut work short and leave a brief wrap-up;
+- a failed `result` whose last main-loop API error, or `api_error_status`, is a limit (429), an authentication failure (401 or 403), or a server error (5xx);
+- a session cut off, as by a timeout, while it was still retrying an API call (`system/api_retry`).
+
+For Codex, the signal is a turn that never completed, whose rollout ends with a `codex_error_info` code for a limit, an authorization failure, or a server, connection or retry failure. Codex's `error` events alone are not a stop: they include its "Reconnecting..." retries. The error names Claude's limit window and reset time, or carries Codex's own message. `status` shows it. The attempt stays `interrupted`, is not graded, and never enters the vanilla cache. A cached vanilla attempt that stopped this way is not reused: in a saved cohort it is skipped, and under the run's own key the run stops and names the entry to move out of the cache. Resume once the limit resets or the provider recovers: the attempt is discarded and its slot is coded again. Invalid requests, unknown errors, and output, turn, or context limits stay the agent's attempt.
+
+Each Claude attempt's `execution.json` records `api_retries`: how many API calls Claude Code retried, by error, and `announced_wait_ms`, the sum of the waits it announced before each retry. Coding time includes those waits. The sum is announced, not measured, and it can count a long background rate-limit wait more than once, because Claude Code repeats that announcement while it waits.
+
 A Harbor worker process that overruns its budget is recorded like any other failed call. The attempt is kept with its saved usage and logs. Its error says that the worker exceeded its budget, without the command line. When Harbor collected no submission, the attempt is not graded and its correctness is unknown, never a fail. It is not coded again, and the run continues.
 
 When 3 attempts in a row each end with a failed call and no submission, no new attempt starts. "In a row" follows the order in which attempts finish in this invocation. Any attempt that finishes without such a failure resets the count, including a graded failing solution. Reused vanilla attempts do not count. With more than one job, calls already in flight finish. The run then stops with an error that names the 3 attempts and their errors. The 3 attempts stay recorded as they are. Fix the cause, then `pluginbench run runs/<run>` codes the pending slots.

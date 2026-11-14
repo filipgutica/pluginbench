@@ -242,6 +242,7 @@ Every setting lives in the config. Flags only control how a command runs.
 - `pluginbench stop runs/<run>` stops new attempts. Attempts already coding finish and are kept, including with `jobs: 1`. Resume never codes complete attempts again.
 - `pluginbench run runs/<run>` resumes. A run that was killed, for example by a host shutdown, shows `interrupted`, and `status` prints this command. Complete attempts are kept and never coded again. An attempt cut off mid-call is recorded as `discarded-interrupted` and a new attempt takes its slot. Containers the killed attempt left running are stopped before coding resumes, and `status` names them until then. Resume cannot repair a failing solution.
 - If Codex fails before its first model turn, for example during a network outage, the run stops instead of scoring the attempt. Resume when Codex is reachable.
+- If a Claude Code or Codex session stops at a usage or rate limit, an authentication failure, or a provider error that retries did not recover, the run also stops instead of scoring the attempt. Resume after the limit resets. [Concurrency and resume](docs/running-evaluations.md#concurrency-and-resume).
 - Vanilla attempts are cached in `$XDG_CACHE_HOME/pluginbench` (default `~/.cache/pluginbench`) and reused by any later run with the same task, model, and settings. Grading and measures run again. Reports mark reused attempts. Claude Code attempts are cached under their own key, for Claude Code 2.1.322 only. [Baselines and reports](docs/running-evaluations.md#baselines-and-reports).
 
 ## Compare and judge
