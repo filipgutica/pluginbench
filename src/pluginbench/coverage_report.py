@@ -794,7 +794,7 @@ def parse_go_coverage(
     covered: set[str] = set()
     carriers: dict[str, str | None] = {}
     row_counts: dict[str, int] = {}
-    carrier_paths: set[str] = set()  # files a //line target names
+    carrier_paths: set[str] = set()  # files whose //line directive names a target
     for row in rows[1:]:
         match = re.fullmatch(r"(.+):([0-9]+)\.([0-9]+),([0-9]+)\.([0-9]+) ([0-9]+) ([0-9]+)", row)
         if not match:

@@ -1038,8 +1038,9 @@ def test_go_line_directive_blocks_the_build_disowns_are_rejected(
 def test_a_repeated_section_of_line_directive_blocks_is_refused(
     tmp_path: Path, source: Path
 ) -> None:
-    # Target rows skip the duplicate check, so the declared count bounds them instead.
-    repeated = LINE_DIRECTED_BLOCKS + LINE_DIRECTED_BLOCKS.split("\n", 1)[1]
+    # Target rows skip the duplicate check, so the declared count bounds them instead. The
+    # file's own row counts too: 1 own row and 4 + 1 target rows exceed the 5 declared.
+    repeated = LINE_DIRECTED_BLOCKS + "example.test/value/yaccpar:2.0,4.0 2 1\n"
     with pytest.raises(ValueError, match="more blocks than go cover declared for: \\['parser.go"):
         go_build_metrics(
             tmp_path,

@@ -75,7 +75,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # Blocks Go names after a `//line` target that is no frozen Go file count for the
             # one file naming it instead of aborting. Only refused reports change: stays v1.
             "coverage_report.py": (
-                "ca10cd18278ffc6cfba6072777dae2fe64fd5ff8183d50b10aa06d594f0c7716"
+                "997f704ee614f05980b6de367aa287494a018c57d5af179f206f4746f9bb2187"
             ),
         },
     ),
