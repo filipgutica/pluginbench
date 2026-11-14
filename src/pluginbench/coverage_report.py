@@ -655,6 +655,7 @@ def _go_build(
     source_scope: list[str],
     workdir: str,
     measured: set[str],
+    carrier_rows: dict[str, int],
 ) -> dict[str, object]:
     """Split scoped sources by the `go list -deps -test -json` output the coverage command wrote.
 
@@ -758,6 +759,10 @@ def _go_build(
     counts = _declared_counts(blocks, files, "go cover blocks") if blocks.is_file() else {}
     if declared_empty := sorted(path for path in measured if counts.get(path) == 0):
         raise ValueError(f"go cover declared no blocks for measured files: {declared_empty}")
+    # Rows a //line target names skip the duplicate check, so a profile that repeats a section
+    # would count them twice; Go writes at most one row per declared block.
+    if overcounted := sorted(p for p, n in carrier_rows.items() if n > counts.get(p, n)):
+        raise ValueError(f"Go profile has more blocks than go cover declared for: {overcounted}")
     in_scope = compiled & expected
     return {
         "go_list_sha256": hashlib.sha256(listing.read_bytes()).hexdigest(),
@@ -788,6 +793,8 @@ def parse_go_coverage(
     weights: dict[str, int] = {}
     covered: set[str] = set()
     carriers: dict[str, str | None] = {}
+    row_counts: dict[str, int] = {}
+    carrier_paths: set[str] = set()  # files a //line target names
     for row in rows[1:]:
         match = re.fullmatch(r"(.+):([0-9]+)\.([0-9]+),([0-9]+)\.([0-9]+) ([0-9]+) ([0-9]+)", row)
         if not match:
@@ -815,7 +822,9 @@ def parse_go_coverage(
         start, start_col, end, end_col, statements, hits = map(_integer, values)
         if rows[0] == "mode: set" and hits not in {0, 1}:
             raise ValueError("Go set-mode hit count must be zero or one")
+        row_counts[path] = row_counts.get(path, 0) + 1
         if carrier is not None:
+            carrier_paths.add(path)
             # The block's lines are the //line target's, and two targets' lines can coincide,
             # so it is keyed by the target and numbered by order in the profile when repeated.
             target = PurePosixPath(raw_path).name
@@ -861,6 +870,7 @@ def parse_go_coverage(
             source_scope=source_scope,
             workdir=workdir,
             measured=set(records),
+            carrier_rows={path: row_counts[path] for path in carrier_paths},
         )
     return result
 

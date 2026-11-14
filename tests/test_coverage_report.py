@@ -1035,6 +1035,22 @@ def test_go_line_directive_blocks_the_build_disowns_are_rejected(
         )
 
 
+def test_a_repeated_section_of_line_directive_blocks_is_refused(
+    tmp_path: Path, source: Path
+) -> None:
+    # Target rows skip the duplicate check, so the declared count bounds them instead.
+    repeated = LINE_DIRECTED_BLOCKS + LINE_DIRECTED_BLOCKS.split("\n", 1)[1]
+    with pytest.raises(ValueError, match="more blocks than go cover declared for: \\['parser.go"):
+        go_build_metrics(
+            tmp_path,
+            source,
+            profile=GO_REPORT + ADDED_BLOCK + repeated,
+            go_list=GO_LIST.replace('"added.go",', '"added.go", "parser.go",'),
+            blocks=GO_BLOCKS + "5 parser.go\n",
+            extra_files=LINE_DIRECTED_FILES,
+        )
+
+
 @pytest.mark.parametrize(
     ("old", "new", "error"),
     [
