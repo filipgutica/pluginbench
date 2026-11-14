@@ -70,8 +70,10 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # files Jest's istanbul found nothing in, such as TypeScript type modules, leave
             # completeness. A profile that writes no sidecar and was not refused parses as
             # before, so this stays v1.
+            # coverage.py 7.2.x JSON, which has no meta.format, reads as format 2. Such reports
+            # were always refused, and every other report parses as before, so this stays v1.
             "coverage_report.py": (
-                "6814b1a5ca50e5d635f41ec8eff4e3db25a397e3586685d36442c6142d42f46a"
+                "39b00c05cad9e30a9148811c8f74387752bddb8c89754365193c8be3bfd5bfc9"
             ),
         },
     ),

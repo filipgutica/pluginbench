@@ -410,7 +410,9 @@ def test_repeated_callback_names_preserve_provable_coverage(
         assert partial["functions"]["files_measured"] == ["src/index.ts"]
 
 
-def python_report(tmp_path: Path, source: Path, data: PythonCoverageData) -> dict[str, object]:
+def python_report(
+    tmp_path: Path, source: Path, data: PythonCoverageData | dict[str, object]
+) -> dict[str, object]:
     (source / "src/value.py").write_text(
         "def value(x):\n    if x:\n        return 1\n    return 0\n"
     )
@@ -525,6 +527,76 @@ def test_python_statement_coordinates_exclude_traced_nonstatements(
         == report["lines"]["covered"]
         == ["src/value.py:1", "src/value.py:2", "src/value.py:3"]
     )
+
+
+def coverage_7_2_report(meta: dict[str, object]) -> dict[str, object]:
+    """The JSON that coverage.py 7.2.7 writes, enriched by the documented profile script.
+
+    Line 4 is excluded but traced, as coverage.py lists it among the executed lines.
+    """
+    summary = {
+        "covered_lines": 2,
+        "num_statements": 3,
+        "percent_covered": 66.66666666666667,
+        "percent_covered_display": "67",
+        "missing_lines": 1,
+        "excluded_lines": 1,
+    }
+    return {
+        "meta": meta,
+        "files": {
+            "src/value.py": {
+                "executed_lines": [1, 2, 4],
+                "summary": summary,
+                "missing_lines": [3],
+                "excluded_lines": [4],
+                "statement_lines": [1, 2, 3],
+            }
+        },
+        "totals": dict(summary),
+        "per_test_numbits": {"src/value.py": {"test_value": lines_to_numbits({2, 4})}},
+    }
+
+
+COVERAGE_7_2_META: dict[str, object] = {
+    "version": "7.2.7",
+    "timestamp": "2026-11-14T03:02:48.154320",
+    "branch_coverage": False,
+    "show_contexts": False,
+    "statement_lines_source": "coverage.Coverage.analysis2",
+}
+
+
+def test_python_report_without_format_from_coverage_7_2_reads_as_format_2(
+    tmp_path: Path, source: Path
+) -> None:
+    report = python_report(tmp_path, source, coverage_7_2_report(COVERAGE_7_2_META))
+    numbered = coverage_7_2_report({**COVERAGE_7_2_META, "format": 2})
+    assert report == python_report(tmp_path, source, numbered)
+    assert report["lines"] == {
+        "total": ["src/value.py:1", "src/value.py:2", "src/value.py:3"],
+        "covered": ["src/value.py:1", "src/value.py:2"],
+        "files_measured": ["src/value.py"],
+        "unit": "line",
+    }
+    assert report["tool_version"] == "7.2.7"
+    assert report["per_test_numbits"] == {"test_value": {"src/value.py": lines_to_numbits({2})}}
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        # Other releases without meta.format stay refused, though 7.3.0 to 7.4.0 write the same shape.
+        {**COVERAGE_7_2_META, "version": version}
+        for version in ("7.3.0", "7.4.0", "6.5.0", "7.2", "7.2.7a1")
+    ]
+    + [{**COVERAGE_7_2_META, "format": None}],
+)
+def test_python_report_without_a_known_format_is_rejected(
+    tmp_path: Path, source: Path, meta: dict[str, object]
+) -> None:
+    with pytest.raises(ValueError, match="nonnegative integer: None"):
+        python_report(tmp_path, source, coverage_7_2_report(meta))
 
 
 @pytest.mark.parametrize(

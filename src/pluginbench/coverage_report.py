@@ -424,10 +424,22 @@ def _python_file(
 def parse_python_coverage(
     report: Path, *, snapshot: Path, source_scope: list[str], test_scope: list[str], workdir: str
 ) -> dict[str, object]:
-    """Read coverage.py JSON formats 2/3; excluded lines are outside the denominator."""
+    """Read coverage.py JSON formats 2/3, and 7.2.x's unnumbered format 2.
+
+    Excluded lines are outside the denominator.
+    """
     data = _json_object(json.loads(report.read_text(), object_pairs_hook=_json_pairs), "coverage")
     meta = _json_object(data.get("meta"), "Python coverage metadata")
-    if _json_count(meta.get("format")) not in {2, 3}:
+    version = meta.get("version")
+    if "format" not in meta and isinstance(version, str) and re.fullmatch(r"7\.2\.\d+", version):
+        # coverage.py numbered its JSON in 7.4.1 (commit 576cb3e): "Version 1" had no format
+        # number, and format 2 only added meta.format. At 7.2.0 and 7.2.7, jsonreport.py,
+        # results.py, numbits.py, analysis2 and contexts_by_lineno match 7.4.1 apart from it,
+        # quote style and one import path, so every field read below means the same.
+        json_format = 2
+    else:
+        json_format = _json_count(meta.get("format"))
+    if json_format not in {2, 3}:
         raise ValueError("Unsupported coverage.py JSON format")
     if not isinstance(meta.get("branch_coverage"), bool) or not isinstance(
         meta.get("version"), str
