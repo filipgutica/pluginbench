@@ -1677,7 +1677,7 @@ def test_iteration_rows_preserve_incomplete_and_diagnostic_failures() -> None:
     assert all("malformed JSON event" in str(row["reason"]) for row in rows)
     stage["iterations"] = {
         "status": "complete", "iterations": 0, "verification_commands": 2,
-        "failed_verification_commands": 1, "method": "verification transcript count v1",
+        "failed_verification_commands": 1, "method": "verification transcript count v2",
     }
     data = evaluation_data(report, _config("iterations"))
     rows = [row for row in _rows(data, "observations") if row["attempt_id"] == _attempt(report, 0)["id"]]
