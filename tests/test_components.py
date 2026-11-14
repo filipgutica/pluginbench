@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from pluginbench import collectors, components, evaluation, harbor_backend, isolation
-from pluginbench import language_analysis
+from pluginbench import language_analysis, mutation
 
 PINNED: dict[str, tuple[int, dict[str, str]]] = {
     "launcher": (
@@ -56,8 +56,10 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
     "analysis_observer": (
         1,
         {
+            # prepare_go_observer also builds mutation's standard-library site finder, which
+            # ships no go.sum. The analysis observer's files, cache and binary are unchanged.
             "language_analysis.py": (
-                "df4f76cff23df1e011e5a75bc79c3754d9e8893eb207512cd25f05a664eb8545"
+                "9f7bda8669ee200eca790f453d32bb43e801ecdda0a3a2b7603ee701639c2e0f"
             ),
         },
     ),
@@ -76,6 +78,18 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # one file naming it instead of aborting. Only refused reports change: stays v1.
             "coverage_report.py": (
                 "997f704ee614f05980b6de367aa287494a018c57d5af179f206f4746f9bb2187"
+            ),
+        },
+    ),
+    "mutation_observer": (
+        1,
+        {
+            "mutation.py": "8961ffaab670f20b1761e6f1c48e344f51771ac0a5179a36d6ee8259447a998d",
+            "mutation_sites.mjs": (
+                "f7a602774f3e6f2415c1745127134862a9a6f42e8e9807b4c28368e7a3c27c88"
+            ),
+            "observer_data/go-mutation-v1/main.go": (
+                "ee3f96b8d281dc135ccfe706aadc250444ff686af0acfc10339510504c8e6eca"
             ),
         },
     ),
@@ -105,6 +119,7 @@ def test_the_pinned_files_are_the_files_the_code_hashes() -> None:
         "launcher": set(evaluation._launcher_sha256("claude")),
         "analysis_observer": {Path(language_analysis.__file__).name},
         "coverage_observer": set(collectors.observer_identity()),
+        "mutation_observer": set(mutation.observer_identity()),
         "local_sandbox": {Path(isolation.__file__).name},
     }
     assert {name: set(files) for name, files in components.FILES.items()} == hashed

@@ -71,6 +71,10 @@ class CollectedInput:
 
 # A task with no collector has two empty repeats and no family outcome.
 _NOTHING_COLLECTED = CollectedInput(repeats=[{}, {}], outcomes={})
+# Families collected once per input: their second repeat binds the first's artifact. Mutation
+# has its own stability rules (two baseline runs, confirmed kills); a second whole collection
+# would double its suite runs and add an unavailable state its preregistration does not define.
+SINGLE_RUN_KINDS = frozenset({"mutation"})
 
 
 @dataclass(frozen=True)
@@ -428,7 +432,10 @@ def _collect_references(
     base: Path,
     frozen: dict[str, list[Collector]],
 ) -> dict[str, object]:
-    """Measure each task's reference solution with the frozen code collectors (not coverage)."""
+    """Measure each task's reference solution with the frozen code collectors.
+
+    Coverage and mutation run the task's tests, so references skip them.
+    """
     catalog = root / "frozen/tasks.json"
     entries = _object(json.loads(catalog.read_text())).get("tasks", []) if catalog.is_file() else []
     if not isinstance(entries, list):
@@ -444,7 +451,7 @@ def _collect_references(
         befores.setdefault(record.task_id, (base / record.before.path).resolve())
     references: dict[str, object] = {}
     for task, collectors in sorted(frozen.items()):
-        code = [collector for collector in collectors if collector.kind != "coverage"]
+        code = [item for item in collectors if item.kind not in {"coverage", "mutation"}]
         patch = tasks[task] / "solution/solution.patch" if task in tasks else None
         if patch is None or not patch.is_file():
             references[task] = {
@@ -636,9 +643,20 @@ def propose_remeasurement(
                         return
                     evidence = directory / "measurements" / str(item.index) / str(repeat)
                     emit(partial(update_input, item, "running", repeat))
+                    collectors = [
+                        collector
+                        for collector in frozen[item.key[0]]
+                        if not (repeat and collector.kind in SINGLE_RUN_KINDS)
+                    ]
                     paths = collect_measurements(
-                        item.snapshot, evidence, frozen[item.key[0]], before=item.before
+                        item.snapshot, evidence, collectors, before=item.before
                     )
+                    if repeat:
+                        paths |= {
+                            kind: directory / ref.path
+                            for kind, ref in repeats[0].items()
+                            if kind in SINGLE_RUN_KINDS and ref.path.name == "envelope.json"
+                        }
                     result = evaluate_evidence(
                         item.snapshot,
                         {kind: str(path.resolve()) for kind, path in paths.items()},
@@ -649,6 +667,9 @@ def propose_remeasurement(
                     refs: dict[MetricKind, ArtifactRef] = {}
                     for collector in frozen[item.key[0]]:
                         path = paths.get(collector.kind)
+                        if path is None and repeat and collector.kind in SINGLE_RUN_KINDS:
+                            refs[collector.kind] = repeats[0][collector.kind]
+                            continue
                         if path is None:
                             path = evidence / collector.kind / "failure.json"
                             failure = _object(json.loads(path.read_text()))
@@ -765,6 +786,7 @@ def propose_remeasurement(
             proposed_report=study._reference(root, report_path),
             normalization="evaluated metrics/counts/sets/populations and configuration/observer identity; raw temporary paths and execution timings excluded",
             repeats=2,
+            single_run_families=sorted(SINGLE_RUN_KINDS),
             unique_inputs=len(observations),
         )
         study._write(directory / "revision.json", state)
@@ -921,11 +943,13 @@ def validate_remeasurement(root: Path, directory: Path) -> Path:
                     if not path.is_relative_to(directory):
                         raise ValueError("repeat artifact escapes its measurement revision")
                     parts = path.relative_to(directory).parts
+                    # A single-run family's second repeat binds its first repeat's artifact.
+                    collected = 0 if collector.kind in SINGLE_RUN_KINDS else index
                     if (
                         len(parts) != 5
                         or parts[0] != "measurements"
                         or not parts[1].isdigit()
-                        or parts[2:4] != (str(index), collector.kind)
+                        or parts[2:4] != (str(collected), collector.kind)
                         or parts[4] not in {"envelope.json", "failure.json"}
                     ):
                         raise ValueError("repeat artifact does not bind a distinct recorded repeat")
@@ -950,7 +974,7 @@ def validate_remeasurement(root: Path, directory: Path) -> Path:
                             collector=collector,
                             snapshot_digest=snapshot_ref.sha256,
                             before_digest=record.before.sha256,
-                            repeat=index,
+                            repeat=collected,
                         )
                         continue
                     envelope = _object(json.loads(path.read_text()))

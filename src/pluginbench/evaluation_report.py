@@ -57,6 +57,7 @@ MEASUREMENT_METRICS = {
         "Branch coverage %",
         "Function coverage %",
     ),
+    "mutation": ("Mutation bug-catch rate %", "Test-change kill share %"),
     "review": (
         "Total review findings",
         "P0 review findings",
@@ -177,6 +178,7 @@ COMPLETENESS_COUNTS = {
     "cyclomatic": "Complexity population",
     "dead_code": "Introduced dead findings",
     "coverage": "Coverage covered/total counts",
+    "mutation": "Mutation killed/valid counts",
 }
 
 
@@ -925,6 +927,11 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
     if "coverage" in selected:
         limitations.append(
             "Coverage counts are proxies, not proof of correct assertions or unnecessary tests."
+        )
+    if "mutation" in selected:
+        limitations.append(
+            "Mutation rates compare each arm's tests on that arm's own mutants; populations "
+            "differ, so they are not a pure measure of test quality."
         )
     if "review" in selected:
         limitations.append(

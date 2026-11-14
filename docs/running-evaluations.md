@@ -565,7 +565,7 @@ The server answers only on 127.0.0.1, only to requests whose `Host` is `127.0.0.
 
 ## Measure again
 
-`pluginbench measure runs/<run> --measurements cyclomatic,cognitive --revision <name>` adds measures to a finished run from its saved submissions, as measurement revision `<name>`. It makes no model calls and codes nothing again. It adds only measures that a collector takes from saved submissions: `cyclomatic`, `cognitive`, `dead_code`, and `coverage`. It prints what it will measure and asks before starting unless `--yes` is set. It owns `run.lock` while it works, so it refuses an active run.
+`pluginbench measure runs/<run> --measurements cyclomatic,cognitive --revision <name>` adds measures to a finished run from its saved submissions, as measurement revision `<name>`. It makes no model calls and codes nothing again. It adds only measures that a collector takes from saved submissions: `cyclomatic`, `cognitive`, `dead_code`, `coverage`, and `mutation`. It prints what it will measure and asks before starting unless `--yes` is set. It owns `run.lock` while it works, so it refuses an active run.
 
 It refuses:
 
@@ -590,6 +590,15 @@ The run's saved settings change only through this command, as `review` changes t
 Coverage needs a coverage profile for the task. If the run's settings have none, pass `--coverage-profiles <file>`, a YAML `coverage_profiles` mapping such as the files in [coverage profiles](coverage-profiles/README.md). The command adds the mapping to `measurement_settings.coverage_profiles`. It refuses a key that the run already saved with a different profile. Pass the same file for every run in a batch.
 
 Use exact model IDs. Harbor does not support `ultra` reasoning. Requested effort is separate from effective effort when native evidence cannot verify it.
+
+### Mutation
+
+`mutation` measures how many small bugs in an attempt's own changed code its test suite catches. It needs the task's coverage profile, whose command it runs, and a Python, Go, TypeScript or JavaScript task. Each submission is measured once, not twice like other collectors:
+
+- **Sites:** relational boundary, equality negation, boolean connective and condition negation operators on the production lines the attempt added or changed. Python sites come from `ast`, Go sites from a standard-library observer built like the analysis observer, and JavaScript/TypeScript sites from the pinned oxc parser. Test files, and anko's `parser/parser.go` and sql-formatter's `src/parser/grammar.ts`, give no sites. A changed file no parser reads leaves the result incomplete.
+- **Sample:** at most one mutant per line and ten per attempt, ordered by sha256 of the submission digest, path, line, column and operator, round-robin over the operators. The report keeps every candidate and the changed lines that hold one.
+- **Runs:** the unmutated submission runs the coverage-profile command twice in the frozen image, offline. Its suite status is the `PB-SUITE-EXIT <n>` line the command prints, or its exit when it prints none. A red or unstable baseline makes the attempt unavailable. Each mutant then runs the same command. A non-zero status, confirmed by one rerun, is a kill; one that does not reproduce is flaky and excluded. A run past three times the slower baseline plus 60 seconds is a timeout, counted as a kill. Go mutants that fail `go build ./... && go test -run '^$' ./...`, and TypeScript mutants with a `tsc --noEmit` error the unmutated tree lacks, are invalid and excluded.
+- **Results:** the bug-catch rate is kills over kills plus survivors. The test-change kill share is the kills that the suite without the attempt's test changes misses, over valid mutants, using the source-only grade's filter. It is 0 when the attempt changed no test file. The report also splits mutants by whether line coverage marks their line executed.
 
 ## Compare runs
 

@@ -2049,7 +2049,12 @@ def test_parser_only_change_keeps_the_vanilla_cache_identity(
 
 
 def _coding_and_review_backend(
-    calls: list[str], reviews: list[str], *, timeout: int, interrupt_at: int | None
+    calls: list[str],
+    reviews: list[str],
+    *,
+    timeout: int,
+    interrupt_at: int | None,
+    source: str = "answer = 1\n",
 ) -> Callable[..., dict[str, Any]]:
     usage = {"input_tokens": 10, "output_tokens": 5}
 
@@ -2081,7 +2086,7 @@ def _coding_and_review_backend(
             (area / "artifacts").mkdir()
             (area / "artifacts/execution.json").write_text(json.dumps({"usage": usage}))
             raise KeyboardInterrupt("stopped by SIGTERM")
-        (area / "workspace/src/answer.py").write_text("answer = 1\n")
+        (area / "workspace/src/answer.py").write_text(source)
         result = native_execution(
             area,
             kwargs["protocol"]["native_task_identity"],
@@ -2402,6 +2407,62 @@ def test_measure_adds_a_selected_measurement_revision_from_saved_submissions(
     assert unfinished.exit_code == 2 and "has not finished" in unfinished.stderr
     assert not (root / "measure/m3").exists()
     assert not (root / "evidence/observer-revisions/m3").exists()
+
+
+def test_measure_adds_mutation_from_saved_submissions_offline(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _measured_and_reviewed(config, tmp_path, monkeypatch)
+    calls: list[str] = []
+    reviews: list[str] = []
+    # Line 2 holds a relational and a condition site; one mutant per line takes the first.
+    backend = _coding_and_review_backend(
+        calls,
+        reviews,
+        timeout=config.timeout_seconds,
+        interrupt_at=None,
+        source="def answer(flag):\n    return 1 if flag < 2 else 0\n",
+    )
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    task = config.tasks.resolve() / config.tasks.ids[0]
+    toml = (task / "task.toml").read_text()
+    (task / "task.toml").write_text(
+        toml.replace("[agent]", "[metadata]\nlanguage='python'\n[agent]")
+    )
+    (task / "solution/solution.patch").write_text("")
+    root = tmp_path / "run"
+    evaluation.run_evaluation(config, root)
+    coded, reviewed = len(calls), len(reviews)
+    suites: list[tuple[str, int]] = []
+
+    def native(**kwargs: Any) -> dict[str, object]:
+        # The coverage profile's suite fails only on a mutant, which `<=` marks here.
+        source = (kwargs["snapshot"] / "src/answer.py").read_text()
+        status = int("flag <= 2" in source)
+        suites.append((source, kwargs["timeout"]))
+        return {**_lcov(**kwargs), "stdout": f"tests ran\nPB-SUITE-EXIT {status}\n"}
+
+    monkeypatch.setattr(harbor_backend, "run_native_command", native)
+    result = CliRunner().invoke(
+        cli.app, ["measure", str(root), "--measurements", "mutation", "--revision", "m1", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert "0 model calls" in result.stdout and (len(calls), len(reviews)) == (coded, reviewed)
+    rows = {(row["metric"], row["attempt_id"]): row for row in _observations(root, {"mutation"})}
+    rates = [row for (metric, _), row in rows.items() if metric == "Mutation bug-catch rate %"]
+    shares = [row for (metric, _), row in rows.items() if metric == "Test-change kill share %"]
+    assert rates and {(row["status"], row["value"]) for row in rates} == {("measured", 100.0)}
+    assert {row["value"] for row in shares} == {0.0}
+    assert {row["provenance"]["covered"] for row in rates} == {1}
+    # Every attempt submitted the same source, so it is measured once: the mutant and its
+    # confirming rerun, each with three times the slower baseline plus a minute.
+    assert [timeout for source, timeout in suites if "flag <= 2" in source] == [60, 60]
+    selection = evaluation._load_selection(root)
+    assert selection["measurement_revision"] == "m1" and "mutation" in selection["measurements"]
+    revision = json.loads((root / "evidence/observer-revisions/m1/revision.json").read_text())
+    assert revision["single_run_families"] == ["mutation"]
 
 
 def test_measure_refuses_a_measure_no_task_can_collect(

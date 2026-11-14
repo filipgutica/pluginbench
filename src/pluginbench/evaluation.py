@@ -1059,7 +1059,7 @@ def _code(
     }
     for task, collectors in _saved_profiles(root).items():
         for collector in collectors:
-            if collector.kind == "analysis" or (
+            if collector.kind in {"analysis", "mutation"} or (
                 collector.kind == "coverage" and collector.report_format is not None
             ):
                 payload = json.loads(collector.config.read_text())
@@ -1481,7 +1481,7 @@ def review_evaluation(
 
 
 # The measures `measure` can add: each is collected from saved submissions, with no model call.
-_COLLECTED = FALLOW_MEASUREMENTS | {"coverage"}
+_COLLECTED = FALLOW_MEASUREMENTS | {"coverage", "mutation"}
 
 
 def _measure_inputs(
