@@ -300,11 +300,20 @@ def test_a_transport_fallback_notice_is_no_work_between_retries_and_failure() ->
                 *_turn_failed()),
          [codex_rollout("other", "unexpected status 400: invalid_request_error")]),
         # A failed turn right after a notice, on a code that is no stop.
-        (_lines(*_CODEX_WORK, _reconnect(2), *_turn_failed()),
+        (_lines(*_CODEX_WORK, _reconnect(2), _turn_failed()[1]),
          [codex_rollout("context_window_exceeded", _DISCONNECTED)]),
+        # Exhausted retries, then a failed turn on a code other than `other` that is no stop.
+        (_lines(*_CODEX_WORK, *(_reconnect(attempt) for attempt in range(1, 6)),
+                _turn_failed()[1]),
+         [codex_rollout("context_window_exceeded", _DISCONNECTED)]),
+        # Only a fragment of the notice, not its cause.
+        (_lines(*_CODEX_WORK, *(_reconnect(attempt) for attempt in range(1, 6)),
+                *_turn_failed()),
+         [codex_rollout("other", "stream disconnected")]),
     ],
     ids=["other-before-exhausted", "work-after-exhausted", "waiting-then-failed",
-         "work-after-reconnect", "unrelated-error-after-exhausted", "no-stop-code"],
+         "work-after-reconnect", "unrelated-error-after-exhausted", "no-stop-code",
+         "no-stop-code-after-exhausted", "notice-fragment"],
 )
 def test_a_codex_session_that_reconnected_or_failed_otherwise_is_no_provider_stop(
     stdout: str, traces: list[str]

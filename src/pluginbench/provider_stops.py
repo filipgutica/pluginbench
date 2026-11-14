@@ -191,14 +191,16 @@ def _codex_retries(events: list[dict[str, Any]]) -> list[str]:
 def _exhausted(messages: list[str], error: object) -> str | None:
     """The "n/n" of the last retry notice when it used up its retries on this turn error.
 
-    The error's message must appear in that notice, so a later, unrelated failure (an
-    invalid request, say) is not read as the end of the retries.
+    The notice's parenthesised cause must be the error's message, so a later, unrelated
+    failure (an invalid request, say) is not read as the end of the retries.
     """
     notices = [message for message in messages if message.startswith(_RECONNECTING)]
     count = _RECONNECT_COUNT.match(notices[-1]) if notices else None
     if count is None or count[1] != count[2]:
         return None
-    if not isinstance(error, str) or not error.strip() or error.strip() not in notices[-1]:
+    if not isinstance(error, str) or not error.strip() or not notices[-1].endswith(
+        f"({error.strip()})"
+    ):
         return None
     return f"{count[1]}/{count[2]}"
 
