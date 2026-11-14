@@ -73,7 +73,7 @@ from pluginbench.study_review import (
 )
 
 Measurement = Literal[
-    "tokens", "lines", "cyclomatic", "cognitive", "dead_code", "coverage", "review"
+    "tokens", "lines", "cyclomatic", "cognitive", "dead_code", "coverage", "review", "iterations"
 ]
 
 
@@ -956,7 +956,7 @@ def prepare_evaluation(
         "measurement_readiness": capabilities,
         "not_measured": checked.report["not_measured"],
         "artifact_base": "evidence",
-        "measurement_required": any(profiles.values()),
+        "measurement_required": any(profiles.values()) or "iterations" in config.measurements,
         "measurement_revision": None,
         "review_revision": None,
     }
@@ -1084,7 +1084,7 @@ def _finish_evaluation(
 ) -> Path:
     evidence = root / "evidence"
     config = _saved_evaluation(selection)
-    if profiles and selection["measurement_revision"] is None:
+    if (profiles or "iterations" in config.measurements) and selection["measurement_revision"] is None:
         revision = _next_measurement_revision(evidence)
         if selection.get("pending_measurement_revision") is not None:
             selection["recovery_measurement_revision"] = selection["pending_measurement_revision"]
@@ -1096,6 +1096,7 @@ def _finish_evaluation(
             revision=revision,
             progress=progress,
             jobs=config.jobs,
+            iterations="iterations" in config.measurements,
             masks_listed_pairs=bool(selection.get("not_measured")),
         )
         _adopt_measurement_revision(root, selection, revision)
@@ -1445,12 +1446,19 @@ def plan_review(root: Path, revision: str) -> dict[str, object]:
 
 
 def review_evaluation(
-    root: Path, revision: str, *, progress: Callable[[str], None] | None = None
+    root: Path,
+    revision: str,
+    *,
+    reviewer: Runner | None = None,
+    select: bool = True,
+    progress: Callable[[str], None] | None = None,
 ) -> str:
-    """Review every submission again with the frozen reviewer as `revision`, then select it.
+    """Review every submission again as `revision`, then select it unless `select` is false.
 
-    Earlier revisions stay in evidence. Returns the selected revision: `<revision>-citations`
-    when offline citation recovery repaired its formatting.
+    `reviewer` replaces the frozen reviewer's harness, model and effort for this revision only;
+    the frozen criteria and timeout still apply, and the run records who reviewed. Earlier
+    revisions stay in evidence. Returns the revision: `<revision>-citations` when offline
+    citation recovery repaired its formatting.
     """
     root = root.expanduser().resolve()
     plan_review(root, revision)
@@ -1459,14 +1467,28 @@ def review_evaluation(
     if config.reviewer is None:
         raise ValueError("this run has no reviewer, so it has no review to repeat")
     guidance = _frozen_review_guidance(root, selection, config.reviewer)
-    _review_preflight(selection)
+    identity = reviewer or config.reviewer
+    _review_preflight({"reviewer": identity.model_dump(mode="json")})
+    override = None
+    if reviewer is not None:
+        override = {
+            **reviewer.model_dump(mode="json", include={"harness", "model", "reasoning"}),
+            "harness_version": _harness_version(reviewer.harness),
+        }
+        # Saved before any review call, so an interrupted revision is still attributed.
+        _record_override(root, selection, revision, override)
+    elif revision in (overrides := _object(selection.get("reviewer_overrides", {}))):
+        # An override interrupted before its revision existed must not claim this retry.
+        del overrides[revision]
+        selection["reviewer_overrides"] = overrides
+        _save_selection(root, selection)
     if progress:
         progress(f"Reviewing all submissions again as review revision {revision}")
     review_study(
         root / "evidence",
-        harness=config.reviewer.harness,
-        model=config.reviewer.model,
-        effort=config.reviewer.reasoning,
+        harness=identity.harness,
+        model=identity.model,
+        effort=identity.reasoning,
         timeout=config.reviewer.timeout_seconds or config.timeout_seconds,
         seed=config.seed,
         revision=revision,
@@ -1474,14 +1496,19 @@ def review_evaluation(
         jobs=config.jobs,
     )
     selected = recover_review_citations(root / "evidence", revision)
-    selection["review_revision"] = selected
+    if override is not None:
+        # Also under the recovered name: a report can project the revision by either name.
+        _record_override(root, selection, selected, override)
+    if select:
+        selection["review_revision"] = selected
     _save_selection(root, selection)
-    regenerate_report(root)
+    if select:
+        regenerate_report(root)
     return selected
 
 
 # The measures `measure` can add: each is collected from saved submissions, with no model call.
-_COLLECTED = FALLOW_MEASUREMENTS | {"coverage"}
+_COLLECTED = FALLOW_MEASUREMENTS | {"coverage", "iterations"}
 
 
 def _measure_inputs(
@@ -1572,7 +1599,7 @@ def measure_evaluation(
 ) -> str:
     """Add `measurements` to a finished run as measurement revision `revision`, then select it.
 
-    No model call. A revision is built from the run's own saved submissions, so this one
+    No model call. A revision is built from saved traces and submissions, so this one
     collects every collector-backed measure the run selects, earlier ones included. Earlier
     revisions stay in evidence and measurement history; coding, correctness, token and review
     evidence is unchanged. Profiles, readiness probes and the replaced settings stay in
@@ -1648,6 +1675,7 @@ def measure_evaluation(
         revision=revision,
         progress=progress,
         jobs=_saved_evaluation(selection).jobs,
+        iterations="iterations" in collected,
         masks_listed_pairs=bool(listed),
     )
     current = _selected_revision(selection, "measurement_revision")
@@ -1761,6 +1789,19 @@ def _measurement_collection(root: Path, selection: dict[str, object]) -> dict[st
                     "diagnostics": diagnostics,
                 }
             )
+    if "iterations" in state:
+        counts = study._bound_document(evidence, state["iterations"])
+        for attempt_id, stages in counts.items():
+            for stage, counted in stages.items():
+                if counted["status"] == "complete":
+                    available += 1
+                else:
+                    failures.append({
+                        "attempt_id": attempt_id, "task": tasks[attempt_id],
+                        "stage": stage, "family": "iterations", **counted,
+                        "receipts": [state["iterations"]],
+                        "diagnostics": [counted["reason"]],
+                    })
     history = []
     saved_history = selection.get("measurement_history", [])
     if not isinstance(saved_history, list):
@@ -1783,6 +1824,35 @@ def _measurement_collection(root: Path, selection: dict[str, object]) -> dict[st
     }
 
 
+def _record_override(
+    root: Path, selection: dict[str, object], revision: str, override: dict[str, object]
+) -> None:
+    overrides = _object(selection.get("reviewer_overrides", {}))
+    overrides[revision] = override
+    selection["reviewer_overrides"] = overrides
+    _save_selection(root, selection)
+
+
+def _revision_reviewer(
+    evidence: Path, selection: dict[str, object], revision: str
+) -> dict[str, object]:
+    """The reviewer that ran `revision`: its recorded override, else the frozen reviewer.
+
+    Refuses a revision whose protocol names another harness, model or effort.
+    """
+    override = _object(selection.get("reviewer_overrides", {})).get(revision)
+    reviewer = {**_object(selection["reviewer"]), **(_object(override) if override else {})}
+    state = json.loads((_review_directory(evidence, revision) / "review-state.json").read_text())
+    protocol = study._bound_document(evidence, state["protocol"])
+    if (protocol.get("harness", "codex"), protocol.get("model"), protocol.get("effort")) != (
+        reviewer["harness"],
+        reviewer["model"],
+        reviewer["reasoning"],
+    ):
+        raise ValueError(f"review revision {revision} was not run by its recorded reviewer")
+    return reviewer
+
+
 def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path:
     root = root.expanduser().resolve()
     config = _load_selection(root)
@@ -1794,7 +1864,7 @@ def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path
         review_path = validate_review_revision(evidence, review_revision)
         state = study._bound_document(evidence, study._reference(evidence, review_path))
         protocol = study._bound_document(evidence, state["protocol"])
-        reviewer = _object(config["reviewer"])
+        reviewer = _revision_reviewer(evidence, config, review_revision)
         expected = {
             "harness": reviewer["harness"],
             "model": reviewer["model"],
@@ -1834,7 +1904,29 @@ def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path
         measurement_revision=_selected_revision(config, "measurement_revision"),
         review_revision=_selected_revision(config, "review_revision"),
     )
+    reviewed = _selected_revision(config, "review_revision")
+    if config.get("reviewer") and reviewed is not None:
+        reviewer = _revision_reviewer(evidence, config, reviewed)
+        if reviewed in _object(config.get("reviewer_overrides", {})):
+            # Another reviewer's findings must not be reported, or compared, as the frozen one's.
+            config["reviewer"] = reviewer
+            comparison["reviewer"] = {
+                **_object(comparison["reviewer"]),
+                **{key: reviewer[key] for key in ("harness", "model", "reasoning")},
+            }
     report = json.loads(report_path.read_text())
+    if "iterations" in TypeAdapter(list[str]).validate_python(config["measurements"]):
+        from pluginbench import iterations
+
+        revision = _selected_revision(config, "measurement_revision")
+        state = (
+            json.loads((evidence / "observer-revisions" / revision / "revision.json").read_text())
+            if revision else {}
+        )
+        if "iterations" not in state:
+            raise ValueError("iterations requires a bound measurement revision")
+        measured = study._bound_document(evidence, state["iterations"])
+        iterations.attach(report, measured)
     if config.get("source_only_grades") is not None:
         attach_source_only_grades(evidence, config["source_only_grades"], report["attempts"])
     recipe = json.loads((evidence / "frozen/resolved-recipe.json").read_text())

@@ -16,6 +16,9 @@ See [running evaluations](running-evaluations.md#compare-runs) for gate statisti
 
 | Metric | What it measures | Unit | Gates-file name | Direction |
 | --- | --- | --- | --- | --- |
+| Verification iterations (transcript count) | A verification command, a production or test edit by that agent, then its next verification command. Counted within each agent and summed. Shell edits and hook-run tests are unseen. | iterations | `Verification iterations (transcript count)` | Gate chooses |
+| Verification commands | Shell commands matching the documented verification-command list; ad-hoc scripts are excluded. | commands | `Verification commands` | Gate chooses |
+| Failed verification commands (unmasked; descriptive) | Descriptive failures only for unmasked commands. Missing exit statuses stay unknown; permission denials and cancellations are not failures. | commands | `Failed verification commands (unmasked; descriptive)` | Gate chooses |
 | Line coverage | Executable source lines reached by the selected tests. Unsupported units remain unknown; coverage alone does not establish useful assertions. | % covered | `Line coverage %` | Gate chooses |
 | Statement coverage | Source statements reached by the selected tests. Go counts statements within measured blocks; this is not branch or function coverage. | % covered | `Statement coverage %` | Gate chooses |
 | Input tokens | Tokens the implementation model read: the task, guidance, context, and tool results. Repeated context can be counted again on later turns; fewer tokens means less input used. | tokens | `Input tokens` | Lower for paired token bounds |

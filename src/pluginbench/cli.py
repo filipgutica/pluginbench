@@ -24,6 +24,7 @@ from pluginbench import __version__, run_lock
 from pluginbench.isolation import RuntimeDriftError
 from pluginbench.evaluation import (
     CheckFailed,
+    Runner,
     check_evaluation,
     load_evaluation,
     measure_evaluation,
@@ -621,24 +622,53 @@ def review(
     revision: str = typer.Option(
         ..., "--revision", help="Name for the new review revision, such as review-2."
     ),
+    reviewer_harness: str | None = typer.Option(
+        None, "--reviewer-harness", help="Review with this harness instead of the frozen one."
+    ),
+    reviewer_model: str | None = typer.Option(
+        None, "--reviewer-model", help="Review with this model instead of the frozen one."
+    ),
+    reviewer_effort: str | None = typer.Option(
+        None, "--reviewer-effort", help="Review with this effort instead of the frozen one."
+    ),
+    select: bool = typer.Option(
+        True, "--select/--no-select", help="Select the new revision for the report."
+    ),
     yes: bool = typer.Option(False, "--yes", help="Start without confirmation."),
 ) -> None:
     """Review every submission again with the run's frozen reviewer and criteria.
 
-    Earlier review revisions stay in evidence. The new one is selected and the report rebuilt.
+    The three --reviewer options together review with another harness, model and effort.
+    Earlier review revisions stay in evidence. The new one is selected and the report rebuilt,
+    unless --no-select is set.
     """
     try:
+        override = (reviewer_harness, reviewer_model, reviewer_effort)
+        reviewer = None
+        if any(value is not None for value in override):
+            if None in override:
+                raise ValueError(
+                    "--reviewer-harness, --reviewer-model and --reviewer-effort go together"
+                )
+            reviewer = Runner.model_validate(
+                {"harness": reviewer_harness, "model": reviewer_model, "reasoning": reviewer_effort}
+            )
         with run_lock.hold(run):
             plan = plan_review(run, revision)
-            typer.echo(f"{plan['review_calls']} review calls as review revision {revision}.")
+            by = (
+                f" by {reviewer.harness} {reviewer.model} ({reviewer.reasoning})"
+                if reviewer
+                else ""
+            )
+            typer.echo(f"{plan['review_calls']} review calls as review revision {revision}{by}.")
             if not yes and not _confirm("Start review?"):
                 raise typer.Exit()
-            _review(run, revision)
+            _review(run, revision, reviewer=reviewer, select=select)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         _error(exc)
 
 
-def _review(run: Path, revision: str) -> None:
+def _review(run: Path, revision: str, *, reviewer: Runner | None, select: bool) -> None:
     """Run a planned review while this process owns the run, recording it in events.jsonl."""
     with _events(run) as event:
         event("started", command="review", pid=os.getpid(), revision=revision)
@@ -648,12 +678,17 @@ def _review(run: Path, revision: str) -> None:
             typer.echo(message)
 
         try:
-            selected = review_evaluation(run, revision, progress=logged)
+            recorded = review_evaluation(
+                run, revision, reviewer=reviewer, select=select, progress=logged
+            )
         except BaseException as exc:
             _ended(event, exc)
             raise
-        event("finished", command="review", revision=selected)
-    typer.echo(f"Selected review revision {selected}.")
+        event("finished", command="review", revision=recorded)
+    if not select:
+        typer.echo(f"Recorded review revision {recorded}; the selected revision is unchanged.")
+        return
+    typer.echo(f"Selected review revision {recorded}.")
     typer.echo(f"Report: {run / 'report/report.html'}")
 
 
@@ -663,7 +698,7 @@ def measure(
     measurements: str = typer.Option(
         ...,
         "--measurements",
-        help="Comma-separated measures to add: cyclomatic, cognitive, dead_code, coverage.",
+        help="Comma-separated measures to add: cyclomatic, cognitive, dead_code, coverage, iterations.",
     ),
     revision: str = typer.Option(
         ..., "--revision", help="Name for the new measurement revision, such as measurements-2."
