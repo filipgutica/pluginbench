@@ -2622,6 +2622,14 @@ def _mutation_run(
     config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **backend: Any
 ) -> tuple[Path, list[str], list[str]]:
     """A finished run with coverage and review, whose submissions each hold one mutant line."""
+    from pluginbench import measurement_profiles
+
+    def offline(*args: object) -> Path:
+        raise OSError("this test host prepares no other-language site finder")
+
+    # The Python task needs no other finder; preparing one would download or build it.
+    monkeypatch.setattr(measurement_profiles, "prepare_observer", offline)
+    monkeypatch.setattr(language_analysis, "prepare_go_observer", offline)
     config = _measured_and_reviewed(config, tmp_path, monkeypatch)
     calls: list[str] = []
     reviews: list[str] = []
