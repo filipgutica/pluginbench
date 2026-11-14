@@ -431,7 +431,7 @@ def parse_python_coverage(
     data = _json_object(json.loads(report.read_text(), object_pairs_hook=_json_pairs), "coverage")
     meta = _json_object(data.get("meta"), "Python coverage metadata")
     version = meta.get("version")
-    if "format" not in meta and isinstance(version, str) and re.fullmatch(r"7\.2\.\d+", version):
+    if "format" not in meta and isinstance(version, str) and re.fullmatch(r"7\.2\.[0-9]+", version):
         # coverage.py numbered its JSON in 7.4.1 (commit 576cb3e): "Version 1" had no format
         # number, and format 2 only added meta.format. At 7.2.0 and 7.2.7, jsonreport.py,
         # results.py, numbits.py, analysis2 and contexts_by_lineno match 7.4.1 apart from it,
