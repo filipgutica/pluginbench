@@ -665,7 +665,7 @@ def test_go_files_the_build_does_not_compile_leave_the_report_complete(
     assert metrics["statement_population_complete"] is True
     assert metrics["unmeasured_source_files"] == []
     assert metrics["go_files_not_compiled"] == {
-        "testdata/fixture.go": "in no package that go list listed",
+        "testdata/fixture.go": "in no package that go list -deps -test listed",
         "value_windows.go": "excluded from package example.test/value by build constraints",
     }
     # Go's cover tool declared no blocks for doc.go: nothing to measure.
@@ -717,16 +717,45 @@ def test_a_compiled_go_file_missing_from_the_report_stays_incomplete(
     assert metrics["unmeasured_source_files"] == ["added.go"]
 
 
-@pytest.mark.parametrize("directory", ["testdata/helper", "_tools/helper"])
-def test_go_files_compiled_only_as_imports_stay_expected(
-    tmp_path: Path, source: Path, directory: str
+@pytest.mark.parametrize(
+    ("directory", "helper"),
+    [
+        # value_test.go imports a helper that does not import the package: go lists it plain.
+        (
+            "testdata/helper",
+            '{"Dir": "/app/testdata/helper", "ImportPath": "example.test/value/testdata/helper",'
+            ' "GoFiles": ["helper.go"]}\n',
+        ),
+        # x_test.go imports a helper that imports the package: go lists only its test variant.
+        (
+            "_tools/helper",
+            '{"Dir": "/app/_tools/helper", "ImportPath":'
+            ' "example.test/value/_tools/helper [example.test/value.test]",'
+            ' "ForTest": "example.test/value", "GoFiles": ["helper.go"]}\n',
+        ),
+    ],
+    ids=["internal-test-import", "external-test-import"],
+)
+def test_go_files_only_tests_import_stay_expected(
+    tmp_path: Path, source: Path, directory: str, helper: str
 ) -> None:
-    # `go list -deps` also lists the standard library and packages that failed to load.
-    go_list = GO_LIST + (
-        '{"Dir": "/usr/local/go/src/fmt", "ImportPath": "fmt", "GoFiles": ["print.go"]}\n'
+    # The shape go1.25 `go list -e -deps -test -json` writes: the standard library, packages
+    # that failed to load, test variants that repeat the package's files with its `_test.go`
+    # files, and the synthesized `.test` main, whose only file is in the build cache.
+    go_list = (
+        GO_LIST
+        + '{"Dir": "/usr/local/go/src/testing", "ImportPath": "testing",'
+        ' "GoFiles": ["testing.go"]}\n'
         '{"ImportPath": "missing.example/x"}\n'
-        f'{{"Dir": "/app/{directory}", "ImportPath": "example.test/value/{directory}",'
-        ' "GoFiles": ["helper.go"]}\n'
+        + helper
+        + '{"Dir": "/app", "ImportPath": "example.test/value [example.test/value.test]",'
+        ' "ForTest": "example.test/value",'
+        ' "GoFiles": ["added.go", "doc.go", "value.go", "value_test.go"],'
+        ' "IgnoredGoFiles": ["value_windows.go"]}\n'
+        '{"Dir": "/app", "ImportPath": "example.test/value_test [example.test/value.test]",'
+        ' "ForTest": "example.test/value", "GoFiles": ["x_test.go"]}\n'
+        '{"Dir": "/app", "ImportPath": "example.test/value.test",'
+        ' "GoFiles": ["/root/.cache/go-build/16/16b6c34b-d"]}\n'
     )
     metrics = go_build_metrics(
         tmp_path,
@@ -734,10 +763,44 @@ def test_go_files_compiled_only_as_imports_stay_expected(
         profile=GO_REPORT + ADDED_BLOCK,
         go_list=go_list,
         blocks=GO_BLOCKS + f"1 {directory}/helper.go\n",
-        extra_files={f"{directory}/helper.go": "package helper\n\nfunc Help() {}\n"},
+        extra_files={
+            f"{directory}/helper.go": "package helper\n\nfunc Help() {}\n",
+            "value_test.go": "package value\n",
+            "x_test.go": "package value_test\n",
+        },
     )
     assert metrics["population_complete_for_declared_scope"] is False
     assert metrics["unmeasured_source_files"] == [f"{directory}/helper.go"]
+    assert metrics["go_files_not_compiled"] == {
+        "testdata/fixture.go": "in no package that go list -deps -test listed",
+        "value_windows.go": "excluded from package example.test/value by build constraints",
+    }
+
+
+def test_vendored_go_packages_are_out_of_scope(tmp_path: Path, source: Path) -> None:
+    # `-deps` lists vendored packages from inside the workdir; they are not the repo's code.
+    go_list = GO_LIST + (
+        '{"Dir": "/app/vendor/example.com/dep", "ImportPath": "example.com/dep",'
+        ' "GoFiles": ["dep.go"], "IgnoredGoFiles": ["dep_windows.go"]}\n'
+    )
+    metrics = go_build_metrics(
+        tmp_path,
+        source,
+        profile=GO_REPORT + ADDED_BLOCK,
+        go_list=go_list,
+        extra_files={
+            "vendor/example.com/dep/dep.go": "package dep\n\nfunc D() int { return 2 }\n",
+            "vendor/example.com/dep/dep_windows.go": "//go:build windows\n\npackage dep\n",
+        },
+    )
+    assert metrics["population_complete_for_declared_scope"] is True
+    assert metrics["unmeasured_source_files"] == []
+    assert metrics["go_files_not_compiled"] == {
+        "testdata/fixture.go": "in no package that go list -deps -test listed",
+        "value_windows.go": "excluded from package example.test/value by build constraints",
+        "vendor/example.com/dep/dep.go": "vendored dependency",
+        "vendor/example.com/dep/dep_windows.go": "vendored dependency",
+    }
 
 
 @pytest.mark.parametrize(

@@ -540,7 +540,11 @@ def _go_cover_blocks(path: Path, files: set[str]) -> dict[str, int]:
     toolchain itself found nothing to measure. A file without a line has no declared count.
     """
     counts: dict[str, int] = {}
-    for line in path.read_text().splitlines():
+    # Only "\n" ends a line: a path may hold any other character `splitlines` would split on.
+    lines = path.read_text().split("\n")
+    if lines[-1] == "":
+        lines.pop()  # what follows the last line's newline
+    for line in lines:
         match = re.fullmatch(r"(0|[1-9][0-9]*) (\S.*)", line)
         if match is None:
             raise ValueError(f"go cover blocks line is malformed: {line!r}")
@@ -563,14 +567,21 @@ def _go_build(
     workdir: str,
     measured: set[str],
 ) -> dict[str, object]:
-    """Split scoped sources by the `go list -deps -json` output the coverage command wrote.
+    """Split scoped sources by the `go list -deps -test -json` output the coverage command wrote.
 
-    Packages outside the workdir, such as the standard library, are skipped. Files that no
-    listed package compiles are recorded with a reason, never as empty records. Compiled files
-    the report omits stay expected unless `go tool cover` declared them zero blocks.
+    Packages outside the workdir, such as the standard library, and vendored packages are
+    skipped. Files that no listed package compiles are recorded with a reason, never as empty
+    records. Compiled files the report omits stay expected unless `go tool cover` declared them
+    zero blocks.
     """
     text = listing.read_text()
     decoder = json.JSONDecoder(object_pairs_hook=_json_pairs)
+    roots = {directory for directories in modules.values() for directory in directories}
+    vendors = {root / "vendor" for root in roots}
+
+    def vendored(path: PurePosixPath) -> bool:
+        return any(path.is_relative_to(vendor) for vendor in vendors)
+
     compiled: set[str] = set()
     ignored: dict[str, str] = {}
     listed: dict[str, str] = {}
@@ -593,36 +604,57 @@ def _go_build(
         ):
             continue
         relative = PurePosixPath(directory).relative_to(workdir)
-        listed[relative.as_posix()] = name
+        # A module's vendor/ holds its dependencies' code, not the repository's.
+        if vendored(relative):
+            continue
+        fields: dict[str, list[str]] = {}
         for field_name in ("GoFiles", "CgoFiles", "IgnoredGoFiles"):
             items = package.get(field_name, [])
             if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
                 raise ValueError(f"go list {field_name} must hold file names")
+            fields[field_name] = items
+        # `-test` adds each tested package's synthesized `<package>.test` main. Its one file is
+        # the generated test main in the build cache, by absolute path; a real package lists
+        # file names, so a package directory merely named `x.test` is not skipped.
+        if (
+            name.endswith(".test")
+            and " [" not in name
+            and fields["GoFiles"]
+            and all(PurePosixPath(item).is_absolute() for item in fields["GoFiles"])
+        ):
+            continue
+        # `-test` also lists test variants, `<package> [<tested>.test]`: the package's files
+        # again with its `_test.go` files, or a package only tests import. The set drops the
+        # repeats and the scope drops `_test.go`; reasons name the package as first listed.
+        name = name.split(" [", 1)[0]
+        listed.setdefault(relative.as_posix(), name)
+        for field_name, items in fields.items():
             for item in items:
                 path = (relative / item).as_posix()
                 if path not in files:
                     raise ValueError(f"go list file is absent from the frozen snapshot: {path}")
                 if field_name == "IgnoredGoFiles":
-                    ignored[path] = f"excluded from package {name} by build constraints"
+                    ignored.setdefault(path, f"excluded from package {name} by build constraints")
                 else:
                     compiled.add(path)
     expected = coverage_sources(files, source_scope)
-    roots = {directory.as_posix() for directories in modules.values() for directory in directories}
 
     def reason(path: str) -> str:
+        if vendored(PurePosixPath(path)):
+            return "vendored dependency"
         if path in ignored:
             return ignored[path]
         parent = PurePosixPath(path).parent
         if parent.as_posix() in listed:
             return f"not among the files go list compiles for package {listed[parent.as_posix()]}"
         module = next(
-            (str(p) for p in (parent, *parent.parents) if str(p) in roots and str(p) != "."), None
+            (str(p) for p in (parent, *parent.parents) if p in roots and str(p) != "."), None
         )
         if module is not None and not any(
             directory == module or directory.startswith(module + "/") for directory in listed
         ):
             return f"in nested module {module}, which go list did not list"
-        return "in no package that go list listed"
+        return "in no package that go list -deps -test listed"
 
     counts = _go_cover_blocks(blocks, files) if blocks.is_file() else {}
     if declared_empty := sorted(path for path in measured if counts.get(path) == 0):

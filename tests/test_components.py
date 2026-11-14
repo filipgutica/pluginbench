@@ -69,7 +69,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # instead of aborting. A profile that writes no sidecar and was not refused parses
             # as before, so this stays v1.
             "coverage_report.py": (
-                "0b975d40f2cc5d4328e1b7ef659ded82e4c45dd1a069642b8d330e710ab93b08"
+                "d36d343aa696fe72700b3144ba71dcfbe5e00b0d846545f406755c9e94bff752"
             ),
         },
     ),
