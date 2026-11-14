@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from pluginbench import components, harbor_backend, mutation
+from pluginbench import components, harbor_backend, isolation, mutation
 from pluginbench.assessment_metrics import compare_snapshots, evaluate_evidence, inspect_snapshot
 from pluginbench.collectors import Collector, collect_measurements
 from pluginbench.mutation import Run, Site
@@ -466,6 +466,85 @@ def test_the_native_executor_tells_infrastructure_failures_from_integrity_violat
     assert type(raised.value) is kind
 
 
+# `assert_runtime`'s one message for every failure to read the current Docker runtime.
+_UNVERIFIED = "Cannot verify the frozen Harbor and Docker runtime"
+
+
+def _drift(message: str, cause: BaseException | None) -> isolation.RuntimeDriftError:
+    error = isolation.RuntimeDriftError(message)
+    error.__cause__ = cause
+    return error
+
+
+@pytest.mark.parametrize(
+    ("error", "kind"),
+    [
+        (_drift(_UNVERIFIED, ValueError("docker info failed: daemon gone")), "infrastructure"),
+        (_drift(_UNVERIFIED, subprocess.TimeoutExpired(["docker", "info"], 30)), "infrastructure"),
+        (_drift(_UNVERIFIED, FileNotFoundError("docker")), "infrastructure"),
+        # Docker answered, and what it reported is refused: these stay integrity failures.
+        (_drift(_UNVERIFIED, ValueError("Harbor 0.1 is required; installed is 0.2")), "drift"),
+        (_drift(_UNVERIFIED, ValueError("Docker did not report a complete daemon identity")), "drift"),
+        (_drift(_UNVERIFIED, ValueError("Harbor execution currently requires Linux containers")), "drift"),
+        (_drift("Harbor or Docker runtime changed since this run was prepared: x", None), "drift"),
+        (_drift("Docker capacity no longer fits this run: 1 jobs", None), "drift"),
+        (_drift("Cannot verify frozen Docker CLI", FileNotFoundError("docker")), "drift"),
+        (_drift(_UNVERIFIED + ".", ValueError("docker info failed: daemon gone")), "drift"),
+    ],
+    ids=[
+        "docker-info-failed",
+        "docker-info-timeout",
+        "docker-missing",
+        "harbor-version",
+        "daemon-identity",
+        "platform",
+        "runtime-changed",
+        "capacity",
+        "frozen-cli",
+        "other-message",
+    ],
+)
+def test_docker_lost_before_launch_leaves_the_attempt_incomplete_and_drift_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: isolation.RuntimeDriftError,
+    kind: str,
+) -> None:
+    before = _tree(tmp_path / "before", {"src/grade.py": BEFORE})
+    after = _tree(tmp_path / "after", {"src/grade.py": AFTER})
+
+    def native(**kwargs: object) -> dict[str, object]:
+        snapshot, destination, command = (
+            kwargs["snapshot"],
+            kwargs["destination"],
+            kwargs["command"],
+        )
+        assert isinstance(snapshot, Path) and isinstance(destination, Path)
+        assert isinstance(command, list)
+        # The launcher's runtime check fails on the first mutant, before it writes a receipt.
+        if (snapshot / "src/grade.py").read_text() != AFTER:
+            raise error
+        _receipt(destination, snapshot, command, Run(0, False, "PB-SUITE-EXIT 0\n", 1))
+        return dict(json.loads((destination / "execution.json").read_text()))
+
+    monkeypatch.setattr(harbor_backend, "run_native_command", native)
+    destination = tmp_path / "evidence"
+    destination.mkdir()
+    execute = mutation.native_executor({}, "cov.json")
+    if kind == "drift":
+        with pytest.raises(isolation.RuntimeDriftError):
+            mutation.collect_mutation(after, before, _config(), destination, execute=execute)
+        return
+    report = mutation.collect_mutation(after, before, _config(), destination, execute=execute)
+    metrics = mutation.mutation_metrics(report, destination, config=_config(), snapshot=after)
+    assert metrics["status"] == "incomplete"
+    assert str(metrics["reason"]).startswith(f"infrastructure failure: {_UNVERIFIED}: ")
+    # The record must match what the executor saved for the run that never launched.
+    _object(report["infrastructure_failure"])["reason"] = "other"
+    with pytest.raises(ValueError, match="infrastructure failure differs"):
+        mutation.mutation_metrics(report, destination, config=_config(), snapshot=after)
+
+
 @pytest.mark.parametrize(
     "second",
     [(1, False, ""), (None, True, ""), (None, False, "")],
@@ -513,6 +592,53 @@ def test_generated_and_unparsable_files_give_no_sites(tmp_path: Path) -> None:
     assert metrics["candidate_count"] == 0 and not fake.calls
     assert set(_object(metrics["unparsed_files"])) == {"src/broken.py", "src/table.go"}
     assert metrics["status"] == "incomplete" and "src/broken.py" in str(metrics["reason"])
+
+
+def test_a_parse_failure_outranks_a_red_baseline(tmp_path: Path) -> None:
+    report, _, destination = _measure(
+        tmp_path,
+        lambda view: (1, False, "") if view.seen == 1 else (0, False, ""),
+        after={"src/broken.py": "def (:\n"},
+    )
+    metrics = _metrics(report, destination)
+    assert metrics["status"] == "incomplete" and "src/broken.py" in str(metrics["reason"])
+
+
+@pytest.mark.parametrize(
+    "finder",
+    [
+        subprocess.TimeoutExpired(["finder"], 600),
+        OSError("finder killed"),
+        subprocess.CompletedProcess(["finder"], 2, "", "panic: crashed"),
+        subprocess.CompletedProcess(["finder"], 0, "not json", ""),
+        subprocess.CompletedProcess(["finder"], 0, '{"sites": []}', ""),
+    ],
+    ids=["timeout", "os-error", "crash", "not-json", "no-failure-list"],
+)
+def test_a_site_finder_that_fails_leaves_its_files_unparsed_and_the_attempt_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, finder: object
+) -> None:
+    binary = tmp_path / "go-finder"
+    binary.write_bytes(b"finder")
+
+    def run(*args: object, **kwargs: object) -> object:
+        if isinstance(finder, BaseException):
+            raise finder
+        return finder
+
+    monkeypatch.setattr(isolation, "run", run)
+    tool = {"path": str(binary), "sha256": hashlib.sha256(b"finder").hexdigest()}
+    report, _, destination = _measure(
+        tmp_path,
+        _passing(_kills_first),
+        after={"src/table.go": "package x\n"},
+        config=_config(site_finders={"go": tool}),
+    )
+    metrics = _metrics(report, destination, _config(site_finders={"go": tool}))
+    unparsed = _object(metrics["unparsed_files"])
+    assert set(unparsed) == {"src/table.go"}
+    assert str(unparsed["src/table.go"]).startswith("go site finder: ")
+    assert metrics["status"] == "incomplete" and "src/table.go" in str(metrics["reason"])
 
 
 def test_changed_test_files_give_no_sites(tmp_path: Path) -> None:
@@ -730,6 +856,25 @@ def _edit_receipt(directory: Path, run: dict[str, object], **changes: object) ->
         lambda report, directory: report["baseline"][1].update(
             receipts=report["baseline"][0]["receipts"]
         ),
+        # Another spelling of the first baseline run's receipts names the same directory.
+        lambda report, directory: report["baseline"][1].update(
+            receipts=report["baseline"][0]["receipts"] + "/."
+        ),
+        lambda report, directory: report["baseline"][1].update(
+            receipts=report["baseline"][0]["receipts"].replace("/", "//")
+        ),
+        lambda report, directory: report["baseline"][1].update(
+            receipts="runs/../" + report["baseline"][0]["receipts"]
+        ),
+        lambda report, directory: report["baseline"][1].update(
+            receipts=str(directory / report["baseline"][0]["receipts"])
+        ),
+        lambda report, directory: (
+            (directory / "runs/999-alias").symlink_to(
+                directory / report["baseline"][0]["receipts"]
+            ),
+            report["baseline"][1].update(receipts="runs/999-alias"),
+        ),
         lambda report, directory: report["mutants"][0].update(mutated_sha256="sha256:0"),
         lambda report, directory: report["mutants"][0]["runs"][0].update(timeout_seconds=1),
     ],
@@ -746,6 +891,11 @@ def _edit_receipt(directory: Path, run: dict[str, object], **changes: object) ->
         "receipt-output",
         "receipt-input",
         "shared-receipts",
+        "receipts-dot-alias",
+        "receipts-double-slash-alias",
+        "receipts-parent-alias",
+        "receipts-absolute-alias",
+        "receipts-symlink-alias",
         "mutant-bytes",
         "timeout-limit",
     ],

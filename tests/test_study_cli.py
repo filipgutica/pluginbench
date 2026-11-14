@@ -2623,9 +2623,12 @@ def _mutation_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     source: str = "def answer(flag):\n    return 1 if flag < 2 else 0\n",
+    solution: str = "",
+    coverage: bool = True,
     **backend: Any,
 ) -> tuple[Path, list[str], list[str]]:
-    """A finished run with coverage and review, whose submissions each hold one mutant line."""
+    """A finished run with review, and with coverage unless `coverage` is False, whose
+    submissions each hold one mutant line."""
     from pluginbench import measurement_profiles
 
     def offline(*args: object) -> Path:
@@ -2635,6 +2638,8 @@ def _mutation_run(
     monkeypatch.setattr(measurement_profiles, "prepare_observer", offline)
     monkeypatch.setattr(language_analysis, "prepare_go_observer", offline)
     config = _measured_and_reviewed(config, tmp_path, monkeypatch)
+    if not coverage:
+        config.measurements.remove("coverage")
     calls: list[str] = []
     reviews: list[str] = []
     # Line 2 holds a relational and a condition site; one mutant per line takes the first.
@@ -2653,7 +2658,7 @@ def _mutation_run(
     (task / "task.toml").write_text(
         toml.replace("[agent]", "[metadata]\nlanguage='python'\n[agent]")
     )
-    (task / "solution/solution.patch").write_text("")
+    (task / "solution/solution.patch").write_text(solution)
     root = tmp_path / "run"
     evaluation.run_evaluation(config, root)
     return root, calls, reviews
@@ -2823,6 +2828,145 @@ def test_measure_resumes_a_stopped_backfill_without_measuring_finished_inputs_ag
         cli.app, ["measure", str(root), "--measurements", "coverage", "--revision", "m1"]
     )
     assert refused.exit_code == 2 and "choose a new --revision name" in refused.stderr
+
+
+def test_measure_refuses_to_resume_with_another_observer_implementation(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _, _ = _mutation_run(config, tmp_path, monkeypatch, vary=True)
+    revision = root / "evidence/observer-revisions/m1"
+    monkeypatch.setattr(
+        harbor_backend,
+        "run_native_command",
+        _suite(
+            [],
+            lambda source, destination: (
+                ValueError("Frozen measurement input changed during execution")
+                if "VALUE = 3" in source
+                else None
+            ),
+        ),
+    )
+    assert _measure_mutation(root).exit_code == 2
+    stopped = (revision / "revision.json").read_bytes()
+    finished = _input_files(revision)
+    assert finished
+    # The site finder's bytes change before the resume, as after updating PluginBench.
+    hashed = components.source_sha256
+    monkeypatch.setattr(
+        components,
+        "source_sha256",
+        lambda name: "0" * 64 if name == "mutation_sites.mjs" else hashed(name),
+    )
+    suites: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(harbor_backend, "run_native_command", _suite(suites))
+
+    refused = _measure_mutation(root)
+
+    assert refused.exit_code == 2, refused.stderr + refused.stdout
+    assert "changed since measurement revision m1 started" in refused.stderr
+    assert "choose a new --revision name" in refused.stderr
+    assert not suites
+    assert (revision / "revision.json").read_bytes() == stopped
+    assert not (revision / "abandoned").exists()
+    assert _input_files(revision) == finished
+
+
+def test_adding_mutation_carries_reference_measurements_unchanged(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _, _ = _mutation_run(config, tmp_path, monkeypatch, solution=_SOLUTION)
+    _python_analysis(monkeypatch)
+    added = CliRunner().invoke(
+        cli.app,
+        ["measure", str(root), "--measurements", "cyclomatic", "--revision", "m0", "--yes"],
+    )
+    assert added.exit_code == 0, added.stderr + added.stdout
+    revisions = root / "evidence/observer-revisions"
+    measured = json.loads((revisions / "m0/references.json").read_text())
+    assert {record["status"] for record in measured.values()} == {"available"}
+    monkeypatch.setattr(harbor_backend, "run_native_command", _suite([]))
+
+    result = _measure_mutation(root)
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    state = json.loads((revisions / "m1/revision.json").read_text())
+    assert "analysis" in state["carried_from"]["kinds"]
+    # The reference solutions are not measured again: m0's records are bound as they are.
+    assert json.loads((revisions / "m1/references.json").read_text()) == measured
+    assert not (revisions / "m1/references").exists()
+
+
+def test_adding_mutation_carries_the_bound_iteration_counts_unchanged(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from test_iterations import _command, _patch, _write
+
+    from pluginbench import iterations
+
+    # Iterations alone: no other measure is carried, so nothing else checks the selected revision.
+    root, _, _ = _mutation_run(config, tmp_path, monkeypatch, coverage=False)
+    evidence = root / "evidence"
+    native = json.loads((evidence / "run.json").read_text())
+    for stages in native["executions"].values():
+        for reference in stages.values():
+            receipt = evidence / reference["path"]
+            _write(receipt.parent / "artifacts/harbor/trial/agent/sessions/root.jsonl", [
+                {"type": "session_meta", "payload": {"id": "root"}},
+                *_command("a", "pytest", 1), *_patch("b", "tests/test_a.py"),
+                *_command("c", "pytest"),
+            ])
+    added = CliRunner().invoke(
+        cli.app,
+        ["measure", str(root), "--measurements", "iterations", "--revision", "m0", "--yes"],
+    )
+    assert added.exit_code == 0, added.stderr + added.stdout
+    counted = json.loads((evidence / "observer-revisions/m0/revision.json").read_text())
+    values = {
+        row["value"]
+        for row in _observations(root, {"iterations"})
+        if row["metric"] == "Verification iterations (transcript count)"
+    }
+    assert values == {1}
+    monkeypatch.setattr(harbor_backend, "run_native_command", _suite([]))
+    # A changed trace parser counts other values from the same traces.
+    measure_run = iterations.measure_run
+
+    def recounted(root: Path) -> dict[str, object]:
+        counts = measure_run(root)
+        for stages in counts.values():
+            for stage in stages.values():  # type: ignore[attr-defined]
+                if stage["status"] == "complete":
+                    stage["iterations"] += 6
+        return counts
+
+    monkeypatch.setattr(iterations, "measure_run", recounted)
+    selection = (root / "evaluation.json").read_bytes()
+
+    refused = CliRunner().invoke(
+        cli.app,
+        ["measure", str(root), "--measurements", "mutation", "--revision", "m1", "--yes"],
+    )
+
+    assert refused.exit_code == 2, refused.stderr + refused.stdout
+    assert "verification iteration evidence changed" in refused.stderr
+    assert (root / "evaluation.json").read_bytes() == selection
+    monkeypatch.setattr(iterations, "measure_run", measure_run)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["measure", str(root), "--measurements", "mutation", "--revision", "m2", "--yes"],
+    )
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    state = json.loads((evidence / "observer-revisions/m2/revision.json").read_text())
+    assert state["carried_from"]["kinds"] == ["iterations"]
+    assert state["iterations"] == counted["iterations"]
+    assert {
+        row["value"]
+        for row in _observations(root, {"iterations"})
+        if row["metric"] == "Verification iterations (transcript count)"
+    } == values
 
 
 def test_an_infrastructure_failure_leaves_one_attempt_incomplete_not_the_revision(

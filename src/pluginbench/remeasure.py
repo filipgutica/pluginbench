@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -15,7 +16,8 @@ from functools import partial
 from threading import Event
 from pathlib import Path
 
-from pluginbench import harbor_backend, study
+import pluginbench
+from pluginbench import components, harbor_backend, study
 from pluginbench.parallel import run_jobs, validate_jobs
 from pluginbench.assessment import _load_manifest, build_assessment
 from pluginbench.assessment_metrics import (
@@ -437,10 +439,14 @@ def _collect_references(
     manifest: AssessmentInput,
     base: Path,
     frozen: dict[str, list[Collector]],
+    *,
+    carried_kinds: set[str],
+    carried: dict[str, object],
 ) -> dict[str, object]:
     """Measure each task's reference solution with the frozen code collectors.
 
-    Coverage and mutation run the task's tests, so references skip them.
+    Coverage and mutation run the task's tests, so references skip them. A task whose code
+    collectors are carried keeps `carried`, the carried revision's reference record, unchanged.
     """
     catalog = root / "frozen/tasks.json"
     entries = _object(json.loads(catalog.read_text())).get("tasks", []) if catalog.is_file() else []
@@ -458,6 +464,14 @@ def _collect_references(
     references: dict[str, object] = {}
     for task, collectors in sorted(frozen.items()):
         code = [item for item in collectors if item.kind not in {"coverage", "mutation"}]
+        if kept := {item.kind for item in code} & carried_kinds:
+            if kept != {item.kind for item in code}:
+                raise ValueError("a task's reference collectors are only partly carried")
+            references[task] = carried.get(task) or {
+                "status": "unavailable",
+                "reason": "the carried revision measured no reference",
+            }
+            continue
         patch = tasks[task] / "solution/solution.patch" if task in tasks else None
         if patch is None or not patch.is_file():
             references[task] = {
@@ -537,6 +551,13 @@ def _carried_collectors(
     }
 
 
+def _carried_revision(root: Path, state: dict[str, object]) -> dict[str, object]:
+    """The bound receipt of the revision this one carries measures from; it must still validate."""
+    receipt = study._bound_path(root, _object(state["carried_from"])["receipt"])
+    validate_remeasurement(root, receipt.parent)
+    return _object(json.loads(receipt.read_text()))
+
+
 def _carried_artifacts(
     root: Path, state: dict[str, object], manifest: AssessmentInput
 ) -> dict[tuple[str, str, str], list[dict[str, Path]]]:
@@ -547,11 +568,9 @@ def _carried_artifacts(
     if state.get("carried_from") is None:
         return {}
     kinds = _carried_kinds(state)
-    receipt = study._bound_path(root, _object(state["carried_from"])["receipt"])
-    validate_remeasurement(root, receipt.parent)
     tasks = {record.id: record.task_id for record in manifest.records}
     artifacts: dict[tuple[str, str, str], list[dict[str, Path]]] = {}
-    for value in _list(_object(json.loads(receipt.read_text()))["observations"]):
+    for value in _list(_carried_revision(root, state)["observations"]):
         observation = _object(value)
         key = (
             tasks[str(observation["attempt_id"])],
@@ -656,6 +675,26 @@ def _checked_input(
     return CollectedInput(repeats=repeats, outcomes=outcomes)
 
 
+def _implementation() -> dict[str, object]:
+    """What decides measured values besides the frozen profiles, which a resume must run again.
+
+    The PluginBench release, each observer's version and source bytes, the site finders among
+    them, and the Python whose `ast` finds Python mutation sites.
+    """
+    observers = ("analysis_observer", "coverage_observer", "mutation_observer")
+    return {
+        "pluginbench": pluginbench.__version__,
+        "observers": {
+            name: {
+                "version": components.VERSIONS[name],
+                "files": {file: components.source_sha256(file) for file in components.FILES[name]},
+            }
+            for name in observers
+        },
+        "python": platform.python_version(),
+    }
+
+
 def propose_remeasurement(
     root: Path,
     *,
@@ -710,6 +749,7 @@ def propose_remeasurement(
         "source_run": study._reference(root, root / "run.json"),
         "source_assessment": run["assessment_input"],
         "preserved": protected,
+        "implementation": _implementation(),
     }
     try:
         previous = directory / "previous"
@@ -784,6 +824,11 @@ def resume_remeasurement(
         raise ValueError(
             f"measurement revision {revision} did not stop while collecting, so it cannot "
             "resume; choose a new --revision name"
+        )
+    if state.get("implementation") != _implementation():
+        raise ValueError(
+            f"PluginBench or its observers changed since measurement revision {revision} "
+            "started, so a resume would mix two implementations; choose a new --revision name"
         )
     validate_jobs(state["jobs"])
     run, manifest, original = _native_state(root)
@@ -1058,19 +1103,39 @@ def _collect_revision(
         if progress:
             progress("Measuring task reference solutions")
         references_path = directory / "references.json"
+        # Checked again here: what this revision binds from it must still validate.
+        carried_revision = _carried_revision(root, state) if carried_kinds else {}
+        carried_references = (
+            study._bound_document(root, carried_revision["references"])
+            if "references" in carried_revision
+            else {}
+        )
         study._write(
-            references_path, _collect_references(root, directory, manifest, original.parent, frozen)
+            references_path,
+            _collect_references(
+                root,
+                directory,
+                manifest,
+                original.parent,
+                frozen,
+                carried_kinds=carried_kinds,
+                carried=_object(carried_references),
+            ),
         )
         proposed_path = directory / "assessment-input.json"
         study._write(proposed_path, revised.model_dump(mode="json"))
         if iterations:
-            from pluginbench.iterations import measure_run
+            if "iterations" in carried_kinds:
+                # Bound as the carried revision bound them; validating it counted them again.
+                state["iterations"] = carried_revision["iterations"]
+            else:
+                from pluginbench.iterations import measure_run
 
-            if progress:
-                progress("Counting verification iterations from saved traces")
-            count_path = directory / "iterations.json"
-            study._write(count_path, measure_run(root))
-            state["iterations"] = study._reference(root, count_path)
+                if progress:
+                    progress("Counting verification iterations from saved traces")
+                count_path = directory / "iterations.json"
+                study._write(count_path, measure_run(root))
+                state["iterations"] = study._reference(root, count_path)
         assessment = build_assessment(proposed_path)
         if iterations:
             from pluginbench.iterations import attach

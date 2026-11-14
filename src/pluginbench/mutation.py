@@ -81,6 +81,12 @@ _SUFFIXES = {
 }
 # A docker command's own failure, as the launcher's `_docker` helper words it.
 _DOCKER_FAILURE = re.compile(r"^docker \S+ failed: ")
+# `assert_runtime`'s one message for any failure to read the current Docker runtime.
+_RUNTIME_UNVERIFIED = "Cannot verify the frozen Harbor and Docker runtime"
+# The executor's record of a run whose launcher stopped before it wrote execution.json.
+PRELAUNCH_FAILURE = "prelaunch-failure.json"
+# The only receipt directory name `_Runner` writes.
+_RECEIPTS = re.compile(r"runs/\d{3,}-[a-z0-9-]+")
 METHOD = (
     "single-site mutants of changed production lines (relational boundary, equality negation, "
     "boolean connective, condition negation); at most one mutant per line, ten per attempt, "
@@ -96,6 +102,10 @@ LIMITATIONS = (
 
 class SiteError(ValueError):
     """A parser reported a span that is not the operator it names; its file stays unparsed."""
+
+
+class SiteFinderFailure(Exception):
+    """A pinned site finder did not run to a result; the files it was given stay unparsed."""
 
 
 class InfrastructureFailure(Exception):
@@ -302,7 +312,12 @@ def find_sites(
                 ["node", str(script), str(binary), str(root), *selected],
                 [binary, script],
             )
-        output = _observer_output(argv, root, readable, timeout)
+        try:
+            output = _observer_output(argv, root, readable, timeout)
+        except SiteFinderFailure as error:
+            for path in selected:
+                unparsed[path] = f"{kind} site finder: {error}"
+            continue
         for failure in output["failures"]:
             unparsed[str(failure["path"])] = f"{parser} parser: {failure['reason']}"
         for row in output["sites"]:
@@ -331,18 +346,19 @@ def _observer_output(
     try:
         result = isolation.run(argv, cwd=root, env=env, timeout=timeout, readable=readable)
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise CollectorUnavailable(f"mutation site finder failed: {error}") from error
+        raise SiteFinderFailure(f"failed: {error}") from error
     if result.returncode:
-        raise CollectorUnavailable(
-            f"mutation site finder exited {result.returncode}: {result.stderr[-2000:]}"
-        )
-    output = json.loads(result.stdout)
+        raise SiteFinderFailure(f"exited {result.returncode}: {result.stderr[-2000:]}")
+    try:
+        output = json.loads(result.stdout)
+    except ValueError as error:
+        raise SiteFinderFailure(f"printed no JSON: {error}") from error
     if (
         not isinstance(output, dict)
         or not isinstance(output.get("sites"), list)
         or not isinstance(output.get("failures"), list)
     ):
-        raise CollectorUnavailable("mutation site finder output has no site and failure lists")
+        raise SiteFinderFailure("output has no site and failure lists")
     return output
 
 
@@ -463,6 +479,14 @@ def native_executor(identity: dict[str, object], report_path: str) -> Executor:
             ).is_file():
                 raise
             raise InfrastructureFailure(str(error)) from error
+        except isolation.RuntimeDriftError as error:
+            # Docker stopped answering the launcher's runtime check, before it launched or wrote
+            # a receipt, so this executor records the failure. Any other drift fails closed.
+            if not _runtime_unreachable(error) or (destination / "execution.json").exists():
+                raise
+            reason = f"{error}: {error.__cause__}"
+            (destination / PRELAUNCH_FAILURE).write_text(json.dumps({"error": reason}))
+            raise InfrastructureFailure(reason) from error
         finally:
             # execution.json keeps the digests of both exports and of the coverage report,
             # which mutation never reads; the copies themselves are not kept.
@@ -480,6 +504,20 @@ def native_executor(identity: dict[str, object], report_path: str) -> Executor:
         )
 
     return execute
+
+
+def _runtime_unreachable(error: isolation.RuntimeDriftError) -> bool:
+    """Whether the launcher's runtime check failed only because a docker command did not run.
+
+    `assert_runtime` words every failure to read the runtime the same way, and chains the cause.
+    A docker command that failed, timed out or could not start is infrastructure. A runtime that
+    Docker reported and the check refused, such as another Harbor version or platform, is not.
+    """
+    cause = error.__cause__
+    return str(error) == _RUNTIME_UNVERIFIED and (
+        isinstance(cause, (OSError, subprocess.TimeoutExpired))
+        or (isinstance(cause, ValueError) and bool(_DOCKER_FAILURE.match(str(cause))))
+    )
 
 
 def _digest(path: Path) -> str:
@@ -828,14 +866,26 @@ class _Receipts:
         self.image = identity["image_id"]
         self.seen: set[str] = set()
 
-    def receipt(self, receipts: object) -> dict[str, object]:
-        """A run's launcher receipt; no two runs share one."""
+    def _own(self, receipts: object) -> Path:
+        """A run's receipt directory, named as `_Runner` names it; no two runs share one.
+
+        Only that one spelling is accepted, and it must not pass through a link, so the name
+        alone tells two directories apart.
+        """
         name = str(receipts)
-        path = self.directory / name / "execution.json"
-        if name in self.seen or not path.resolve().is_relative_to(self.directory.resolve()):
+        path = self.directory / name
+        if (
+            not _RECEIPTS.fullmatch(name)
+            or name in self.seen
+            or path.resolve() != self.directory.resolve() / name
+        ):
             raise ValueError("a mutation run does not have its own receipt directory")
         self.seen.add(name)
-        return _object(json.loads(path.read_text()))
+        return path
+
+    def receipt(self, receipts: object) -> dict[str, object]:
+        """A run's launcher receipt."""
+        return _object(json.loads((self._own(receipts) / "execution.json").read_text()))
 
     def runs(
         self, value: object, command: list[str], tree: str, timeout: int
@@ -873,7 +923,17 @@ class _Receipts:
         """An infrastructure failure's reason, as the failing run's receipt records it."""
         record = _object(value)
         reason = str(record["reason"])
-        receipt = self.receipt(record["receipts"])
+        directory = self._own(record["receipts"])
+        launched, prelaunch = directory / "execution.json", directory / PRELAUNCH_FAILURE
+        if launched.is_file() == prelaunch.is_file():
+            raise ValueError("a mutation infrastructure failure needs exactly one receipt")
+        if prelaunch.is_file():
+            if _object(json.loads(prelaunch.read_text())).get("error") != reason:
+                raise ValueError(
+                    "a mutation infrastructure failure differs from its prelaunch record"
+                )
+            return reason
+        receipt = _object(json.loads(launched.read_text()))
         cleanup = receipt.get("cleanup")
         if reason not in (
             receipt.get("error"),
@@ -1027,9 +1087,10 @@ def mutation_metrics(
     result.update(killed=killed, valid=valid, mutants=rows)
     if unavailable is None and not incomplete and not valid:
         unavailable = "no valid mutants"
-    status = "unavailable" if unavailable else "incomplete" if incomplete else "available"
+    # An incomplete attempt stays incomplete whatever else made it unavailable.
+    status = "incomplete" if incomplete else "unavailable" if unavailable else "available"
     result["status"] = status
-    result["reason"] = unavailable or ("; ".join(incomplete) if incomplete else None)
+    result["reason"] = "; ".join(incomplete) if incomplete else unavailable
     result["bug_catch_percent"] = round(100 * killed / valid, 6) if status == "available" else None
     result["test_change_kill_share"] = _share(share, rows, valid, status)
     return result

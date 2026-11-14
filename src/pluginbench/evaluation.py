@@ -1515,6 +1515,8 @@ _GROUP_KINDS = {
     "code": frozenset({"fallow", "analysis"}),
     "coverage": frozenset({"coverage"}),
     "mutation": frozenset({"mutation"}),
+    # Not a collector: a carried revision binds the counts its selected revision bound.
+    "iterations": frozenset({"iterations"}),
 }
 
 
@@ -1527,9 +1529,10 @@ def _measure_split(
 ) -> tuple[list[str], list[str]]:
     """The measures a new revision collects, and the earlier ones it carries forward unchanged.
 
-    Adding mutation collects only what was asked: every earlier measure is carried from the
-    selected revision, with its evidence. An earlier mutation is always carried, so a later
-    measure never runs its suites again. Other earlier measures are collected again.
+    Adding mutation collects only what was asked: every earlier measure, iteration counts
+    included, is carried from the selected revision, with its evidence. An earlier mutation is
+    always carried, so a later measure never runs its suites again. Other earlier measures are
+    collected again, and iterations counted again.
     """
     saved = [
         name
@@ -1540,10 +1543,7 @@ def _measure_split(
         return sorted({*saved, *measurements}), []
     asked = {_measure_group(name) for name in measurements}
     groups = {_measure_group(name) for name in saved} if "mutation" in asked else {"mutation"}
-    # Iterations are counted again from saved traces: cheap, and bound to each revision.
-    carried = sorted(
-        name for name in saved if _measure_group(name) in groups - asked - {"iterations"}
-    )
+    carried = sorted(name for name in saved if _measure_group(name) in groups - asked)
     return sorted({*saved, *measurements} - set(carried)), carried
 
 
@@ -1726,7 +1726,11 @@ def measure_evaluation(
             progress=progress,
             jobs=_saved_evaluation(selection).jobs,
             masks_listed_pairs=bool(selection.get("not_measured")) or bool(plan["skipped"]),
-            iterations="iterations" in TypeAdapter(list[str]).validate_python(plan["collected"]),
+            # Counted, or carried as the selected revision bound them.
+            iterations=any(
+                "iterations" in TypeAdapter(list[str]).validate_python(plan[key])
+                for key in ("collected", "carried")
+            ),
             carried_from=_selected_revision(plan, "carried_from"),
             carried_kinds=frozenset(TypeAdapter(list[str]).validate_python(plan["carried_kinds"])),
         )

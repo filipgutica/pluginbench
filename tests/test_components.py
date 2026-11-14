@@ -87,7 +87,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
     "mutation_observer": (
         1,
         {
-            "mutation.py": "ae953976544e5df3716bb872e2e790b5e0606f80fee16f19498fa89ee99ec1eb",
+            "mutation.py": "09a27c63adfca42809a7f05f6bf0576daa0515dcd784201f9680e93495aff8b4",
             "mutation_sites.mjs": (
                 "f7a602774f3e6f2415c1745127134862a9a6f42e8e9807b4c28368e7a3c27c88"
             ),
