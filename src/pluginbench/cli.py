@@ -149,7 +149,10 @@ def _plan_summary(plan: dict[str, object]) -> str:
     for label, key in (("Repeats", "repeats"), ("Jobs", "jobs")):
         if key in plan:
             lines.append(f"{label}: {plan[key]}")
-    lines.append(f"Coding attempts: {plan['coding_calls']}   Review calls: {plan['review_calls']}")
+    calls = f"Coding attempts: {plan['coding_calls']}   Review calls: {plan['review_calls']}"
+    if "verifier_replays" in plan:
+        calls += f"   Verifier replays: {plan['verifier_replays']}"
+    lines.append(calls)
     measurements = plan.get("measurements")
     if isinstance(measurements, list):
         lines.append("Measurements: " + (", ".join(measurements) or "none"))

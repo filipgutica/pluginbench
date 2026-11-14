@@ -848,6 +848,10 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
                 else None,
                 "correctness": states[attempt.get("id")],
                 "native_grading": stage.get("task_result"),
+                # The native verifier over the submission without its test files; see
+                # source_only.py. Null when the run has no such grade.
+                "source_only_reward": _map(stage.get("source_only_grading")).get("reward"),
+                "source_only_grading": stage.get("source_only_grading"),
                 "execution": {
                     **execution_outcome(execution),
                     **{

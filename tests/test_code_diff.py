@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from pluginbench.code_diff import analyze_patch
+from pluginbench.code_diff import _is_test_path, analyze_patch, without_test_files
 
 
 def _git(*args: str, cwd: Path) -> str:
@@ -109,3 +109,95 @@ def test_shared_classifier_recognizes_go_tests_without_matching_parent_filename(
     metrics = analyze_patch(patch)
     assert metrics["test_files_changed"] == expected
     assert metrics["source_files_changed"] == 1 - expected
+
+
+def _repository(path: Path, files: dict[str, bytes]) -> None:
+    _git("init", "-q", cwd=path)
+    _git("config", "user.email", "test@example.com", cwd=path)
+    _git("config", "user.name", "Test", cwd=path)
+    for name, content in files.items():
+        (path / name).parent.mkdir(parents=True, exist_ok=True)
+        (path / name).write_bytes(content)
+    _git("add", "-A", cwd=path)
+    _git("-c", "commit.gpgsign=false", "commit", "-qm", "base", cwd=path)
+
+
+def test_leaving_out_test_files_keeps_every_production_change_byte_for_byte(
+    tmp_path: Path,
+) -> None:
+    base = {
+        "etree.go": b"package etree\n\nfunc Diff() {}\n",
+        "diff_test.go": b"package etree\n\nfunc mustDoc() {}\n",
+        "path_test.go": b"package etree\n",
+        "tests/conftest.py": b"import pytest\n",
+        "pkg/core.py": b"value = 0\n",
+        "web/app.ts": b"export const a = 0;\n",
+        "logo.png": bytes(range(256)),
+    }
+    work = tmp_path / "work"
+    work.mkdir()
+    _repository(work, base)
+    (work / "etree.go").write_text("package etree\n\nfunc Diff() int { return 1 }\n")
+    (work / "diff_test.go").write_text("package etree\n\nfunc mustDoc() int { return 2 }\n")
+    (work / "path_test.go").unlink()
+    (work / "diff_edge_test.go").write_text("package etree\n\nvar _ = mustDoc()\n")
+    (work / "tests/conftest.py").write_text("import pytest\n\nfixture = 1\n")
+    (work / "pkg/test_core.py").write_text("def test_value(): pass\n")
+    (work / "pkg/core.py").write_text("value = 1\n")
+    (work / "web/app.test.ts").write_text("test('a', () => {});\n")
+    (work / "web/app.ts").write_text("export const a = 1;\n")
+    (work / "logo.png").write_bytes(bytes(reversed(range(256))))
+    _git("add", "-A", cwd=work)
+    patch = subprocess.run(
+        ["git", "diff", "--binary", "--cached"], cwd=work, capture_output=True, check=True
+    ).stdout.decode()
+
+    filtered, removed = without_test_files(patch, is_test=_is_test_path)
+
+    # Added, changed and deleted test files of every language leave together.
+    assert removed == [
+        "diff_edge_test.go", "diff_test.go", "path_test.go", "pkg/test_core.py",
+        "tests/conftest.py", "web/app.test.ts",
+    ]
+    graded = tmp_path / "graded"
+    graded.mkdir()
+    _repository(graded, base)
+    (tmp_path / "filtered.patch").write_text(filtered)
+    _git("apply", "--binary", str(tmp_path / "filtered.patch"), cwd=graded)
+    for name in ("etree.go", "pkg/core.py", "web/app.ts", "logo.png"):
+        assert (graded / name).read_bytes() == (work / name).read_bytes(), name
+    for name in ("diff_test.go", "path_test.go", "tests/conftest.py"):
+        assert (graded / name).read_bytes() == base[name], name
+    assert not (graded / "diff_edge_test.go").exists()
+    assert not (graded / "pkg/test_core.py").exists()
+
+
+def test_a_patch_without_test_files_is_returned_unchanged() -> None:
+    patch = (
+        "diff --git a/src/app.py b/src/app.py\n"
+        "--- a/src/app.py\n+++ b/src/app.py\n@@ -1 +1 @@\n-old\n+new\n"
+    )
+
+    assert without_test_files(patch, is_test=_is_test_path) == (patch, [])
+    assert without_test_files("", is_test=_is_test_path) == ("", [])
+
+
+def test_a_line_break_inside_file_content_neither_splits_nor_names_a_section() -> None:
+    # Git ends patch lines with "\n" only. A file with old Mac "\r" line ends is one patch line,
+    # and text in it that looks like a diff header is still that file's content.
+    patch = (
+        "diff --git a/notes.md b/notes.md\n--- a/notes.md\n+++ b/notes.md\n@@ -1 +1 @@\n"
+        "-old\r\n+see\rdiff --git a/x_test.go b/x_test.go\rend\r\n"
+    )
+
+    assert without_test_files(patch, is_test=_is_test_path) == (patch, [])
+
+
+def test_a_rename_between_a_test_file_and_production_is_refused() -> None:
+    patch = (
+        "diff --git a/src/helpers.py b/tests/helpers.py\n"
+        "similarity index 100%\nrename from src/helpers.py\nrename to tests/helpers.py\n"
+    )
+
+    with pytest.raises(ValueError, match="src/helpers.py, tests/helpers.py"):
+        without_test_files(patch, is_test=_is_test_path)

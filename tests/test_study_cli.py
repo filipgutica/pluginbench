@@ -39,6 +39,7 @@ from pluginbench import (
     parallel,
     remeasure,
     run_lock,
+    source_only,
     study,
     submissions,
     trial_containers,
@@ -147,12 +148,14 @@ def test_config_dry_run_includes_fresh_vanilla_and_every_package(
     assert result.exit_code == 0, result.stderr
     plan = json.loads(result.stdout)
     assert plan["coding_calls"] == 9 and plan["review_calls"] == 0
+    # The owner approves a batch from this plan, so it counts the source-only replays too.
+    assert plan["verifier_replays"] == 9
     assert set(plan["treatments"]) == {"superpowers", "workflow"}
     assert "fresh vanilla" in plan["vanilla"]
     summary = CliRunner().invoke(cli.app, ["run", str(path), "--dry-run"])
     assert summary.exit_code == 0, summary.stderr
     assert "Arms: vanilla, " in summary.stdout
-    assert "Coding attempts: 9   Review calls: 0" in summary.stdout
+    assert "Coding attempts: 9   Review calls: 0   Verifier replays: 9" in summary.stdout
     assert not summary.stdout.lstrip().startswith("{")
 
 
@@ -2642,6 +2645,247 @@ def test_run_interrupted_after_its_last_attempt_finishes_measurement_and_reviews
     assert len(calls) == coded and len(reviews) == 9
     assert json.loads((root / "evidence/run.json").read_text())["status"] == "complete"
     assert evaluation._load_selection(root)["review_revision"] == "review"
+
+
+# The reference solution changes a production file whose name looks like a test.
+_SOLUTION = (
+    "diff --git a/src/test_set.py b/src/test_set.py\nnew file mode 100644\n"
+    "--- /dev/null\n+++ b/src/test_set.py\n@@ -0,0 +1 @@\n+flag = True\n"
+)
+
+
+def _finished_without_source_only_grades(
+    config: evaluation.Evaluation,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    solution: str = _SOLUTION,
+) -> tuple[Path, list[str]]:
+    """A run finished by an earlier build, and the patches its source-only replays grade."""
+    config.jobs = 1
+    (tmp_path / "deep-swe/tasks/arbitrary-native-task/solution/solution.patch").write_text(
+        solution
+    )
+    monkeypatch.setattr(codex, "preflight", lambda: {"harness_version": "codex-cli 0.167.0"})
+    monkeypatch.setattr(codex, "runtime_environment", lambda *args, **kwargs: ({}, ()))
+    monkeypatch.setattr(harbor_backend, "prepare_native_task", _prepare_fixture_task)
+    monkeypatch.setattr(harbor_backend, "_assert_native_image", lambda image, expected: None)
+
+    def invoke(**kwargs: Any) -> dict[str, Any]:
+        workspace = kwargs["area"] / "workspace"
+        (workspace / "src/answer.py").write_text("answer = 1\n")
+        # Package attempts also write a test that calls a helper the hidden tests replace,
+        # which fails the native grade of a correct answer, and a conftest.py, which could
+        # pass a wrong one.
+        broken = kwargs["entry"]["arm"] != "baseline"
+        if broken:
+            (workspace / "src/test_set.py").write_text("flag = True\n")
+            (workspace / "tests").mkdir()
+            (workspace / "tests/test_more.py").write_text("from tests.hidden import h\n")
+            (workspace / "conftest.py").write_text("collect_ignore = ['tests']\n")
+            (workspace / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
+        result = native_execution(
+            kwargs["area"], kwargs["protocol"]["native_task_identity"],
+            reward=0 if broken else 1, version="0.167.0",
+        )
+        result["startup"] = [{"type": "session_meta", "payload": {"cli_version": "0.167.0"}}]
+        return result
+
+    graded: list[str] = []
+
+    def regrade(**kwargs: Any) -> dict[str, object]:
+        trial = kwargs["artifacts"] / "harbor/trial/artifacts"
+        # As the real regrade does: the replayed trial must be the hash-bound one.
+        assert harbor_backend._native_artifact_hashes(trial) == kwargs["artifact_hashes"]
+        patch = (trial / submissions.PATCH_ARTIFACT).read_text()
+        graded.append(patch)
+        # Correct only with the production test_set.py and without the agent's test files.
+        reward = int("+flag = True" in patch and "tests/" not in patch and "conftest" not in patch)
+        return {
+            "verifier_result": {"rewards": {"reward": reward}},
+            "exception_info": None,
+            "receipt": {"model_calls": 0},
+        }
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
+    monkeypatch.setattr(harbor_backend, "regrade_native", regrade)
+    root = tmp_path / "run"
+    with monkeypatch.context() as patched:
+        patched.setattr(evaluation, "record_source_only_grades", lambda *args, **kwargs: None)
+        evaluation.run_evaluation(config, root)
+    return root, graded
+
+
+def _rows(root: Path) -> dict[str, dict[str, Any]]:
+    return {
+        row["id"]: row for row in json.loads((root / "report/results.json").read_text())["attempts"]
+    }
+
+
+def test_a_finished_run_grades_each_submission_again_without_its_test_files(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, graded = _finished_without_source_only_grades(config, tmp_path, monkeypatch)
+    before = _rows(root)
+    assert {row["source_only_reward"] for row in before.values()} == {None}
+    native = {
+        path: digest
+        for path, digest in _tree(root / "evidence").items()
+        if path == "run.json" or path.endswith(("verifier-result.json", "model.patch"))
+    }
+
+    result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    after = _rows(root)
+    # The native grade, its evidence and the correctness it gives are unchanged.
+    assert {key: (row["correctness"], row["native_grading"]) for key, row in before.items()} == {
+        key: (row["correctness"], row["native_grading"]) for key, row in after.items()
+    }
+    assert {key: digest for key, digest in _tree(root / "evidence").items() if key in native} == native
+    packages = [row for row in after.values() if row["guidance"] != "vanilla"]
+    vanilla = [row for row in after.values() if row["guidance"] == "vanilla"]
+    assert packages and vanilla and len(graded) == len(packages)
+    for row in packages:
+        grading = row["source_only_grading"]
+        assert row["native_grading"]["native_verifier_result"]["rewards"]["reward"] == 0
+        assert row["source_only_reward"] == 1
+        assert grading["source_only_filter"] == source_only.FILTER_REVISION
+        assert grading["removed_test_files"] == ["conftest.py", "tests/test_more.py"]
+        assert grading["kept_reference_solution_files"] == ["src/test_set.py"]
+        assert grading["kept_test_setup_files"] == ["pyproject.toml"]
+        assert grading["nothing_removed"] is False and grading["native_result_reused"] is False
+        assert grading["native_patch_sha256"] == row["native_grading"]["patch_sha256"]
+    for patch in graded:
+        assert "+answer = 1" in patch and "+flag = True" in patch and "pyproject.toml" in patch
+    for row in vanilla:
+        grading = row["source_only_grading"]
+        assert grading["nothing_removed"] is True and grading["native_result_reused"] is True
+        assert grading["filtered_patch_sha256"] == grading["native_patch_sha256"]
+        assert row["source_only_reward"] == 1
+    selection = evaluation._load_selection(root)
+    index = study._bound_document(root / "evidence", selection["source_only_grades"])
+    assert set(index["records"]) == set(after) and index["pending"] == {}
+
+
+def test_source_only_replays_wait_for_the_frozen_grader_and_a_failed_try_is_cleared(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, graded = _finished_without_source_only_grades(config, tmp_path, monkeypatch)
+    packages = [key for key, row in _rows(root).items() if row["guidance"] != "vanilla"]
+    # The plan, the dry run and the prompt count the replays a resume starts.
+    assert evaluation.plan_resume(root)["verifier_replays"] == len(packages)
+    dry = CliRunner().invoke(cli.app, ["run", str(root), "--dry-run"])
+    assert f"Verifier replays: {len(packages)}" in dry.stdout
+
+    def gone(image: object, expected: object) -> None:
+        raise ValueError("Frozen native image is unavailable or its reference was rebound")
+
+    monkeypatch.setattr(harbor_backend, "_assert_native_image", gone)
+    result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+
+    # The run and its report finish; the grades that need the grader say why they wait.
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert graded == []
+    waiting = [line for line in result.stdout.splitlines() if "source-only" in line]
+    assert len(waiting) == 1 and str(len(packages)) in waiting[0]
+    assert "Frozen native image is unavailable" in waiting[0]
+    for key, row in _rows(root).items():
+        grading = row["source_only_grading"]
+        if key in packages:
+            # Pending, unlike a permanent `unavailable`: a later run grades it.
+            assert grading["status"] == "pending" and row["source_only_reward"] is None
+            assert grading["reason"].startswith("Frozen native image is unavailable")
+        else:
+            assert grading["status"] == "complete" and row["source_only_reward"] == 1
+    assert evaluation.plan_resume(root)["verifier_replays"] == len(packages)
+
+    monkeypatch.setattr(harbor_backend, "_assert_native_image", lambda image, expected: None)
+    replay = harbor_backend.regrade_native
+
+    def crash(**kwargs: Any) -> dict[str, object]:
+        monkeypatch.setattr(harbor_backend, "regrade_native", replay)
+        raise ValueError("verifier container crashed")
+
+    monkeypatch.setattr(harbor_backend, "regrade_native", crash)
+    failed = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+    assert failed.exit_code != 0
+    directory = root / "evidence/source-only" / f"filter-{source_only.FILTER_REVISION}"
+    assert len(list(directory.glob("*/*.try-*"))) == 1
+
+    result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert list(directory.glob("*/*.try-*")) == []
+    assert {_rows(root)[key]["source_only_reward"] for key in packages} == {1}
+    assert evaluation.plan_resume(root)["verifier_replays"] == 0
+
+
+def test_a_new_filter_revision_grades_again_beside_the_earlier_one(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, graded = _finished_without_source_only_grades(config, tmp_path, monkeypatch)
+    runner = CliRunner()
+    assert runner.invoke(cli.app, ["run", str(root), "--yes", "--foreground"]).exit_code == 0
+    first = root / "evidence/source-only" / f"filter-{source_only.FILTER_REVISION}"
+    earlier = _tree(first)
+    replays = len(graded)
+    monkeypatch.setattr(source_only, "FILTER_REVISION", source_only.FILTER_REVISION + 1)
+    assert evaluation.plan_resume(root)["verifier_replays"] == replays
+
+    result = runner.invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert _tree(first) == earlier and len(graded) == 2 * replays
+    index = study._bound_document(
+        root / "evidence", evaluation._load_selection(root)["source_only_grades"]
+    )
+    assert index["source_only_filter"] == source_only.FILTER_REVISION
+    assert {
+        row["source_only_grading"]["source_only_filter"] for row in _rows(root).values()
+    } == {source_only.FILTER_REVISION}
+    # Once graded under the current revision, a resume replays nothing.
+    assert evaluation.plan_resume(root)["verifier_replays"] == 0
+    assert runner.invoke(cli.app, ["run", str(root), "--yes", "--foreground"]).exit_code == 0
+    assert len(graded) == 2 * replays
+
+
+@pytest.mark.parametrize(
+    ("solution", "reason"),
+    [
+        (
+            _SOLUTION.replace("src/test_set.py", '"src/t\\303\\251st_set.py"'),
+            "unsupported quoted native patch path",
+        ),
+        (
+            _SOLUTION.replace("new file mode 100644", "new file mode 120000"),
+            "unsupported native patch file mode",
+        ),
+    ],
+    ids=["quoted-path", "symlink-mode"],
+)
+def test_a_reference_solution_the_parser_refuses_leaves_the_grade_unavailable(
+    config: evaluation.Evaluation,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    solution: str,
+    reason: str,
+) -> None:
+    root, graded = _finished_without_source_only_grades(config, tmp_path, monkeypatch, solution)
+    runner = CliRunner()
+    dry = runner.invoke(cli.app, ["run", str(root), "--dry-run"])
+    assert dry.exit_code == 0, dry.stderr + dry.stdout
+    assert "Verifier replays: 0" in dry.stdout
+
+    result = runner.invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+
+    # The run finishes; no stage can tell its files from tests, so none is replayed.
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert graded == []
+    for row in _rows(root).values():
+        grading = row["source_only_grading"]
+        assert grading["status"] == "unavailable" and row["source_only_reward"] is None
+        assert grading["reason"] == reason
+    assert evaluation.plan_resume(root)["verifier_replays"] == 0
 
 
 class _Killed(BaseException):
