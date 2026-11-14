@@ -3721,3 +3721,49 @@ def test_measure_backfills_iterations_without_collectors_or_model_calls(
     counts.write_text("{}")
     with pytest.raises(ValueError):
         remeasure.validate_remeasurement(evidence, revision)
+
+
+def test_fresh_iterations_only_evaluation_binds_saved_trace_counts(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from test_iterations import _command, _patch, _write
+
+    config, calls, reviews = _recorded_calls(config, tmp_path, monkeypatch)
+    config.measurements = ["iterations"]
+    config.reviewer = None
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=config.timeout_seconds, interrupt_at=None,
+    )
+
+    def invoke(**kwargs: Any) -> dict[str, Any]:
+        result = backend(**kwargs)
+        _write(kwargs["area"] / "artifacts/harbor/trial/agent/sessions/root.jsonl", [
+            {"type": "session_meta", "payload": {"id": "root", "cwd": "/app"}},
+            *_command("a", "pytest"), *_patch("b", "src/a.py"), *_command("c", "pytest"),
+        ])
+        return result
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
+    progress: list[str] = []
+    root = tmp_path / "run"
+    evaluation.run_evaluation(config, root, progress=progress.append)
+    selection = evaluation._load_selection(root)
+    assert selection["measurement_required"] is True
+    assert selection["measurement_revision"] == "measurements"
+    evidence = root / "evidence"
+    revision = evidence / "observer-revisions/measurements"
+    state = json.loads((revision / "revision.json").read_text())
+    assert state["schema_version"] == 4
+    assert state["unique_inputs"] == 0
+    counts = study._bound_document(evidence, state["iterations"])
+    assert counts
+    assert all(stage["iterations"] == 1 for stages in counts.values() for stage in stages.values())
+    assert "Counting verification iterations from saved traces" in progress
+    assert calls and not reviews
+    rows = _observations(root, {"iterations"})
+    assert {row["value"] for row in rows if row["metric"] == "Verification commands"} == {2}
+    # Reporting refuses changed source traces rather than silently measuring new values.
+    trace = next((evidence / "attempts").glob("*/handoff/artifacts/harbor/trial/agent/sessions/root.jsonl"))
+    trace.write_text(trace.read_text().replace("pytest", "pytest -q"))
+    with pytest.raises(ValueError, match="verification iteration evidence changed"):
+        evaluation.regenerate_report(root)

@@ -743,6 +743,8 @@ def propose_remeasurement(
         if iterations:
             from pluginbench.iterations import measure_run
 
+            if progress:
+                progress("Counting verification iterations from saved traces")
             count_path = directory / "iterations.json"
             study._write(count_path, measure_run(root))
             state["iterations"] = study._reference(root, count_path)

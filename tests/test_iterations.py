@@ -50,6 +50,20 @@ from pluginbench.iterations import masked, measure_attempt, verification_command
         "bash -lc 'cd /app && env X=y timeout 5 uv run pytest'",
         "env X=y bash -c 'npm run test:unit'",
         "bash -c \"bash -lc 'go test ./...'\"",
+        "bash -lc \"python - <<'PY-EOF'\nprint('ok')\nPY-EOF\npytest\"",
+        "cat <<'PY-EOF'\npytest\nPY-EOF\ngo test ./...",
+        "pytest <<< 'input'",
+        "echo $((1<<3)) && pytest",
+        "if pytest; then echo ok; fi",
+        "then X=y timeout 5 uv run pytest",
+        "elif go test ./...; then true; fi",
+        "else pytest",
+        "while pytest; do true; done",
+        "until pytest; do true; done",
+        "do pytest",
+        "! pytest",
+        "(pytest)",
+        "{pytest; }",
     ],
 )
 def test_frozen_verification_commands(command: str) -> None:
@@ -62,6 +76,7 @@ def test_frozen_verification_commands(command: str) -> None:
         "python - <<PY\nprint('ok')\nPY",
         "python /tmp/check.py",
         "npm run serve",
+        "npm run dev",
         "npm run",
         "npm install",
         "pnpm install",
@@ -74,6 +89,13 @@ def test_frozen_verification_commands(command: str) -> None:
         "git diff",
         "python3 -m compileall",
         "go version",
+        "cat <<'PY-EOF'\npytest\nPY-EOF",
+        "bash -lc \"cat <<'PY-EOF'\npytest\nPY-EOF\"",
+        "echo $((1<<3))",
+        "cat <<< 'data'",
+        "echo 'unterminated",
+        "# pytest; go test ./...\necho ok",
+        "echo $(pytest)",
     ],
 )
 def test_commands_outside_frozen_list(command: str) -> None:
@@ -180,6 +202,10 @@ def test_interleaved_stream_does_not_use_another_agents_edits(tmp_path: Path) ->
         ("pytest && ruff check .", False),
         ("set -o pipefail; pytest | tee log", False),
         ("bash -lc 'set -o pipefail; pytest | tee log'", False),
+        ("go test -run 'A|B' ./...", False),
+        ("pytest -k 'A;B'", False),
+        ("pytest -k 'A||true'", False),
+        ("bash -lc \"go test -run 'A|B' ./...\"", False),
     ],
 )
 def test_failure_masking(command: str, is_masked: bool) -> None:
@@ -205,7 +231,7 @@ def test_claude_permission_denials_cancellations_and_failed_edits(tmp_path: Path
     )
     result = measure_attempt(tmp_path, claude=True)
     assert result["iterations"] == 0
-    assert result["verification_commands"] == 4
+    assert result["verification_commands"] == 2
     assert result["failed_verification_commands"] == 1
     assert result["masked_commands"] == 1
 
@@ -318,6 +344,8 @@ def test_codex_stream_command_and_file_change_items(tmp_path: Path) -> None:
     "trace", ['{"type": "assistant"}\nnot-json', '{"type":"assistant"}', "[]", ""]
 )
 def test_unparseable_traces_fail_closed(tmp_path: Path, claude: bool, trace: str) -> None:
+    if not claude:
+        trace = trace.replace('"assistant"', '"response_item"')
     (tmp_path / "stdout.jsonl").write_text(trace)
     result = measure_attempt(tmp_path, claude=claude)
     assert result["status"] == "incomplete"
@@ -359,14 +387,22 @@ def test_missing_claude_subagent_transcript_fails_closed(tmp_path: Path) -> None
     assert "subagent transcripts" in str(result["reason"])
 
 
-def test_missing_codex_subagent_trace_fails_closed(tmp_path: Path) -> None:
+@pytest.mark.parametrize("payload", [
+    {"type": "collab_agent_spawn_end", "new_thread_id": "lost"},
+    {"type": "item_completed", "item": {
+        "type": "SubAgentActivity", "kind": "started", "agent_thread_id": "lost",
+    }},
+])
+def test_missing_codex_subagent_trace_fails_closed(
+    tmp_path: Path, payload: dict[str, object],
+) -> None:
     _write(
         tmp_path / "harbor/trial/agent/sessions/root.jsonl",
         [
             {"type": "session_meta", "payload": {"id": "root"}},
             {
                 "type": "event_msg",
-                "payload": {"type": "collab_agent_spawn_end", "new_thread_id": "lost"},
+                "payload": payload,
             },
         ],
     )
@@ -441,3 +477,153 @@ def test_claude_stream_only_requires_successful_subagents(tmp_path: Path) -> Non
     )
     result = measure_attempt(tmp_path, claude=True)
     assert result["status"] == "complete" and result["verification_commands"] == 0
+
+
+def _native_item(item: dict[str, object], *, completed: bool = True) -> dict[str, object]:
+    return {
+        "type": "event_msg",
+        "payload": {"type": "item_completed" if completed else "item_started", "item": item},
+    }
+
+
+def test_codex_code_mode_uses_native_items_once_per_thread(tmp_path: Path) -> None:
+    sessions = tmp_path / "harbor/trial/agent/sessions"
+    metadata: list[dict[str, object]] = [
+        {"type": kind} for kind in [
+            "configuration_update", "world_state", "token_usage_record",
+            "inter_agent_communication_metadata",
+        ]
+    ]
+    messages: list[dict[str, object]] = [
+        {"type": "response_item", "payload": {"type": kind}} for kind in [
+            "additional_tools", "agent_message",
+        ]
+    ]
+    for identity, parent in [("root", None), ("child", "root")]:
+        _write(sessions / f"{identity}.jsonl", [
+            {"type": "session_meta", "payload": {
+                "id": identity, "parent_thread_id": parent, "cwd": "/workspace",
+            }},
+            *metadata, *messages,
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call", "name": "exec", "call_id": "exec",
+                "input": 'await tools.exec_command({cmd: "pytest"})',
+            }},
+            _native_item({"type": "CommandExecution", "id": "a",
+                          "command": ["bash", "-lc", "pytest"], "exit_code": 1}),
+            _native_item({"type": "FileChange", "id": "b", "status": "completed",
+                          "changes": {"/tmp/check.py": {"type": "add"}}}),
+            _native_item({"type": "CommandExecution", "id": "c",
+                          "command": ["bash", "-lc", "pytest"], "exit_code": 0}),
+            _native_item({"type": "FileChange", "id": "d", "status": "completed",
+                          "changes": {"/workspace/src/a.py": {"type": "update"}}}),
+            _native_item({"type": "CommandExecution", "id": "e", "status": "declined",
+                          "command": ["bash", "-lc", "pytest"], "exit_code": None}),
+            _native_item({"type": "CommandExecution", "id": "f", "status": "cancelled",
+                          "command": ["bash", "-lc", "pytest"], "exit_code": None}),
+            _native_item({"type": "CommandExecution", "id": "g",
+                          "command": ["bash", "-lc", "pytest"], "exit_code": 0}),
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call_output", "call_id": "exec", "output": "ok",
+            }},
+        ])
+    result = measure_attempt(tmp_path, claude=False)
+    assert result["status"] == "complete", result
+    assert result["verification_commands"] == 6
+    assert result["iterations"] == 2
+    assert result["failed_verification_commands"] == 2
+
+
+@pytest.mark.parametrize("claude", [True, False])
+def test_unresolved_final_verification_is_counted_with_unknown_outcome(
+    tmp_path: Path, claude: bool,
+) -> None:
+    events = (
+        [*_tool("a", "Bash", {"command": "pytest"}),
+         *_tool("b", "Edit", {"file_path": "src/a.py"}),
+         *_tool("c", "Bash", {"command": "pytest"})[:1]]
+        if claude else
+        [*_command("a", "pytest"), *_patch("b", "src/a.py"), *_command("c", "pytest")[:1]]
+    )
+    _write(tmp_path / "stdout.jsonl", events)
+    result = measure_attempt(tmp_path, claude=claude)
+    assert result["status"] == "complete", result
+    assert result["verification_commands"] == 2
+    assert result["iterations"] == 1
+    assert result["known_failed_verification_commands"] == 0
+    assert result["failed_verification_commands"] is None
+    assert result["unknown_exit_commands"] == 1
+
+
+def test_codex_unresolved_native_command_keeps_start_order(tmp_path: Path) -> None:
+    _write(tmp_path / "harbor/trial/agent/sessions/root.jsonl", [
+        {"type": "session_meta", "payload": {"id": "root", "cwd": "/app"}},
+        _native_item({"type": "CommandExecution", "id": "a",
+                      "command": ["bash", "-lc", "pytest"]}, completed=False),
+    ])
+    result = measure_attempt(tmp_path, claude=False)
+    assert result["status"] == "complete", result
+    assert result["verification_commands"] == result["unknown_exit_commands"] == 1
+    assert result["failed_verification_commands"] is None
+
+
+def test_claude_tool_error_without_exit_status_keeps_the_command_unknown(tmp_path: Path) -> None:
+    _write(tmp_path / "stdout.jsonl", _tool(
+        "a", "Bash", {"command": "pytest"}, error=True, output="Tool transport error",
+    ))
+    result = measure_attempt(tmp_path, claude=True)
+    assert result["status"] == "complete", result
+    assert result["verification_commands"] == result["unknown_exit_commands"] == 1
+    assert result["failed_verification_commands"] is None
+
+
+def test_claude_metadata_unrelated_subagents_and_workspace_boundary(tmp_path: Path) -> None:
+    sessions = tmp_path / "harbor/trial/agent/sessions/projects/workspace"
+    metadata: list[dict[str, object]] = [
+        {"type": kind, "cwd": "/workspace"} for kind in [
+            "attachment", "atis-latch", "api-request", "api-request-blob", "api-request-shape",
+            "tools-used", "cost-state",
+        ]
+    ]
+    _write(sessions / "root.jsonl", [
+        *metadata,
+        *_tool("a", "Bash", {"command": "pytest"}),
+        *_tool("b", "Write", {"file_path": "/tmp/check.py"}),
+        *_tool("c", "Edit", {"file_path": "/workspace-other/a.py"}),
+        *_tool("d", "Edit", {"file_path": "../outside/a.py"}),
+        *_tool("e", "Bash", {"command": "pytest"}),
+        *_tool("f", "Edit", {"file_path": "/workspace/src/a.py"}),
+        *_tool("g", "Bash", {"command": "pytest"}),
+    ])
+    _write(sessions / "root/subagents/agent-unrelated.jsonl", [{"type": "attachment"}])
+    _write(tmp_path / "stdout.jsonl", [{"type": "tool_progress"}])
+    result = measure_attempt(tmp_path, claude=True)
+    assert result["status"] == "complete", result
+    assert result["verification_commands"] == 3
+    assert result["iterations"] == 1
+
+
+def test_claude_missing_matched_subagent_metadata_reports_relative_paths(tmp_path: Path) -> None:
+    sessions = tmp_path / "harbor/trial/agent/sessions"
+    _write(sessions / "root.jsonl", _tool("spawn", "Agent", {}))
+    _write(sessions / "root/subagents/agent-child.jsonl", [{"type": "attachment"}])
+    result = measure_attempt(tmp_path, claude=True)
+    assert result["status"] == "incomplete"
+    assert "subagent transcripts" in str(result["reason"])
+    assert str(tmp_path) not in str(result["reason"])
+    # Exercise an OS error containing an absolute artifact path.
+    (sessions / "root.jsonl").unlink()
+    (sessions / "root.jsonl").mkdir()
+    result = measure_attempt(tmp_path, claude=True)
+    assert result["status"] == "incomplete"
+    assert str(tmp_path) not in str(result["reason"])
+    assert "harbor/trial/agent/sessions/root.jsonl" in str(result["reason"])
+
+
+def test_older_harbor_trial_directory_is_read(tmp_path: Path) -> None:
+    _write(tmp_path / "harbor/task-trial/agent/sessions/root.jsonl", [
+        {"type": "session_meta", "payload": {"id": "root"}}, *_command("a", "pytest"),
+    ])
+    result = measure_attempt(tmp_path, claude=False)
+    assert result["status"] == "complete", result
+    assert result["verification_commands"] == 1

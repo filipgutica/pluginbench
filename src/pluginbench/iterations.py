@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import re
 import shlex
 from dataclasses import dataclass
@@ -25,38 +26,77 @@ def _object(value: object) -> dict[str, object]:
     return dict(value)
 
 
-def _tokens(command: str) -> list[list[str]]:
-    # Here-document bodies are data, not additional shell commands.
-    lines = []
-    delimiters: list[str] = []
-    for line in command.splitlines(keepends=True):
-        if delimiters:
-            if line.strip() == delimiters[0]:
-                delimiters.pop(0)
+# Preserve quoting until operators have been separated. Quoted wrappers are one word,
+# so their here-documents are handled only after bash -c/-lc is unwrapped.
+_SHELL_PART = re.compile(
+    r"'[^']*'|\"(?:\\[\s\S]|[^\"\\])*\"|\\[\s\S]"
+    r"|(?P<comment>(?<!\S)\#[^\n]*)"
+    r"|\$\(\(.*?\)\)|<<<"
+    r"|(?P<heredoc><<-?)[ \t]*(?P<delimiter>'[^']*'|\"[^\"]*\"|[^\s;&|<>]+)"
+    r"|(?P<operator>&&|\|\||[;|\n(){}])|.",
+    re.S,
+)
+
+
+def _tokens(command: str) -> list[list[str] | str]:
+    segments: list[list[str] | str] = []
+    raw: list[str] = []
+    delimiters: list[tuple[str, bool]] = []
+    position = 0
+    while position < len(command):
+        match = _SHELL_PART.match(command, position)
+        assert match is not None
+        position = match.end()
+        if match.group("comment"):
             continue
-        lines.append(line)
-        delimiters.extend(re.findall(r"<<-?\s*['\"]?(\w+)['\"]?", line))
+        if match.group("heredoc"):
+            delimiter_words = shlex.split(match["delimiter"])
+            if len(delimiter_words) != 1:
+                raise ValueError("invalid shell here-document delimiter")
+            delimiters.append((delimiter_words[0], match["heredoc"] == "<<-"))
+        operator = match.group("operator")
+        if operator in {"(", ")", "{", "}"}:
+            raw.append(f" {operator} ")
+            continue
+        if operator is None:
+            raw.append(match[0])
+            continue
+        words = _front(shlex.split("".join(raw)))
+        raw = []
+        if len(words) >= 2 and Path(words[0]).name == "bash" and words[1] in {"-c", "-lc"}:
+            if len(words) < 3:
+                raise ValueError("bash wrapper has no command")
+            segments.extend(_tokens(words[2]))
+        else:
+            segments.append(words)
+        segments.append(operator)
+        if operator == "\n":
+            for delimiter, strip_tabs in delimiters:
+                while position < len(command):
+                    end = command.find("\n", position)
+                    end = len(command) if end < 0 else end + 1
+                    line = command[position:end].removesuffix("\n")
+                    position = end
+                    if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                        break
+                else:
+                    raise ValueError("unterminated shell here-document")
+            delimiters = []
     if delimiters:
         raise ValueError("unterminated shell here-document")
-    command = "".join(lines)
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n")
-    lexer.whitespace = " \t\r"
-    lexer.whitespace_split = True
-    segments: list[list[str]] = [[]]
-    for token in lexer:
-        if token and all(char in ";&|\n" for char in token):
-            segments.append([])
-        else:
-            segments[-1].append(token)
+    if raw:
+        # A synthetic separator flushes the final segment through the same wrapper logic.
+        segments.extend(_tokens("".join(raw) + "\n"))
     return segments
 
 
-def _matches(words: list[str]) -> bool:
+def _front(words: list[str]) -> list[str]:
     while words:
         if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", words[0]) or words[0] in {
             "env",
             "time",
             "npx",
+            "if", "then", "elif", "else", "while", "until", "do", "!", "(", "{",
         }:
             words = words[1:]
         elif words[0] == "timeout" and len(words) >= 2:
@@ -65,10 +105,11 @@ def _matches(words: list[str]) -> bool:
             words = words[2:]
         else:
             break
-    if len(words) >= 2 and Path(words[0]).name == "bash" and words[1] in {"-c", "-lc"}:
-        if len(words) < 3:
-            raise ValueError("bash wrapper has no command")
-        return verification_command(words[2])
+    return words
+
+
+def _matches(words: list[str]) -> bool:
+    words = _front(words)
     if not words:
         return False
     first = words[0]
@@ -118,13 +159,27 @@ def _matches(words: list[str]) -> bool:
 
 
 def verification_command(command: str) -> bool:
-    # Parse every segment even after a match: malformed trailing syntax is not a complete trace.
-    return any([_matches(segment) for segment in _tokens(command)])
+    try:
+        segments = _tokens(command)
+    except ValueError:
+        # Fail closed only if ambiguity could affect a count. If even treating every
+        # word as a command start cannot match M4, malformed non-verification data is safe.
+        unquoted = command.translate(str.maketrans("", "", "'\"\\"))
+        words = re.findall(r"[A-Za-z0-9_./:=+-]+", unquoted)
+        if any(_matches(words[index:]) for index in range(len(words))):
+            raise
+        return False
+    return any(_matches(segment) for segment in segments if isinstance(segment, list))
 
 
 def masked(command: str) -> bool:
-    return "pipefail" not in command and bool(
-        re.search(r"(?<!\|)\|(?!\|)|;|\|\|\s*true\b", command)
+    tokens = _tokens(command)
+    if any(isinstance(token, list) and "pipefail" in token for token in tokens):
+        return False
+    return any(
+        token in ("|", ";")
+        or (token == "||" and index + 1 < len(tokens) and tokens[index + 1] == ["true"])
+        for index, token in enumerate(tokens)
     )
 
 
@@ -153,10 +208,13 @@ def _read(path: Path) -> list[dict[str, object]]:
     return events
 
 
-def _edit(path: object) -> bool:
+def _edit(path: object, workspace: Path) -> bool:
     if not isinstance(path, str) or not path:
         raise ValueError("edit has no file path")
-    return _is_test_path(path) or _is_source_path(path)
+    absolute = Path(posixpath.normpath(workspace / path))
+    return absolute.is_relative_to(workspace) and (
+        _is_test_path(path) or _is_source_path(path)
+    )
 
 
 def _claude_calls(events: list[dict[str, object]]) -> dict[str, dict[str, object]]:
@@ -191,24 +249,14 @@ def _claude_spawns(events: list[dict[str, object]]) -> set[str]:
     return calls
 
 
-def _claude(events: list[dict[str, object]]) -> dict[str, list[Action]]:
+def _claude(
+    events: list[dict[str, object]], workspace: Path = Path("/app")
+) -> dict[str, list[Action]]:
     agents: dict[str, list[Action]] = {}
     calls: dict[str, tuple[dict[str, object], Action]] = {}
     results: dict[str, dict[str, object]] = {}
     for event in events:
         if event["type"] not in {"assistant", "user"}:
-            if event["type"] not in {
-                "system",
-                "result",
-                "stream_event",
-                "rate_limit_event",
-                "progress",
-                "file-history-snapshot",
-                "queue-operation",
-                "summary",
-                "last-prompt",
-            }:
-                raise ValueError(f"unsupported Claude event: {event['type']}")
             continue
         message = _object(event.get("message"))
         content = message.get("content")
@@ -244,7 +292,8 @@ def _claude(events: list[dict[str, object]]) -> dict[str, list[Action]]:
                     action.command = command
                 elif name in {"Edit", "Write", "MultiEdit", "NotebookEdit"}:
                     action.edit = _edit(
-                        inputs.get("notebook_path" if name == "NotebookEdit" else "file_path")
+                        inputs.get("notebook_path" if name == "NotebookEdit" else "file_path"),
+                        workspace,
                     )
                 calls[identity] = (block, action)
                 agents.setdefault(agent, []).append(action)
@@ -266,13 +315,21 @@ def _claude(events: list[dict[str, object]]) -> dict[str, list[Action]]:
                     text = "\n".join(str(_object(part).get("text", "")) for part in text)
                 if not isinstance(text, str):
                     raise ValueError("invalid Claude tool result content")
-                action.failed = is_error and text.lstrip().startswith("Exit code")
+                action.failed = False
                 if is_error:
+                    action.failed = True if text.lstrip().startswith("Exit code") else None
                     action.edit = False
+                    if action.failed is None and re.search(
+                        r"(?i)\b(?:denied|cancelled|canceled|interrupted|aborted|rejected)\b", text
+                    ):
+                        action.command = None  # Denied/cancelled: never executed.
+                result = event.get("toolUseResult")
+                if isinstance(result, dict) and result.get("interrupted") is True:
+                    action.command = None
             elif kind not in {"text", "thinking", "redacted_thinking", "image", "document"}:
                 raise ValueError(f"unsupported Claude content block: {kind}")
-    if calls.keys() - results.keys():
-        raise ValueError("Claude trace has unresolved tool calls")
+    for identity in calls.keys() - results.keys():
+        calls[identity][1].edit = False  # Unresolved commands keep their unknown outcome.
     return agents
 
 
@@ -294,17 +351,54 @@ def _exit(output: object) -> bool | None:
     return None
 
 
-def _codex(events: list[dict[str, object]]) -> list[Action]:
+def _codex(events: list[dict[str, object]], workspace: Path = Path("/app")) -> list[Action]:
     actions: list[Action] = []
     calls: dict[str, Action] = {}
+    ignored_calls: set[str] = set()
     resolved: set[str] = set()
     stream_commands: dict[str, Action] = {}
-    pending_items: set[str] = set()
+    # 0.167.x code-mode calls contain JavaScript, not shell. The native item records
+    # carry the commands and edits, including calls nested inside exec/parallel.
+    native_items = any(
+        event["type"] == "event_msg"
+        and isinstance(payload := event.get("payload"), dict)
+        and payload.get("type") in {"item_started", "item_completed"}
+        for event in events
+    )
     for event in events:
+        if event["type"] == "event_msg":
+            payload = _object(event.get("payload"))
+            if payload.get("type") not in {"item_started", "item_completed"}:
+                continue
+            item = _object(payload.get("item"))
+            if item.get("type") not in {"CommandExecution", "FileChange"}:
+                continue
+            item = dict(item)
+            if item["type"] == "CommandExecution":
+                command = item.get("command")
+                if not isinstance(command, list) or not all(
+                    isinstance(word, str) for word in command
+                ):
+                    raise ValueError("Codex command item has no argv")
+                item.update(type="command_execution", command=shlex.join(command))
+            else:
+                changes = _object(item.get("changes"))
+                item.update(type="file_change", changes=[{"path": path} for path in changes])
+            event = {
+                "type": str(payload["type"]).replace("_", "."), "item": item,
+            }
         if event["type"] == "response_item":
             item = _object(event.get("payload"))
             kind, name = item.get("type"), item.get("name")
             if kind in {"function_call", "custom_tool_call", "local_shell_call"}:
+                if native_items or (
+                    name not in {"exec_command", "shell", "shell_command", "apply_patch"}
+                    and kind != "local_shell_call"
+                ):
+                    identity = item.get("call_id") or item.get("id")
+                    if isinstance(identity, str):
+                        ignored_calls.add(identity)
+                    continue
                 action = Action()
                 identity = item.get("call_id") or item.get("id")
                 if not isinstance(identity, str):
@@ -327,18 +421,25 @@ def _codex(events: list[dict[str, object]]) -> list[Action]:
                     paths = re.findall(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", patch, re.M)
                     if not paths:
                         raise ValueError("unparseable Codex apply_patch")
-                    action.edit = any(_edit(path) for path in paths)
-                elif name in {"exec", "parallel"}:
-                    raise ValueError("embedded Codex code-mode tools are not parseable")
+                    action.edit = any([_edit(path, workspace) for path in paths])
                 calls[identity] = action
                 actions.append(action)
             elif kind in {"function_call_output", "custom_tool_call_output"}:
+                if native_items or item.get("call_id") in ignored_calls:
+                    continue
                 identity = item.get("call_id")
                 if not isinstance(identity, str) or identity not in calls:
                     raise ValueError("Codex output has no tool call")
                 resolved.add(identity)
                 action = calls[identity]
                 action.failed = _exit(item.get("output"))
+                output = item.get("output")
+                if isinstance(output, str) and re.search(
+                    r"(?i)^(?:Error: )?(?:Permission denied|Cancelled|Canceled|"
+                    r"Aborted|User rejected|Command rejected|Tool execution denied)", output
+                ):
+                    action.command = None
+                    action.edit = False
                 if action.edit and action.failed is not False:
                     # apply_patch success uses a textual receipt rather than exit_code.
                     output = item.get("output")
@@ -351,17 +452,6 @@ def _codex(events: list[dict[str, object]]) -> list[Action]:
                         "Success. Updated the following files:"
                     ):
                         raise ValueError("Codex patch outcome is unknown")
-            elif kind not in {
-                "message",
-                "reasoning",
-                "compaction",
-                "compaction_summary",
-                "web_search_call",
-                "tool_search_call",
-                "tool_search_output",
-                "image_generation_call",
-            }:
-                raise ValueError(f"unsupported Codex response item: {kind}")
         elif event["type"] in {"item.started", "item.updated", "item.completed"}:
             item = _object(event.get("item"))
             if item.get("type") == "command_execution":
@@ -381,37 +471,27 @@ def _codex(events: list[dict[str, object]]) -> list[Action]:
                     raise ValueError("Codex command changed between start and completion")
                 if event["type"] == "item.completed":
                     stream_action.failed = _exit(item)
-                    pending_items.discard(str(identity))
-                elif isinstance(identity, str):
-                    pending_items.add(identity)
-                else:
+                    if item.get("status") in {
+                        "declined", "denied", "rejected", "cancelled", "canceled", "aborted",
+                    }:
+                        stream_action.command = None
+                elif not isinstance(identity, str):
                     raise ValueError("Codex started command has no id")
             elif item.get("type") == "file_change" and event["type"] == "item.completed":
-                changes = item.get("changes")
-                if not isinstance(changes, list):
+                file_changes = item.get("changes")
+                if not isinstance(file_changes, list):
                     raise ValueError("Codex file change has no paths")
                 actions.append(
                     Action(
                         edit=item.get("status") == "completed"
-                        and any(_edit(_object(change).get("path")) for change in changes)
+                        and any([
+                            _edit(_object(change).get("path"), workspace) for change in file_changes
+                        ])
                     )
                 )
-        elif event["type"] not in {
-            "session_meta",
-            "turn_context",
-            "event_msg",
-            "compacted",
-            "thread.started",
-            "turn.started",
-            "turn.completed",
-            "turn.failed",
-            "error",
-            "item.started",
-            "item.updated",
-        }:
-            raise ValueError(f"unsupported Codex event: {event['type']}")
-    if calls.keys() - resolved or pending_items:
-        raise ValueError("Codex trace has unresolved tool calls")
+    # Unresolved edits are not evidence of an edit. Commands retain failed=None.
+    for identity in calls.keys() - resolved:
+        calls[identity].edit = False
     return actions
 
 
@@ -451,12 +531,17 @@ def _claude_traces(
 ) -> dict[str, list[Action]]:
     agents: dict[str, list[Action]] = {}
     # Validate both saved representations, but count their tool calls once.
-    if stream_events:
-        _claude(stream_events)
     if paths:
         roots = [path for path in paths if path.parent.name != "subagents"]
         if len(roots) != 1:
             raise ValueError("Claude traces need exactly one root transcript")
+        root_events = _read(roots[0])
+        workspace = Path(str(next(
+            (event["cwd"] for event in root_events if isinstance(event.get("cwd"), str)),
+            "/app",
+        )))
+        if stream_events:
+            _claude(stream_events, workspace)
         inits = [
             event
             for event in stream_events
@@ -467,9 +552,14 @@ def _claude_traces(
         agent_calls: set[str] = set()
         child_calls: set[str] = set()
         saved_calls: dict[str, dict[str, object]] = {}
-        for path in paths:
-            events = _read(path)
-            parsed = _claude(events)
+        # Unrelated persisted agents (for example compactors) are not task agents.
+        # Match metadata to a real Agent/Task call before requiring or counting a child.
+        pending = [roots[0]]
+        children = [path for path in paths if path.parent.name == "subagents"]
+        while pending:
+            path = pending.pop(0)
+            events = root_events if path == roots[0] else _read(path)
+            parsed = _claude(events, workspace)
             saved_calls.update(_claude_calls(events))
             agent_calls.update(_claude_spawns(events))
             if path.parent.name == "subagents":
@@ -480,6 +570,14 @@ def _claude_traces(
                 child_calls.add(call)
             for identity, actions in parsed.items():
                 agents[f"{path}:{identity}"] = actions
+            for child in children[:]:
+                metadata = child.with_suffix(".meta.json")
+                if not metadata.is_file():
+                    continue
+                meta = _object(json.loads(metadata.read_text()))
+                if meta.get("toolUseId") in agent_calls:
+                    pending.append(child)
+                    children.remove(child)
         if agent_calls != child_calls:
             raise ValueError("Claude Agent calls and subagent transcripts do not match")
         if any(
@@ -488,9 +586,13 @@ def _claude_traces(
         ):
             raise ValueError("Claude stream calls are missing or differ in transcripts")
     elif stream_events:
-        agents = _claude(stream_events)
-        children = {event.get("parent_tool_use_id") for event in stream_events}
-        if _claude_spawns(stream_events) - children:
+        workspace = Path(str(next(
+            (event["cwd"] for event in stream_events if isinstance(event.get("cwd"), str)),
+            "/app",
+        )))
+        agents = _claude(stream_events, workspace)
+        child_parents = {event.get("parent_tool_use_id") for event in stream_events}
+        if _claude_spawns(stream_events) - child_parents:
             raise ValueError("Claude subagent stream missing")
     else:
         raise ValueError("no saved Claude traces")
@@ -502,6 +604,7 @@ def _codex_traces(
 ) -> dict[str, list[Action]]:
     sessions: dict[str, list[dict[str, object]]] = {}
     parents: dict[str, str | None] = {}
+    workspaces: dict[str, Path] = {}
     agent_paths: set[str] = set()
     reasons: set[str] = set()
     for path in paths:
@@ -521,6 +624,7 @@ def _codex_traces(
         if parent is not None and not isinstance(parent, str):
             raise ValueError("invalid Codex parent identity")
         parents[session_id] = parent
+        workspaces[session_id] = Path(str(meta.get("cwd", "/app")))
         if isinstance(meta.get("agent_path"), str):
             agent_paths.add(str(meta["agent_path"]))
         previous = sessions.get(session_id, [])
@@ -543,6 +647,8 @@ def _codex_traces(
         for events in sessions.values():
             spawn_calls: set[str] = set()
             for event in events:
+                if event["type"] not in {"response_item", "event_msg"}:
+                    continue
                 item = event.get("payload")
                 if not isinstance(item, dict):
                     raise ValueError("invalid Codex trace payload")
@@ -552,6 +658,14 @@ def _codex_traces(
                     and item.get("new_thread_id") not in sessions
                 ):
                     raise ValueError("Codex subagent session missing")
+                if item.get("type") == "item_completed":
+                    completed = _object(item.get("item"))
+                    if (
+                        completed.get("type") == "SubAgentActivity"
+                        and completed.get("kind") == "started"
+                        and completed.get("agent_thread_id") not in sessions
+                    ):
+                        raise ValueError("Codex subagent session missing")
                 if item.get("name") == "spawn_agent" and isinstance(item.get("call_id"), str):
                     spawn_calls.add(item["call_id"])
                 if (
@@ -566,9 +680,10 @@ def _codex_traces(
                     ):
                         if not output.get("error"):
                             raise ValueError("Codex spawned agent trace missing")
+        workspace = workspaces[root_sessions[0]]
         if stream_events:
-            _codex(stream_events)
-        agents = {identity: _codex(events) for identity, events in sessions.items()}
+            _codex(stream_events, workspace)
+        agents = {identity: _codex(events, workspace) for identity, events in sessions.items()}
     elif stream_events:
         agents = {"root": _codex(stream_events)}
         if any(
@@ -585,6 +700,12 @@ def measure_attempt(artifacts: Path, *, claude: bool) -> dict[str, object]:
     """Prefer native sessions over their duplicate stream; unreadable evidence stays unknown."""
     try:
         agent = artifacts / "harbor/trial/agent"
+        if not agent.is_dir():
+            candidates = sorted((artifacts / "harbor").glob("*/agent"))
+            if len(candidates) > 1:
+                raise ValueError("multiple saved Harbor agent directories")
+            if candidates:
+                agent = candidates[0]
         paths = sorted((agent / "sessions").rglob("*.jsonl"))
         stream = artifacts / "stdout.jsonl"
         if not stream.is_file():
@@ -604,7 +725,7 @@ def measure_attempt(artifacts: Path, *, claude: bool) -> dict[str, object]:
     except (OSError, UnicodeError, ValueError, TypeError) as error:
         return {
             "status": "incomplete",
-            "reason": str(error),
+            "reason": str(error).replace(str(artifacts) + "/", ""),
             "iterations": None,
             "verification_commands": None,
             "failed_verification_commands": None,

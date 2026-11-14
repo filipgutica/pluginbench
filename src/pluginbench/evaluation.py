@@ -956,7 +956,7 @@ def prepare_evaluation(
         "measurement_readiness": capabilities,
         "not_measured": checked.report["not_measured"],
         "artifact_base": "evidence",
-        "measurement_required": any(profiles.values()),
+        "measurement_required": any(profiles.values()) or "iterations" in config.measurements,
         "measurement_revision": None,
         "review_revision": None,
     }
@@ -1084,7 +1084,7 @@ def _finish_evaluation(
 ) -> Path:
     evidence = root / "evidence"
     config = _saved_evaluation(selection)
-    if profiles and selection["measurement_revision"] is None:
+    if (profiles or "iterations" in config.measurements) and selection["measurement_revision"] is None:
         revision = _next_measurement_revision(evidence)
         if selection.get("pending_measurement_revision") is not None:
             selection["recovery_measurement_revision"] = selection["pending_measurement_revision"]
@@ -1573,7 +1573,7 @@ def measure_evaluation(
 ) -> str:
     """Add `measurements` to a finished run as measurement revision `revision`, then select it.
 
-    No model call. A revision is built from the run's own saved submissions, so this one
+    No model call. A revision is built from saved traces and submissions, so this one
     collects every collector-backed measure the run selects, earlier ones included. Earlier
     revisions stay in evidence and measurement history; coding, correctness, token and review
     evidence is unchanged. Profiles, readiness probes and the replaced settings stay in
@@ -1858,10 +1858,9 @@ def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path
             json.loads((evidence / "observer-revisions" / revision / "revision.json").read_text())
             if revision else {}
         )
-        measured = (
-            study._bound_document(evidence, state["iterations"])
-            if "iterations" in state else iterations.measure_run(evidence)
-        )
+        if "iterations" not in state:
+            raise ValueError("iterations requires a bound measurement revision")
+        measured = study._bound_document(evidence, state["iterations"])
         iterations.attach(report, measured)
     if config.get("source_only_grades") is not None:
         attach_source_only_grades(evidence, config["source_only_grades"], report["attempts"])
