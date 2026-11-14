@@ -527,6 +527,37 @@ def test_python_statement_coordinates_exclude_traced_nonstatements(
     )
 
 
+def coverage_7_2_data(meta: dict[str, object]) -> PythonCoverageData:
+    """python_data without branches, under the given meta: coverage.py 7.2.x writes no format."""
+    data = python_data(False)
+    data["meta"] = meta
+    return data
+
+
+def test_python_report_without_format_from_coverage_7_2_reads_as_format_2(
+    tmp_path: Path, source: Path
+) -> None:
+    meta: dict[str, object] = {"version": "7.2.7", "branch_coverage": False}
+    report = python_report(tmp_path, source, coverage_7_2_data(meta))
+    assert report == python_report(tmp_path, source, coverage_7_2_data({**meta, "format": 2}))
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        # Other releases without meta.format stay refused, though 7.3.0 to 7.4.0 write the same shape.
+        {"version": version, "branch_coverage": False}
+        for version in ("7.4.0", "7.2", "7.2.7a1", "7.2.\u0663")
+    ]
+    + [{"version": "7.2.7", "branch_coverage": False, "format": None}],
+)
+def test_python_report_without_a_known_format_is_rejected(
+    tmp_path: Path, source: Path, meta: dict[str, object]
+) -> None:
+    with pytest.raises(ValueError, match="nonnegative integer: None"):
+        python_report(tmp_path, source, coverage_7_2_data(meta))
+
+
 @pytest.mark.parametrize(
     "fault",
     [
