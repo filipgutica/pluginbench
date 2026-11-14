@@ -2619,7 +2619,11 @@ def test_measure_adds_a_selected_measurement_revision_from_saved_submissions(
 
 
 def _mutation_run(
-    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **backend: Any
+    config: evaluation.Evaluation,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str = "def answer(flag):\n    return 1 if flag < 2 else 0\n",
+    **backend: Any,
 ) -> tuple[Path, list[str], list[str]]:
     """A finished run with coverage and review, whose submissions each hold one mutant line."""
     from pluginbench import measurement_profiles
@@ -2639,7 +2643,7 @@ def _mutation_run(
         reviews,
         timeout=config.timeout_seconds,
         interrupt_at=None,
-        source="def answer(flag):\n    return 1 if flag < 2 else 0\n",
+        source=source,
         **backend,
     )
     monkeypatch.setattr(codex, "invoke", coding)
@@ -2732,6 +2736,25 @@ def test_measure_adds_mutation_alone_and_carries_coverage_forward(
         "measurements",
         ["coverage"],
     )
+
+
+def test_the_report_shows_a_measured_zero_share_beside_an_unavailable_catch_rate(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No decision operator on a changed line and no changed test: no mutant, yet no test change.
+    root, _, _ = _mutation_run(config, tmp_path, monkeypatch, source="answer = 2\n")
+    suites: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(harbor_backend, "run_native_command", _suite(suites))
+
+    result = _measure_mutation(root)
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    rows = _observations(root, {"mutation"})
+    rates = [row for row in rows if row["metric"] == "Mutation bug-catch rate %"]
+    shares = [row for row in rows if row["metric"] == "Test-change kill share %"]
+    assert rates and {(row["status"], row["value"]) for row in rates} == {("unknown", None)}
+    assert shares and {(row["status"], row["value"]) for row in shares} == {("measured", 0.0)}
+    assert not suites
 
 
 def _input_files(revision: Path) -> dict[str, dict[str, str]]:
