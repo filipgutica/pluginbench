@@ -57,6 +57,7 @@ from pluginbench.remeasure import (
     _preserved_inventory,
     load_profiles,
     propose_remeasurement,
+    resume_remeasurement,
     validate_remeasurement,
 )
 from pluginbench import study
@@ -1508,6 +1509,71 @@ def review_evaluation(
 
 # The measures `measure` can add: each is collected from saved submissions, with no model call.
 _COLLECTED = FALLOW_MEASUREMENTS | {"coverage", "mutation"}
+# The collector kinds of each group of measures; a group is collected again, or carried, whole.
+_GROUP_KINDS = {
+    "code": frozenset({"fallow", "analysis"}),
+    "coverage": frozenset({"coverage"}),
+    "mutation": frozenset({"mutation"}),
+}
+
+
+def _measure_group(name: str) -> str:
+    return "code" if name in FALLOW_MEASUREMENTS else name
+
+
+def _measure_split(
+    selection: dict[str, object], measurements: list[str]
+) -> tuple[list[str], list[str]]:
+    """The measures a new revision collects, and the earlier ones it carries forward unchanged.
+
+    Adding mutation collects only what was asked: every earlier measure is carried from the
+    selected revision, with its evidence. An earlier mutation is always carried, so a later
+    measure never runs its suites again. Other earlier measures are collected again.
+    """
+    saved = [
+        name
+        for name in TypeAdapter(list[str]).validate_python(selection["measurements"])
+        if name in _COLLECTED
+    ]
+    if _selected_revision(selection, "measurement_revision") is None:
+        return sorted({*saved, *measurements}), []
+    asked = {_measure_group(name) for name in measurements}
+    groups = {_measure_group(name) for name in saved} if "mutation" in asked else {"mutation"}
+    carried = sorted(name for name in saved if _measure_group(name) in groups - asked)
+    return sorted({*saved, *measurements} - set(carried)), carried
+
+
+def _resumed_plan(
+    root: Path, selection: dict[str, object], measurements: list[str], revision: str
+) -> dict[str, object] | None:
+    """The saved plan of `revision` when this request resumes it, else None.
+
+    A revision resumes when `measure` saved its plan and it was never selected; the request
+    must ask for the same measures.
+    """
+    path = root / "measure" / revision / "plan.json"
+    history = TypeAdapter(list[dict[str, str]]).validate_python(
+        selection.get("measurement_history", [])
+    )
+    if (
+        not path.is_file()
+        or selection["measurement_revision"] == revision
+        or any(item["path"] == f"observer-revisions/{revision}/revision.json" for item in history)
+    ):
+        return None
+    plan = _object(json.loads(path.read_text()))
+    if plan["measurements"] != measurements:
+        raise ValueError(
+            f"measurement revision {revision} stopped while adding "
+            f"{','.join(TypeAdapter(list[str]).validate_python(plan['measurements']))}; resume "
+            "it with those --measurements, or choose a new --revision name"
+        )
+    if plan["selected_revision"] != selection["measurement_revision"]:
+        raise ValueError(
+            f"the run's selected measurement revision changed since {revision} started; choose "
+            "a new --revision name"
+        )
+    return plan
 
 
 def _measure_inputs(
@@ -1516,8 +1582,11 @@ def _measure_inputs(
     measurements: list[str],
     revision: str,
     coverage_profiles: Path | None,
-) -> MeasurementSettings:
-    """Refuse what `measure` cannot add; return the settings it measures with."""
+) -> tuple[MeasurementSettings, dict[str, object] | None]:
+    """Refuse what `measure` cannot add; return the settings it measures with.
+
+    Also the saved plan when this request resumes a revision that stopped while collecting.
+    """
     if (
         not _coding_done(root)
         or selection.get("pending_measurement_revision") is not None
@@ -1528,12 +1597,15 @@ def _measure_inputs(
         raise ValueError(f"this run has not finished; finish it with `pluginbench run {root}`")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", revision):
         raise ValueError("--revision must be one name of letters, digits, '.', '_' and '-'")
+    resumed = None
     if (root / "evidence/observer-revisions" / revision).exists() or (
         root / "measure" / revision
     ).exists():
-        raise ValueError(
-            f"measurement revision {revision} already exists; choose a new --revision name"
-        )
+        resumed = _resumed_plan(root, selection, measurements, revision)
+        if resumed is None:
+            raise ValueError(
+                f"measurement revision {revision} already exists; choose a new --revision name"
+            )
     if not measurements or len(set(measurements)) != len(measurements):
         raise ValueError("give each measurement to add once")
     selected_measurements(measurements)
@@ -1552,7 +1624,8 @@ def _measure_inputs(
         if not fallow.is_file() or hashlib.sha256(fallow.read_bytes()).hexdigest() != expected:
             raise ValueError(f"the run's Fallow settings {fallow} changed or are missing")
     if coverage_profiles is None:
-        return settings
+        settings = _resumed_settings(settings, resumed)
+        return settings, resumed
     if "coverage" not in measurements:
         raise ValueError("--coverage-profiles is for adding coverage; add coverage too")
     added = TypeAdapter(dict[str, CoverageSettings]).validate_python(
@@ -1565,9 +1638,24 @@ def _measure_inputs(
         if key in settings.coverage_profiles and settings.coverage_profiles[key] != value
     ]:
         raise ValueError(f"--coverage-profiles changes saved profiles: {', '.join(changed)}")
-    return settings.model_copy(
+    settings = settings.model_copy(
         update={"coverage_profiles": {**settings.coverage_profiles, **added}}
     )
+    return _resumed_settings(settings, resumed), resumed
+
+
+def _resumed_settings(
+    settings: MeasurementSettings, resumed: dict[str, object] | None
+) -> MeasurementSettings:
+    """A resume measures with the coverage profiles its revision started with."""
+    if resumed is not None and (
+        settings.model_dump(mode="json")["coverage_profiles"] != resumed["coverage_profiles"]
+    ):
+        raise ValueError(
+            "--coverage-profiles differs from the measurement revision being resumed; give the "
+            "same one"
+        )
+    return settings
 
 
 def plan_measure(
@@ -1576,14 +1664,20 @@ def plan_measure(
     """Check that a finished run can gain `measurements` as measurement revision `revision`."""
     root = root.expanduser().resolve()
     selection = _load_selection(root)
-    _measure_inputs(root, selection, measurements, revision, coverage_profiles)
-    saved = TypeAdapter(list[str]).validate_python(selection["measurements"])
+    _, resumed = _measure_inputs(root, selection, measurements, revision, coverage_profiles)
+    collected, carried = (
+        _measure_split(selection, measurements)
+        if resumed is None
+        else (resumed["collected"], resumed["carried"])
+    )
     catalog = TaskCatalog.model_validate_json((root / "evidence/frozen/tasks.json").read_text())
     return {
         "name": selection["name"],
         "revision": revision,
         "measurements": measurements,
-        "collected": sorted({*saved, *measurements} & _COLLECTED),
+        "collected": collected,
+        "carried": carried,
+        "resume": resumed is not None,
         "tasks": len(catalog.tasks),
     }
 
@@ -1598,22 +1692,96 @@ def measure_evaluation(
 ) -> str:
     """Add `measurements` to a finished run as measurement revision `revision`, then select it.
 
-    No model call. A revision is built from the run's own saved submissions, so this one
-    collects every collector-backed measure the run selects, earlier ones included. Earlier
-    revisions stay in evidence and measurement history; coding, correctness, token and review
-    evidence is unchanged. Profiles, readiness probes and the replaced settings stay in
-    measure/<revision>.
+    No model call. A revision is built from the run's own saved submissions. It collects the
+    measures `_measure_split` names and carries the others forward unchanged from the selected
+    revision. Earlier revisions stay in evidence and measurement history; coding, correctness,
+    token and review evidence is unchanged. Profiles, readiness probes, the plan and the replaced
+    settings stay in measure/<revision>.
+
+    The same request again resumes a revision that stopped while collecting: each input it
+    finished is checked and kept, and only the others are collected.
     """
     root = root.expanduser().resolve()
-    plan = plan_measure(root, measurements, revision, coverage_profiles)
     selection = _load_selection(root)
-    settings = _measure_inputs(root, selection, measurements, revision, coverage_profiles)
+    settings, plan = _measure_inputs(root, selection, measurements, revision, coverage_profiles)
+    evidence = root / "evidence"
+    directory = evidence / "observer-revisions" / revision
+    if plan is None:
+        plan, profiles = _prepare_measure(
+            root, selection, measurements, revision, settings, progress
+        )
+        for row in TypeAdapter(list[dict[str, object]]).validate_python(plan["skipped"]):
+            if progress:
+                progress(
+                    f"Warning: {row['task']}: {row['measure']} is broken, so it is not measured"
+                )
+        propose_remeasurement(
+            evidence,
+            profiles=profiles,
+            revision=revision,
+            progress=progress,
+            jobs=_saved_evaluation(selection).jobs,
+            masks_listed_pairs=bool(selection.get("not_measured")) or bool(plan["skipped"]),
+            carried_from=_selected_revision(plan, "carried_from"),
+            carried_kinds=frozenset(TypeAdapter(list[str]).validate_python(plan["carried_kinds"])),
+        )
+    elif not (directory / "revision.json").is_file():
+        raise ValueError(
+            f"measurement revision {revision} stopped before it started collecting; choose a new "
+            "--revision name"
+        )
+    elif _object(json.loads((directory / "revision.json").read_text()))["status"] != "complete":
+        resume_remeasurement(evidence, revision=revision, progress=progress)
+    current = _selected_revision(selection, "measurement_revision")
+    if current is not None:
+        _refuse_lost_observations(evidence, current, revision)
+    rows = TypeAdapter(dict[str, dict[str, dict[str, object]]]).validate_python(plan["rows"])
+    comparison = _object(selection["comparison_identity"])
+    selected = [*TypeAdapter(list[str]).validate_python(selection["measurements"]), *measurements]
+    selection["measurements"] = selected
+    comparison["measurements"] = sorted(selected)
+    for owner in (selection, comparison):
+        owner["measurement_settings"] = {
+            **_object(owner["measurement_settings"]),
+            "coverage_profiles": plan["coverage_profiles"],
+        }
+    for owner, key in (
+        (selection, "measurement_capabilities"),
+        (selection, "measurement_readiness"),
+        (comparison, "measurement_capabilities"),
+    ):
+        saved = _object(owner[key])
+        owner[key] = {
+            **saved,
+            **{task: {**_object(saved[task]), **by} for task, by in rows.items()},
+        }
+    selection["comparison_identity"] = comparison
+    selection["not_measured"] = [
+        *TypeAdapter(list[dict[str, object]]).validate_python(selection.get("not_measured", [])),
+        *TypeAdapter(list[dict[str, object]]).validate_python(plan["skipped"]),
+    ]
+    selection["measurement_required"] = True
+    _adopt_measurement_revision(root, selection, revision)
+    _save_selection(root, selection)
+    regenerate_report(root)
+    return revision
+
+
+def _prepare_measure(
+    root: Path,
+    selection: dict[str, object],
+    measurements: list[str],
+    revision: str,
+    settings: MeasurementSettings,
+    progress: Callable[[str], None] | None,
+) -> tuple[dict[str, object], dict[str, list[Collector]]]:
+    """Prepare and probe the profiles of a new revision, and save its plan for a resume."""
     evidence = root / "evidence"
     work = root / "measure" / revision
     work.mkdir(parents=True)
     shutil.copy2(root / "evaluation.json", work / "evaluation-before.json")
     readiness = _object(selection["measurement_readiness"])
-    collected = TypeAdapter(list[str]).validate_python(plan["collected"])
+    collected, carried = _measure_split(selection, measurements)
     catalog = TaskCatalog.model_validate_json((evidence / "frozen/tasks.json").read_text())
     profiles: dict[str, list[Collector]] = {}
     rows: dict[str, dict[str, dict[str, object]]] = {}
@@ -1633,8 +1801,8 @@ def measure_evaluation(
             fixture, output / "measurements", collected, settings, identity
         )
         provenance = json.loads((output / "measurements/measurement-provenance.json").read_text())
-        # Earlier measures are collected again too, so each is checked again: one that was ready
-        # and no longer is would replace its measured values with unknown ones.
+        # Earlier measures collected again are checked again: one that was ready and no longer
+        # is would replace its measured values with unknown ones.
         probed = probe_measurements(
             fixture,
             output / "measurement-readiness",
@@ -1660,52 +1828,22 @@ def measure_evaluation(
     }
     if findings := blocking_findings(matrix, require_ready=settings.require_ready):
         raise ValueError("cannot add these measurements: " + "; ".join(findings))
-    skipped = [] if settings.require_ready else not_measured(matrix)
-    for row in skipped:
-        if progress:
-            progress(f"Warning: {row['task']}: {row['measure']} is broken, so it is not measured")
-    listed = [
-        *TypeAdapter(list[dict[str, object]]).validate_python(selection.get("not_measured", [])),
-        *skipped,
-    ]
-    propose_remeasurement(
-        evidence,
-        profiles=profiles,
-        revision=revision,
-        progress=progress,
-        jobs=_saved_evaluation(selection).jobs,
-        masks_listed_pairs=bool(listed),
-    )
     current = _selected_revision(selection, "measurement_revision")
-    if current is not None:
-        _refuse_lost_observations(evidence, current, revision)
-    comparison = _object(selection["comparison_identity"])
-    selected = [*TypeAdapter(list[str]).validate_python(selection["measurements"]), *measurements]
-    selection["measurements"] = selected
-    comparison["measurements"] = sorted(selected)
-    coverage = settings.model_dump(mode="json")["coverage_profiles"]
-    for owner in (selection, comparison):
-        owner["measurement_settings"] = {
-            **_object(owner["measurement_settings"]),
-            "coverage_profiles": coverage,
-        }
-    for owner, key in (
-        (selection, "measurement_capabilities"),
-        (selection, "measurement_readiness"),
-        (comparison, "measurement_capabilities"),
-    ):
-        saved = _object(owner[key])
-        owner[key] = {
-            **saved,
-            **{task: {**_object(saved[task]), **by} for task, by in rows.items()},
-        }
-    selection["comparison_identity"] = comparison
-    selection["not_measured"] = listed
-    selection["measurement_required"] = True
-    _adopt_measurement_revision(root, selection, revision)
-    _save_selection(root, selection)
-    regenerate_report(root)
-    return revision
+    plan: dict[str, object] = {
+        "measurements": measurements,
+        "collected": collected,
+        "carried": carried,
+        "carried_from": current if carried else None,
+        "carried_kinds": sorted(
+            kind for name in carried for kind in _GROUP_KINDS[_measure_group(name)]
+        ),
+        "selected_revision": current,
+        "rows": rows,
+        "skipped": [] if settings.require_ready else not_measured(matrix),
+        "coverage_profiles": settings.model_dump(mode="json")["coverage_profiles"],
+    }
+    _write(work / "plan.json", plan)
+    return plan, profiles
 
 
 def _refuse_lost_observations(evidence: Path, current: str, proposed: str) -> None:

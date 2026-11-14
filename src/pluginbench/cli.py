@@ -713,18 +713,20 @@ def measure(
     """Add measures to a finished run from its saved submissions, with no model calls.
 
     The new measurement revision is selected and the report rebuilt. Earlier revisions stay in
-    evidence and measurement history.
+    evidence and measurement history. If it stops while collecting, run the same command again:
+    it keeps every submission already measured and measures only the rest.
     """
     names = [name.strip() for name in measurements.split(",") if name.strip()]
     try:
         with run_lock.hold(run):
             plan = plan_measure(run, names, revision, coverage_profiles)
-            collected = plan["collected"]
-            assert isinstance(collected, list)
+            collected, carried = plan["collected"], plan["carried"]
+            assert isinstance(collected, list) and isinstance(carried, list)
+            carries = f"; carries {', '.join(carried)} forward unchanged" if carried else ""
             typer.echo(
-                f"Adds {', '.join(names)} on {plan['tasks']} tasks as measurement revision "
-                f"{revision}, collecting {', '.join(collected)} from saved "
-                "submissions. 0 model calls."
+                f"{'Resumes' if plan['resume'] else 'Adds'} {', '.join(names)} on "
+                f"{plan['tasks']} tasks as measurement revision {revision}, collecting "
+                f"{', '.join(collected)} from saved submissions{carries}. 0 model calls."
             )
             if not yes and not _confirm("Start measurement?"):
                 raise typer.Exit()

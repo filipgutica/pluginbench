@@ -41,6 +41,12 @@ def _object(value: object) -> dict[str, object]:
     return dict(value)
 
 
+def _list(value: object) -> list[object]:
+    if not isinstance(value, list):
+        raise ValueError("remeasurement requires a JSON list")
+    return value
+
+
 def _canonical(value: object) -> object:
     if isinstance(value, dict):
         return {key: _canonical(item) for key, item in value.items()}
@@ -496,6 +502,160 @@ def _container_runtimes(collectors: list[Collector]) -> list[dict[str, object]]:
     return [runtime for item in collectors if (runtime := container_runtime(item)) is not None]
 
 
+# Saved in measurements/<input>/ once the input finishes; a resumed revision keeps that input.
+CHECKPOINT = "collected.json"
+
+
+def _link_or_copy(source: str, destination: str) -> None:
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+
+
+def _carried_kinds(state: dict[str, object]) -> set[str]:
+    carried = state.get("carried_from")
+    if carried is None:
+        return set()
+    kinds = _object(carried).get("kinds")
+    if not isinstance(kinds, list) or not all(isinstance(kind, str) for kind in kinds):
+        raise ValueError("carried measurement kinds must be a list of names")
+    return set(kinds)
+
+
+def _carried_collectors(
+    root: Path, revision: str, kinds: frozenset[str]
+) -> dict[str, list[Collector]]:
+    """Revision `revision`'s frozen collectors of `kinds`, unchanged; it must still validate."""
+    directory = root / "observer-revisions" / revision
+    validate_remeasurement(root, directory)
+    state = _object(json.loads((directory / "revision.json").read_text()))
+    profiles = load_profiles(study._bound_path(root, state["frozen_profiles"]))
+    return {
+        task: [collector for collector in collectors if collector.kind in kinds]
+        for task, collectors in profiles.items()
+    }
+
+
+def _carried_artifacts(
+    root: Path, state: dict[str, object], manifest: AssessmentInput
+) -> dict[tuple[str, str, str], list[dict[str, Path]]]:
+    """Each input's carried artifacts per repeat, from the revision this one carries them from.
+
+    A single-run kind's second repeat binds its first, so only its first repeat lists it.
+    """
+    if state.get("carried_from") is None:
+        return {}
+    kinds = _carried_kinds(state)
+    receipt = study._bound_path(root, _object(state["carried_from"])["receipt"])
+    validate_remeasurement(root, receipt.parent)
+    tasks = {record.id: record.task_id for record in manifest.records}
+    artifacts: dict[tuple[str, str, str], list[dict[str, Path]]] = {}
+    for value in _list(_object(json.loads(receipt.read_text()))["observations"]):
+        observation = _object(value)
+        key = (
+            tasks[str(observation["attempt_id"])],
+            str(observation["snapshot_digest"]),
+            str(observation["before_digest"]),
+        )
+        artifacts[key] = [
+            {
+                kind: study._bound_path(root, reference)
+                for kind, reference in _object(refs).items()
+                if kind in kinds and not (repeat and kind in SINGLE_RUN_KINDS)
+            }
+            for repeat, refs in enumerate(_list(observation["repeats"]))
+        ]
+    return artifacts
+
+
+def _sources(
+    carried: dict[tuple[str, str, str], list[dict[str, Path]]],
+    item: MeasurementInput,
+    collectors: list[Collector],
+    repeat: int,
+    kinds: set[str],
+) -> dict[str, Path]:
+    """The artifacts one repeat of one input carries; each carried collector must have one."""
+    expected = {
+        collector.kind
+        for collector in collectors
+        if collector.kind in kinds and not (repeat and collector.kind in SINGLE_RUN_KINDS)
+    }
+    sources = carried[item.key][repeat] if expected else {}
+    if set(sources) != expected:
+        raise ValueError("the carried revision did not measure this input with its collectors")
+    return sources
+
+
+def _write_checkpoint(directory: Path, item: MeasurementInput, collected: CollectedInput) -> None:
+    """Record a finished input with the digest of every file it measured."""
+    measured = directory / "measurements" / str(item.index)
+    study._write(
+        measured / CHECKPOINT,
+        {
+            "key": list(item.key),
+            "inventory": study._inventory(measured),
+            "repeats": [
+                {kind: ref.model_dump(mode="json") for kind, ref in refs.items()}
+                for refs in collected.repeats
+            ],
+            "outcomes": collected.outcomes,
+        },
+    )
+
+
+def _checked_input(
+    directory: Path, item: MeasurementInput, collectors: list[Collector]
+) -> CollectedInput:
+    """A finished input from its checkpoint, after rederiving its outcomes from its files."""
+    measured = directory / "measurements" / str(item.index)
+    saved = _object(json.loads((measured / CHECKPOINT).read_text()))
+    inventory = {
+        path: digest
+        for path, digest in study._inventory(measured).items()
+        if path.split(":")[0] != CHECKPOINT
+    }
+    if saved.get("key") != list(item.key) or saved.get("inventory") != inventory:
+        raise ValueError(
+            f"measurement input {item.index} changed after its checkpoint; start a new revision"
+        )
+    repeats: list[dict[MetricKind, ArtifactRef]] = []
+    normalized = []
+    for repeat, values in enumerate(_list(saved["repeats"])):
+        bound = _object(values)
+        if set(bound) != {collector.kind for collector in collectors}:
+            raise ValueError("a checkpoint does not bind every collector")
+        refs: dict[MetricKind, ArtifactRef] = {
+            collector.kind: ArtifactRef.model_validate(bound[collector.kind])
+            for collector in collectors
+        }
+        envelopes: dict[str, str] = {}
+        for collector in collectors:
+            path = study._bound_path(directory, refs[collector.kind].model_dump(mode="json"))
+            if not path.resolve().is_relative_to(measured.resolve()):
+                raise ValueError("a checkpoint binds another input's artifact")
+            if path.name == "failure.json":
+                _validate_failure(
+                    path=path,
+                    collector=collector,
+                    snapshot_digest=item.snapshot_digest,
+                    before_digest=item.before_digest,
+                    repeat=0 if collector.kind in SINGLE_RUN_KINDS else repeat,
+                )
+            else:
+                envelopes[collector.kind] = str(path.resolve())
+        evidence = measured / str(repeat)
+        normalized.append(
+            _normalized(evaluate_evidence(item.snapshot, envelopes, evidence.resolve()))
+        )
+        repeats.append(refs)
+    outcomes = _family_outcomes(normalized, repeats)
+    if len(repeats) != 2 or saved.get("outcomes") != outcomes:
+        raise ValueError(f"measurement input {item.index} differs from its checkpoint")
+    return CollectedInput(repeats=repeats, outcomes=outcomes)
+
+
 def propose_remeasurement(
     root: Path,
     *,
@@ -504,11 +664,16 @@ def propose_remeasurement(
     progress: Callable[[str], None] | None = None,
     jobs: int = 1,
     masks_listed_pairs: bool = False,
+    carried_from: str | None = None,
+    carried_kinds: frozenset[str] = frozenset(),
 ) -> Path:
     """Write a separate proposal; exceptions retain diagnostics and never promote it.
 
     masks_listed_pairs: the run's report hides pairs its check listed as not measured. Protocol 3
     marks that, so an earlier build, which accepts only 2 and would publish those values, refuses.
+    carried_from, carried_kinds: collector kinds this revision does not collect again. Their
+    frozen collectors and measured artifacts come unchanged from revision `carried_from`, so the
+    proposal binds them exactly as if it had collected them.
     """
     validate_jobs(jobs)
     root = root.resolve()
@@ -552,10 +717,26 @@ def propose_remeasurement(
         shutil.copy2(original, previous / "assessment-input.json")
         if (root / "report").is_dir():
             shutil.copytree(root / "report", previous / "report")
+        carried: dict[str, list[Collector]] = {}
+        if carried_from is not None:
+            carried = _carried_collectors(root, carried_from, carried_kinds)
+            state["carried_from"] = {
+                "revision": carried_from,
+                "receipt": study._reference(root, parent / carried_from / "revision.json"),
+                "kinds": sorted(carried_kinds),
+            }
         frozen = {
-            task: freeze_collectors(collectors, directory / "profiles" / str(index))
+            task: [
+                *freeze_collectors(collectors, directory / "profiles" / str(index)),
+                *carried.get(task, []),
+            ]
             for index, (task, collectors) in enumerate(sorted(profiles.items()))
         }
+        if any(
+            len({item.kind for item in collectors}) != len(collectors)
+            for collectors in frozen.values()
+        ):
+            raise ValueError("a carried collector kind is also collected again")
         profile_path = directory / "profiles.json"
         study._write(
             profile_path,
@@ -570,6 +751,88 @@ def propose_remeasurement(
             profile_inventory=profile_inventory,
         )
         study._write(directory / "revision.json", state)
+    except BaseException as exc:
+        state.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+        study._write(directory / "revision.json", state)
+        raise
+    return _collect_revision(
+        root,
+        directory,
+        state,
+        frozen,
+        native=(run, manifest, original, protected),
+        progress=progress,
+    )
+
+
+def resume_remeasurement(
+    root: Path, *, revision: str, progress: Callable[[str], None] | None = None
+) -> Path:
+    """Finish a revision that stopped while collecting, keeping every input it finished.
+
+    The native evidence and the frozen profiles must be unchanged since the revision started.
+    """
+    root = root.resolve()
+    directory = root / "observer-revisions" / revision
+    if directory.is_symlink() or directory.resolve().parent != root / "observer-revisions":
+        raise ValueError("measurement revision must remain inside its native study")
+    state = _object(json.loads((directory / "revision.json").read_text()))
+    if state["status"] not in ("failed", "collecting") or not all(
+        key in state for key in ("frozen_profiles", "profile_inventory")
+    ):
+        raise ValueError(
+            f"measurement revision {revision} did not stop while collecting, so it cannot "
+            "resume; choose a new --revision name"
+        )
+    validate_jobs(state["jobs"])
+    run, manifest, original = _native_state(root)
+    protected = _preserved_inventory(root, manifest, original.parent)
+    if (
+        protected != state["preserved"]
+        or study._bound_document(root, state["source_run"]) != run
+        or study._bound_path(root, state["source_assessment"]) != original
+        or study._inventory(directory / "profiles") != state["profile_inventory"]
+    ):
+        raise ValueError(
+            f"native evidence or frozen profiles changed since measurement revision {revision} "
+            "started; choose a new --revision name"
+        )
+    frozen = load_profiles(study._bound_path(root, state["frozen_profiles"]))
+    state.pop("error", None)
+    state.update(status="collecting", resumes=int(str(state.get("resumes", 0))) + 1)
+    study._write(directory / "revision.json", state)
+    if progress:
+        progress(f"Resuming measurement revision {revision}")
+    return _collect_revision(
+        root,
+        directory,
+        state,
+        frozen,
+        native=(run, manifest, original, protected),
+        progress=progress,
+    )
+
+
+def _collect_revision(
+    root: Path,
+    directory: Path,
+    state: dict[str, object],
+    frozen: dict[str, list[Collector]],
+    *,
+    native: tuple[dict[str, object], AssessmentInput, Path, dict[str, object]],
+    progress: Callable[[str], None] | None,
+) -> Path:
+    """Collect every input a revision has not finished, then bind and write its proposal.
+
+    Each input saves a checkpoint as it finishes, so a resumed revision collects only the
+    inputs without one, after checking the ones that have it.
+    """
+    run, manifest, original, protected = native
+    jobs = int(str(state["jobs"]))
+    profile_path = directory / "profiles.json"
+    profile_inventory = state["profile_inventory"]
+    previous = directory / "previous"
+    try:
         revised = _rebased(manifest, original.parent, directory)
         observations: dict[tuple[str, str, str], CollectedInput] = {}
         inputs: list[MeasurementInput] = []
@@ -606,7 +869,22 @@ def propose_remeasurement(
                         )
                     )
                 cases.append((record.id, stage_id, snapshot_ref.sha256, record.before.sha256, key))
-        input_states = {str(item.index): "pending" for item in inputs}
+        carried = _carried_artifacts(root, state, manifest)
+        # A resumed revision keeps each input its checkpoint proves finished. Any other input's
+        # partial files move aside, kept for diagnosis, and that input is collected again.
+        for item in inputs:
+            measured = directory / "measurements" / str(item.index)
+            if (measured / CHECKPOINT).is_file():
+                observations[item.key] = _checked_input(directory, item, frozen[item.key[0]])
+            elif measured.exists():
+                aside = directory / "abandoned" / str(state.get("resumes", 0)) / str(item.index)
+                aside.parent.mkdir(parents=True, exist_ok=True)
+                measured.rename(aside)
+        pending = [item for item in inputs if item.key not in observations]
+        input_states = {
+            str(item.index): "complete" if item.key in observations else "pending"
+            for item in inputs
+        }
         state["input_states"] = input_states
 
         def update_input(item: MeasurementInput, status: str, repeat: int | None = None) -> None:
@@ -643,14 +921,21 @@ def propose_remeasurement(
                         return
                     evidence = directory / "measurements" / str(item.index) / str(repeat)
                     emit(partial(update_input, item, "running", repeat))
+                    sources = _sources(carried, item, frozen[item.key[0]], repeat, carried_kinds)
                     collectors = [
                         collector
                         for collector in frozen[item.key[0]]
                         if not (repeat and collector.kind in SINGLE_RUN_KINDS)
+                        and collector.kind not in sources
                     ]
                     paths = collect_measurements(
                         item.snapshot, evidence, collectors, before=item.before
                     )
+                    for kind, source in sources.items():
+                        # Linked, not copied: measured artifacts are never written again.
+                        shutil.copytree(source.parent, evidence / kind, copy_function=_link_or_copy)
+                        if source.name == "envelope.json":
+                            paths[kind] = evidence / kind / source.name
                     if repeat:
                         paths |= {
                             kind: directory / ref.path
@@ -672,9 +957,10 @@ def propose_remeasurement(
                             continue
                         if path is None:
                             path = evidence / collector.kind / "failure.json"
-                            failure = _object(json.loads(path.read_text()))
-                            failure["repeat_index"] = repeat
-                            study._write(path, failure)
+                            if collector.kind not in sources:
+                                failure = _object(json.loads(path.read_text()))
+                                failure["repeat_index"] = repeat
+                                study._write(path, failure)
                             _validate_failure(
                                 path=path,
                                 collector=collector,
@@ -687,18 +973,32 @@ def propose_remeasurement(
                         )
                     repeats.append(refs)
                 outcomes = _family_outcomes(normalized, repeats)
-                emit(partial(accept, item, CollectedInput(repeats=repeats, outcomes=outcomes)))
+                collected = CollectedInput(repeats=repeats, outcomes=outcomes)
+                # Saved here, as the input finishes, whatever happens to other inputs.
+                _write_checkpoint(directory, item, collected)
+                emit(partial(accept, item, collected))
             except BaseException:
                 emit(partial(update_input, item, "failed"))
                 raise
 
         # Inputs run `jobs` at a time, and each runs its task's containers one after another.
+        carried_kinds = _carried_kinds(state)
         containers = [
-            runtimes for item in inputs if (runtimes := _container_runtimes(frozen[item.key[0]]))
+            runtimes
+            for item in pending
+            if (
+                runtimes := _container_runtimes(
+                    [
+                        collector
+                        for collector in frozen[item.key[0]]
+                        if collector.kind not in carried_kinds
+                    ]
+                )
+            )
         ]
         if containers:
             harbor_backend.assert_capacity(containers, jobs=jobs)
-        run_jobs(inputs, jobs=jobs, operation=collect_input)
+        run_jobs(pending, jobs=jobs, operation=collect_input)
         bindings = []
         proposed_records = {record.id: record for record in revised.records}
         for attempt_id, stage_id, snapshot_digest, before_digest, key in cases:
@@ -837,6 +1137,10 @@ def validate_remeasurement(root: Path, directory: Path) -> Path:
         raise ValueError("saved original reports changed")
     if study._inventory(directory / "profiles") != protocol.get("profile_inventory"):
         raise ValueError("frozen measurement profile changed")
+    if "carried_from" in protocol:
+        # Carried collectors and artifacts come from that revision, which must still hold.
+        carried = study._bound_path(root, _object(protocol["carried_from"])["receipt"])
+        validate_remeasurement(root, carried.parent)
     if study._inventory(directory / "measurements") != protocol.get("measurement_inventory"):
         raise ValueError("measurement artifacts changed")
     if "references" in protocol:
