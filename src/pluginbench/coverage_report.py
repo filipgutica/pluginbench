@@ -540,8 +540,9 @@ def _go_cover_blocks(path: Path, files: set[str]) -> dict[str, int]:
     toolchain itself found nothing to measure. A file without a line has no declared count.
     """
     counts: dict[str, int] = {}
-    # Only "\n" ends a line: a path may hold any other character `splitlines` would split on.
-    lines = path.read_text().split("\n")
+    # Only "\n" ends a line: a path may hold any other character `splitlines` would split on,
+    # and reading bytes keeps text mode from turning "\r" into one.
+    lines = path.read_bytes().decode().split("\n")
     if lines[-1] == "":
         lines.pop()  # what follows the last line's newline
     for line in lines:
@@ -585,6 +586,7 @@ def _go_build(
     compiled: set[str] = set()
     ignored: dict[str, str] = {}
     listed: dict[str, str] = {}
+    test_mains = 0
     index, spaces = 0, re.compile(r"\s*")
     while True:
         # `go list -json` writes a stream of objects, not one JSON document.
@@ -622,6 +624,7 @@ def _go_build(
             and fields["GoFiles"]
             and all(PurePosixPath(item).is_absolute() for item in fields["GoFiles"])
         ):
+            test_mains += 1
             continue
         # `-test` also lists test variants, `<package> [<tested>.test]`: the package's files
         # again with its `_test.go` files, or a package only tests import. The set drops the
@@ -637,6 +640,13 @@ def _go_build(
                     ignored.setdefault(path, f"excluded from package {name} by build constraints")
                 else:
                     compiled.add(path)
+    # Without `-test`, packages only tests import are missing and their files would read as
+    # out of scope. A list from `-test` names a test main for any tested package.
+    if not test_mains and any(
+        file.endswith("_test.go") and PurePosixPath(file).parent.as_posix() in listed
+        for file in files
+    ):
+        raise ValueError("go list must be run with -deps -test: it lists no test main")
     expected = coverage_sources(files, source_scope)
 
     def reason(path: str) -> str:

@@ -837,6 +837,40 @@ def test_go_cover_blocks_that_disagree_with_the_snapshot_or_report_are_rejected(
         go_build_metrics(tmp_path, source, profile=GO_REPORT + ADDED_BLOCK, blocks=blocks)
 
 
+GO_TEST_MAIN = """{
+\t"Dir": "/app",
+\t"ImportPath": "example.test/value.test",
+\t"GoFiles": ["/root/.cache/go-build/ab/abcdef-d"]
+}
+"""
+
+
+def test_a_go_list_without_test_mains_is_refused_when_the_repo_has_tests(
+    tmp_path: Path, source: Path
+) -> None:
+    tests = {"value_test.go": "package value\n"}
+    with pytest.raises(ValueError, match="-deps -test"):
+        go_build_metrics(
+            tmp_path, source, profile=GO_REPORT + ADDED_BLOCK, extra_files=tests
+        )
+    metrics = go_build_metrics(
+        tmp_path, source, profile=GO_REPORT + ADDED_BLOCK, extra_files=tests,
+        go_list=GO_LIST + GO_TEST_MAIN,
+    )
+    assert metrics["population_complete_for_declared_scope"] is True
+
+
+@pytest.mark.parametrize("name", ["we\rird.go", "form\x0cfeed.go"])
+def test_go_cover_blocks_keep_line_breaking_characters_in_file_names(
+    tmp_path: Path, source: Path, name: str
+) -> None:
+    metrics = go_build_metrics(
+        tmp_path, source, profile=GO_REPORT + ADDED_BLOCK,
+        blocks=GO_BLOCKS + f"1 {name}\n", extra_files={name: "package value\n"},
+    )
+    assert metrics["population_complete_for_declared_scope"] is True
+
+
 def test_python_duplicate_json_keys_are_rejected(tmp_path: Path, source: Path) -> None:
     report = tmp_path / "coverage.json"
     report.write_text('{"files": {}, "files": {}}')
