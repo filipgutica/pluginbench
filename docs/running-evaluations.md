@@ -114,7 +114,7 @@ Installing PluginBench also installs Harbor 0.24.0; see [Install](../README.md#i
 
 ### Verified coding CLIs
 
-Codex CLI trace layouts are verified for **0.162.1**, **0.167.0**, and **0.167.1** in [`codex_events.py`](../src/pluginbench/codex_events.py).
+Codex CLI trace layouts are verified for **0.162.1**, **0.167.0**, **0.167.1**, and **0.167.2** in [`codex_events.py`](../src/pluginbench/codex_events.py).
 Other versions warn once and continue: matching plain sessions are measured, while incompatible traces or unverified inherited-history layouts leave that attempt's tokens unavailable.
 Reports mark missing tokens as unknown rather than zero; comparisons show unmeasured attempts, and token gates cannot pass on missing measurements.
 Cache reuse and `report` re-run the current per-attempt validator on saved Codex stdout and session traces. Invalid evidence or totals that disagree with the recorded usage make tokens unavailable, with a reason. Legacy stdout-only totals also become unavailable. Token gates treat unavailable usage as unknown and cannot pass on it.

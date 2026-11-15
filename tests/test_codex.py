@@ -826,7 +826,7 @@ def named_native_spawn() -> list[dict[str, object]]:
     ]
 
 
-@pytest.mark.parametrize("version", ["0.162.1", "0.167.0", "0.167.1"])
+@pytest.mark.parametrize("version", ["0.162.1", "0.167.0", "0.167.1", "0.167.2"])
 def test_native_inherited_child_counts_only_own_history_and_deduplicates_copies(
     version: str,
 ) -> None:
