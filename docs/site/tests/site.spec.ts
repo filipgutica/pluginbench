@@ -1,4 +1,5 @@
 import { expect, test as base } from '@playwright/test';
+import { SITE_PROJECTS } from '@filipgutica/ui/site';
 import { documents } from '../src/lib/pages';
 import { expectNoOverflow, routes } from './pages';
 
@@ -152,6 +153,8 @@ test('Home installs from PyPI and copies the command', async ({ page }) => {
 });
 
 test('shared project menu, header links, and appearance picker work', async ({ page }) => {
+  // The header fetches the published project list after mount; serve the pinned /ui's own list so the live one cannot change this test.
+  await page.route('https://filipgutica.github.io/ui/projects.json', (route) => route.fulfill({ json: SITE_PROJECTS }));
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.goto('/pluginbench/');
   await expect(page.getByRole('navigation', { name: 'Site links' }).getByRole('link')).toHaveText(['GitHub', 'Releases']);
@@ -159,7 +162,7 @@ test('shared project menu, header links, and appearance picker work', async ({ p
   const trigger = page.getByLabel('Project: PluginBench', { exact: true });
   await trigger.click();
   const projects = page.getByRole('navigation', { name: 'Projects', exact: true });
-  await expect(projects.getByRole('link')).toHaveText(['annoterm', 'wtree', 'devps', 'PluginBench', 'Workbench', 'Filip Stack', 'UI']);
+  await expect(projects.getByRole('link')).toHaveText(['annoterm', 'wtree', 'devps', 'PluginBench', 'Workbench', 'Filip Stack', 'UI', 'Design system']);
   await expect(projects.locator('[aria-current="page"]')).toHaveText('PluginBench');
   await page.keyboard.press('Escape');
   await expect(projects).toBeHidden();
