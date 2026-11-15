@@ -320,7 +320,8 @@ def _token_usage(value: object) -> dict[str, int] | None:
 
 # Codex versions checked against real traces or equivalent upstream rollout source.
 # rust-v0.167.1 keeps rust-v0.167.0's protocol, rollout writer, and fork/history code.
-_VERIFIED_TRACE_VERSIONS = frozenset({"0.162.1", "0.167.0", "0.167.1"})
+# rust-v0.167.2 changes only GCP incremental-tool feature gating relative to rust-v0.167.1.
+_VERIFIED_TRACE_VERSIONS = frozenset({"0.162.1", "0.167.0", "0.167.1", "0.167.2"})
 
 
 @cache
@@ -363,7 +364,7 @@ def _session_history(
 
     # 0.162.1 protocol.rs defines this ordinal as the first own-history record.
     # Earlier records are inherited model context, including other session headers.
-    # 0.167.0 and 0.167.1 keep the same header fields, boundary, and ordinals.
+    # 0.167.0, 0.167.1, and 0.167.2 keep the same header fields, boundary, and ordinals.
     assert isinstance(first, dict)
     version = first.get("cli_version")
     if not isinstance(version, str) or version not in _VERIFIED_TRACE_VERSIONS:
