@@ -628,6 +628,19 @@ def test_an_arm_with_plugin_agents_pairs_with_the_verified_vanilla(tmp_path: Pat
     assert study._has_pinned_builtins(receipt, pinned)
 
 
+def test_a_treatment_command_that_replaces_a_built_in_keeps_the_pinned_built_ins() -> None:
+    # A treatment skill named like a built-in command replaces it in discovery.
+    pinned = baselines.CLAUDE_BUILTINS[VERSION]
+    name = pinned["commands"][0]
+    rest = [command for command in pinned["commands"] if command != name]
+    agents = pinned["agents"]
+    receipt = {"builtins": {"commands": rest, "agents": agents}, "commands": [name]}
+    assert study._has_pinned_builtins(receipt, pinned)
+    assert not study._has_pinned_builtins({**receipt, "commands": []}, pinned)
+    extra = {"builtins": {"commands": [*pinned["commands"], "new"], "agents": agents}, "commands": [name]}
+    assert not study._has_pinned_builtins(extra, pinned)
+
+
 def _agent_rows(attempt: Attempt) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = attempt.scenario["responses"]["get_context_usage"]["agents"]
     return rows

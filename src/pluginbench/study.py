@@ -1268,8 +1268,19 @@ def _discovery_receipt(execution: dict[str, Any], artifacts: Path) -> dict[str, 
 
 
 def _has_pinned_builtins(receipt: dict[str, Any] | None, pinned: object) -> bool:
-    """Whether a discovery receipt reports the built-ins the vanilla cache pins."""
-    return pinned is not None and receipt is not None and receipt.get("builtins") == pinned
+    """Whether a discovery receipt reports the built-ins the vanilla cache pins.
+
+    A treatment command named like a built-in command replaces it, so discovery leaves that
+    built-in out. The CLI's built-ins are unchanged, so the replaced name still counts.
+    """
+    if not isinstance(pinned, dict) or receipt is None:
+        return False
+    builtins = receipt.get("builtins")
+    if not isinstance(builtins, dict) or builtins.get("agents") != pinned.get("agents"):
+        return False
+    commands = builtins.get("commands")
+    replaced = set(receipt.get("commands") or []) & set(pinned.get("commands") or [])
+    return isinstance(commands, list) and sorted({*commands, *replaced}) == pinned.get("commands")
 
 
 def _reused_vanilla(plan: dict[str, Any]) -> list[str]:
