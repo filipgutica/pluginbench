@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from pluginbench.language_analysis import (
     AnalysisUnavailable,
     RCASpace,
     _complexity,
+    _execute,
     _go_unused,
     _path,
     _rca_functions,
@@ -218,6 +220,116 @@ def test_go_missing_build_population_is_unknown_instead_of_empty() -> None:
         _go_unused(
             Path("/source"), ["ignored.go"], tools, lambda argv: '{"Dir":"/source","GoFiles":[]}'
         )
+
+
+GO_TOOLS: dict[str, dict[str, object]] = {
+    "go": {"path": "/trusted/go"},
+    "staticcheck": {"path": "/trusted/staticcheck"},
+}
+GO_ENV = '{"CGO_ENABLED": "0", "GOARCH": "amd64", "GOOS": "linux"}'
+GO_PACKAGES: dict[str, object] = {
+    "GoFiles": ["live.go"],
+    "CgoFiles": ["cgo.go"],
+    "IgnoredGoFiles": ["live_windows.go"],
+}
+
+
+def _go_source(root: Path, paths: list[str]) -> None:
+    for path in paths:
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text("package live\n")
+
+
+def _fake_go(
+    root: Path, packages: dict[str, object], diagnostics: str
+) -> Callable[[list[str]], str]:
+    def execute(argv: list[str]) -> str:
+        if argv[1:2] == ["list"]:
+            return json.dumps({"Dir": str(root), **packages})
+        return GO_ENV if argv[1:2] == ["env"] else diagnostics
+
+    return execute
+
+
+def test_go_dead_code_reads_cgo_files_and_lists_declared_files_outside_the_build(
+    tmp_path: Path,
+) -> None:
+    paths = ["cgo.go", "live.go", "live_windows.go", "nested/inner.go"]
+    _go_source(tmp_path, paths)
+    diagnostic = {
+        "code": "U1000",
+        "location": {"file": str(tmp_path / "cgo.go"), "line": 1, "column": 6},
+        "message": "func viaCgo is unused",
+    }
+    rows, excluded, build = _go_unused(
+        tmp_path, paths, GO_TOOLS, _fake_go(tmp_path, GO_PACKAGES, json.dumps(diagnostic))
+    )
+    assert [(row["path"], row["symbol"]) for row in rows] == [("cgo.go", "func viaCgo")]
+    assert excluded == {
+        "live_windows.go": "build constraints exclude it from the host build",
+        "nested/inner.go": "no package of the host build lists it (nested module or ignored directory)",
+    }
+    assert build == {"GOOS": "linux", "GOARCH": "amd64", "CGO_ENABLED": "0"}
+
+
+@pytest.mark.parametrize(
+    "packages,diagnostics,message",
+    [
+        (
+            {**GO_PACKAGES, "DepsErrors": [{"Err": "cannot find module providing package"}]},
+            "",
+            "failed to load",
+        ),
+        (GO_PACKAGES, '{"code": "compile", "message": "syntax error"}', "load/compile"),
+    ],
+)
+def test_go_load_and_compile_errors_keep_dead_code_unavailable(
+    tmp_path: Path, packages: dict[str, object], diagnostics: str, message: str
+) -> None:
+    paths = ["cgo.go", "live.go", "live_windows.go"]
+    _go_source(tmp_path, paths)
+    with pytest.raises(AnalysisUnavailable, match=message):
+        _go_unused(tmp_path, paths, GO_TOOLS, _fake_go(tmp_path, packages, diagnostics))
+
+
+def _pinned_go(
+    root: Path, destination: Path
+) -> tuple[dict[str, dict[str, object]], Callable[[list[str]], str]]:
+    tools = probe_language_tools("go")
+    if any(tools[name]["status"] != "available" for name in ("go", "staticcheck")):
+        pytest.skip("Pinned Go compiler and Staticcheck are not installed")
+    go = Path(str(tools["go"]["path"]))
+    readable = [go.parent.parent, Path(str(tools["staticcheck"]["path"])).parent]
+    destination.mkdir()
+    return tools, lambda argv: _execute(argv, root, destination, readable, 120)
+
+
+@pytest.mark.parametrize("compiles", [True, False])
+def test_pinned_staticcheck_measures_the_host_build_of_the_declared_files(
+    tmp_path: Path, compiles: bool
+) -> None:
+    root = tmp_path / "source"
+    files = {
+        "go.mod": "module example.com/sample\n\ngo 1.25.0\n",
+        "sample.go": SAMPLES["go"][1] if compiles else "package sample\nfunc broken( {}\n",
+        "sample_windows.go": "package sample\nfunc windowsOnly() {}\n",
+        "gen/gen.go": "//go:build ignore\n\npackage main\n\nfunc main() {}\n",
+        "nested/go.mod": "module example.com/nested\n\ngo 1.25.0\n",
+        "nested/inner.go": "package nested\nfunc inner() {}\n",
+    }
+    for path, text in files.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text(text)
+    paths = sorted(path for path in files if path.endswith(".go"))
+    tools, execute = _pinned_go(root, tmp_path / "evidence")
+    if not compiles:
+        with pytest.raises(AnalysisUnavailable, match="load/compile"):
+            _go_unused(root, paths, tools, execute)
+        return
+    rows, excluded, build = _go_unused(root, paths, tools, execute)
+    assert [row["symbol"] for row in rows] == ["func abandoned"]
+    assert sorted(excluded) == ["gen/gen.go", "nested/inner.go", "sample_windows.go"]
+    assert build["CGO_ENABLED"] == "0" and build["GOOS"] and build["GOARCH"]
 
 
 def test_analyzer_location_outside_source_is_rejected(tmp_path: Path) -> None:

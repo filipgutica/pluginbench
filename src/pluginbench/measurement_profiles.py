@@ -646,9 +646,19 @@ def _metric_readiness(metric: str, first: dict[str, object]) -> tuple[bool, obje
             if metric == "dead_code" and not ready:
                 reason = first.get("dead_code_incomplete_reason") or reason
         if metric == "dead_code" and ready:
-            comparison = _dead_changes(first, first)
+            comparison = _dead_changes(first, first, set())
             ready = comparison["status"] == "available"
             reason = comparison.get("reason")
+            excluded = first.get("dead_code_excluded")
+            if ready and isinstance(excluded, dict) and excluded:
+                # Findings in the build are still compared; an attempt that changes one of these
+                # files, or moves a file into or out of the build, is recorded as incomplete.
+                build = first.get("dead_code_build")
+                assert isinstance(build, dict)  # _analysis requires it beside excluded files
+                settings = " ".join(f"{key}={value}" for key, value in build.items())
+                reason = f"declared source files outside the dead-code build ({settings}): " + (
+                    "; ".join(f"{path} ({detail})" for path, detail in sorted(excluded.items()))
+                )
     elif metric == "mutation":
         # The starting source changes no line, so a report with no candidates is ready.
         ready = first.get("status") == "available" or first.get("candidate_count") == 0
