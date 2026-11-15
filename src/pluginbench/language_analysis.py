@@ -23,7 +23,8 @@ from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.code_diff import _is_test_path
 
 # v2 adds the complexity partition: a file the pinned parser rejects no longer makes complexity
-# unavailable for the whole repository.
+# unavailable for the whole repository. It also partitions dead code: a declared Go file outside
+# the host build no longer makes dead code unavailable.
 VERSION = "language-analysis-v2"
 SUFFIXES = {"python": ".py", "go": ".go", "rust": ".rs"}
 PINNED = {
@@ -578,17 +579,44 @@ def _go_unused(
     paths: list[str],
     tools: dict[str, dict[str, object]],
     execute: Callable[[list[str]], str],
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], dict[str, str], dict[str, str]]:
+    """Unused candidates in the declared files the host build compiles.
+
+    Also returns each declared file the build leaves out, with its reason, and the GOOS, GOARCH
+    and CGO_ENABLED the analyzer ran with. Package load and compile errors stay metric-wide.
+    """
     packages = _json_stream(execute([_tool_path(tools, "go"), "list", "-json", "./..."]))
-    included = {
-        _path(str(Path(_string(package["Dir"])) / path), root)
-        for package in packages
-        for path in _strings(package.get("GoFiles", []))
-    }
-    if not set(paths) <= included:
-        raise AnalysisUnavailable(
-            "Some declared Go source files are excluded by the active build configuration"
+    if any(package.get("Error") or package.get("DepsErrors") for package in packages):
+        raise AnalysisUnavailable("Go packages failed to load in the host build")
+    included: set[str] = set()
+    constrained: set[str] = set()
+    for package in packages:
+        directory = Path(_string(package["Dir"]))
+        for key in ("GoFiles", "CgoFiles"):
+            included.update(
+                _path(str(directory / path), root) for path in _strings(package.get(key, []))
+            )
+        constrained.update(
+            _path(str(directory / path), root)
+            for path in _strings(package.get("IgnoredGoFiles", []))
         )
+    if not set(paths) & included:
+        raise AnalysisUnavailable(
+            "Every declared Go source file is excluded by the active build configuration"
+        )
+    excluded = {
+        path: "build constraints exclude it from the host build"
+        if path in constrained
+        else "no package of the host build lists it (nested module or ignored directory)"
+        for path in paths
+        if path not in included
+    }
+    environment = _object(
+        json.loads(
+            execute([_tool_path(tools, "go"), "env", "-json", "GOOS", "GOARCH", "CGO_ENABLED"])
+        )
+    )
+    build = {key: _string(environment.get(key)) for key in ("GOOS", "GOARCH", "CGO_ENABLED")}
     diagnostics = _json_stream(
         execute(
             [
@@ -623,7 +651,7 @@ def _go_unused(
                 "ignored": diagnostic.get("ignored", False),
             }
         )
-    return rows
+    return rows, excluded, build
 
 
 RUST_COMMAND = [
@@ -824,6 +852,8 @@ def _collect_language_analysis(
     functions: list[dict[str, object]] = []
     unanalyzed: dict[str, str] = {}
     candidates: list[dict[str, object]] = []
+    excluded: dict[str, str] = {}
+    build: dict[str, str] | None = None
     complexity_tool = tools["go_analysis" if language == "go" else "rca"]
     try:
         if complexity_tool["status"] != "available":
@@ -843,13 +873,10 @@ def _collect_language_analysis(
                 raise AnalysisUnavailable(tool["reason"])
             if language == "go" and tools["go"]["status"] != "available":
                 raise AnalysisUnavailable(tools["go"]["reason"])
-            candidates = (
-                (_python_unused if language == "python" else _go_unused)(
-                    root, paths, tools, execute
-                )
-                if paths
-                else []
-            )
+            if language == "python":
+                candidates = _python_unused(root, paths, tools, execute) if paths else []
+            elif paths:
+                candidates, excluded, build = _go_unused(root, paths, tools, execute)
         unused_status = {"status": "available", "reason": None}
     except (AnalysisUnavailable, SyntaxError) as exc:
         unused_status = {"status": "unavailable", "reason": str(exc)}
@@ -883,6 +910,13 @@ def _collect_language_analysis(
         else [],
         "complexity_unanalyzed": unanalyzed,
         "functions": functions,
+        # Dead code partitions the declared population too: Go analyzes the files its host
+        # build compiles and lists the rest with a reason, under the recorded build settings.
+        "dead_code_analyzed_paths": [path for path in paths if path not in excluded]
+        if unused_status["status"] == "available"
+        else [],
+        "dead_code_excluded": excluded,
+        "dead_code_build": build,
         "unused_candidates": candidates,
         "metrics": {
             "cognitive": complexity_status,
