@@ -681,7 +681,28 @@ def test_native_completion_failure_overrides_a_passing_verifier(
     assert bool(status["alerts"]["items"]) is (not native_completion)
 
 
-def test_native_completion_failures_alert_per_arm_from_current_receipts(tmp_path: Path) -> None:
+def test_a_failed_native_completion_stays_unknown_when_no_existing_test_ran(
+    tmp_path: Path,
+) -> None:
+    # As the report scores it: a withheld overlap result with no pass-to-pass test passing.
+    root = _run(tmp_path / "run", states=STATES, ledger=True)
+    handoff = root / "evidence/attempts/a1/handoff"
+    _write(handoff / "correctness.json", {"checks": {"behavior": None, "native_completion": False}})
+    _write(handoff / "execution.json", {"treatment_error": "treatment failed"})
+    _write(handoff / "verifier-result.json", {
+        "patch_sha256": "ab" * 32,
+        "reason": "trusted verifier tests overwrite authored patch paths",
+        "native_verifier_result": {"rewards": {
+            "reward": 0, "f2p_passed": 0, "f2p_total": 3, "p2p_passed": 0, "p2p_total": 9,
+        }},
+    })
+
+    row = next(r for r in run_status.run_status(root, containers=False)["attempts"] if r["id"] == "a1")
+
+    assert (row["outcome"], row["outcome_reason"]) == ("unknown", "treatment failed")
+
+
+def test_native_completion_failures_alert_per_arm_from_saved_receipts(tmp_path: Path) -> None:
     root = _run(tmp_path / "run", states=dict.fromkeys(STATES, "complete"), ledger=False)
     entries = [{**row, "task_id": "task-b" if row["id"] == "a4" else "task-a"}
                for row in ENTRIES]

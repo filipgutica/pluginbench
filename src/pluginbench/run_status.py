@@ -100,13 +100,14 @@ def _failure_reason(error: object) -> str | None:
 def _outcome(handoff: Path) -> tuple[str, str | None]:
     """pass, overlap_pass, fail, empty, or unknown with a saved failure or verifier reason."""
     checks = ((_read(handoff / "correctness.json") or {}).get("checks") or {})
-    # A passing verifier or empty patch cannot rescue a coding session that failed its checks.
+    verifier = _read(handoff / "verifier-result.json") or {}
+    # A passing verifier or empty patch cannot rescue a coding session that failed its checks;
+    # the report scores it as a failed receipt, which a withheld overlap result can leave unknown.
     if checks.get("native_completion") is False:
         current = handoff / "execution-current.json"
         execution = _read(current if current.is_file() else handoff / "execution.json") or {}
         reason = _failure_reason(execution.get("treatment_error") or execution.get("error"))
-        return "fail", reason or "native completion failed"
-    verifier = _read(handoff / "verifier-result.json") or {}
+        return correctness_state("fail", verifier), reason or "native completion failed"
     if verifier.get("patch_sha256") == _EMPTY_PATCH:
         return "empty", None
     behavior = checks.get("behavior")
