@@ -1876,7 +1876,9 @@ def test_reference_agents_admit_their_patch_exactly_as_paid_attempts_do(
     monkeypatch.setattr(harbor, "_native_cleanup_projects", lambda **kwargs: {"status": "complete"})
     results = harbor.run_reference_agents(identity, tmp_path / "check")
     rows = evaluation._reference_agent_rows(results)
-    findings = blocking_findings({"reference-task": rows}, require_ready=False)
+    findings = blocking_findings(
+        {"reference-task": rows}, require_ready=False, max_not_ready_share=None
+    )
     # A broken export or reconstruction must block before any paid attempt hits it.
     if failure == "export":
         assert findings == [
