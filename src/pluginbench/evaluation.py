@@ -40,6 +40,7 @@ from pluginbench.measurement_profiles import (
     MeasurementSettings,
     blocking_findings,
     not_measured,
+    not_ready_share_warnings,
     capability_plan,
     prepare_profiles,
     probe_measurements,
@@ -828,15 +829,22 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
         repeats=config.repeats,
         identity=vanilla_identity,
     )
-    findings = blocking_findings(matrix, require_ready=config.measurement_settings.require_ready)
+    findings = blocking_findings(
+        matrix,
+        require_ready=config.measurement_settings.require_ready,
+        max_not_ready_share=config.measurement_settings.max_not_ready_share,
+    )
     # Decided once here and saved with the run: status and the report read this list. Under
     # require_ready a broken measure blocks instead, so nothing is skipped.
     skipped = [] if config.measurement_settings.require_ready else not_measured(matrix)
-    for row in skipped:
-        warning = (
+    for warning in [
+        *(
             f"{row['task']}: {row['measure']} is broken, so it is not measured for this task: "
             f"{row['reason']}"
-        )
+            for row in skipped
+        ),
+        *not_ready_share_warnings(matrix, config.measurement_settings.max_not_ready_share),
+    ]:
         if progress:
             progress("Warning: " + warning)
         warnings.append(warning)
@@ -1891,8 +1899,15 @@ def _prepare_measure(
         for task, by in rows.items()
         if tasks is None or task in tasks
     }
-    if findings := blocking_findings(matrix, require_ready=settings.require_ready):
+    if findings := blocking_findings(
+        matrix,
+        require_ready=settings.require_ready,
+        max_not_ready_share=settings.max_not_ready_share,
+    ):
         raise ValueError("cannot add these measurements: " + "; ".join(findings))
+    if progress:
+        for warning in not_ready_share_warnings(matrix, settings.max_not_ready_share):
+            progress("Warning: " + warning)
     current = _selected_revision(selection, "measurement_revision")
     plan: dict[str, object] = {
         "measurements": measurements,

@@ -1079,6 +1079,33 @@ def _analysis_candidates(
     return candidates, identities
 
 
+def _declared_partition(
+    report: dict[str, object],
+    keys: tuple[str, str],
+    *,
+    label: str,
+    declared: set[str],
+    available: bool,
+) -> tuple[set[str], dict[str, str]]:
+    """Read one metric's split of the declared files into analyzed and set aside with reasons.
+
+    An available metric splits every declared file and analyzes at least one; an unavailable
+    metric splits none.
+    """
+    paths = set(_strings(report.get(keys[0]), "analyzed paths"))
+    reasons = _object(report.get(keys[1]), f"unanalyzed {label} paths")
+    if not all(isinstance(reason, str) and reason for reason in reasons.values()):
+        raise ValueError(f"unanalyzed {label} paths require reasons")
+    skipped = {path: str(reason) for path, reason in reasons.items()}
+    if paths & set(skipped) or not paths | set(skipped) <= declared:
+        raise ValueError(f"{label} partition overlaps or escapes declared source")
+    if available and (paths | set(skipped) != declared or (declared and not paths)):
+        raise ValueError(f"available {label} must partition the declared source population")
+    if not available and (paths or skipped):
+        raise ValueError(f"unavailable {label} must not partition declared source")
+    return paths, skipped
+
+
 def _analysis(
     report: dict[str, object],
     files: set[str],
@@ -1114,25 +1141,41 @@ def _analysis(
         for key in ("cognitive", "cyclomatic", "dead_code")
     }
     complexity_available = complete["cognitive"] and complete["cyclomatic"]
+    build = report.get("dead_code_build")
     if version == "language-analysis-v1":
-        # v1 analyzed every declared file or reported complexity unavailable.
-        complexity_paths, unanalyzed = analyzed, {}
+        # v1 analyzed every declared file or reported the metric unavailable.
+        unanalyzed: dict[str, str] = {}
+        excluded: dict[str, str] = {}
+        complexity_paths, dead_paths = analyzed, analyzed
     else:
-        complexity_paths = set(_strings(report.get("complexity_analyzed_paths"), "analyzed paths"))
-        reasons = _object(report.get("complexity_unanalyzed"), "unanalyzed complexity paths")
-        if not all(isinstance(reason, str) and reason for reason in reasons.values()):
-            raise ValueError("unanalyzed complexity paths require reasons")
-        unanalyzed = {path: str(reason) for path, reason in reasons.items()}
-        if complexity_paths & set(unanalyzed) or not complexity_paths | set(unanalyzed) <= analyzed:
-            raise ValueError("complexity partition overlaps or escapes declared source")
-        if complexity_available and (
-            complexity_paths | set(unanalyzed) != analyzed or (analyzed and not complexity_paths)
+        complexity_paths, unanalyzed = _declared_partition(
+            report,
+            ("complexity_analyzed_paths", "complexity_unanalyzed"),
+            label="complexity",
+            declared=analyzed,
+            available=complexity_available,
+        )
+        dead_paths, excluded = _declared_partition(
+            report,
+            ("dead_code_analyzed_paths", "dead_code_excluded"),
+            label="dead code",
+            declared=analyzed,
+            available=complete["dead_code"],
+        )
+        if (report.get("language") != "go" or not complete["dead_code"]) and (
+            excluded or build is not None
         ):
-            raise ValueError("available complexity must partition the declared source population")
-        if not complexity_available and (complexity_paths or unanalyzed):
-            raise ValueError("unavailable complexity must not partition declared source")
+            raise ValueError("only available Go dead code records a build population")
+        if build is not None and (
+            not isinstance(build, dict)
+            or set(build) != {"GOOS", "GOARCH", "CGO_ENABLED"}
+            or not all(isinstance(value, str) for value in build.values())
+        ):
+            raise ValueError("the dead-code build records GOOS, GOARCH and CGO_ENABLED")
+        if excluded and build is None:
+            raise ValueError("files outside the dead-code build require its build settings")
     functions = _analysis_functions(report, analyzed=complexity_paths, root=root, complete=complete)
-    candidates, identities = _analysis_candidates(report, analyzed=analyzed, root=root)
+    candidates, identities = _analysis_candidates(report, analyzed=dead_paths, root=root)
     return {
         **_function_population(functions),
         "complexity_complete_for_declared_scope": complexity_available and not unanalyzed,
@@ -1142,7 +1185,11 @@ def _analysis(
         "metric_statuses": statuses,
         "dead_code": len(candidates) if complete["dead_code"] else None,
         "dead_finding_identities": identities if complete["dead_code"] else None,
-        "dead_code_complete_for_declared_scope": complete["dead_code"],
+        "dead_code_complete_for_declared_scope": complete["dead_code"] and not excluded,
+        # The declared files dead code covers, or None when dead code is unavailable.
+        "dead_code_analyzed_paths": sorted(dead_paths) if complete["dead_code"] else None,
+        "dead_code_excluded": dict(sorted(excluded.items())),
+        "dead_code_build": build,
         "dead_code_detection": "unused candidates under the named analyzer and build settings; not semantic deadness or absence proof",
         "analyzed_paths": sorted(analyzed),
         "unused_candidates": candidates,
@@ -1779,14 +1826,59 @@ def _function_changes(
     }
 
 
-def _dead_changes(left: dict[str, object], right: dict[str, object]) -> dict[str, object]:
+def _dead_population_drift(
+    left: dict[str, object], right: dict[str, object], changed_paths: set[str] | None
+) -> str | None:
+    """Why the two snapshots' dead-code populations do not cover the attempt's changes alike.
+
+    Only Go sets declared files aside. Findings stay comparable while every changed file is in
+    both builds and each file present on both snapshots keeps its build membership.
+    """
+    excluded = [
+        set(_object(row.get("dead_code_excluded") or {}, "excluded dead-code paths"))
+        for row in (left, right)
+    ]
+    if not any(excluded):
+        return None
+    if changed_paths is None:
+        return "a bound source diff is required while declared files are outside the dead-code build"
+    reasons = []
+    changed = sorted(changed_paths & (excluded[0] | excluded[1]))
+    if changed:
+        reasons.append("changed files outside the dead-code build: " + ", ".join(changed))
+    declared = [set(_strings(row.get("analyzed_paths"), "analyzed paths")) for row in (left, right)]
+    moved = sorted(
+        path
+        for path in (declared[0] & declared[1]) - changed_paths
+        if (path in excluded[0]) != (path in excluded[1])
+    )
+    if moved:
+        reasons.append("files that changed dead-code build membership: " + ", ".join(moved))
+    return "; ".join(reasons) or None
+
+
+def _dead_changes(
+    left: dict[str, object], right: dict[str, object], changed_paths: set[str] | None
+) -> dict[str, object]:
+    """Introduced and resolved unused findings; `changed_paths` are the attempt's changed files."""
     identities = [row.get("dead_finding_identities") for row in (left, right)]
+    # A Go population that leaves files outside its build is still usable for the files inside it.
     if not all(
-        row.get("dead_code_complete_for_declared_scope") is True for row in (left, right)
+        row.get("dead_code_complete_for_declared_scope") is True
+        or isinstance(row.get("dead_code_analyzed_paths"), list)
+        for row in (left, right)
     ) or not all(isinstance(value, list) for value in identities):
         return {
             "status": "unavailable",
             "reason": "complete graph populations and unambiguous declaration identities required on both snapshots",
+            "introduced_count": None,
+            "resolved_count": None,
+        }
+    drift = _dead_population_drift(left, right, changed_paths)
+    if drift is not None:
+        return {
+            "status": "incomplete",
+            "reason": drift,
             "introduced_count": None,
             "resolved_count": None,
         }
@@ -2130,7 +2222,13 @@ def compare_evidence(
         if kind in {"fallow", "analysis"}:
             comparison = _object(result[kind], "static analysis comparison")
             comparison.update(_function_changes(left_metrics, right_metrics, change))
-            comparison["dead_findings"] = _dead_changes(left_metrics, right_metrics)
+            comparison["dead_findings"] = _dead_changes(
+                left_metrics,
+                right_metrics,
+                None
+                if change is None
+                else set(_object(change.get("changed_line_ranges"), "changed-line ranges")),
+            )
             if kind == "analysis":
                 dead = _object(comparison["dead_findings"], "unused candidate comparison")
                 dead["limitations"] = (

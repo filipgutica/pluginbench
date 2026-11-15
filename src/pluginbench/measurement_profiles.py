@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 import fnmatch
+from fractions import Fraction
 import hashlib
 import json
 import os
@@ -13,7 +14,15 @@ import subprocess
 import tomllib
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from pluginbench.assessment_metrics import (
     inspect_snapshot,
@@ -143,6 +152,13 @@ class MeasurementSettings(BaseModel):
         default=False,
         description="Requires every selected measurement to be ready on every task before coding.",
     )
+    max_not_ready_share: Fraction | None = Field(
+        default=None,
+        description=(
+            "Stops the check when a selected measurement is not ready on more than this share "
+            'of tasks, given as an exact fraction such as "1/3" or a decimal such as 0.25.'
+        ),
+    )
 
     @field_validator("test_contribution", mode="before")
     @classmethod
@@ -151,10 +167,32 @@ class MeasurementSettings(BaseModel):
             raise ValueError(REMOVED_TEST_CONTRIBUTION)
         return None
 
+    @field_validator("max_not_ready_share", mode="before")
+    @classmethod
+    def decimal_share(cls, value: object) -> object:
+        # An unquoted YAML 0.33 arrives as a float; read it as the decimal written, 33/100.
+        return Fraction(str(value)) if isinstance(value, float) else value
+
+    @field_validator("max_not_ready_share")
+    @classmethod
+    def proper_share(cls, value: Fraction | None) -> Fraction | None:
+        if value is not None and not 0 < value < 1:
+            raise ValueError("max_not_ready_share must be greater than 0 and less than 1")
+        return value
+
     @model_validator(mode="after")
     def safe_scopes(self) -> MeasurementSettings:
         _validate_scopes([self.source_scope, self.test_scope])
         return self
+
+    @model_serializer(mode="wrap")
+    def omit_unset_share(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        # Saved runs and comparison identities without a share keep their earlier shape, so an
+        # earlier build still reads them and refuses them by schema version, not this new key.
+        data: dict[str, object] = handler(self)
+        if self.max_not_ready_share is None:
+            data.pop("max_not_ready_share", None)
+        return data
 
 
 def selected_measurements(selection: Iterable[str] | None) -> frozenset[str]:
@@ -247,14 +285,31 @@ def _ready_nowhere(matrix: dict[str, dict[str, dict[str, object]]]) -> list[str]
     ]
 
 
+def _not_ready_shares(
+    matrix: dict[str, dict[str, dict[str, object]]],
+) -> dict[str, tuple[list[str], int]]:
+    """For each selected measure, the tasks where it is not ready and the number of tasks."""
+    shares: dict[str, tuple[list[str], int]] = {}
+    for task, rows in matrix.items():
+        for name, row in rows.items():
+            if name in MEASUREMENT_NAMES:
+                tasks, total = shares.get(name, ([], 0))
+                shares[name] = ([*tasks, task] if row["state"] != "ready" else tasks, total + 1)
+    return shares
+
+
 def blocking_findings(
-    matrix: dict[str, dict[str, dict[str, object]]], *, require_ready: bool
+    matrix: dict[str, dict[str, dict[str, object]]],
+    *,
+    require_ready: bool,
+    max_not_ready_share: Fraction | None,
 ) -> list[str]:
     """Rows that stop the run before any coding call.
 
     A broken check of the coding environment, submission source or reference agents blocks. A
-    broken measure blocks only when no task can measure it; otherwise that task is recorded as not
-    measured (see not_measured). require_ready makes every row that is not ready block.
+    broken measure blocks only when no task can measure it, or when it is not ready (broken or
+    not configured) on more than max_not_ready_share of the tasks; otherwise that task is recorded
+    as not measured (see not_measured). require_ready makes every row that is not ready block.
     """
     nowhere = _ready_nowhere(matrix)
     findings = [
@@ -267,9 +322,32 @@ def blocking_findings(
             or (name in nowhere if name in MEASUREMENT_NAMES else row["state"] == "broken")
         )
     ]
+    if max_not_ready_share is not None:
+        findings += [
+            f"{name} is not ready on {len(tasks)} of {total} tasks, more than "
+            f"max_not_ready_share {max_not_ready_share}: {', '.join(tasks)}"
+            for name, (tasks, total) in _not_ready_shares(matrix).items()
+            # A measure ready nowhere already blocks below with a clearer reason.
+            if name not in nowhere and Fraction(len(tasks), total) > max_not_ready_share
+        ]
     return findings + [
         f"{name} is ready on no task, so the run would measure nothing for it"
         for name in nowhere
+    ]
+
+
+def not_ready_share_warnings(
+    matrix: dict[str, dict[str, dict[str, object]]], max_not_ready_share: Fraction | None
+) -> list[str]:
+    """Measures not ready on exactly max_not_ready_share of tasks: one more dropout would block."""
+    if max_not_ready_share is None:
+        return []
+    return [
+        f"{name} is not ready on {len(tasks)} of {total} tasks, exactly max_not_ready_share "
+        f"{max_not_ready_share}, so any task that fails to measure it during the run crosses "
+        f"that share: {', '.join(tasks)}"
+        for name, (tasks, total) in _not_ready_shares(matrix).items()
+        if Fraction(len(tasks), total) == max_not_ready_share
     ]
 
 
@@ -646,9 +724,19 @@ def _metric_readiness(metric: str, first: dict[str, object]) -> tuple[bool, obje
             if metric == "dead_code" and not ready:
                 reason = first.get("dead_code_incomplete_reason") or reason
         if metric == "dead_code" and ready:
-            comparison = _dead_changes(first, first)
+            comparison = _dead_changes(first, first, set())
             ready = comparison["status"] == "available"
             reason = comparison.get("reason")
+            excluded = first.get("dead_code_excluded")
+            if ready and isinstance(excluded, dict) and excluded:
+                # Findings in the build are still compared; an attempt that changes one of these
+                # files, or moves a file into or out of the build, is recorded as incomplete.
+                build = first.get("dead_code_build")
+                assert isinstance(build, dict)  # _analysis requires it beside excluded files
+                settings = " ".join(f"{key}={value}" for key, value in build.items())
+                reason = f"declared source files outside the dead-code build ({settings}): " + (
+                    "; ".join(f"{path} ({detail})" for path, detail in sorted(excluded.items()))
+                )
     elif metric == "mutation":
         # The starting source changes no line, so a report with no candidates is ready.
         ready = first.get("status") == "available" or first.get("candidate_count") == 0

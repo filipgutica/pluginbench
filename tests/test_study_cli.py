@@ -1472,6 +1472,45 @@ def test_check_refuses_a_measure_that_no_task_can_measure(
     assert not checkable["calls"]
 
 
+def _set_max_not_ready_share(checkable: dict[str, Any], share: str) -> None:
+    raw = yaml.safe_load(checkable["path"].read_text())
+    raw["measurement_settings"]["max_not_ready_share"] = share
+    checkable["path"].write_text(yaml.safe_dump(raw))
+
+
+@pytest.mark.parametrize("share", ["1/3", "1/2"])
+def test_check_blocks_a_measure_not_ready_on_more_than_the_share_of_tasks(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch, share: str
+) -> None:
+    # Coverage is broken on one of the two tasks.
+    _coverage_broken_on_one_task(checkable, monkeypatch)
+    _set_max_not_ready_share(checkable, share)
+
+    result = CliRunner().invoke(
+        cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"])]
+    )
+
+    report = json.loads((checkable["output"] / "check.json").read_text())
+    if share == "1/3":
+        assert result.exit_code == 2
+        finding = (
+            "coverage is not ready on 1 of 2 tasks, more than max_not_ready_share 1/3: "
+            "arbitrary-native-task"
+        )
+        assert report["status"] == "blocked" and finding in report["findings"]
+        assert finding in result.stderr
+    else:
+        assert result.exit_code == 0, result.stderr
+        warning = (
+            "coverage is not ready on 1 of 2 tasks, exactly max_not_ready_share 1/2, so any "
+            "task that fails to measure it during the run crosses that share: "
+            "arbitrary-native-task"
+        )
+        assert report["status"] == "ready" and warning in report["warnings"]
+        assert "Warning: " + warning in result.stdout
+    assert not checkable["calls"]
+
+
 def _run_checkable(
     checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Path, Any, list[str], list[str]]:
@@ -3354,6 +3393,37 @@ def test_measure_lists_a_new_measure_broken_on_one_task_as_not_measured(
         ("covered-native-task", "measured", False),
         ("arbitrary-native-task", "unavailable", True),
     }
+
+
+@pytest.mark.parametrize("share", ["1/3", "1/2"])
+def test_measure_applies_the_run_max_not_ready_share(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch, share: str
+) -> None:
+    _coverage_broken_on_one_task(checkable, monkeypatch)
+    _set_max_not_ready_share(checkable, share)
+    raw = yaml.safe_load(checkable["path"].read_text())
+    raw["measurements"].remove("coverage")
+    checkable["path"].write_text(yaml.safe_dump(raw))
+    root, result, _, _ = _run_checkable(checkable, monkeypatch)
+    assert result.exit_code == 0, result.stderr + result.stdout
+
+    added = CliRunner().invoke(
+        cli.app, ["measure", str(root), "--measurements", "coverage", "--revision", "m1", "--yes"]
+    )
+
+    if share == "1/3":
+        assert added.exit_code == 2
+        assert (
+            "coverage is not ready on 1 of 2 tasks, more than max_not_ready_share 1/3: "
+            "arbitrary-native-task"
+        ) in added.stderr
+        assert not (root / "evidence/observer-revisions/m1").exists()
+    else:
+        assert added.exit_code == 0, added.stderr + added.stdout
+        assert (
+            "Warning: coverage is not ready on 1 of 2 tasks, exactly max_not_ready_share 1/2"
+        ) in added.stdout
+        assert evaluation._load_selection(root)["measurement_revision"] == "m1"
 
 
 def test_run_on_a_stopped_run_codes_only_unfinished_slots_then_measures_and_reviews(

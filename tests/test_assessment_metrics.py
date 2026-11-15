@@ -1716,6 +1716,9 @@ def _analysis_evidence(
             sorted(set(sources) - set(unanalyzed)) if available else []
         )
         report["complexity_unanalyzed"] = unanalyzed
+        report["dead_code_analyzed_paths"] = sorted(sources) if available else []
+        report["dead_code_excluded"] = {}
+        report["dead_code_build"] = None
     metrics = assessment_metrics._analysis(report, set(sources), ["*"], root, config)
     return {
         "snapshot_digest": inspect_snapshot(root)["digest"],
@@ -1925,6 +1928,9 @@ def test_malformed_complexity_partition_is_rejected(
         "analyzed_paths": sorted(sources),
         "complexity_analyzed_paths": analyzed,
         "complexity_unanalyzed": unanalyzed,
+        "dead_code_analyzed_paths": sorted(sources),
+        "dead_code_excluded": {},
+        "dead_code_build": None,
         "functions": [{**row, "end_line": row["line"]} for row in functions],
         "metrics": {"cognitive": status, "cyclomatic": status, "dead_code": status},
         "unused_candidates": [],
@@ -1935,6 +1941,150 @@ def test_malformed_complexity_partition_is_rejected(
         "settings": {},
         "supported_suffixes": [".py"],
     }
+    with pytest.raises(ValueError, match=message):
+        assessment_metrics._analysis(report, set(sources), ["*"], tmp_path, config)
+
+
+GO_LIVE = "package live\n\nfunc Live() int { return 1 }\n"
+GO_UNUSED = "\nfunc unused() int { return 2 }\n"
+GO_IGNORED = "//go:build ignore\n\npackage main\n\nfunc main() {}\n"
+GO_BUILD = {"GOOS": "linux", "GOARCH": "amd64", "CGO_ENABLED": "0"}
+NOT_BUILT = "build constraints exclude it from the host build"
+
+
+def _go_dead_report(
+    sources: dict[str, str], excluded: dict[str, str], candidates: list[dict[str, object]]
+) -> dict[str, object]:
+    status = {"status": "available"}
+    return {
+        "version": "language-analysis-v2",
+        "language": "go",
+        "tools": {},
+        "settings": {},
+        "supported_suffixes": [".go"],
+        "analyzed_paths": sorted(sources),
+        "complexity_analyzed_paths": sorted(sources),
+        "complexity_unanalyzed": {},
+        "dead_code_analyzed_paths": sorted(set(sources) - set(excluded)),
+        "dead_code_excluded": excluded,
+        "dead_code_build": GO_BUILD,
+        "functions": [],
+        "metrics": {"cognitive": status, "cyclomatic": status, "dead_code": status},
+        "unused_candidates": candidates,
+    }
+
+
+GO_CONFIG: dict[str, object] = {
+    "language": "go",
+    "tool_identities": {},
+    "settings": {},
+    "supported_suffixes": [".go"],
+}
+
+
+def _go_dead_evidence(
+    root: Path,
+    sources: dict[str, str],
+    excluded: dict[str, str],
+    candidates: list[dict[str, object]],
+) -> dict[str, object]:
+    for path, source in sources.items():
+        _write(root / path, source)
+    report = _go_dead_report(sources, excluded, candidates)
+    metrics = assessment_metrics._analysis(report, set(sources), ["*"], root, GO_CONFIG)
+    return {
+        "snapshot_digest": inspect_snapshot(root)["digest"],
+        "analysis": {"provenance": GO_CONFIG, "metrics": metrics},
+    }
+
+
+UNUSED_CANDIDATE = {"path": "live.go", "line": 5, "category": "U1000", "symbol": "func unused"}
+
+
+@pytest.mark.parametrize(
+    "after_sources,after_excluded,status,reason",
+    [
+        # anko's packages/*NotGo1x.go and tengo's stdlib/gensrcmods.go stay untouched.
+        (
+            {"live.go": GO_LIVE + GO_UNUSED, "gen.go": GO_IGNORED},
+            {"gen.go": NOT_BUILT},
+            "available",
+            None,
+        ),
+        (
+            {"live.go": GO_LIVE + GO_UNUSED, "gen.go": GO_IGNORED + "// edited\n"},
+            {"gen.go": NOT_BUILT},
+            "incomplete",
+            "changed files outside the dead-code build: gen.go",
+        ),
+        # A new nested go.mod moves an untouched file out of the build.
+        (
+            {"live.go": GO_LIVE + GO_UNUSED, "gen.go": GO_IGNORED, "other.go": GO_LIVE},
+            {"gen.go": NOT_BUILT, "other.go": "no package of the host build lists it"},
+            "incomplete",
+            "files that changed dead-code build membership: other.go",
+        ),
+    ],
+)
+def test_go_dead_code_compares_findings_inside_a_stable_host_build(
+    tmp_path: Path,
+    after_sources: dict[str, str],
+    after_excluded: dict[str, str],
+    status: str,
+    reason: str | None,
+) -> None:
+    before = _go_dead_evidence(
+        tmp_path / "before",
+        {"live.go": GO_LIVE, "gen.go": GO_IGNORED, "other.go": GO_LIVE},
+        {"gen.go": NOT_BUILT},
+        [],
+    )
+    after_sources = {"other.go": GO_LIVE, **after_sources}
+    after = _go_dead_evidence(tmp_path / "after", after_sources, after_excluded, [UNUSED_CANDIDATE])
+    change = compare_snapshots(tmp_path / "before", tmp_path / "after")
+    dead = _metric(
+        _metric(compare_evidence(before, after, change=change), "analysis"), "dead_findings"
+    )
+    assert dead["status"] == status
+    assert dead.get("reason") == reason
+    assert dead["introduced_count"] == (1 if status == "available" else None)
+
+
+def test_go_dead_code_is_ready_with_files_outside_the_build_disclosed(tmp_path: Path) -> None:
+    evidence = _go_dead_evidence(
+        tmp_path, {"live.go": GO_LIVE, "gen.go": GO_IGNORED}, {"gen.go": NOT_BUILT}, []
+    )
+    metrics = _metric(_metric(evidence, "analysis"), "metrics")
+    assert metrics["dead_code_complete_for_declared_scope"] is False
+    assert _metric_readiness("dead_code", metrics) == (
+        True,
+        "declared source files outside the dead-code build "
+        f"(GOOS=linux GOARCH=amd64 CGO_ENABLED=0): gen.go ({NOT_BUILT})",
+    )
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        ({"dead_code_analyzed_paths": ["gen.go", "live.go"]}, "overlaps or escapes"),
+        ({"dead_code_excluded": {}}, "must partition the declared"),
+        ({"dead_code_build": None}, "require its build settings"),
+        ({"dead_code_build": {"GOOS": "linux"}}, "GOOS, GOARCH and CGO_ENABLED"),
+        ({"language": "python"}, "only available Go dead code"),
+        (
+            {"unused_candidates": [{**UNUSED_CANDIDATE, "path": "gen.go", "line": 1}]},
+            "escapes analyzed source",
+        ),
+    ],
+)
+def test_malformed_go_dead_code_partition_is_rejected(
+    tmp_path: Path, change: dict[str, object], message: str
+) -> None:
+    sources = {"live.go": GO_LIVE, "gen.go": GO_IGNORED}
+    for path, source in sources.items():
+        _write(tmp_path / path, source)
+    report = {**_go_dead_report(sources, {"gen.go": NOT_BUILT}, []), **change}
+    config = {**GO_CONFIG, "language": report["language"]}
     with pytest.raises(ValueError, match=message):
         assessment_metrics._analysis(report, set(sources), ["*"], tmp_path, config)
 

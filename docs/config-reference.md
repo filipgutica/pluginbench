@@ -55,6 +55,7 @@ See [report format](metrics.md#report-files) for schema versions and legacy repo
 | `measurement_settings.coverage_profiles.<name>.source_scope` | `list[str] \| None` | `null` | no | Selects repository-relative source patterns for this coverage profile. |
 | `measurement_settings.test_contribution` | `NoneType` | `null` | no | Retains the removed test contribution setting as null for saved evaluations. |
 | `measurement_settings.require_ready` | `bool` | `false` | no | Requires every selected measurement to be ready on every task before coding. |
+| `measurement_settings.max_not_ready_share` | `fractions.Fraction \| None` | `null` | no | Stops the check when a selected measurement is not ready on more than this share of tasks, given as an exact fraction such as "1/3" or a decimal such as 0.25. |
 | `reviewer` | `Reviewer \| None` | `null` | no | Configures the independent reviewer exactly when review is selected. |
 | `reviewer.harness` | `Literal['codex', 'claude']` | `—` | yes | Selects the coding or review CLI. |
 | `reviewer.model` | `str` | `—` | yes | Selects the model ID, with an exact claude-* ID required for Claude. |

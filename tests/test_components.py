@@ -61,8 +61,10 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # v2: rust-code-analysis files the parser rejects are listed in a complexity
             # partition instead of making complexity unavailable for the whole repository, so a
             # profile v1 froze would now report complexity it reported unavailable.
+            # v2 also partitions Go dead code by the host build. Version 2 is unreleased, so it
+            # carries both partitions.
             "language_analysis.py": (
-                "3b6a7e0592f5dac65a3d98991cac8a35fd3d3e64a26f984cb77d5f639003e031"
+                "0c3a0a4b5c34e2e85265ed83255f8c44135a0cfa5d31784e96b72ff64ea0baac"
             ),
         },
     ),
