@@ -203,7 +203,7 @@ test('Markdown shell commands are command plates: $ on each command, none on con
 
 test('Markdown source samples are library code blocks; JSON gets syntax colours', async ({ page }) => {
   await page.goto('/pluginbench/running-evaluations/');
-  await expect(page.locator('[data-code-language="yaml"] > .fg-code-block:not([data-command])')).toHaveCount(5);
+  await expect(page.locator('[data-code-language="yaml"] > .fg-code-block:not([data-command])')).toHaveCount(6);
   const json = page.locator('[data-code-language="json"] .fg-code-block__pre');
   await expect(json.locator('span[style*="--color-syntax-string"]').first()).toBeVisible();
 });
@@ -233,6 +233,6 @@ test('code blocks keep their height when Copy appears, so deep links do not drif
   const before = await heights(staticPage);
   await staticContext.close();
   await page.goto('/pluginbench/running-evaluations/');
-  await expect(page.locator('[data-code-language] .fg-code-block__copy')).toHaveCount(9);
+  await expect(page.locator('[data-code-language] .fg-code-block__copy')).toHaveCount(11);
   expect(await heights(page)).toEqual(before);
 });

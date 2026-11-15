@@ -23,7 +23,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             "codex.py": "185d0c33e1389051ddfb97a85c08978a6f65773c2378d601cdf608f4b0c17ccf",
             # The Claude launch contract; tests/test_codex_identity.py proves Codex launches equal.
             # Measurement and regrade skip launch-only runtime fields; coding checks are unchanged.
-            "harbor_backend.py": "a0279b9c8733f5097fe8160bfac1f7e125a2f82703ede84d8b5c68b6d69b34de",
+            # Audited command hooks keep native usage; with no audited_hooks every launch is
+            # unchanged, and vanilla has no hooks, so this stays v1.
+            "harbor_backend.py": "f184e4a2fca458967010849d574424cd8bd4fb75cf98f0371060941544260af4",
             "processes.py": "0170e0a4902fc610d19b50ed5656c601474adad97b9b8d6fb5b08c6ab6ad00d1",
             # Claude admission dispatch, and the Codex config's V2 spawn-override hide. The
             # vanilla cache refuses a cohort saved without the hide by its config, so this stays v1.

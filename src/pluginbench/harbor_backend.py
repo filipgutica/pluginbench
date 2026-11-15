@@ -24,11 +24,14 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import uuid4
+
+from pydantic import TypeAdapter
 
 from pluginbench import codex, components, isolation, submissions, native_treatments
 from pluginbench import claude, claude_launch, claude_treatments, saved_usage
@@ -2363,6 +2366,7 @@ def _native_completion(
     launch: dict[str, object],
     failure: BaseException | None,
     started: float,
+    audited_hooks: Sequence[saved_usage.AuditedHook],
 ) -> None:
     artifacts = area / "artifacts"
     host = str(launch["harness"]).removesuffix("-cli")
@@ -2451,14 +2455,23 @@ def _native_completion(
                     )
             execution["native_treatment"] = treatment_receipt
             # Command hooks may execute subprocesses outside native session logging.
-            # Preserve native observed usage, but never present it as complete total cost.
-            if _native_object(treatment_receipt.get("hooks"), "native hooks").get("hooks"):
+            # Preserve native observed usage, but never present it as complete total cost,
+            # unless every hook is on the evaluation's audited list.
+            _native_object(treatment_receipt.get("hooks"), "native hooks")
+            hook_reason, audited = saved_usage.hook_rule(treatment_receipt, audited_hooks)
+            if hook_reason:
                 execution["native_session_usage"] = execution.get("usage")
                 execution["usage"] = None
                 execution["usage_accounting"] = {
                     "status": "incomplete",
-                    "reason": "command-hook subprocess usage is not independently metered",
+                    "reason": hook_reason,
                     "native_sessions": execution.get("usage_accounting"),
+                }
+            elif audited:
+                accounting = execution.get("usage_accounting")
+                execution["usage_accounting"] = {
+                    **(accounting if isinstance(accounting, dict) else {}),
+                    "audited_hooks": audited,
                 }
         except (OSError, ValueError) as error:
             execution["treatment_error"] = str(error)
@@ -2484,6 +2497,9 @@ def invoke_native(
     host = str(entry["host"])
     treatment = Treatment.model_validate(protocol.get("treatment", {}))
     capabilities = NativeCapabilities.model_validate(protocol.get("capabilities", {}))
+    audited_hooks = TypeAdapter(list[saved_usage.AuditedHook]).validate_python(
+        protocol.get("audited_hooks", [])
+    )
     native_treatments.admit(treatment, host)
     if prompt:
         raise ValueError("native coding task prompts must not contain treatment text")
@@ -2656,6 +2672,7 @@ def invoke_native(
             launch=launch,
             failure=failure,
             started=started,
+            audited_hooks=audited_hooks,
         )
     if failure is not None:
         raise failure

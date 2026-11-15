@@ -16,7 +16,16 @@ from typing import Literal
 from collections.abc import Callable
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    TypeAdapter,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from pluginbench import (
     baselines,
@@ -29,6 +38,7 @@ from pluginbench import (
     submissions,
 )
 from pluginbench.treatments import Treatment, resolve_treatment, treatment_inventory
+from pluginbench.saved_usage import AuditedHook
 from pluginbench.native_treatments import NativeCapabilities, admit
 from pluginbench.claude_launch import UNENFORCED_LIMITS, recorded_capabilities
 from pluginbench.claude_launch import refuse_unenforced_limits
@@ -138,6 +148,10 @@ class Evaluation(BaseModel):
     treatments: dict[str, Treatment] = Field(
         description="Maps treatment names to nonempty native packages, with vanilla included automatically."
     )
+    audited_hooks: list[AuditedHook] = Field(
+        default_factory=list,
+        description="Lists treatment command hooks audited to make no model call, so their attempts keep complete usage.",
+    )
     capabilities: NativeCapabilities = Field(
         default_factory=NativeCapabilities,
         description="Sets the same native agent capabilities for vanilla and every treatment.",
@@ -226,6 +240,15 @@ class Evaluation(BaseModel):
         if self.runner.harness == "claude":
             refuse_unenforced_limits(self.capabilities)
         return self
+
+    @model_serializer(mode="wrap")
+    def omit_unset_audits(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        # Saved evaluations without audited hooks keep their earlier shape, so an earlier build
+        # still reads them.
+        data: dict[str, object] = handler(self)
+        if not self.audited_hooks:
+            data.pop("audited_hooks", None)
+        return data
 
 
 def _resolve(base: Path, path: Path) -> Path:
@@ -942,6 +965,12 @@ def prepare_evaluation(
         "seed": config.seed,
         "timeout_seconds": config.timeout_seconds,
         "jobs": config.jobs,
+        # Only when set, so a recipe without audited hooks keeps its earlier shape.
+        **(
+            {"audited_hooks": [hook.model_dump(mode="json") for hook in config.audited_hooks]}
+            if config.audited_hooks
+            else {}
+        ),
     }
     _write(prepared / "study.json", recipe)
     comparison.update(
