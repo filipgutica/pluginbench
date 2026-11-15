@@ -1710,6 +1710,8 @@ def _function_changes(
         for row in raw_after
         if _object(row, "function")["path"] in new_paths
     ]
+    # New-file functions read only the new files on the after snapshot.
+    new_gap = _unanalyzed_changes(right, new_paths)
     status = "available" if complete else "incomplete"
     before_all = left["functions"]
     assert isinstance(before_all, list)
@@ -1734,7 +1736,16 @@ def _function_changes(
             "limitations": "line-level overlap, not AST identity or semantic change; enclosing/nested spans may both count, same-line changes may overcount, moves/renames count as changes; before/after populations are not matched functions",
         },
         "new_file_functions": {
-            "status": "available" if _unanalyzed_changes(right, new_paths) == [] else "incomplete",
+            "status": "available" if new_gap == [] else "incomplete",
+            **(
+                {}
+                if new_gap == []
+                else {
+                    "reason": "complexity population incomplete on one side"
+                    if new_gap is None
+                    else "the pinned parser did not analyze new source files: " + ", ".join(new_gap)
+                }
+            ),
             "after": {
                 **_function_population(new_functions),
                 "complete_for_declared_scope": right.get("complexity_complete_for_declared_scope")

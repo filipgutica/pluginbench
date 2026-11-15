@@ -1759,6 +1759,23 @@ def test_changed_file_without_complexity_is_incomplete_not_zero(
     assert _metric(comparison, "changed_functions")["status"] == "incomplete"
 
 
+def test_a_new_file_without_complexity_leaves_new_file_functions_incomplete(
+    tmp_path: Path,
+) -> None:
+    comparison = _attempt(
+        tmp_path,
+        ({"src/live.py": LIVE}, [_python_function("live", 1, 2, 0, "src/live.py")], {}),
+        (
+            {"src/live.py": LIVE, BROKEN_PATH: BROKEN},
+            [_python_function("live", 1, 2, 0, "src/live.py")],
+            {BROKEN_PATH: "Python does not parse it"},
+        ),
+    )
+    new = _metric(comparison, "new_file_functions")
+    assert new["status"] == "incomplete"
+    assert new["reason"] == f"the pinned parser did not analyze new source files: {BROKEN_PATH}"
+
+
 def test_every_file_rejected_leaves_complexity_unavailable_and_not_ready(tmp_path: Path) -> None:
     evidence = _analysis_evidence(tmp_path, {BROKEN_PATH: BROKEN}, [], {}, available=False)
     metrics = _metric(_metric(evidence, "analysis"), "metrics")
