@@ -16,7 +16,7 @@ for (const width of [320, 390, 720, 801, 1280]) {
     }
     const trigger = page.getByLabel('Project: PluginBench', { exact: true });
     await trigger.click();
-    await expect(page.getByRole('navigation', { name: 'Projects', exact: true }).getByRole('link')).toHaveCount(7);
+    await expect(page.getByRole('navigation', { name: 'Projects', exact: true }).getByRole('link')).toHaveCount(8);
     await trigger.click();
     if (width <= 800) await page.locator('.fg-site-rail__menu > summary').click();
     await page.getByRole('navigation', { name: 'Documentation', exact: true }).getByRole('group', { name: 'On this page', exact: true }).getByRole('link', { name: 'Requirements', exact: true }).click();
