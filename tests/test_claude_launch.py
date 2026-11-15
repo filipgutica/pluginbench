@@ -941,6 +941,29 @@ def test_each_listed_startup_hook_runs_once_by_its_command(change: str) -> None:
     assert any(reason in error for error in _errors(events, receipt, transcript))
 
 
+def test_a_startup_hook_with_a_status_message_is_named_by_it_in_the_transcript() -> None:
+    # Real 2.1.322 coding runs of two plugins: the attachment's command is the statusMessage.
+    events, receipt, transcript = _captured("treated")
+    hook = receipt["hooks"]["hooks"][0]
+    hook["statusMessage"] = "Loading routing"
+    transcript[0]["attachment"]["command"] = "Loading routing"
+    assert _errors(events, receipt, transcript) == []
+    transcript[0]["attachment"]["command"] = hook["commandText"]
+    assert any("are not each listed hook once" in e for e in _errors(events, receipt, transcript))
+
+
+def test_startup_hooks_that_share_a_status_message_fail_the_attempt() -> None:
+    # Hook A run twice and hook B never would otherwise match the listing.
+    events, receipt, transcript = _captured("two-hooks")
+    for hook in receipt["hooks"]["hooks"]:
+        hook["statusMessage"] = "Loading"
+    for entry in transcript:
+        entry["attachment"]["command"] = "Loading"
+    assert "two listed SessionStart startup hooks share a transcript name" in _errors(
+        events, receipt, transcript
+    )
+
+
 def test_a_failed_usage_check_leaves_the_attempt_usage_unvalidated(
     attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch
 ) -> None:
