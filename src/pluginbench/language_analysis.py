@@ -22,7 +22,9 @@ from pluginbench import components, isolation
 from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.code_diff import _is_test_path
 
-VERSION = "language-analysis-v1"
+# v2 adds the complexity partition: a file the pinned parser rejects no longer makes complexity
+# unavailable for the whole repository.
+VERSION = "language-analysis-v2"
 SUFFIXES = {"python": ".py", "go": ".go", "rust": ".rs"}
 PINNED = {
     "rca": ("rust-code-analysis-cli", "--version", "rust-code-analysis-cli 0.0.25"),
@@ -468,7 +470,13 @@ def _complexity(
     language: str,
     tools: dict[str, dict[str, object]],
     execute: Callable[[list[str]], str],
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], dict[str, str]]:
+    """Function rows, and each declared file the pinned parser rejects with its reason.
+
+    Go is one observer call, so it analyzes every file or raises. Rust-code-analysis runs per
+    file: a file it rejects is set aside, and only when it rejects every file does the whole
+    metric become unavailable. Tool failures stay metric-wide.
+    """
     if language == "go":
         rows = json.loads(
             execute([_tool_path(tools, "go_analysis"), *[str(root / path) for path in paths]])
@@ -478,15 +486,25 @@ def _complexity(
         functions = [_object(row) for row in rows]
         for row in functions:
             row["path"] = _path(_string(row["path"]), root)
-        return functions
+        return functions, {}
     rows = []
+    unanalyzed: dict[str, str] = {}
     for path in paths:
-        if language == "python" and not ast.parse((root / path).read_bytes(), filename=path).body:
-            continue
+        if language == "python":
+            try:
+                module = ast.parse((root / path).read_bytes(), filename=path)
+            except SyntaxError as exc:
+                unanalyzed[path] = f"Python does not parse {path}: {exc.msg}"
+                continue
+            if not module.body:
+                continue
         errors = execute([_tool_path(tools, "rca"), "-C", "ERROR", "-p", str(root / path)])
         found = re.search(r"Found nodes: (\d+)", errors)
-        if found is None or int(found[1]):
-            raise AnalysisUnavailable(f"Pinned parser does not accept {path}")
+        if found is None:
+            raise AnalysisUnavailable(f"Pinned parser reported no error-node count for {path}")
+        if int(found[1]):
+            unanalyzed[path] = f"Pinned parser does not accept {path}"
+            continue
         space = RCASpace.model_validate_json(
             execute([_tool_path(tools, "rca"), "-m", "-O", "json", "-p", str(root / path)])
         )
@@ -495,11 +513,15 @@ def _complexity(
             space.metrics.nom.functions if language == "python" else space.metrics.nom.total
         )
         if len(functions) != expected:
-            raise AnalysisUnavailable(
-                f"Parser did not expose complete declared function spans for {path}"
-            )
+            unanalyzed[path] = f"Parser did not expose complete declared function spans for {path}"
+            continue
         rows.extend(functions)
-    return rows
+    if paths and len(unanalyzed) == len(paths):
+        raise AnalysisUnavailable(
+            f"Pinned parser analyzed none of {len(paths)} declared source files: "
+            + "; ".join(unanalyzed.values())
+        )
+    return rows, unanalyzed
 
 
 def _python_unused(
@@ -800,12 +822,15 @@ def _collect_language_analysis(
         return _execute(argv, root, destination, readable, timeout)
 
     functions: list[dict[str, object]] = []
+    unanalyzed: dict[str, str] = {}
     candidates: list[dict[str, object]] = []
     complexity_tool = tools["go_analysis" if language == "go" else "rca"]
     try:
         if complexity_tool["status"] != "available":
             raise AnalysisUnavailable(complexity_tool["reason"])
-        functions = _complexity(root, paths, language, tools, execute) if paths else []
+        functions, unanalyzed = (
+            _complexity(root, paths, language, tools, execute) if paths else ([], {})
+        )
         complexity_status = {"status": "available", "reason": None}
     except (AnalysisUnavailable, SyntaxError) as exc:
         complexity_status = {"status": "unavailable", "reason": str(exc)}
@@ -850,6 +875,13 @@ def _collect_language_analysis(
         "tools": tools,
         "supported_suffixes": [suffix],
         "analyzed_paths": paths,
+        # Complexity partitions the declared population: rows come only from the analyzed
+        # files, and each file the parser rejected is listed with its reason. An unavailable
+        # metric analyzed no file.
+        "complexity_analyzed_paths": [path for path in paths if path not in unanalyzed]
+        if complexity_status["status"] == "available"
+        else [],
+        "complexity_unanalyzed": unanalyzed,
         "functions": functions,
         "unused_candidates": candidates,
         "metrics": {

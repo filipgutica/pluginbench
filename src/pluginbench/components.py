@@ -15,7 +15,8 @@ from pathlib import Path
 
 VERSIONS: dict[str, int] = {
     "launcher": 1,
-    "analysis_observer": 1,
+    # Version 2 sets aside files the parser rejects instead of failing complexity everywhere.
+    "analysis_observer": 2,
     # Version 2 adds Go line populations, so a profile version 1 froze reads differently.
     "coverage_observer": 2,
     "mutation_observer": 1,

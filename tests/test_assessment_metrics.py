@@ -1615,6 +1615,255 @@ def _python_candidate_evidence(
     return {"analysis": {"provenance": config, "metrics": metrics}}
 
 
+LIVE = "def live():\n    return 1\n"
+ADDED = "def added(x):\n    if x:\n        return 2\n    return 3\n"
+BROKEN = "def broken(:\n"
+BROKEN_PATH = "examples/new_candidates-none.py"
+
+
+def _analysis_evidence(
+    root: Path,
+    sources: dict[str, str],
+    functions: list[dict[str, object]],
+    unanalyzed: dict[str, str] | None,
+    *,
+    available: bool = True,
+) -> dict[str, object]:
+    """Python language-analysis evidence; `unanalyzed=None` writes a v1 report."""
+    for path, source in sources.items():
+        _write(root / path, source)
+    config: dict[str, object] = {
+        "language": "python",
+        "tool_identities": {},
+        "settings": {},
+        "supported_suffixes": [".py"],
+    }
+    status = {"status": "available" if available else "unavailable"}
+    report: dict[str, object] = {
+        "version": "language-analysis-v1" if unanalyzed is None else "language-analysis-v2",
+        "language": "python",
+        "tools": {},
+        "settings": {},
+        "supported_suffixes": [".py"],
+        "analyzed_paths": sorted(sources),
+        "functions": [
+            {**row, "end_line": _integer(row["line"]) + _integer(row["line_count"]) - 1}
+            for row in functions
+        ],
+        "metrics": {"cognitive": status, "cyclomatic": status, "dead_code": status},
+        "unused_candidates": [],
+    }
+    if unanalyzed is not None:
+        report["complexity_analyzed_paths"] = (
+            sorted(set(sources) - set(unanalyzed)) if available else []
+        )
+        report["complexity_unanalyzed"] = unanalyzed
+    metrics = assessment_metrics._analysis(report, set(sources), ["*"], root, config)
+    return {
+        "snapshot_digest": inspect_snapshot(root)["digest"],
+        "analysis": {"provenance": config, "metrics": metrics},
+    }
+
+
+def _integer(value: object) -> int:
+    assert isinstance(value, int)
+    return value
+
+
+def _python_function(
+    name: str, line: int, size: int, cognitive: int, path: str
+) -> dict[str, object]:
+    return {**_function(name, line, size, cognitive, path=path), "col": None}
+
+
+def _attempt(
+    tmp_path: Path,
+    before: tuple[dict[str, str], list[dict[str, object]], dict[str, str]],
+    after: tuple[dict[str, str], list[dict[str, object]], dict[str, str]],
+) -> dict[str, object]:
+    left = _analysis_evidence(tmp_path / "before", *before)
+    right = _analysis_evidence(tmp_path / "after", *after)
+    change = compare_snapshots(tmp_path / "before", tmp_path / "after")
+    return _metric(compare_evidence(left, right, change=change), "analysis")
+
+
+def test_untouched_unparseable_file_leaves_attempt_complexity_available(tmp_path: Path) -> None:
+    rejected = {BROKEN_PATH: "Python does not parse it"}
+    comparison = _attempt(
+        tmp_path,
+        (
+            {"src/live.py": LIVE, BROKEN_PATH: BROKEN},
+            [_python_function("live", 1, 2, 0, "src/live.py")],
+            rejected,
+        ),
+        (
+            {"src/live.py": LIVE + ADDED, BROKEN_PATH: BROKEN},
+            [
+                _python_function("live", 1, 2, 0, "src/live.py"),
+                _python_function("added", 3, 4, 1, "src/live.py"),
+            ],
+            rejected,
+        ),
+    )
+    code_added = _metric(comparison, "code_added")
+    assert code_added["status"] == "available"
+    assert code_added["net_cognitive"] == 1 and code_added["functions_added"] == 1
+    # The repository scan stays partial; only the changed files are complete.
+    assert code_added["complete_for_declared_scope"] is False
+    assert _metric(comparison, "changed_functions")["status"] == "available"
+
+
+@pytest.mark.parametrize(
+    "after",
+    [
+        pytest.param(
+            (
+                {"src/live.py": LIVE, BROKEN_PATH: BROKEN + ADDED + LIVE},
+                [_python_function("live", 1, 2, 0, "src/live.py")],
+                {BROKEN_PATH: "Python does not parse it"},
+            ),
+            id="changed-unparseable-file",
+        ),
+        pytest.param(
+            (
+                # The functions leave the rejected file, which now parses and holds none.
+                {"src/live.py": LIVE, BROKEN_PATH: "VALUE = 1\n", "src/moved.py": ADDED},
+                [
+                    _python_function("live", 1, 2, 0, "src/live.py"),
+                    _python_function("added", 1, 4, 1, "src/moved.py"),
+                ],
+                {},
+            ),
+            id="functions-moved-out-of-unparseable-file",
+        ),
+    ],
+)
+def test_changed_file_without_complexity_is_incomplete_not_zero(
+    tmp_path: Path, after: tuple[dict[str, str], list[dict[str, object]], dict[str, str]]
+) -> None:
+    comparison = _attempt(
+        tmp_path,
+        (
+            {"src/live.py": LIVE, BROKEN_PATH: BROKEN + ADDED},
+            [_python_function("live", 1, 2, 0, "src/live.py")],
+            {BROKEN_PATH: "Python does not parse it"},
+        ),
+        after,
+    )
+    code_added = _metric(comparison, "code_added")
+    assert code_added["status"] == "incomplete"
+    assert code_added["reason"] == (
+        f"the pinned parser did not analyze changed source files: {BROKEN_PATH}"
+    )
+    assert "net_cognitive" not in code_added
+    assert _metric(comparison, "changed_functions")["status"] == "incomplete"
+
+
+def test_every_file_rejected_leaves_complexity_unavailable_and_not_ready(tmp_path: Path) -> None:
+    evidence = _analysis_evidence(tmp_path, {BROKEN_PATH: BROKEN}, [], {}, available=False)
+    metrics = _metric(_metric(evidence, "analysis"), "metrics")
+    assert metrics["complexity_complete_for_declared_scope"] is False
+    assert metrics["complexity_analyzed_paths"] is None
+    assert _metric_readiness("cognitive", metrics) == (False, None)
+
+
+def test_unparseable_untouched_file_is_ready_with_disclosure(tmp_path: Path) -> None:
+    evidence = _analysis_evidence(
+        tmp_path,
+        {"src/live.py": LIVE, BROKEN_PATH: BROKEN},
+        [_python_function("live", 1, 2, 0, "src/live.py")],
+        {BROKEN_PATH: "Python does not parse it"},
+    )
+    metrics = _metric(_metric(evidence, "analysis"), "metrics")
+    assert metrics["complexity_complete_for_declared_scope"] is False
+    assert _metric_readiness("cognitive", metrics) == (
+        True,
+        f"declared source files without complexity: {BROKEN_PATH} (Python does not parse it)",
+    )
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_v1_language_analysis_evidence_evaluates_as_before(tmp_path: Path, available: bool) -> None:
+    sources = {"src/live.py": LIVE}
+    before = ([_python_function("live", 1, 2, 0, "src/live.py")] if available else [], None)
+    after = (
+        [
+            _python_function("live", 1, 2, 0, "src/live.py"),
+            _python_function("added", 3, 4, 1, "src/live.py"),
+        ]
+        if available
+        else [],
+        None,
+    )
+    left = _analysis_evidence(tmp_path / "before", sources, *before, available=available)
+    right = _analysis_evidence(
+        tmp_path / "after", {"src/live.py": LIVE + ADDED}, *after, available=available
+    )
+    metrics = _metric(_metric(right, "analysis"), "metrics")
+    assert metrics["complexity_complete_for_declared_scope"] is available
+    assert metrics["complexity_unanalyzed"] == {}
+    change = compare_snapshots(tmp_path / "before", tmp_path / "after")
+    code_added = _metric(
+        _metric(compare_evidence(left, right, change=change), "analysis"), "code_added"
+    )
+    if available:
+        assert code_added["status"] == "available"
+        assert code_added["net_cognitive"] == 1
+        assert code_added["complete_for_declared_scope"] is True
+    else:
+        assert code_added["status"] == "incomplete"
+        assert code_added["reason"] == "complexity population incomplete on one side"
+
+
+@pytest.mark.parametrize(
+    ("analyzed", "unanalyzed", "functions", "message"),
+    [
+        (["src/live.py"], {"src/live.py": "rejected"}, [], "overlaps or escapes"),
+        (["src/live.py", "src/other.py"], {}, [], "overlaps or escapes"),
+        (["src/live.py"], {}, [], "must partition the declared"),
+        ([], {"src/live.py": "rejected", BROKEN_PATH: "rejected"}, [], "must partition"),
+        (
+            ["src/live.py"],
+            {BROKEN_PATH: "rejected"},
+            [_python_function("broken", 1, 1, 0, BROKEN_PATH)],
+            "escapes analyzed source",
+        ),
+    ],
+)
+def test_malformed_complexity_partition_is_rejected(
+    tmp_path: Path,
+    analyzed: list[str],
+    unanalyzed: dict[str, str],
+    functions: list[dict[str, object]],
+    message: str,
+) -> None:
+    sources = {"src/live.py": LIVE, BROKEN_PATH: BROKEN}
+    for path, source in sources.items():
+        _write(tmp_path / path, source)
+    status = {"status": "available"}
+    report: dict[str, object] = {
+        "version": "language-analysis-v2",
+        "language": "python",
+        "tools": {},
+        "settings": {},
+        "supported_suffixes": [".py"],
+        "analyzed_paths": sorted(sources),
+        "complexity_analyzed_paths": analyzed,
+        "complexity_unanalyzed": unanalyzed,
+        "functions": [{**row, "end_line": row["line"]} for row in functions],
+        "metrics": {"cognitive": status, "cyclomatic": status, "dead_code": status},
+        "unused_candidates": [],
+    }
+    config: dict[str, object] = {
+        "language": "python",
+        "tool_identities": {},
+        "settings": {},
+        "supported_suffixes": [".py"],
+    }
+    with pytest.raises(ValueError, match=message):
+        assessment_metrics._analysis(report, set(sources), ["*"], tmp_path, config)
+
+
 @pytest.mark.parametrize("remove_second", [False, True])
 def test_python_unused_declarations_match_lexical_scopes_after_line_shifts_and_deletion(
     tmp_path: Path, remove_second: bool

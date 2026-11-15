@@ -1049,9 +1049,10 @@ def _analysis(
     root: Path,
     config: dict[str, object],
 ) -> dict[str, object]:
-    if report.get("version") != "language-analysis-v1" or report.get("language") != config.get(
+    version = report.get("version")
+    if version not in {"language-analysis-v1", "language-analysis-v2"} or report.get(
         "language"
-    ):
+    ) != config.get("language"):
         raise ValueError("language analysis version or language differs from frozen configuration")
     if report.get("tools") != config.get("tool_identities"):
         raise ValueError("analysis tools differ from frozen configuration")
@@ -1075,11 +1076,32 @@ def _analysis(
         key: _object(statuses.get(key), key).get("status") == "available"
         for key in ("cognitive", "cyclomatic", "dead_code")
     }
-    functions = _analysis_functions(report, analyzed=analyzed, root=root, complete=complete)
+    complexity_available = complete["cognitive"] and complete["cyclomatic"]
+    if version == "language-analysis-v1":
+        # v1 analyzed every declared file or reported complexity unavailable.
+        complexity_paths, unanalyzed = analyzed, {}
+    else:
+        complexity_paths = set(_strings(report.get("complexity_analyzed_paths"), "analyzed paths"))
+        reasons = _object(report.get("complexity_unanalyzed"), "unanalyzed complexity paths")
+        if not all(isinstance(reason, str) and reason for reason in reasons.values()):
+            raise ValueError("unanalyzed complexity paths require reasons")
+        unanalyzed = {path: str(reason) for path, reason in reasons.items()}
+        if complexity_paths & set(unanalyzed) or not complexity_paths | set(unanalyzed) <= analyzed:
+            raise ValueError("complexity partition overlaps or escapes declared source")
+        if complexity_available and (
+            complexity_paths | set(unanalyzed) != analyzed or (analyzed and not complexity_paths)
+        ):
+            raise ValueError("available complexity must partition the declared source population")
+        if not complexity_available and (complexity_paths or unanalyzed):
+            raise ValueError("unavailable complexity must not partition declared source")
+    functions = _analysis_functions(report, analyzed=complexity_paths, root=root, complete=complete)
     candidates, identities = _analysis_candidates(report, analyzed=analyzed, root=root)
     return {
         **_function_population(functions),
-        "complexity_complete_for_declared_scope": complete["cognitive"] and complete["cyclomatic"],
+        "complexity_complete_for_declared_scope": complexity_available and not unanalyzed,
+        # The declared files with complexity rows, or None when complexity is unavailable.
+        "complexity_analyzed_paths": sorted(complexity_paths) if complexity_available else None,
+        "complexity_unanalyzed": dict(sorted(unanalyzed.items())),
         "metric_statuses": statuses,
         "dead_code": len(candidates) if complete["dead_code"] else None,
         "dead_finding_identities": identities if complete["dead_code"] else None,
@@ -1547,15 +1569,21 @@ def _code_added(
     changed_paths: set[str],
     new_paths: list[str],
     complete: bool,
+    incomplete_reason: str = "complexity population incomplete on one side",
+    declared_scope_complete: bool = True,
 ) -> dict[str, object]:
-    """Net source complexity and structure an attempt added, independent of inherited code."""
+    """Net source complexity and structure an attempt added, independent of inherited code.
+
+    `complete` covers the changed files the result sums; `declared_scope_complete` only reports
+    whether both snapshots also analyzed every other declared file.
+    """
     method = "all source functions in changed files after the edit minus the same files before; unchanged functions cancel, new functions count in full, deleted ones subtract; tests and Go closure rows inside a declaration (already in its score) excluded"
     limitations = "added and grown functions match on path and name with line numbers removed; nested functions, overloads, renames and Go methods sharing a name on different receivers in one file can misclassify them; net sums do not depend on matching"
     if not complete:
         return {
             "status": "incomplete",
             "complete_for_declared_scope": False,
-            "reason": "complexity population incomplete on one side",
+            "reason": incomplete_reason,
             "method": method,
             "limitations": limitations,
         }
@@ -1613,10 +1641,25 @@ def _code_added(
         ),
         "hotspot_threshold": HOTSPOT_COGNITIVE,
         "function_count_reported": len(after_rows),
-        "complete_for_declared_scope": True,
+        "complete_for_declared_scope": declared_scope_complete,
         "method": method,
         "limitations": limitations,
     }
+
+
+def _unanalyzed_changes(metrics: dict[str, object], paths: set[str]) -> list[str] | None:
+    """Declared source files among `paths` on this snapshot that have no complexity rows.
+
+    None when the snapshot has no complexity to rely on. A file counts only when its analysis
+    is recorded, so a changed file the parser rejected is never read as having no functions.
+    """
+    if metrics.get("complexity_complete_for_declared_scope") is True:
+        return []
+    analyzed = metrics.get("complexity_analyzed_paths")
+    if not isinstance(analyzed, list):
+        return None
+    declared = set(_strings(metrics.get("analyzed_paths"), "analyzed paths"))
+    return sorted(paths & declared - set(analyzed))
 
 
 def _function_changes(
@@ -1631,8 +1674,15 @@ def _function_changes(
         }
     ranges = _object(change.get("changed_line_ranges"), "changed-line ranges")
     populations = []
-    complete = all(
-        row.get("complexity_complete_for_declared_scope") is True for row in (left, right)
+    # Only changed files enter these results, so files the parser rejected elsewhere in the
+    # repository leave them complete.
+    gaps = [_unanalyzed_changes(metrics, set(ranges)) for metrics in (left, right)]
+    complete = all(gap == [] for gap in gaps)
+    missing = sorted({path for gap in gaps for path in gap or []})
+    reason = (
+        "complexity population incomplete on one side"
+        if None in gaps
+        else "the pinned parser did not analyze changed source files: " + ", ".join(missing)
     )
     for side, metrics in (("before", left), ("after", right)):
         raw = metrics["functions"]
@@ -1670,18 +1720,21 @@ def _function_changes(
             changed_paths=set(ranges),
             new_paths=sorted(new_paths),
             complete=complete,
+            incomplete_reason=reason,
+            declared_scope_complete=all(
+                row.get("complexity_complete_for_declared_scope") is True for row in (left, right)
+            ),
         ),
         "changed_functions": {
             "status": status,
+            **({} if complete else {"reason": reason}),
             "before": populations[0],
             "after": populations[1],
             "method": "reported function line..line+line_count-1 overlaps a zero-context Git hunk on that snapshot; zero-width edits strictly inside the span count; includes tests when scoped",
             "limitations": "line-level overlap, not AST identity or semantic change; enclosing/nested spans may both count, same-line changes may overcount, moves/renames count as changes; before/after populations are not matched functions",
         },
         "new_file_functions": {
-            "status": "available"
-            if right.get("complexity_complete_for_declared_scope") is True
-            else "incomplete",
+            "status": "available" if _unanalyzed_changes(right, new_paths) == [] else "incomplete",
             "after": {
                 **_function_population(new_functions),
                 "complete_for_declared_scope": right.get("complexity_complete_for_declared_scope")
