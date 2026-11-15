@@ -42,6 +42,7 @@ from pluginbench import (
     remeasure,
     run_lock,
     run_status,
+    saved_usage,
     source_only,
     study,
     submissions,
@@ -1530,6 +1531,49 @@ def _run_checkable(
         ["run", str(checkable["path"]), "--output", str(root), "--yes", "--foreground"],
     )
     return root, result, calls, reviews
+
+
+@pytest.mark.parametrize("audited", [False, True])
+def test_audited_hooks_are_saved_only_when_set_and_reach_launch_and_report(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch, audited: bool
+) -> None:
+    audit = {"plugin_sha256": "d" * 64, "hook": "sha256:" + "a" * 64, "note": "No model call."}
+    raw = yaml.safe_load(checkable["path"].read_text())
+    if audited:
+        raw["audited_hooks"] = [audit]
+        checkable["path"].write_text(yaml.safe_dump(raw))
+    backend = _coding_and_review_backend([], [], timeout=raw["timeout_seconds"], interrupt_at=None)
+    protocols: list[object] = []
+
+    def coding(**kwargs: Any) -> dict[str, Any]:
+        protocols.append(kwargs["protocol"].get("audited_hooks"))
+        return backend(**kwargs)
+
+    revalidated: list[list[dict[str, str]]] = []
+    revalidate = saved_usage.revalidate_usage
+
+    def spy(execution: dict[str, Any], receipt: Path, audited_hooks: Any = ()) -> dict[str, Any]:
+        revalidated.append([hook.model_dump() for hook in audited_hooks])
+        return revalidate(execution, receipt, audited_hooks)
+
+    monkeypatch.setattr(codex, "invoke", backend)
+    monkeypatch.setattr(harbor_backend, "invoke_native", coding)
+    monkeypatch.setattr(study, "revalidate_usage", spy)
+    root = checkable["output"]
+    result = CliRunner().invoke(
+        cli.app, ["run", str(checkable["path"]), "--output", str(root), "--yes", "--foreground"]
+    )
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    expected = [audit] if audited else []
+    # Unset, the saved settings keep their earlier shape.
+    for saved in ("evaluation.json", "inputs/study.json", "evidence/frozen/resolved-recipe.json"):
+        settings = json.loads((root / saved).read_text())
+        assert settings.get("audited_hooks", []) == expected
+        assert ("audited_hooks" in settings) == audited
+    assert protocols and all(protocol == expected for protocol in protocols)
+    # The report revalidates each attempt with the run's frozen list.
+    assert revalidated and all(hooks == expected for hooks in revalidated)
 
 
 def test_run_reports_a_measure_broken_on_one_task_as_not_measured(

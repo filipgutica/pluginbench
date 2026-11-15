@@ -7,6 +7,7 @@ No Docker, credentials or model call: the container runs commands on the host, a
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import json
 import os
@@ -250,6 +251,7 @@ class Attempt:
     container: Container
     treatment: Treatment
     subagents: bool
+    audited_hooks: list[dict[str, str]] = field(default_factory=list)
 
     def invoke(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         self.container.install_cli()
@@ -273,6 +275,7 @@ class Attempt:
             "models": {"claude": MODEL},
             "treatment": self.treatment.model_dump(mode="json"),
             "capabilities": {"subagents": self.subagents},
+            "audited_hooks": self.audited_hooks,
         }
         monkeypatch.setattr(harbor, "assert_runtime", lambda expected, **kwargs: expected)
         monkeypatch.setattr(harbor, "_assert_native_image", lambda image, expected: None)
@@ -438,6 +441,55 @@ def test_a_claude_attempt_runs_the_pinned_command_with_the_pinned_subscription_e
         assert saved["usage_accounting"]["rule"] == "equal"
         assert revalidated["usage"] == saved["usage"]
         assert revalidated["usage_validation"]["status"] == "validated"
+
+
+# A Claude hook's identity: its event, matcher and command, as the hook listing gives them.
+DEMO_HOOK = "sha256:" + hashlib.sha256(json.dumps(["SessionStart", "startup", HOOK]).encode()).hexdigest()
+
+
+@pytest.mark.parametrize("listed", ["demo", "other"])
+def test_a_fresh_attempt_whose_hooks_are_all_audited_keeps_complete_usage(
+    attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch, listed: str
+) -> None:
+    made = attempt(treated=True)
+    plugin = admit(made.treatment, "claude")["plugins"][0]["sha256"]
+    audit = {
+        "plugin_sha256": plugin if listed == "demo" else "0" * 64,
+        "hook": DEMO_HOOK,
+        "note": "Prints a fixed JSON line; no model call, no model CLI.",
+    }
+    made.audited_hooks = [audit]
+    made.invoke(monkeypatch)
+    saved = json.loads((made.area / "artifacts/execution.json").read_text())
+    # Discovery lists the hook disabled, yet the coding session runs it.
+    (hook,) = saved["native_treatment"]["hooks"]["hooks"]
+    assert hook["disabled"] is True
+    (made.area / "execution.json").write_text(json.dumps(saved))
+    audited = [saved_usage.AuditedHook.model_validate(audit)]
+    revalidated = saved_usage.revalidate_usage(saved, made.area / "execution.json", audited)
+    if listed == "demo":
+        assert saved["usage"] is not None and "native_session_usage" not in saved
+        assert saved["usage_accounting"]["status"] == "complete"
+        identity = {"plugin_sha256": plugin, "hook": DEMO_HOOK}
+        assert saved["usage_accounting"]["audited_hooks"] == [identity]
+        # Revalidation with the run's frozen list reaches the same decision.
+        assert revalidated["usage"] == saved["usage"]
+        assert revalidated["usage_validation"]["status"] == "validated"
+        assert revalidated["usage_accounting"]["audited_hooks"] == [identity]
+        # Without the list, the same saved attempt is incomplete, as before.
+        unlisted = saved_usage.revalidate_usage(saved, made.area / "execution.json")
+        assert unlisted["usage"] is None
+        assert unlisted["usage_validation"]["reasons"] == [saved_usage.HOOK_REASON]
+    else:
+        reason = (
+            f"{saved_usage.HOOK_REASON}; unaudited hooks: demo SessionStart "
+            f"(plugin_sha256 {plugin}, hook {DEMO_HOOK})"
+        )
+        assert saved["usage"] is None and saved["native_session_usage"] is not None
+        assert saved["usage_accounting"]["status"] == "incomplete"
+        assert saved["usage_accounting"]["reason"] == reason
+        assert revalidated["usage"] is None
+        assert revalidated["usage_validation"]["reasons"] == [reason]
 
 
 def test_a_token_in_a_saved_artifact_refuses_the_attempt(

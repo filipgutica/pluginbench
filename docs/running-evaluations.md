@@ -108,6 +108,37 @@ The receipt is saved as `native-treatment.json`. After coding, the attempt fails
 
 A failed check keeps the attempt and its verifier result. Its execution outcome is a failure, with the reason in `execution.json`.
 
+### Audited command hooks
+
+A command hook runs a subprocess that the native session logs do not meter. An attempt whose treatment has any command hook keeps its session usage as `native_session_usage` and reports total usage as unknown. This includes a Claude Code hook that the receipt marks `disabled`: discovery lists hooks with `disableAllHooks`, and the coding run still executes them.
+
+To keep such an attempt's usage, audit each of its hooks and list it under `audited_hooks`:
+
+```yaml
+audited_hooks:
+  - plugin_sha256: <64 hex characters>
+    hook: "sha256:<a>/sha256:<b>"
+    note: <what the hook runs, and that it makes no model call and starts no model CLI>
+```
+
+An entry is an audit statement: the hook, and every file its command runs, makes no model call and starts no model CLI, such as `codex` or `claude`. Read the hook's command and the files it runs at that `plugin_sha256` before you add the entry. Record what you found in `note`.
+
+Each entry names one hook by two values:
+
+| Field | Value |
+| --- | --- |
+| `plugin_sha256` | The plugin's `sha256` in `native-treatment.json` at `inventory.plugins[].sha256`. It hashes every file of the plugin, so any change to the plugin needs a new audit. |
+| `hook` | Codex: the hook's `currentHash` in `native-treatment.json` at `hooks.hooks[]`, in the form `sha256:<a>/sha256:<b>`. It does not cover the files the command runs; `plugin_sha256` does. Claude Code: the receipt has no hook hash, so the identity is `sha256:` and the SHA-256 of the JSON array of the hook's `event`, `matcher` (`""` when absent) and `commandText`. |
+
+To compute a Claude Code hook's identity:
+
+```sh
+python3 -c 'import hashlib, json, sys; print("sha256:" + hashlib.sha256(json.dumps(sys.argv[1:]).encode()).hexdigest())' \
+  SessionStart 'startup|clear|compact' '"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd" session-start'
+```
+
+When every hook of an attempt is listed, the attempt keeps its usage, and `usage_accounting.audited_hooks` records the identities that applied. When the list is set and any hook is not on it, usage stays unknown, and the reason names each unaudited hook with both values. Without `audited_hooks`, usage, its reason and the saved settings are as before. The list is frozen with the run, and `report` checks usage again with that frozen list, so it reaches the same decision. To change the list, start a new run.
+
 ## Execution and isolation
 
 Installing PluginBench also installs Harbor 0.24.0; see [Install](../README.md#install). Docker must run Linux containers through a local Unix endpoint, with Compose and Buildx available. The current runner accepts single-step Linux CPU tasks with separate verifiers and Dockerfiles or prebuilt images. Shared verifiers, task-authored Compose, multistep tasks, GPUs, and TPUs are rejected before model calls.
@@ -185,7 +216,7 @@ Known limits:
 - On a 2.1.322 compaction run, each compact boundary in the root transcript bounds the runner model's untranscribed excess. Input may exceed the transcripts by at most `preTokens` plus a 4,000-token compaction-prompt allowance, and output by at most `postTokens`. Bounds of several compactions add up. A boundary without these counts, or an excess above the bound, leaves usage unavailable.
 - The bound is empirical, calibrated on one manual compaction whose call read 1,995 tokens more than `preTokens` and wrote 421 output tokens. `postTokens` estimates the context after compaction and does not contain the call's thinking. A genuine automatic compaction can exceed the bound, for example with a large tool result or long thinking; it is refused, not accepted.
 - On a CLI version other than 2.1.322 the one-sided rule applies, and the runner model's untranscribed excess has no upper bound.
-- Command hooks make total usage unknown, as for Codex; see [Measurements](#measurements).
+- Command hooks make total usage unknown, as for Codex, unless every hook is audited; see [Audited command hooks](#audited-command-hooks).
 
 ### Container boundary
 
@@ -239,7 +270,7 @@ Cleanup removes owned containers, networks, sidecars, temporary homes, and job c
 
 | Measurement | Meaning and current support |
 | --- | --- |
-| Tokens and time | Native root and reachable descendant input, cached input, uncached input, output and reasoning-output totals, plus coding time, deduplicated by session. Missing final totals or child logs make totals unknown; observed usage remains a lower bound. Arbitrary hook subprocess usage is unmetered, so hook treatments retain native-session usage separately and report total usage as unknown. Reviewer usage is separate. |
+| Tokens and time | Native root and reachable descendant input, cached input, uncached input, output and reasoning-output totals, plus coding time, deduplicated by session. Missing final totals or child logs make totals unknown; observed usage remains a lower bound. Arbitrary hook subprocess usage is unmetered, so hook treatments retain native-session usage separately and report total usage as unknown, unless every hook is [audited](#audited-command-hooks). Reviewer usage is separate. |
 | Verification iterations (transcript count) | `iterations`: verification commands and command → production/test edit → next command sequences, counted within each root/subagent trace and summed per attempt. Only workspace edits count; commands refused before starting and ad-hoc scripts are excluded. Interrupted commands that started count with unknown outcomes. Missing traces or parse ambiguity that could change a count are incomplete, never zero. Failed commands are descriptive and exclude masked statuses; missing exit codes and unresolved final commands stay unknown. Shell-command edits and hook-run tests are unseen. |
 | Lines | Source/test lines added and removed, and added test lines that repeat in six-line blocks. Default scope covers the repository, with tests classified separately. |
 | Complexity | Net cognitive/cyclomatic complexity the submission added to source code, functions and source files added, and new or grown functions with a cognitive score above 15. Fallow covers JS/TS; pinned language analyzers cover Python, Go, and Rust. |

@@ -20,13 +20,21 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from pluginbench import baselines, claude, codex, harbor_backend, provider_stops, submissions
 from pluginbench import trial_containers
 from pluginbench.arms import normalize_arm_name
 from pluginbench.codex_events import failed_before_first_turn
-from pluginbench.saved_usage import revalidate_usage
+from pluginbench.saved_usage import AuditedHook, revalidate_usage
 from pluginbench.harbor_backend import binary_native_reward as _binary_native_reward
 from pluginbench.treatments import (
     Treatment, resolve_treatment, freeze_treatment, treatment_inventory,
@@ -101,6 +109,8 @@ class StudyRecipe(BaseModel):
     seed: int = Field(default=42, strict=True)
     auth_file: Path = Path("~/.codex/auth.json")
     collectors: list[Collector] = Field(default_factory=list)
+    # Command hooks whose usage counts as complete; see saved_usage.hook_rule.
+    audited_hooks: list[AuditedHook] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -138,6 +148,14 @@ class StudyRecipe(BaseModel):
         }:
             raise ValueError("unsupported Claude effort")
         return self
+
+    @model_serializer(mode="wrap")
+    def omit_unset_audits(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        # A frozen recipe without audited hooks keeps its earlier shape.
+        data: dict[str, object] = handler(self)
+        if not self.audited_hooks:
+            data.pop("audited_hooks", None)
+        return data
 
 
 @dataclass(frozen=True)
@@ -543,6 +561,7 @@ def _execute_stage(
                 "treatment": study.treatments.get(str(entry["arm"]), Treatment()).model_dump(mode="json"),
                 "capabilities": study.recipe.capabilities.model_dump(mode="json"),
                 "delivery": delivery_policy(study.recipe.harness),
+                "audited_hooks": [hook.model_dump(mode="json") for hook in study.recipe.audited_hooks],
                 **(
                     {"auth_file": str(study.recipe.auth_file)}
                     if study.recipe.harness == "codex"
@@ -1595,7 +1614,9 @@ def _run_attempts(
                     for stage in record["stages"]:
                         target = attempt_dir / stage["id"]
                         execution = json.loads((target / "execution.json").read_text())
-                        execution = revalidate_usage(execution, target / "execution.json")
+                        execution = revalidate_usage(
+                            execution, target / "execution.json", frozen.recipe.audited_hooks
+                        )
                         stage["work"] = _work(execution)
                         if stage["snapshot"] is not None:
                             regraded = harbor_backend.regrade_native(
@@ -1961,7 +1982,11 @@ def report_study(
                 "requested_reasoning_effort": protocol["effort"],
             }
     entries = {entry["id"]: entry for entry in plan["entries"]}
-    configured = json.loads((root / "frozen/resolved-recipe.json").read_text())["collectors"]
+    frozen_recipe = json.loads((root / "frozen/resolved-recipe.json").read_text())
+    configured = frozen_recipe["collectors"]
+    audited_hooks = [
+        AuditedHook.model_validate(hook) for hook in frozen_recipe.get("audited_hooks", [])
+    ]
     revised_profiles = (
         _bound_document(root, measurement_state["frozen_profiles"])
         if measurement_state is not None
@@ -1983,7 +2008,7 @@ def report_study(
         for stage in attempt["stages"]:
             reference = run["executions"][attempt["id"]][stage["id"]]
             execution = _bound_document(root, reference)
-            execution = revalidate_usage(execution, _bound_path(root, reference))
+            execution = revalidate_usage(execution, _bound_path(root, reference), audited_hooks)
             stage["work"] = {
                 **_work(execution),
                 "usage_validation": execution["usage_validation"],

@@ -554,6 +554,67 @@ def test_a_hooked_saved_codex_run_checks_the_session_usage_kept_at_launch(tmp_pa
     ]
 
 
+def _codex_hook(event: str, handler: str) -> dict[str, object]:
+    """A hook as Codex hooks/list records it, with its handler/source currentHash."""
+    return {
+        "pluginId": "demo@pluginbench-frozen",
+        "eventName": event,
+        "currentHash": f"sha256:{handler * 64}/sha256:{'b' * 64}",
+        "enabled": True,
+    }
+
+
+@pytest.mark.parametrize("audited", [("a", "c"), ("a",)])
+def test_a_saved_codex_run_whose_hooks_are_all_audited_keeps_complete_usage(
+    tmp_path: Path, audited: tuple[str, ...]
+) -> None:
+    from pluginbench.saved_usage import HOOK_REASON, AuditedHook, revalidate_usage
+
+    counts = {"input_tokens": 10, "output_tokens": 5}
+    trace = native_session("root", [counts])
+    stdout = stream({"type": "turn.completed", "usage": counts})
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    (artifacts / "stdout.jsonl").write_text(stdout)
+    (artifacts / "host-trace-0.jsonl").write_text(trace)
+    receipt = tmp_path / "execution.json"
+    receipt.write_text("{}")
+    plugin = "d" * 64
+    by_handler = {"a": _codex_hook("sessionStart", "a"), "c": _codex_hook("userPromptSubmit", "c")}
+    hooks = list(by_handler.values())
+    complete = len(audited) == 2
+    usage = codex.parse_events(stdout, [trace], "codex")["usage"]
+    # At launch an attempt whose hooks are all audited keeps usage; otherwise it moves it aside.
+    execution: dict[str, object] = {
+        "launch": {"harness": "codex-cli"},
+        "native_treatment": {
+            "inventory": {"plugins": [{"name": "demo", "sha256": plugin}]},
+            "hooks": {"hooks": hooks},
+        },
+        **({"usage": usage} if complete else {"usage": None, "native_session_usage": usage}),
+    }
+    listed = [
+        AuditedHook(
+            plugin_sha256=plugin, hook=str(by_handler[handler]["currentHash"]), note="No model call."
+        )
+        for handler in audited
+    ]
+    revalidated = revalidate_usage(execution, receipt, listed)
+    if complete:
+        assert revalidated["usage"] == usage
+        assert revalidated["usage_validation"]["status"] == "validated"
+        assert revalidated["usage_accounting"]["audited_hooks"] == [
+            {"plugin_sha256": plugin, "hook": hook["currentHash"]} for hook in hooks
+        ]
+    else:
+        assert revalidated["usage"] is None
+        assert revalidated["usage_validation"]["reasons"] == [
+            f"{HOOK_REASON}; unaudited hooks: demo userPromptSubmit "
+            f"(plugin_sha256 {plugin}, hook {hooks[1]['currentHash']})"
+        ]
+        assert "audited_hooks" not in revalidated["usage_accounting"]
+
+
 def test_native_descendant_usage_counts_session_totals_once_and_keeps_primary_identity() -> None:
     root = native_session(
         "root",

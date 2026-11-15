@@ -24,6 +24,10 @@ See [report format](metrics.md#report-files) for schema versions and legacy repo
 | `treatments.<name>.guidance` | `list[Path]` | `[]` | no | Selects UTF-8 .md or .txt instruction files relative to the config file. |
 | `treatments.<name>.skills` | `list[Path]` | `[]` | no | Selects standalone skill roots or collections relative to the config file. |
 | `treatments.<name>.plugins` | `list[Path]` | `[]` | no | Selects complete native plugin directories relative to the config file. |
+| `audited_hooks` | `list[AuditedHook]` | `[]` | no | Lists treatment command hooks audited to make no model call, so their attempts keep complete usage. |
+| `audited_hooks[].plugin_sha256` | `str` | `—` | yes | Pins the audited plugin's files by the sha256 that its treatment inventory records. |
+| `audited_hooks[].hook` | `str` | `—` | yes | Identifies the hook: Codex's currentHash, or the sha256: identity PluginBench names for a Claude hook. |
+| `audited_hooks[].note` | `str` | `—` | yes | Records the audit: the hook makes no model call and starts no model CLI. |
 | `capabilities` | `NativeCapabilities` | `{"subagents":true,"max_threads":4,"max_depth":1}` | no | Sets the same native agent capabilities for vanilla and every treatment. |
 | `capabilities.subagents` | `bool` | `true` | no | Enables native agents for vanilla and every treatment. |
 | `capabilities.max_threads` | `int` | `4` | no | Limits concurrent native children to between one and sixteen. |
