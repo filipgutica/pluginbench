@@ -696,7 +696,11 @@ _OXC_COMMIT = "836fe9d51c11981162461216f37a067fc14441a7"
 
 
 def _validated_fallow_inputs(
-    report: dict[str, object], config: dict[str, object], root: Path, inputs: set[str]
+    report: dict[str, object],
+    config: dict[str, object],
+    root: Path,
+    inputs: set[str],
+    assets: set[str],
 ) -> bool:
     """Pinned producer execution plus strict primary parses closes silent read/parse omissions."""
     validation = report.get("syntax_validation")
@@ -786,15 +790,19 @@ def _validated_fallow_inputs(
         ):
             return False
     rows = validation.get("files")
-    if not isinstance(rows, list) or len(rows) != len(inputs):
+    if not isinstance(rows, list) or len(rows) != len(inputs) + len(assets):
         return False
     observed = set()
     for row in rows:
-        if not isinstance(row, dict) or row.get("path") not in inputs:
+        if not isinstance(row, dict) or row.get("path") not in inputs | assets:
             return False
         path = row["path"]
         assert isinstance(path, str)
-        if path in observed or row.get("status") != "valid" or row.get("errors") != []:
+        if path in observed:
+            return False
+        # The primary parser reads only JS/TS, so an asset's parse status carries no meaning;
+        # its digest still proves the validator read the bound file.
+        if path in inputs and (row.get("status") != "valid" or row.get("errors") != []):
             return False
         try:
             data = (root / path).read_bytes()
@@ -804,7 +812,36 @@ def _validated_fallow_inputs(
         if row.get("source_digest") != _digest(data):
             return False
         observed.add(path)
-    return observed == inputs
+    return observed == inputs | assets
+
+
+# Fallow 3.18 also discovers and counts these web assets beside JS/TS sources.
+_FALLOW_ASSET_SUFFIXES = {".html", ".css"}
+
+
+def _fallow_assets(
+    discovery: object, functions: list[dict[str, object]], sources: set[str]
+) -> set[str] | None:
+    """Return the discovered asset paths, or None when Fallow's file population is not closed.
+
+    Closed means discovery lists every scoped source once, and its other files are allowed
+    assets with no function rows.
+    """
+    if not isinstance(discovery, dict):
+        return None
+    discovered = discovery.get("files")
+    if not isinstance(discovered, list) or not all(isinstance(path, str) for path in discovered):
+        return None
+    assets = set(discovered) - sources
+    if (
+        len(discovered) != len(set(discovered))
+        or discovery.get("file_count") != len(discovered)
+        or not sources <= set(discovered)
+        or any(Path(path).suffix.lower() not in _FALLOW_ASSET_SUFFIXES for path in assets)
+        or any(row["path"] in assets for row in functions)
+    ):
+        return None
+    return assets
 
 
 def _clone_identities(dupes: dict[str, object], files: set[str], root: Path) -> list[str] | None:
@@ -1201,13 +1238,18 @@ def _fallow(
         and Path(path).suffix.lower() not in supported_suffixes
     }
     identities = {(row["path"], row["name"], row["line"], row["col"]) for row in functions}
+    # A separate discovery receipt from the same explicit config closes the file population.
+    discovery = report.get("discovery")
+    assets = _fallow_assets(discovery, functions, scoped_source_files)
     complete_complexity = (
         bool(scoped_source_files)
         and not unsupported_source_files
         and all(type(summary.get(key)) is int for key in ("functions_analyzed", "files_analyzed"))
         and summary.get("functions_analyzed") == len(functions)
         and len(identities) == len(functions)
-        and summary.get("files_analyzed") == len(scoped_source_files)
+        and assets is not None
+        # Health analyzes every discovered file, assets included.
+        and summary.get("files_analyzed") == len(scoped_source_files) + len(assets)
     )
     duplicate_stats = _object(dupes.get("stats", {}), "fallow.dupes.stats")
     dead_counts = {key: _list_count(check, key) for key in _DEAD_FIELDS}
@@ -1220,9 +1262,6 @@ def _fallow(
         if None not in boundary_counts and boundary_rules
         else None
     )
-    # A separate discovery receipt from the same explicit config closes the file population.
-    discovery = report.get("discovery")
-    discovered = discovery.get("files") if isinstance(discovery, dict) else None
     entries = check.get("entry_points")
     rooted = (
         isinstance(entries, dict) and type(entries.get("total")) is int and entries["total"] > 0
@@ -1230,12 +1269,7 @@ def _fallow(
     complete_graph = (
         bool(scoped_source_files)
         and not unsupported_source_files
-        and isinstance(discovered, list)
-        and all(isinstance(path, str) for path in discovered)
-        and isinstance(discovery, dict)
-        and discovery.get("file_count") == len(discovered)
-        and len(discovered) == len(set(discovered))
-        and set(discovered) == scoped_source_files
+        and assets is not None
         and check.get("unresolved_imports") == []
         and rooted
     )
@@ -1243,13 +1277,8 @@ def _fallow(
     syntax_valid = (
         isinstance(validation, dict)
         and validation.get("config_digest") == config_digest
-        and isinstance(discovered, list)
-        and all(isinstance(path, str) for path in discovered)
-        and set(discovered) == scoped_source_files
-        and isinstance(discovery, dict)
-        and discovery.get("file_count") == len(discovered)
-        and len(discovered) == len(set(discovered))
-        and _validated_fallow_inputs(report, config, root, scoped_source_files)
+        and assets is not None
+        and _validated_fallow_inputs(report, config, root, scoped_source_files, assets)
     )
     if not syntax_valid:
         complete_complexity = complete_graph = False
@@ -1266,14 +1295,7 @@ def _fallow(
             if len(paths) > 3:
                 preview += f", and {len(paths) - 3} more"
             return prefix + f"unsupported source files in scope ({preview})"
-        if not (
-            isinstance(discovered, list)
-            and all(isinstance(path, str) for path in discovered)
-            and isinstance(discovery, dict)
-            and discovery.get("file_count") == len(discovered)
-            and len(discovered) == len(set(discovered))
-            and set(discovered) == scoped_source_files
-        ):
+        if assets is None:
             return prefix + "the discovered files differ from the scoped source files"
         unresolved = check.get("unresolved_imports")
         if unresolved != []:

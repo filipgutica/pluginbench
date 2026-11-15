@@ -895,6 +895,64 @@ def test_complete_fallow_graph_row_and_readiness_are_unchanged(tmp_path: Path) -
     assert _metric_readiness("dead_code", metrics) == (True, None)
 
 
+@pytest.mark.parametrize(
+    ("fault", "complexity", "graph_reason"),
+    [
+        (None, True, None),
+        ("unknown_suffix", False, "the discovered files differ from the scoped source files"),
+        ("asset_function", False, "the discovered files differ from the scoped source files"),
+        ("missing_source", False, "the discovered files differ from the scoped source files"),
+        ("unresolved", True, "1 unresolved import (src/index.ts imports ../dist/index.js)"),
+        ("sources_only_analyzed", False, None),
+    ],
+)
+def test_fallow_population_admits_only_function_free_web_assets(
+    tmp_path: Path, fault: str | None, complexity: bool, graph_reason: str | None
+) -> None:
+    # Fallow 3.18 discovers and analyzes .html and .css files beside JS/TS sources.
+    report = _fallow()
+    snapshot, _ = _receipt(tmp_path, "fallow", report)
+    _write(snapshot / "src/index.html", "<!doctype html>\n")
+    _write(snapshot / "src/styles.css", "body { margin: 0; }\n")
+    discovered = ["src/index.html", "src/index.ts", "src/styles.css"]
+    if fault == "unknown_suffix":
+        _write(snapshot / "src/App.svelte", "<script></script>\n")
+        discovered.append("src/App.svelte")
+    elif fault == "missing_source":
+        _write(snapshot / "src/other.ts", "export const other = 2;\n")
+    health = report["health"]
+    check = report["check"]
+    assert isinstance(health, dict) and isinstance(check, dict)
+    if fault == "asset_function":
+        findings = health["findings"]
+        assert isinstance(findings, list)
+        findings[0]["path"] = "src/index.html"
+    analyzed = 1 if fault == "sources_only_analyzed" else len(discovered)
+    health["summary"] = {"functions_analyzed": 1, "files_analyzed": analyzed}
+    check["unused_exports"] = []
+    check["entry_points"] = {"total": 1}
+    if fault == "unresolved":
+        check["unresolved_imports"] = [{"path": "src/index.ts", "specifier": "../dist/index.js"}]
+    _syntax_proof(report, snapshot, tmp_path / "config.json", discovered)
+    validation = report["syntax_validation"]
+    assert isinstance(validation, dict) and isinstance(validation["files"], list)
+    # The JS/TS parser rejects assets, as on real receipts.
+    for row in validation["files"]:
+        if not row["path"].endswith(".ts"):
+            row.update(status="invalid", errors=["Unexpected token"])
+    receipt = _rebind_fallow(tmp_path, snapshot, report)
+    metrics = _metric(
+        _metric(evaluate_evidence(snapshot, {"fallow": str(receipt)}, tmp_path), "fallow"),
+        "metrics",
+    )
+    assert metrics["complexity_complete_for_declared_scope"] is complexity
+    assert metrics["dead_code_complete_for_declared_scope"] is (graph_reason is None)
+    assert _metric_readiness("dead_code", metrics) == (
+        graph_reason is None,
+        None if graph_reason is None else f"dead-code graph is incomplete: {graph_reason}",
+    )
+
+
 def _function(
     name: str, line: int, size: int, cognitive: int, *, path: str = "src/index.ts"
 ) -> dict[str, object]:
