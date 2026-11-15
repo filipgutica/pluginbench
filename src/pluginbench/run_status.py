@@ -567,7 +567,9 @@ def format_status(status: dict[str, Any]) -> str:
         phase += f"   last activity {_age(status['heartbeat']['age_seconds'])} ago"
     lines.append(phase)
     for alert in status["alerts"]["items"]:
-        lines.append(f"{alert['severity'].capitalize()}: {alert['message']}")
+        # Collector reasons can carry raw stderr; keep each alert on one terminal line.
+        message = " ".join(alert["message"].split())
+        lines.append(f"{alert['severity'].capitalize()}: {message}")
     if status["resume_command"]:
         lines.append(f"Resume: {status['resume_command']}")
     left = status["left_running"]

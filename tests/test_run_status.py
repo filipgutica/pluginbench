@@ -790,7 +790,7 @@ def test_measurement_failures_alert_per_family_and_arm_vanilla_first(tmp_path: P
         (row["severity"], row["family"], row["arm"], row["attempts"], row["tasks"], row["reasons"])
         for row in alerts["items"]
     ]
-    # The baseline arm is vanilla: without its values no comparison has the measure.
+    # The baseline arm is vanilla: its missing values leave comparisons partial or unavailable.
     assert rows == [
         ("error", "coverage", "vanilla", 2, ["task-a", "task-b"], ["image gone", "no lcov file"]),
         ("error", "fallow", "vanilla", 1, ["task-b"], ["collector unavailable in both repeats"]),
@@ -801,6 +801,18 @@ def test_measurement_failures_alert_per_family_and_arm_vanilla_first(tmp_path: P
         "Error: coverage unavailable for 2 vanilla attempts on 2 tasks: image gone; no lcov file"
         in text
     )
+
+
+def test_a_multiline_collector_reason_prints_as_one_status_line(tmp_path: Path) -> None:
+    root = _run(tmp_path / "run", states=dict.fromkeys(STATES, "complete"), ledger=True)
+    _select_measurement(root, "m1")
+    _collected(root, "m1", [_failure("a1", "task-a", "coverage", "exit 2\nno lcov file\n")])
+
+    status = run_status.run_status(root)
+
+    assert status["alerts"]["items"][0]["reasons"] == ["exit 2\nno lcov file\n"]
+    [line] = [row for row in run_status.format_status(status).splitlines() if "coverage" in row]
+    assert line.endswith("exit 2 no lcov file")
 
 
 @pytest.mark.parametrize("report_revision", ["m2", "m1"])
