@@ -33,6 +33,11 @@ TOKEN_FIELDS = (
 )
 # Native attempts have one stage; its receipts live under attempts/<id>/handoff/.
 _STAGE = "handoff"
+# The `alerts` block's own version, bumped on the same rules as SCHEMA_VERSION; a new `kind`
+# or `severity` is a new enum value.
+ALERTS_SCHEMA_VERSION = 1
+# Worst first; status lists alerts in this order.
+_SEVERITIES = ("error", "warning")
 # sha256 of no bytes: the verifier graded an empty patch.
 _EMPTY_PATCH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
@@ -187,6 +192,79 @@ def _error(events: list[dict[str, Any]], run: dict[str, Any] | None) -> str | No
     if events:
         return events[-1].get("error") if events[-1].get("event") == "failed" else None
     return (run or {}).get("error")
+
+
+def _unavailable_measures(
+    failures: list[dict[str, Any]], attempts: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """One alert per measure family and arm whose collection failed on some attempts."""
+    arms = {attempt["id"]: attempt["arm"] for attempt in attempts}
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for failure in failures:
+        arm = arms.get(failure["attempt_id"], "unknown")
+        groups.setdefault((failure["family"], arm), []).append(failure)
+    alerts = []
+    for (family, arm), rows in sorted(groups.items()):
+        count = len({row["attempt_id"] for row in rows})
+        tasks = sorted({row["task"] for row in rows})
+        # The receipts' own reasons say what broke; the outcome's reason is the generic fallback.
+        reasons = list(
+            dict.fromkeys(
+                str(reason)
+                for row in rows
+                for reason in [d for d in row.get("diagnostics", []) if d] or [row.get("reason")]
+            )
+        )
+        alerts.append(
+            {
+                "kind": "measure_unavailable",
+                # Without the vanilla value, no arm's comparison on that task has this measure.
+                "severity": "error" if arm == "vanilla" else "warning",
+                "message": f"{family} unavailable for {count} {arm} attempts on "
+                f"{len(tasks)} tasks: {'; '.join(reasons)}",
+                "family": family,
+                "arm": arm,
+                "attempts": count,
+                "tasks": tasks,
+                "reasons": reasons,
+            }
+        )
+    return alerts
+
+
+def _alerts(
+    *,
+    selection: dict[str, Any],
+    report: dict[str, Any] | None,
+    error: str | None,
+    attempts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """What an operator should act on, derived from the saved state on every read."""
+    items: list[dict[str, Any]] = []
+    if error:
+        items.append({"kind": "run_failed", "severity": "error", "message": error})
+    # Only a report built from the selected revision counts: one that names an earlier
+    # revision is not rebuilt yet, and its failures may since have been measured.
+    collection = (report or {}).get("measurement_collection") or {}
+    selected = selection.get("measurement_revision")
+    revision = selected if selected is not None and collection.get("revision") == selected else None
+    if revision is not None:
+        items += _unavailable_measures(collection.get("failures", []), attempts)
+    for row in selection.get("not_measured", []):
+        items.append(
+            {
+                "kind": "not_measured",
+                "severity": "warning",
+                "message": f"{row['task']}: {row['measure']} not measured: {row['reason']}",
+                **{key: row.get(key) for key in ("task", "measure", "reason")},
+            }
+        )
+    items.sort(key=lambda item: _SEVERITIES.index(item["severity"]))
+    return {
+        "schema_version": ALERTS_SCHEMA_VERSION,
+        "measurement_revision": revision,
+        "items": items,
+    }
 
 
 def _heartbeat(root: Path, evidence: Path, now: datetime) -> dict[str, Any] | None:
@@ -390,6 +468,7 @@ def run_status(
             "tokens": _tokens(rows),
         }
     log = root / "run.log"
+    error = _error(events, run)
     return {
         "schema_version": SCHEMA_VERSION,
         "run": str(root),
@@ -404,7 +483,10 @@ def run_status(
         "owner": {key: owner.get(key) for key in ("pid", "pgid", "started_at")} if owner else None,
         "heartbeat": _heartbeat(root, evidence, now),
         "last_event": events[-1] if events else None,
-        "error": _error(events, run),
+        "error": error,
+        "alerts": _alerts(
+            selection=selection, report=report, error=error, attempts=attempts
+        ),
         "states_source": source,
         "attempts_total": len(attempts),
         "states": dict(Counter(attempt["state"] for attempt in attempts)),
@@ -484,8 +566,10 @@ def format_status(status: dict[str, Any]) -> str:
     if status["heartbeat"]:
         phase += f"   last activity {_age(status['heartbeat']['age_seconds'])} ago"
     lines.append(phase)
-    if status["error"]:
-        lines.append(f"Error: {status['error']}")
+    for alert in status["alerts"]["items"]:
+        # Collector reasons can carry raw stderr; keep each alert on one terminal line.
+        message = " ".join(alert["message"].split())
+        lines.append(f"{alert['severity'].capitalize()}: {message}")
     if status["resume_command"]:
         lines.append(f"Resume: {status['resume_command']}")
     left = status["left_running"]
@@ -560,8 +644,6 @@ def format_status(status: dict[str, Any]) -> str:
             selected = " (selected)" if row["selected"] else ""
             shown = _shown_state(row["status"], status["active"])
             lines.append(f"{label}: {row['revision']} {shown}{progress}{selected}")
-    for row in measures["not_measured"]:
-        lines.append(f"Warning: {row['task']}: {row['measure']} not measured: {row['reason']}")
     if status["report"]:
         lines.append(f"Report: {status['report']}")
     if status["log"]:

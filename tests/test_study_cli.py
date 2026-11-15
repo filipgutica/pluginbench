@@ -41,6 +41,7 @@ from pluginbench import (
     parallel,
     remeasure,
     run_lock,
+    run_status,
     source_only,
     study,
     submissions,
@@ -1623,6 +1624,15 @@ def test_a_failing_collector_on_a_not_measured_pair_after_coding(
             ("covered-native-task", "Line coverage %", "measured"),
             ("covered-native-task", "Source lines added", "measured"),
         }
+        # Status reads the same failures from the selected revision as alerts.
+        alerts = run_status.run_status(root, containers=False)["alerts"]
+        assert alerts["measurement_revision"] == "measurements"
+        assert {
+            task
+            for item in alerts["items"]
+            if item["kind"] == "measure_unavailable"
+            for task in item["tasks"]
+        } == {"arbitrary-native-task"}
         assert reviews
     else:
         # Evidence that fails an integrity check stays fatal, even for a pair not measured: the

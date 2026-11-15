@@ -160,6 +160,19 @@ def test_an_owned_run_is_read_on_every_poll_so_a_killed_owner_shows_at_once(
     assert len(status.calls) == 2
 
 
+def test_the_run_list_carries_each_run_s_alerts(
+    tmp_path: Path, no_docker: list[tuple[str, ...]]
+) -> None:
+    root = _run(tmp_path / "run")
+    (root / "events.jsonl").write_text(json.dumps({"event": "failed", "error": "boom"}) + "\n")
+
+    [row] = dashboard.Runs([tmp_path]).summaries()
+
+    assert row["alerts"]["items"] == [
+        {"kind": "run_failed", "severity": "error", "message": "boom"}
+    ]
+
+
 def test_a_run_shows_as_owned_as_soon_as_a_process_takes_it(
     tmp_path: Path, no_docker: list[tuple[str, ...]]
 ) -> None:
