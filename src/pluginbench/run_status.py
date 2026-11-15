@@ -34,8 +34,8 @@ TOKEN_FIELDS = (
 # Native attempts have one stage; its receipts live under attempts/<id>/handoff/.
 _STAGE = "handoff"
 # The `alerts` block's own version, bumped on the same rules as SCHEMA_VERSION; a new `kind`
-# or `severity` is a new enum value.
-ALERTS_SCHEMA_VERSION = 1
+# or `severity` is a new enum value. 2: `native_completion_failed` added.
+ALERTS_SCHEMA_VERSION = 2
 # Worst first; status lists alerts in this order.
 _SEVERITIES = ("error", "warning")
 # sha256 of no bytes: the verifier graded an empty patch.
@@ -91,12 +91,25 @@ def _tokens(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _failure_reason(error: object) -> str | None:
+    if isinstance(error, dict):  # Harbor's exception_info for the agent.
+        return f"{error.get('exception_type')}: {error.get('exception_message')}"
+    return str(error) if error else None
+
+
 def _outcome(handoff: Path) -> tuple[str, str | None]:
-    """pass, overlap_pass, fail, empty, or unknown with the verifier's reason, from the receipts."""
+    """pass, overlap_pass, fail, empty, or unknown with a saved failure or verifier reason."""
+    checks = ((_read(handoff / "correctness.json") or {}).get("checks") or {})
+    # A passing verifier or empty patch cannot rescue a coding session that failed its checks.
+    if checks.get("native_completion") is False:
+        current = handoff / "execution-current.json"
+        execution = _read(current if current.is_file() else handoff / "execution.json") or {}
+        reason = _failure_reason(execution.get("treatment_error") or execution.get("error"))
+        return "fail", reason or "native completion failed"
     verifier = _read(handoff / "verifier-result.json") or {}
     if verifier.get("patch_sha256") == _EMPTY_PATCH:
         return "empty", None
-    behavior = ((_read(handoff / "correctness.json") or {}).get("checks") or {}).get("behavior")
+    behavior = checks.get("behavior")
     if behavior is True:
         return "pass", None
     if behavior is False:
@@ -105,9 +118,7 @@ def _outcome(handoff: Path) -> tuple[str, str | None]:
     if outcome != "unknown":
         return outcome, None
     # An attempt with no graded submission keeps why: a failed call names its error here.
-    failure = (_read(handoff / "unsupported-submission.json") or {}).get("error")
-    if isinstance(failure, dict):  # Harbor's exception_info for the agent.
-        failure = f"{failure.get('exception_type')}: {failure.get('exception_message')}"
+    failure = _failure_reason((_read(handoff / "unsupported-submission.json") or {}).get("error"))
     return "unknown", verifier.get("reason") or failure or "no correctness receipt"
 
 
@@ -234,6 +245,7 @@ def _unavailable_measures(
 
 def _alerts(
     *,
+    evidence: Path,
     selection: dict[str, Any],
     report: dict[str, Any] | None,
     error: str | None,
@@ -243,6 +255,30 @@ def _alerts(
     items: list[dict[str, Any]] = []
     if error:
         items.append({"kind": "run_failed", "severity": "error", "message": error})
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for attempt in attempts:
+        if attempt["state"] != "complete":
+            continue
+        handoff = evidence / "attempts" / attempt["id"] / _STAGE
+        checks = ((_read(handoff / "correctness.json") or {}).get("checks") or {})
+        if checks.get("native_completion") is False:
+            groups.setdefault(attempt["arm"], []).append(attempt)
+    for arm, rows in sorted(groups.items()):
+        count = len(rows)
+        tasks = sorted({row["task"] for row in rows})
+        reasons = list(dict.fromkeys(row["outcome_reason"] for row in rows))
+        items.append(
+            {
+                "kind": "native_completion_failed",
+                "severity": "error",
+                "message": f"native completion failed for {count} {arm} attempts on "
+                f"{len(tasks)} tasks: {'; '.join(reasons)}",
+                "arm": arm,
+                "attempts": count,
+                "tasks": tasks,
+                "reasons": reasons,
+            }
+        )
     # Only a report built from the selected revision counts: one that names an earlier
     # revision is not rebuilt yet, and its failures may since have been measured.
     collection = (report or {}).get("measurement_collection") or {}
@@ -485,7 +521,7 @@ def run_status(
         "last_event": events[-1] if events else None,
         "error": error,
         "alerts": _alerts(
-            selection=selection, report=report, error=error, attempts=attempts
+            evidence=evidence, selection=selection, report=report, error=error, attempts=attempts
         ),
         "states_source": source,
         "attempts_total": len(attempts),

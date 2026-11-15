@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -635,6 +636,94 @@ def test_a_withheld_result_gets_the_report_s_outcome(
     assert (row["outcome"], row["outcome_reason"]) == (outcome, None)
 
 
+@pytest.mark.parametrize(
+    ("behavior", "native_completion", "empty", "execution", "expected"),
+    [
+        (True, False, False, {"treatment_error": "treatment failed", "error": "other"},
+         ("fail", "treatment failed")),
+        (None, False, False, {"treatment_error": "treatment failed"},
+         ("fail", "treatment failed")),
+        (True, False, True, {"error": "session failed"}, ("fail", "session failed")),
+        (True, False, False, {"error": {
+            "exception_type": "AgentTimeoutError", "exception_message": "agent timed out",
+        }}, ("fail", "AgentTimeoutError: agent timed out")),
+        (True, False, False, {}, ("fail", "native completion failed")),
+        (True, True, False, {}, ("pass", None)),
+        (None, True, False, {}, ("overlap_pass", None)),
+    ],
+)
+def test_native_completion_failure_overrides_a_passing_verifier(
+    tmp_path: Path,
+    behavior: bool | None,
+    native_completion: bool,
+    empty: bool,
+    execution: dict[str, object],
+    expected: tuple[str, str | None],
+) -> None:
+    root = _run(tmp_path / "run", states=STATES, ledger=True)
+    handoff = root / "evidence/attempts/a1/handoff"
+    _write(handoff / "correctness.json", {
+        "checks": {"behavior": behavior, "verifier": True, "native_completion": native_completion},
+    })
+    _write(handoff / "execution.json", execution)
+    _write(handoff / "verifier-result.json", {
+        "patch_sha256": hashlib.sha256(b"").hexdigest() if empty else "ab" * 32,
+        "reason": "trusted verifier tests overwrite authored patch paths",
+        "native_verifier_result": {"rewards": {
+            "reward": 1, "f2p_passed": 3, "f2p_total": 3, "p2p_passed": 9, "p2p_total": 9,
+        }},
+    })
+
+    status = run_status.run_status(root, containers=False)
+    row = next(row for row in status["attempts"] if row["id"] == "a1")
+
+    assert (row["outcome"], row["outcome_reason"]) == expected
+    assert bool(status["alerts"]["items"]) is (not native_completion)
+
+
+def test_native_completion_failures_alert_per_arm_from_current_receipts(tmp_path: Path) -> None:
+    root = _run(tmp_path / "run", states=dict.fromkeys(STATES, "complete"), ledger=False)
+    entries = [{**row, "task_id": "task-b" if row["id"] == "a4" else "task-a"}
+               for row in ENTRIES]
+    _write(root / "evidence/plan.json", {"entries": entries})
+    reasons = {"a1": "baseline failed", "a2": "treatment failed\ncheck discovery",
+               "a3": "baseline failed", "a4": "another treatment failure"}
+    for attempt, reason in reasons.items():
+        handoff = root / "evidence/attempts" / attempt / "handoff"
+        _write(handoff / "correctness.json", {
+            "checks": {"behavior": True, "native_completion": False},
+        })
+        _write(handoff / "execution.json", {"treatment_error": reason})
+    before = _tree(root)
+
+    result = CliRunner().invoke(cli.app, ["status", str(root), "--json"])
+
+    assert result.exit_code == 0, result.output
+    status = json.loads(result.stdout)
+    alerts = status["alerts"]
+    assert [(row["kind"], row["severity"], row["arm"], row["attempts"], row["tasks"], row["reasons"])
+            for row in alerts["items"]] == [
+        ("native_completion_failed", "error", "vanilla", 2, ["task-a"], ["baseline failed"]),
+        ("native_completion_failed", "error", "workflow", 2, ["task-a", "task-b"],
+         ["treatment failed\ncheck discovery", "another treatment failure"]),
+    ]
+    assert alerts["schema_version"] == 2
+    assert status["outcomes"] == {"fail": 4}
+    assert _tree(root) == before
+    shown = run_status.format_status(status)
+    assert "Error: native completion failed for 2 vanilla attempts on 1 tasks: baseline failed" in shown
+    assert ("Error: native completion failed for 2 workflow attempts on 2 tasks: "
+            "treatment failed check discovery; another treatment failure") in shown
+    # Status re-reads saved receipts without needing a report rebuild.
+    _write(root / "evidence/attempts/a4/handoff/correctness.json", {
+        "checks": {"behavior": True, "native_completion": True},
+    })
+    updated = run_status.run_status(root, containers=False)["alerts"]["items"]
+    assert updated[1]["attempts"] == 1
+    assert updated[1]["tasks"] == ["task-a"]
+    assert updated[1]["reasons"] == ["treatment failed\ncheck discovery"]
+
+
 def test_a_run_saved_before_the_not_measured_list_shows_no_such_warning(tmp_path: Path) -> None:
     # Readiness rows in the older shape: status and readiness, no state, and no saved list.
     root = _run(tmp_path / "run", states=dict.fromkeys(STATES, "complete"), ledger=True)
@@ -785,7 +874,7 @@ def test_measurement_failures_alert_per_family_and_arm_vanilla_first(tmp_path: P
     assert result.exit_code == 0, result.output
     alerts = json.loads(result.stdout)["alerts"]
 
-    assert (alerts["schema_version"], alerts["measurement_revision"]) == (1, "m1")
+    assert (alerts["schema_version"], alerts["measurement_revision"]) == (2, "m1")
     rows = [
         (row["severity"], row["family"], row["arm"], row["attempts"], row["tasks"], row["reasons"])
         for row in alerts["items"]
