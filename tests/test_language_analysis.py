@@ -272,6 +272,74 @@ def test_parser_failure_does_not_hide_healthy_unused_measurement(
     assert metrics["dead_code"]["status"] == "available"
 
 
+@pytest.mark.parametrize("parseable", [True, False])
+def test_files_the_parser_rejects_leave_complexity_for_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parseable: bool
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    rejected = {
+        # bandit ships a deliberately unparseable example; RCA also rejects files Python parses.
+        "examples/new_candidates-none.py": "def broken(:\n",
+        "rejected.py": "def live():\n    return 1\n",
+    }
+    for path, text in {
+        **rejected,
+        **({"live.py": rejected["rejected.py"]} if parseable else {}),
+    }.items():
+        (source / path).parent.mkdir(parents=True, exist_ok=True)
+        (source / path).write_text(text)
+    monkeypatch.setattr(
+        "pluginbench.language_analysis.probe_language_tools",
+        lambda *args: {
+            "rca": {"path": "/trusted/rca", "status": "available"},
+            "vulture": {"path": "/trusted/vulture", "status": "available"},
+        },
+    )
+    function = {
+        "name": "live",
+        "kind": "function",
+        "start_line": 1,
+        "end_line": 2,
+        "spaces": [],
+        "metrics": {
+            "cognitive": {"sum": 0.0},
+            "cyclomatic": {"sum": 1.0},
+            "nom": {"functions": 1.0, "closures": 0.0, "total": 1.0},
+        },
+    }
+    unit = {**function, "name": "live.py", "kind": "unit", "spaces": [function]}
+
+    def execute(argv: list[str], *_: object) -> str:
+        if "-C" in argv:
+            return "Found nodes: 3" if argv[-1].endswith("rejected.py") else "Found nodes: 0"
+        return json.dumps(unit)
+
+    monkeypatch.setattr("pluginbench.language_analysis._execute", execute)
+    report, _ = collect_language_analysis(source, {"language": "python"}, tmp_path / "evidence")
+    metrics = report["metrics"]
+    assert isinstance(metrics, dict)
+    # Vulture still needs the whole program, so one unparseable file leaves dead code unmeasured.
+    assert metrics["dead_code"]["status"] == "unavailable"
+    if parseable:
+        assert metrics["cognitive"] == {"status": "available", "reason": None}
+        assert report["complexity_analyzed_paths"] == ["live.py"]
+        unanalyzed = report["complexity_unanalyzed"]
+        assert isinstance(unanalyzed, dict)
+        assert sorted(unanalyzed) == ["examples/new_candidates-none.py", "rejected.py"]
+        assert unanalyzed["examples/new_candidates-none.py"].startswith("Python does not parse")
+        assert unanalyzed["rejected.py"] == "Pinned parser does not accept rejected.py"
+        functions = report["functions"]
+        assert isinstance(functions, list)
+        assert [(row["path"], row["name"]) for row in functions] == [("live.py", "live")]
+    else:
+        assert metrics["cognitive"]["status"] == "unavailable"
+        assert "analyzed none of 2 declared source files" in metrics["cognitive"]["reason"]
+        assert report["complexity_analyzed_paths"] == []
+        assert report["complexity_unanalyzed"] == {}
+        assert report["functions"] == []
+
+
 def test_malformed_analyzer_evidence_is_fatal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -370,8 +438,8 @@ def test_analysis_settings_and_implementation_drift_are_fatal(tmp_path: Path) ->
     source = tmp_path / "source"
     source.mkdir()
     config = prepare_analysis_config("rust", ["*"], ["*"], {})
-    config["observer_version"] = 2
-    with pytest.raises(ValueError, match="observer version 2 froze this profile"):
+    config["observer_version"] = 3
+    with pytest.raises(ValueError, match="observer version 3 froze this profile"):
         collect_language_analysis(source, config, tmp_path / "evidence")
     config = prepare_analysis_config("rust", ["*"], ["*"], {})
     del config["observer_version"]
@@ -384,10 +452,10 @@ def test_analysis_settings_and_implementation_drift_are_fatal(tmp_path: Path) ->
         collect_language_analysis(source, config, tmp_path / "evidence")
 
 
-def test_a_profile_frozen_before_the_dep_info_fix_still_loads(
+def test_a_profile_frozen_before_versions_is_observer_v1_and_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Runs prepared on 942f12c keep their analysis measurements, and the observer's guard."""
+    """Runs prepared on 942f12c froze observer v1, which partitioned no complexity population."""
     source = tmp_path / "source"
     source.mkdir()
     config = prepare_analysis_config("rust", ["*"], ["*"], {})
@@ -395,9 +463,11 @@ def test_a_profile_frozen_before_the_dep_info_fix_still_loads(
     del config["observer_version"]
     observers = legacy_json("observer-identities.json")
     config["implementation_sha256"] = observers["analysis_implementation_sha256"]
+    with pytest.raises(ValueError, match="observer version 1 froze this profile"):
+        collect_language_analysis(source, config, tmp_path / "evidence")
 
+    config = prepare_analysis_config("rust", ["*"], ["*"], {})
     analysis, _ = collect_language_analysis(source, config, tmp_path / "evidence")
-
     assert analysis["analyzed_paths"] == []
 
     observer = Path(inspect.getfile(collect_language_analysis))

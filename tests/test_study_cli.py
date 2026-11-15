@@ -2513,7 +2513,9 @@ def _python_analysis(monkeypatch: pytest.MonkeyPatch, *, vulture: bool = True) -
         for name in ("rca", "vulture")
     }
 
-    def complexity(root: Path, paths: list[str], *args: object) -> list[dict[str, object]]:
+    def complexity(
+        root: Path, paths: list[str], *args: object
+    ) -> tuple[list[dict[str, object]], dict[str, str]]:
         # One function per file, scored by its branches, so a changed file changes its score.
         return [
             {
@@ -2527,7 +2529,7 @@ def _python_analysis(monkeypatch: pytest.MonkeyPatch, *, vulture: bool = True) -
                 "cyclomatic": 1 + (root / path).read_text().count("if"),
             }
             for path in paths
-        ]
+        ], {}
 
     monkeypatch.setattr(language_analysis, "probe_language_tools", lambda *args: deepcopy(tools))
     monkeypatch.setattr(language_analysis, "_complexity", complexity)
@@ -3296,7 +3298,9 @@ def test_measure_refuses_to_lose_a_metric_its_collector_fails_only_on_submission
     assert {row["status"] for row in cyclomatic} == {"measured"}
     complexity = language_analysis._complexity
 
-    def starting_source_only(root: Path, *args: Any) -> list[dict[str, object]]:
+    def starting_source_only(
+        root: Path, *args: Any
+    ) -> tuple[list[dict[str, object]], dict[str, str]]:
         # The analyzer still reads the starting source, then fails on every submission.
         if (root / "src/answer.py").read_text() == "answer = 1\n":
             raise language_analysis.AnalysisUnavailable("parser rejects the submission")
