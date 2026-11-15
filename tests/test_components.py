@@ -50,7 +50,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
                 "3fb19c0a255775fe1df4f6bb04db4dba0615be016bb67d6109fc5db15e26a656"
             ),
             # The launch check expects the receipt's plugin agents beside the built-ins.
-            "claude_launch.py": "5a2c4eb9e16ef7763fa972241cd3e82101a3f5ae46b7e67e649446aba7b2648a",
+            # A startup hook with a statusMessage is matched by it; such attempts always failed
+            # before, and a hook-free vanilla launch is unchanged, so the launcher stays v1.
+            "claude_launch.py": "7fd4bf8ee86bb27b9ba67cde210dee6f0212ff3bf65f4aec28be397a7cc1ca01",
         },
     ),
     "analysis_observer": (

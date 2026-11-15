@@ -17,7 +17,7 @@ They were captured offline on 2026-11-12 with a fake subscription token and a de
 | `superpowers` | `treated` with Superpowers' hook matcher, `startup\|clear\|compact`. The CLI still names the event `SessionStart:startup`. |
 | `two-hooks` | `treated` with two SessionStart hooks: `${CLAUDE_PLUGIN_ROOT}/hooks/a.sh` (`startup`) and `echo B` (`startup\|clear`) |
 
-The stream names a hook run only by event and trigger. The transcript names it by its command as declared, with `${CLAUDE_PLUGIN_ROOT}` unexpanded, and by its exit code. Discovery lists the same command text.
+The stream names a hook run only by event and trigger. The transcript names it by its command as declared, with `${CLAUDE_PLUGIN_ROOT}` unexpanded, and by its exit code. A hook that declares a `statusMessage` is named by that message instead; real coding runs show this, and these captures have no such hook. Discovery lists the same command text.
 
 Paths are replaced with the container's: `/tmp/pluginbench-treatments` (staged treatment), `/logs/agent/sessions` (`CLAUDE_CONFIG_DIR`), `/app` (task source) and `/SCRATCH` (anything else).
 

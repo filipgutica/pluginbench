@@ -259,7 +259,7 @@ def session_errors(
 
     The session's `system/init` must report what discovery found, the pinned permission mode
     and the pinned tools, and its result must record no permission denial. Its hook events must be the listed hooks:
-    each SessionStart hook that matches `startup` runs once, by its command in the root
+    each SessionStart hook that matches `startup` runs once, by its status message or command in the root
     `transcript`, and exits 0 before the first assistant message; other listed hooks exit 0
     or 2 (a deliberate block), and no other hook event appears.
     """
@@ -276,8 +276,10 @@ def session_errors(
         skills = {skill["name"] for skill in receipt["skills"] if skill["display_name"] in commands}
         plugins = sorted((item["id"], item["loaded_from"]) for item in receipt["plugin_installs"])
         listing = [(hook["event"], hook.get("matcher") or "") for hook in receipt["hooks"]["hooks"]]
+        # The transcript names a hook run by its statusMessage when it declares one, otherwise
+        # by its command (CLI 2.1.322).
         at_startup = Counter(
-            str(hook["commandText"])
+            str(hook.get("statusMessage") or hook["commandText"])
             for hook in receipt["hooks"]["hooks"]
             if hook["event"] == "SessionStart" and _matches(hook.get("matcher") or "", "startup")
         )
@@ -382,8 +384,9 @@ def _hook_errors(events: list[dict[str, Any]], listing: list[tuple[str, str]]) -
 
 
 def _startup_hook_errors(transcript: str, listed: Counter[str]) -> list[str]:
-    """The root transcript names each hook run by its command as declared, with
-    `${CLAUDE_PLUGIN_ROOT}` unexpanded, as discovery lists it (verified on CLI 2.1.322)."""
+    """The root transcript names each hook run by its statusMessage when it declares one,
+    otherwise by its command as declared, with `${CLAUDE_PLUGIN_ROOT}` unexpanded, as
+    discovery lists it (verified on CLI 2.1.322)."""
     entries = _events(transcript)
     first_reply = next(
         (index for index, entry in enumerate(entries) if entry.get("type") == "assistant"),
@@ -396,6 +399,9 @@ def _startup_hook_errors(transcript: str, listed: Counter[str]) -> list[str]:
         and attachment.get("hookName") == "SessionStart:startup"
     ]
     errors = []
+    # Two hooks under one label cannot be told apart: one run twice would hide one never run.
+    if any(count > 1 for count in listed.values()):
+        errors.append("two listed SessionStart startup hooks share a transcript name")
     if Counter(str(run.get("command")) for _, run in runs) != listed:
         errors.append("the transcript's SessionStart startup hooks are not each listed hook once")
     if any(
