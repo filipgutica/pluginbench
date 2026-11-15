@@ -720,3 +720,114 @@ def test_status_uses_current_usage_and_labels_historical_receipts(
         # Codex and Claude runs share the note, so it names neither harness.
         assert "Recorded token usage is unvalidated" in run_status.format_status(status)
     assert _tree(root) == before
+
+
+def _select_measurement(root: Path, revision: str) -> None:
+    selection = json.loads((root / "evaluation.json").read_text())
+    _write(root / "evaluation.json", {**selection, "measurement_revision": revision})
+
+
+def _collected(root: Path, revision: str, failures: list[dict[str, Any]]) -> None:
+    """A report built from `revision`, whose collection failed on `failures`."""
+    _write(
+        root / "report/results.json",
+        {"measurement_collection": {"revision": revision, "failures": failures}},
+    )
+
+
+def _failure(attempt: str, task: str, family: str, *diagnostics: str) -> dict[str, Any]:
+    return {
+        "attempt_id": attempt,
+        "task": task,
+        "stage": "handoff",
+        "family": family,
+        "status": "unavailable",
+        "reason": "collector unavailable in both repeats",
+        "diagnostics": list(diagnostics),
+    }
+
+
+def test_a_blocked_check_alerts_with_its_findings(tmp_path: Path) -> None:
+    root = _run(tmp_path / "run", states=STATES, ledger=True)
+    _write(root / "check.json", {"status": "blocked", "findings": ["coverage is ready nowhere"]})
+
+    [alert] = run_status.run_status(root)["alerts"]["items"]
+
+    assert alert == {
+        "kind": "check_blocked",
+        "severity": "error",
+        "message": "check blocked the run: coverage is ready nowhere",
+        "findings": ["coverage is ready nowhere"],
+    }
+
+
+@pytest.mark.parametrize("ending", ["failed", "stopped"])
+def test_a_failed_operation_alerts_but_a_stop_does_not(tmp_path: Path, ending: str) -> None:
+    root = _run(tmp_path / "run", states=STATES, ledger=True)
+    _write(root / "check.json", {"status": "ready", "findings": []})
+    ended = {"event": ending, **({"error": "boom"} if ending == "failed" else {"reason": "x"})}
+    (root / "events.jsonl").write_text(
+        json.dumps({"event": "started"}) + "\n" + json.dumps(ended) + "\n"
+    )
+
+    status = run_status.run_status(root)
+
+    if ending == "failed":
+        assert status["alerts"]["items"] == [
+            {"kind": "run_failed", "severity": "error", "message": "boom"}
+        ]
+        assert "Error: boom" in run_status.format_status(status)
+    else:
+        assert status["alerts"]["items"] == []
+
+
+def test_measurement_failures_alert_per_family_and_arm_vanilla_first(tmp_path: Path) -> None:
+    root = _run(tmp_path / "run", states=dict.fromkeys(STATES, "complete"), ledger=True)
+    _select_measurement(root, "m1")
+    _collected(
+        root,
+        "m1",
+        [
+            _failure("a2", "task-a", "coverage", "no lcov file"),
+            _failure("a1", "task-a", "coverage", "image gone"),
+            _failure("a3", "task-b", "coverage", "image gone", "no lcov file"),
+            _failure("a3", "task-b", "fallow"),
+        ],
+    )
+
+    result = CliRunner().invoke(cli.app, ["status", str(root), "--json"])
+    assert result.exit_code == 0, result.output
+    alerts = json.loads(result.stdout)["alerts"]
+
+    assert (alerts["schema_version"], alerts["measurement_revision"]) == (1, "m1")
+    rows = [
+        (row["severity"], row["family"], row["arm"], row["attempts"], row["tasks"], row["reasons"])
+        for row in alerts["items"]
+    ]
+    # The baseline arm is vanilla: without its values no comparison has the measure.
+    assert rows == [
+        ("error", "coverage", "vanilla", 2, ["task-a", "task-b"], ["image gone", "no lcov file"]),
+        ("error", "fallow", "vanilla", 1, ["task-b"], ["collector unavailable in both repeats"]),
+        ("warning", "coverage", "workflow", 1, ["task-a"], ["no lcov file"]),
+    ]
+    text = run_status.format_status(run_status.run_status(root))
+    assert (
+        "Error: coverage unavailable for 2 vanilla attempts on 2 tasks: image gone; no lcov file"
+        in text
+    )
+
+
+@pytest.mark.parametrize("report_revision", ["m2", "m1"])
+def test_a_later_measurement_revision_leaves_no_stale_measure_alerts(
+    tmp_path: Path, report_revision: str
+) -> None:
+    root = _run(tmp_path / "run", states=dict.fromkeys(STATES, "complete"), ledger=True)
+    # m2 measured what m1 lost; the report is rebuilt from m2, or not yet rebuilt at all.
+    _select_measurement(root, "m2")
+    failures = [] if report_revision == "m2" else [_failure("a1", "task-a", "coverage", "gone")]
+    _collected(root, report_revision, failures)
+
+    alerts = run_status.run_status(root)["alerts"]
+
+    assert alerts["items"] == []
+    assert alerts["measurement_revision"] == ("m2" if report_revision == "m2" else None)

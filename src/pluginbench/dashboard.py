@@ -291,6 +291,7 @@ def _summary(key: str, root: Path, snapshot: _Snapshot) -> dict[str, Any]:
         "tokens": status.get("tokens"),
         "discarded": len(status.get("discarded") or []),
         "report": status.get("report") is not None,
+        "alerts": status.get("alerts"),
         "stale": snapshot.error is not None,
         "error": snapshot.error,
     }
