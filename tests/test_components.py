@@ -54,12 +54,15 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         },
     ),
     "analysis_observer": (
-        1,
+        2,
         {
             # prepare_go_observer also builds mutation's standard-library site finder, which
             # ships no go.sum. The analysis observer's files, cache and binary are unchanged.
+            # v2: rust-code-analysis files the parser rejects are listed in a complexity
+            # partition instead of making complexity unavailable for the whole repository, so a
+            # profile v1 froze would now report complexity it reported unavailable.
             "language_analysis.py": (
-                "9f7bda8669ee200eca790f453d32bb43e801ecdda0a3a2b7603ee701639c2e0f"
+                "3b6a7e0592f5dac65a3d98991cac8a35fd3d3e64a26f984cb77d5f639003e031"
             ),
         },
     ),

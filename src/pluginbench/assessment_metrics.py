@@ -696,7 +696,11 @@ _OXC_COMMIT = "836fe9d51c11981162461216f37a067fc14441a7"
 
 
 def _validated_fallow_inputs(
-    report: dict[str, object], config: dict[str, object], root: Path, inputs: set[str]
+    report: dict[str, object],
+    config: dict[str, object],
+    root: Path,
+    inputs: set[str],
+    assets: set[str],
 ) -> bool:
     """Pinned producer execution plus strict primary parses closes silent read/parse omissions."""
     validation = report.get("syntax_validation")
@@ -786,15 +790,19 @@ def _validated_fallow_inputs(
         ):
             return False
     rows = validation.get("files")
-    if not isinstance(rows, list) or len(rows) != len(inputs):
+    if not isinstance(rows, list) or len(rows) != len(inputs) + len(assets):
         return False
     observed = set()
     for row in rows:
-        if not isinstance(row, dict) or row.get("path") not in inputs:
+        if not isinstance(row, dict) or row.get("path") not in inputs | assets:
             return False
         path = row["path"]
         assert isinstance(path, str)
-        if path in observed or row.get("status") != "valid" or row.get("errors") != []:
+        if path in observed:
+            return False
+        # The primary parser reads only JS/TS, so an asset's parse status carries no meaning;
+        # its digest still proves the validator read the bound file.
+        if path in inputs and (row.get("status") != "valid" or row.get("errors") != []):
             return False
         try:
             data = (root / path).read_bytes()
@@ -804,7 +812,36 @@ def _validated_fallow_inputs(
         if row.get("source_digest") != _digest(data):
             return False
         observed.add(path)
-    return observed == inputs
+    return observed == inputs | assets
+
+
+# Fallow 3.18 also discovers and counts these web assets beside JS/TS sources.
+_FALLOW_ASSET_SUFFIXES = {".html", ".css"}
+
+
+def _fallow_assets(
+    discovery: object, functions: list[dict[str, object]], sources: set[str]
+) -> set[str] | None:
+    """Return the discovered asset paths, or None when Fallow's file population is not closed.
+
+    Closed means discovery lists every scoped source once, and its other files are allowed
+    assets with no function rows.
+    """
+    if not isinstance(discovery, dict):
+        return None
+    discovered = discovery.get("files")
+    if not isinstance(discovered, list) or not all(isinstance(path, str) for path in discovered):
+        return None
+    assets = set(discovered) - sources
+    if (
+        len(discovered) != len(set(discovered))
+        or discovery.get("file_count") != len(discovered)
+        or not sources <= set(discovered)
+        or any(Path(path).suffix.lower() not in _FALLOW_ASSET_SUFFIXES for path in assets)
+        or any(row["path"] in assets for row in functions)
+    ):
+        return None
+    return assets
 
 
 def _clone_identities(dupes: dict[str, object], files: set[str], root: Path) -> list[str] | None:
@@ -1049,9 +1086,10 @@ def _analysis(
     root: Path,
     config: dict[str, object],
 ) -> dict[str, object]:
-    if report.get("version") != "language-analysis-v1" or report.get("language") != config.get(
+    version = report.get("version")
+    if version not in {"language-analysis-v1", "language-analysis-v2"} or report.get(
         "language"
-    ):
+    ) != config.get("language"):
         raise ValueError("language analysis version or language differs from frozen configuration")
     if report.get("tools") != config.get("tool_identities"):
         raise ValueError("analysis tools differ from frozen configuration")
@@ -1075,11 +1113,32 @@ def _analysis(
         key: _object(statuses.get(key), key).get("status") == "available"
         for key in ("cognitive", "cyclomatic", "dead_code")
     }
-    functions = _analysis_functions(report, analyzed=analyzed, root=root, complete=complete)
+    complexity_available = complete["cognitive"] and complete["cyclomatic"]
+    if version == "language-analysis-v1":
+        # v1 analyzed every declared file or reported complexity unavailable.
+        complexity_paths, unanalyzed = analyzed, {}
+    else:
+        complexity_paths = set(_strings(report.get("complexity_analyzed_paths"), "analyzed paths"))
+        reasons = _object(report.get("complexity_unanalyzed"), "unanalyzed complexity paths")
+        if not all(isinstance(reason, str) and reason for reason in reasons.values()):
+            raise ValueError("unanalyzed complexity paths require reasons")
+        unanalyzed = {path: str(reason) for path, reason in reasons.items()}
+        if complexity_paths & set(unanalyzed) or not complexity_paths | set(unanalyzed) <= analyzed:
+            raise ValueError("complexity partition overlaps or escapes declared source")
+        if complexity_available and (
+            complexity_paths | set(unanalyzed) != analyzed or (analyzed and not complexity_paths)
+        ):
+            raise ValueError("available complexity must partition the declared source population")
+        if not complexity_available and (complexity_paths or unanalyzed):
+            raise ValueError("unavailable complexity must not partition declared source")
+    functions = _analysis_functions(report, analyzed=complexity_paths, root=root, complete=complete)
     candidates, identities = _analysis_candidates(report, analyzed=analyzed, root=root)
     return {
         **_function_population(functions),
-        "complexity_complete_for_declared_scope": complete["cognitive"] and complete["cyclomatic"],
+        "complexity_complete_for_declared_scope": complexity_available and not unanalyzed,
+        # The declared files with complexity rows, or None when complexity is unavailable.
+        "complexity_analyzed_paths": sorted(complexity_paths) if complexity_available else None,
+        "complexity_unanalyzed": dict(sorted(unanalyzed.items())),
         "metric_statuses": statuses,
         "dead_code": len(candidates) if complete["dead_code"] else None,
         "dead_finding_identities": identities if complete["dead_code"] else None,
@@ -1179,13 +1238,18 @@ def _fallow(
         and Path(path).suffix.lower() not in supported_suffixes
     }
     identities = {(row["path"], row["name"], row["line"], row["col"]) for row in functions}
+    # A separate discovery receipt from the same explicit config closes the file population.
+    discovery = report.get("discovery")
+    assets = _fallow_assets(discovery, functions, scoped_source_files)
     complete_complexity = (
         bool(scoped_source_files)
         and not unsupported_source_files
         and all(type(summary.get(key)) is int for key in ("functions_analyzed", "files_analyzed"))
         and summary.get("functions_analyzed") == len(functions)
         and len(identities) == len(functions)
-        and summary.get("files_analyzed") == len(scoped_source_files)
+        and assets is not None
+        # Health analyzes every discovered file, assets included.
+        and summary.get("files_analyzed") == len(scoped_source_files) + len(assets)
     )
     duplicate_stats = _object(dupes.get("stats", {}), "fallow.dupes.stats")
     dead_counts = {key: _list_count(check, key) for key in _DEAD_FIELDS}
@@ -1198,9 +1262,6 @@ def _fallow(
         if None not in boundary_counts and boundary_rules
         else None
     )
-    # A separate discovery receipt from the same explicit config closes the file population.
-    discovery = report.get("discovery")
-    discovered = discovery.get("files") if isinstance(discovery, dict) else None
     entries = check.get("entry_points")
     rooted = (
         isinstance(entries, dict) and type(entries.get("total")) is int and entries["total"] > 0
@@ -1208,12 +1269,7 @@ def _fallow(
     complete_graph = (
         bool(scoped_source_files)
         and not unsupported_source_files
-        and isinstance(discovered, list)
-        and all(isinstance(path, str) for path in discovered)
-        and isinstance(discovery, dict)
-        and discovery.get("file_count") == len(discovered)
-        and len(discovered) == len(set(discovered))
-        and set(discovered) == scoped_source_files
+        and assets is not None
         and check.get("unresolved_imports") == []
         and rooted
     )
@@ -1221,13 +1277,8 @@ def _fallow(
     syntax_valid = (
         isinstance(validation, dict)
         and validation.get("config_digest") == config_digest
-        and isinstance(discovered, list)
-        and all(isinstance(path, str) for path in discovered)
-        and set(discovered) == scoped_source_files
-        and isinstance(discovery, dict)
-        and discovery.get("file_count") == len(discovered)
-        and len(discovered) == len(set(discovered))
-        and _validated_fallow_inputs(report, config, root, scoped_source_files)
+        and assets is not None
+        and _validated_fallow_inputs(report, config, root, scoped_source_files, assets)
     )
     if not syntax_valid:
         complete_complexity = complete_graph = False
@@ -1244,14 +1295,7 @@ def _fallow(
             if len(paths) > 3:
                 preview += f", and {len(paths) - 3} more"
             return prefix + f"unsupported source files in scope ({preview})"
-        if not (
-            isinstance(discovered, list)
-            and all(isinstance(path, str) for path in discovered)
-            and isinstance(discovery, dict)
-            and discovery.get("file_count") == len(discovered)
-            and len(discovered) == len(set(discovered))
-            and set(discovered) == scoped_source_files
-        ):
+        if assets is None:
             return prefix + "the discovered files differ from the scoped source files"
         unresolved = check.get("unresolved_imports")
         if unresolved != []:
@@ -1547,15 +1591,21 @@ def _code_added(
     changed_paths: set[str],
     new_paths: list[str],
     complete: bool,
+    incomplete_reason: str = "complexity population incomplete on one side",
+    declared_scope_complete: bool = True,
 ) -> dict[str, object]:
-    """Net source complexity and structure an attempt added, independent of inherited code."""
+    """Net source complexity and structure an attempt added, independent of inherited code.
+
+    `complete` covers the changed files the result sums; `declared_scope_complete` only reports
+    whether both snapshots also analyzed every other declared file.
+    """
     method = "all source functions in changed files after the edit minus the same files before; unchanged functions cancel, new functions count in full, deleted ones subtract; tests and Go closure rows inside a declaration (already in its score) excluded"
     limitations = "added and grown functions match on path and name with line numbers removed; nested functions, overloads, renames and Go methods sharing a name on different receivers in one file can misclassify them; net sums do not depend on matching"
     if not complete:
         return {
             "status": "incomplete",
             "complete_for_declared_scope": False,
-            "reason": "complexity population incomplete on one side",
+            "reason": incomplete_reason,
             "method": method,
             "limitations": limitations,
         }
@@ -1613,10 +1663,25 @@ def _code_added(
         ),
         "hotspot_threshold": HOTSPOT_COGNITIVE,
         "function_count_reported": len(after_rows),
-        "complete_for_declared_scope": True,
+        "complete_for_declared_scope": declared_scope_complete,
         "method": method,
         "limitations": limitations,
     }
+
+
+def _unanalyzed_changes(metrics: dict[str, object], paths: set[str]) -> list[str] | None:
+    """Declared source files among `paths` on this snapshot that have no complexity rows.
+
+    None when the snapshot has no complexity to rely on. A file counts only when its analysis
+    is recorded, so a changed file the parser rejected is never read as having no functions.
+    """
+    if metrics.get("complexity_complete_for_declared_scope") is True:
+        return []
+    analyzed = metrics.get("complexity_analyzed_paths")
+    if not isinstance(analyzed, list):
+        return None
+    declared = set(_strings(metrics.get("analyzed_paths"), "analyzed paths"))
+    return sorted(paths & declared - set(analyzed))
 
 
 def _function_changes(
@@ -1631,8 +1696,15 @@ def _function_changes(
         }
     ranges = _object(change.get("changed_line_ranges"), "changed-line ranges")
     populations = []
-    complete = all(
-        row.get("complexity_complete_for_declared_scope") is True for row in (left, right)
+    # Only changed files enter these results, so files the parser rejected elsewhere in the
+    # repository leave them complete.
+    gaps = [_unanalyzed_changes(metrics, set(ranges)) for metrics in (left, right)]
+    complete = all(gap == [] for gap in gaps)
+    missing = sorted({path for gap in gaps for path in gap or []})
+    reason = (
+        "complexity population incomplete on one side"
+        if None in gaps
+        else "the pinned parser did not analyze changed source files: " + ", ".join(missing)
     )
     for side, metrics in (("before", left), ("after", right)):
         raw = metrics["functions"]
@@ -1660,6 +1732,8 @@ def _function_changes(
         for row in raw_after
         if _object(row, "function")["path"] in new_paths
     ]
+    # New-file functions read only the new files on the after snapshot.
+    new_gap = _unanalyzed_changes(right, new_paths)
     status = "available" if complete else "incomplete"
     before_all = left["functions"]
     assert isinstance(before_all, list)
@@ -1670,18 +1744,30 @@ def _function_changes(
             changed_paths=set(ranges),
             new_paths=sorted(new_paths),
             complete=complete,
+            incomplete_reason=reason,
+            declared_scope_complete=all(
+                row.get("complexity_complete_for_declared_scope") is True for row in (left, right)
+            ),
         ),
         "changed_functions": {
             "status": status,
+            **({} if complete else {"reason": reason}),
             "before": populations[0],
             "after": populations[1],
             "method": "reported function line..line+line_count-1 overlaps a zero-context Git hunk on that snapshot; zero-width edits strictly inside the span count; includes tests when scoped",
             "limitations": "line-level overlap, not AST identity or semantic change; enclosing/nested spans may both count, same-line changes may overcount, moves/renames count as changes; before/after populations are not matched functions",
         },
         "new_file_functions": {
-            "status": "available"
-            if right.get("complexity_complete_for_declared_scope") is True
-            else "incomplete",
+            "status": "available" if new_gap == [] else "incomplete",
+            **(
+                {}
+                if new_gap == []
+                else {
+                    "reason": "complexity population incomplete on one side"
+                    if new_gap is None
+                    else "the pinned parser did not analyze new source files: " + ", ".join(new_gap)
+                }
+            ),
             "after": {
                 **_function_population(new_functions),
                 "complete_for_declared_scope": right.get("complexity_complete_for_declared_scope")

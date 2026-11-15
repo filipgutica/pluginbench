@@ -431,7 +431,7 @@ def prepare_profiles(
         for name in selected & FALLOW_MEASUREMENTS
     )
     if analysis_available:
-        from pluginbench.language_analysis import prepare_analysis_config
+        from pluginbench.language_analysis import VERSION, prepare_analysis_config
 
         metadata = tomllib.loads((Path(task_dir) / "task.toml").read_text()).get("metadata", {})
         language = str(metadata.get("language", "")).lower()
@@ -450,7 +450,7 @@ def prepare_profiles(
                 kind="analysis",
                 config=analysis_config,
                 scope=source_scope,
-                tool_version="language-analysis-v1",
+                tool_version=VERSION,
                 timeout_seconds=7200,
             )
         )
@@ -628,6 +628,13 @@ def _metric_readiness(metric: str, first: dict[str, object]) -> tuple[bool, obje
             status = statuses.get(metric)
             ready = isinstance(status, dict) and status.get("status") == "available"
             reason = status.get("reason") if isinstance(status, dict) else "missing metric status"
+            unanalyzed = first.get("complexity_unanalyzed")
+            if ready and metric != "dead_code" and isinstance(unanalyzed, dict) and unanalyzed:
+                # Changed files are still measured; an attempt that changes one of these is
+                # recorded as incomplete.
+                reason = "declared source files without complexity: " + "; ".join(
+                    f"{path} ({detail})" for path, detail in sorted(unanalyzed.items())
+                )
         else:
             key = (
                 "dead_code_complete_for_declared_scope"
