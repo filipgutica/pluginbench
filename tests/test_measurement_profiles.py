@@ -1,3 +1,4 @@
+from fractions import Fraction
 import json
 import platform
 import hashlib
@@ -6,6 +7,7 @@ import shutil
 import subprocess
 import sys
 
+from pydantic import ValidationError
 import pytest
 
 from pluginbench import measurement_profiles as profiles
@@ -565,13 +567,13 @@ def test_unready_measures_block_only_when_required_or_ready_on_no_task(
         "covered": {"coverage": {"state": "ready", "reason": None}},
         "uncovered": {"coverage": {"state": "not_configured", "reason": "no coverage tool"}},
     }
-    assert blocking_findings(matrix, require_ready=require_ready) == (
+    assert blocking_findings(matrix, require_ready=require_ready, max_not_ready_share=None) == (
         ["uncovered: coverage is not_configured: no coverage tool"] if require_ready else []
     )
     # Now no task can measure coverage.
     matrix["covered"]["coverage"] = {"state": "broken", "reason": "test command exited 3"}
     assert "covered: coverage is broken: test command exited 3" in blocking_findings(
-        matrix, require_ready=require_ready
+        matrix, require_ready=require_ready, max_not_ready_share=None
     )
 
 
@@ -590,7 +592,7 @@ def test_a_measure_broken_on_one_task_is_not_measured_there(require_ready: bool)
         },
     }
 
-    assert blocking_findings(matrix, require_ready=require_ready) == (
+    assert blocking_findings(matrix, require_ready=require_ready, max_not_ready_share=None) == (
         ["rust: dead_code is broken: No escaped character"] if require_ready else []
     )
     assert not_measured(matrix) == [
@@ -599,7 +601,7 @@ def test_a_measure_broken_on_one_task_is_not_measured_there(require_ready: bool)
     # Checks that protect paid attempts still block in both modes.
     matrix["python"]["oracle"] = {"state": "broken", "reason": "verifier reward is 0"}
     assert "python: oracle is broken: verifier reward is 0" in blocking_findings(
-        matrix, require_ready=require_ready
+        matrix, require_ready=require_ready, max_not_ready_share=None
     )
 
 
@@ -610,14 +612,124 @@ def test_a_measure_ready_on_no_task_blocks(require_ready: bool) -> None:
         "cobol": {"coverage": {"state": "not_configured", "reason": "no coverage tool"}},
     }
 
-    findings = blocking_findings(matrix, require_ready=require_ready)
+    findings = blocking_findings(matrix, require_ready=require_ready, max_not_ready_share=None)
 
     assert findings[-1] == "coverage is ready on no task, so the run would measure nothing for it"
     assert "rust: coverage is broken: test command exited 3" in findings
     assert not_measured(matrix) == []
     # A measure that no task configures is ready nowhere too.
     matrix["rust"]["coverage"] = {"state": "not_configured", "reason": "no coverage tool"}
-    assert blocking_findings(matrix, require_ready=require_ready)[-1] == findings[-1]
+    assert (
+        blocking_findings(matrix, require_ready=require_ready, max_not_ready_share=None)[-1]
+        == findings[-1]
+    )
+
+
+def _dead_code_matrix(
+    tasks: int, broken: int, not_configured: int = 0
+) -> dict[str, dict[str, dict[str, object]]]:
+    """dead_code on `tasks` tasks: the first `broken` are broken, the next not configured."""
+    states = ["broken"] * broken + ["not_configured"] * not_configured
+    states += ["ready"] * (tasks - len(states))
+    return {
+        f"task-{index:02}": {
+            "dead_code": {"state": state, "reason": None if state == "ready" else "no parser"},
+            "lines": {"state": "ready", "reason": None},
+        }
+        for index, state in enumerate(states)
+    }
+
+
+@pytest.mark.parametrize(
+    ("tasks", "broken", "not_configured", "blocks", "warns"),
+    [
+        (13, 4, 0, False, False),
+        (13, 5, 0, True, False),
+        # Not configured counts as not ready too.
+        (13, 2, 3, True, False),
+        # Exactly on the line continues, warning that any dropout during the run crosses it.
+        (12, 4, 0, False, True),
+        (12, 1, 3, False, True),
+    ],
+)
+def test_a_measure_not_ready_on_more_than_the_share_of_tasks_blocks(
+    tasks: int, broken: int, not_configured: int, blocks: bool, warns: bool
+) -> None:
+    matrix = _dead_code_matrix(tasks, broken, not_configured)
+    share = Fraction(1, 3)
+    unready = ", ".join(f"task-{index:02}" for index in range(broken + not_configured))
+
+    findings = blocking_findings(matrix, require_ready=False, max_not_ready_share=share)
+
+    assert findings == (
+        [
+            f"dead_code is not ready on {broken + not_configured} of {tasks} tasks, more than "
+            f"max_not_ready_share 1/3: {unready}"
+        ]
+        if blocks
+        else []
+    )
+    assert profiles.not_ready_share_warnings(matrix, share) == (
+        [
+            f"dead_code is not ready on {broken + not_configured} of {tasks} tasks, exactly "
+            "max_not_ready_share 1/3, so any task that fails to measure it during the run "
+            f"crosses that share: {unready}"
+        ]
+        if warns
+        else []
+    )
+    # Without a share, a measure ready somewhere never blocks, as before.
+    assert blocking_findings(matrix, require_ready=False, max_not_ready_share=None) == []
+    assert profiles.not_ready_share_warnings(matrix, None) == []
+
+
+def test_require_ready_still_blocks_each_unready_task_under_a_share() -> None:
+    matrix = _dead_code_matrix(13, 1)
+    share = Fraction(1, 3)
+
+    assert blocking_findings(matrix, require_ready=True, max_not_ready_share=share) == [
+        "task-00: dead_code is broken: no parser"
+    ]
+
+
+def test_a_measure_ready_on_no_task_blocks_once_under_a_share() -> None:
+    share = Fraction(1, 3)
+
+    findings = blocking_findings(
+        _dead_code_matrix(3, 3), require_ready=False, max_not_ready_share=share
+    )
+
+    assert findings == [
+        "task-00: dead_code is broken: no parser",
+        "task-01: dead_code is broken: no parser",
+        "task-02: dead_code is broken: no parser",
+        "dead_code is ready on no task, so the run would measure nothing for it",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "share"),
+    [("1/3", Fraction(1, 3)), ("0.33", Fraction(33, 100)), (0.33, Fraction(33, 100)), (None, None)],
+)
+def test_max_not_ready_share_reads_an_exact_fraction_or_decimal(
+    value: object, share: Fraction | None
+) -> None:
+    settings = MeasurementSettings.model_validate({"max_not_ready_share": value})
+
+    assert settings.max_not_ready_share == share
+    # Saved with the run as an exact string and read back unchanged.
+    saved = settings.model_dump(mode="json")
+    # Unset, it is left out, so settings saved before it existed keep their exact shape.
+    assert saved.get("max_not_ready_share", "unset") == ("unset" if share is None else str(share))
+    assert MeasurementSettings.model_validate(saved) == settings
+
+
+@pytest.mark.parametrize("value", ["0", "1", "4/3", "-1/3", 0, 1, 1.5, True, "a third"])
+def test_max_not_ready_share_rejects_values_outside_zero_and_one(value: object) -> None:
+    with pytest.raises(ValidationError, match="max_not_ready_share") as error:
+        MeasurementSettings.model_validate({"max_not_ready_share": value})
+
+    assert "Extra inputs are not permitted" not in str(error.value)
 
 
 @pytest.mark.parametrize(

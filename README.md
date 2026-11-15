@@ -233,7 +233,7 @@ Every setting lives in the config. Flags only control how a command runs.
 
 **Treatments.** Each treatment lists `guidance` (instruction files), `skills`, or `plugins`; see [Test your own guidance](#test-your-own-guidance). The task prompt is the same for every arm.
 
-**Measurements.** Before any paid call, PluginBench runs each selected collector twice on the starting code. A measure with no collector for a task is `not_configured`, and one whose collector fails its probe is `broken`. That task is then not measured for it, and the run continues, as long as another task can measure it. A measure that is ready on no task stops the run. With `measurement_settings.require_ready: true`, any such task stops the run. Selecting `review` requires a `reviewer` block. [Measurements](docs/running-evaluations.md#measurements).
+**Measurements.** Before any paid call, PluginBench runs each selected collector twice on the starting code. A measure with no collector for a task is `not_configured`, and one whose collector fails its probe is `broken`. That task is then not measured for it, and the run continues, as long as another task can measure it. A measure that is ready on no task stops the run. With `measurement_settings.max_not_ready_share: "1/3"`, a measure that is not ready on more than a third of the tasks stops the run too. With `measurement_settings.require_ready: true`, any such task stops the run. Selecting `review` requires a `reviewer` block. [Measurements](docs/running-evaluations.md#measurements).
 
 **Concurrency.** `jobs` defaults to 2 and accepts 1 to 4. A value above Docker capacity fails the check; PluginBench does not lower it. [Concurrency and resume](docs/running-evaluations.md#concurrency-and-resume).
 
@@ -258,7 +258,7 @@ Every setting lives in the config. Flags only control how a command runs.
 - Unknown values are never shown as zero.
 - Reused vanilla attempts are not fresh independent samples.
 - Claude Code token rules are calibrated on CLI 2.1.322 only. Other versions get a weaker check, and a timed-out Claude attempt has no token lower bound. See [Claude Code coding](docs/running-evaluations.md#claude-code-coding).
-- A measure that is `broken` on a task is not measured for that task. `check` warns, and the report shows it as unavailable there. With `measurement_settings.require_ready: true`, the check stops instead. A measure that is ready on no task always stops the run.
+- A measure that is `broken` on a task is not measured for that task. `check` warns, and the report shows it as unavailable there. With `measurement_settings.require_ready: true`, the check stops instead. A measure that is ready on no task always stops the run, and so does one that is not ready on more than `measurement_settings.max_not_ready_share` of the tasks.
 - PluginBench executes model-generated code. Use trusted tasks, images, and treatments on a trusted machine. See [Security](SECURITY.md).
 
 ## More
