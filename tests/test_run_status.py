@@ -747,20 +747,6 @@ def _failure(attempt: str, task: str, family: str, *diagnostics: str) -> dict[st
     }
 
 
-def test_a_blocked_check_alerts_with_its_findings(tmp_path: Path) -> None:
-    root = _run(tmp_path / "run", states=STATES, ledger=True)
-    _write(root / "check.json", {"status": "blocked", "findings": ["coverage is ready nowhere"]})
-
-    [alert] = run_status.run_status(root)["alerts"]["items"]
-
-    assert alert == {
-        "kind": "check_blocked",
-        "severity": "error",
-        "message": "check blocked the run: coverage is ready nowhere",
-        "findings": ["coverage is ready nowhere"],
-    }
-
-
 @pytest.mark.parametrize("ending", ["failed", "stopped"])
 def test_a_failed_operation_alerts_but_a_stop_does_not(tmp_path: Path, ending: str) -> None:
     root = _run(tmp_path / "run", states=STATES, ledger=True)

@@ -234,7 +234,6 @@ def _unavailable_measures(
 
 def _alerts(
     *,
-    root: Path,
     selection: dict[str, Any],
     report: dict[str, Any] | None,
     error: str | None,
@@ -242,17 +241,6 @@ def _alerts(
 ) -> dict[str, Any]:
     """What an operator should act on, derived from the saved state on every read."""
     items: list[dict[str, Any]] = []
-    check = _read(root / "check.json") or {}
-    if check.get("status") == "blocked":
-        findings = check.get("findings", [])
-        items.append(
-            {
-                "kind": "check_blocked",
-                "severity": "error",
-                "message": "check blocked the run: " + "; ".join(findings),
-                "findings": findings,
-            }
-        )
     if error:
         items.append({"kind": "run_failed", "severity": "error", "message": error})
     # Only a report built from the selected revision counts: one that names an earlier
@@ -265,7 +253,7 @@ def _alerts(
     for row in selection.get("not_measured", []):
         items.append(
             {
-                "kind": "check_not_measured",
+                "kind": "not_measured",
                 "severity": "warning",
                 "message": f"{row['task']}: {row['measure']} not measured: {row['reason']}",
                 **{key: row.get(key) for key in ("task", "measure", "reason")},
@@ -497,7 +485,7 @@ def run_status(
         "last_event": events[-1] if events else None,
         "error": error,
         "alerts": _alerts(
-            root=root, selection=selection, report=report, error=error, attempts=attempts
+            selection=selection, report=report, error=error, attempts=attempts
         ),
         "states_source": source,
         "attempts_total": len(attempts),
