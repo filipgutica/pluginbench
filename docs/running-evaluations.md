@@ -265,7 +265,7 @@ Coding stage:
 | --- | --- |
 | The agent timed out after its first model turn | Graded, with `timed_out`. Never coded again |
 | The agent exited with an error after its first model turn | Graded, with `agent_error`. Never coded again |
-| The session shows no model turn: no usage, transcript tokens, command, tool call, message from a real model, or Codex token evidence. Claude's `<synthetic>` message for an API error is no turn; a transcript that survives a cut stream is one. An outage (Codex's `turn.failed`), a CLI that exits at startup, and a timeout before the first turn all look like this | Infrastructure. The run stops; resume codes the attempt again |
+| The session shows no model turn: no usage, transcript tokens from this session, command, tool call, message from a real model, or Codex token evidence. Claude's `<synthetic>` message for an API error is no turn; a transcript that survives a cut stream is one, also when unaudited hooks leave usage incomplete. Transcript rows from another session never count. An outage (Codex's `turn.failed`), a CLI that exits at startup, and a timeout before the first turn all look like this | Infrastructure. The run stops; resume codes the attempt again |
 | A usage or rate limit, or a provider stop | Infrastructure. The run stops; resume codes the attempt again |
 | The treatment was not delivered | Infrastructure |
 | The worker or container was lost, or Harbor exported no submission | Infrastructure |
@@ -529,7 +529,7 @@ Claude Code vanilla attempts use the same cache under their own key. A Claude en
 - The discovery receipt is verified and empty. It reports the launched CLI version, the pinned discovery argv and settings, and the pinned built-ins.
 - The session's `system/init` offered exactly the pinned tools, and the run recorded no permission denial.
 
-Timeouts after a model turn and attempts with unknown usage are cached, as for Codex. A Claude session with no usage, transcript tokens, tool call or message from a real model never reached the model, even when it timed out: it is an infrastructure error, the run stops, and it is not cached. A finished Claude vanilla attempt that is not cached prints why. Reuse runs the current Claude usage rules on the saved stream and transcripts.
+Timeouts after a model turn and attempts with unknown usage are cached, as for Codex. A Claude session with no usage, transcript tokens from this session, tool call or message from a real model never reached the model, even when it timed out: it is an infrastructure error, the run stops, and it is not cached. A finished Claude vanilla attempt that is not cached prints why. Reuse runs the current Claude usage rules on the saved stream and transcripts.
 
 Open `report/report.html`. `results.json` contains raw observations, capabilities, grading evidence, vanilla deltas, reference values and ratios, and cost rows. `results.csv` contains individual measurements. Rebuild with `pluginbench report runs/<run>` without model calls.
 Public reports use `vanilla` for the no-guidance arm. See the [report format](metrics.md#report-files) for schema version 2 and compatibility with older reports.

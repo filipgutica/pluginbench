@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import shutil
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
@@ -233,6 +234,31 @@ def test_a_claude_timeout_whose_transcript_shows_model_work_is_the_agent_s_attem
     assert grade.failed_before_first_turn(session, "claude") is None
     # Without the transcript the same timeout shows no turn.
     session["usage_accounting"] = {"status": "incomplete", "reasons": ["no transcript"]}
+    assert grade.failed_before_first_turn(session, "claude") == (
+        "the session timed out before any model turn"
+    )
+
+
+def test_another_session_s_transcript_tokens_are_no_model_turn(tmp_path: Path) -> None:
+    # The current session's transcript file holds only rows labelled with an earlier session,
+    # and the stream was cut after system/init.
+    sessions = tmp_path / "sessions"
+    shutil.copytree(PLAIN.parent / "sessions", sessions)
+    (transcript,) = (sessions / "projects").glob("*/*.jsonl")
+    rows = [json.loads(line) for line in transcript.read_text().splitlines()]
+    transcript.write_text(
+        "".join(json.dumps({**row, "sessionId": "earlier-session"}) + "\n" for row in rows)
+    )
+    init = PLAIN.read_text().splitlines()[0]
+    session = claude.parse_events(init, [], coding=True)
+    session.update(
+        timed_out=True,
+        **claude_usage.coding_usage(
+            init, sessions, runner_model="claude-opus-5-5", cli_version="2.1.322"
+        ),
+    )
+    assert session["usage"] is None
+    assert any("belongs to another session" in r for r in session["usage_accounting"]["reasons"])
     assert grade.failed_before_first_turn(session, "claude") == (
         "the session timed out before any model turn"
     )

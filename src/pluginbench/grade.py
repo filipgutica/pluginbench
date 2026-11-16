@@ -102,8 +102,13 @@ def _claude_turn_observed(execution: Mapping[str, Any]) -> bool:
     a real model. A message from `<synthetic>` alone, such as an initial API error, is none.
     This reads the parsed execution only, so it lives here rather than in the hashed Claude
     launcher.
+
+    Unaudited command hooks or mixed built-ins withhold the total but keep the native
+    accounting, transcript tokens included, under `native_sessions`.
     """
     accounting = execution.get("usage_accounting")
+    while isinstance(accounting, Mapping) and "native_sessions" in accounting:
+        accounting = accounting["native_sessions"]
     per_model = accounting.get("per_model") if isinstance(accounting, Mapping) else None
     transcribed = isinstance(per_model, Mapping) and any(
         isinstance(counts, Mapping)
