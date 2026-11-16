@@ -69,6 +69,13 @@ def _report(*, schema: int) -> dict[str, Any]:
             _observation("a1", "Source lines added", 0),
             _observation("a1", "Test lines added", 7, status="unknown"),
             _observation("a2", "Input tokens", 5, status="unknown"),
+            _observation("a1", "P0 review findings", 0),
+            _observation("a1", "P1 review findings", 2),
+            _observation("a1", "P2 review findings", 3, status="unknown"),
+            _observation("a1", "P3 review findings", 4),
+            _observation("a1", "Verification iterations (transcript count)", 5),
+            _observation("a1", "Net cognitive complexity added", -1),
+            _observation("a1", "Changed-line coverage %", 9, status="unavailable"),
         ],
     }
 
@@ -96,6 +103,7 @@ def test_rows_copy_named_fields_and_never_private_ones(schema: int) -> None:
         "tokens",
         "coding_seconds",
         "lines",
+        "measures",
         "reused_vanilla",
     )
     assert first["runner"] == RUNNER
@@ -117,6 +125,17 @@ def test_rows_copy_named_fields_and_never_private_ones(schema: int) -> None:
         "source_removed": None,
         "test_added": None,
         "test_removed": None,
+    }
+    # Each measure keeps the report's status: a measured zero, a measure that came back unknown,
+    # one the run did not measure, and one the report has no row for all stay distinct.
+    assert first["measures"] == {
+        "p0_findings": {"value": 0, "status": "measured"},
+        "p1_findings": {"value": 2, "status": "measured"},
+        "p2_findings": {"value": None, "status": "unknown"},
+        "verification_iterations": {"value": 5, "status": "measured"},
+        "net_cognitive_complexity": {"value": -1, "status": "measured"},
+        "changed_line_coverage_percent": {"value": None, "status": "unavailable"},
+        "mutation_bug_catch_percent": {"value": None, "status": None},
     }
     assert second["tokens"]["input"] is None
     assert second["reused_vanilla"] is False

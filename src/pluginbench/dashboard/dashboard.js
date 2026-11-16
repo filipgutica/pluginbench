@@ -629,28 +629,95 @@ function lines(value) {
   return typeof value === "number" ? String(value) : "—";
 }
 
+// Rounded down, so 99.96 shows as 99.9%, never as full coverage.
+function percent(value) {
+  return typeof value === "number" ? `${Math.floor(value * 10) / 10}%` : "—";
+}
+
+// Why a measure has no value, from its report status; null when the report has no row for it.
+const MEASURE_STATUSES = { unknown: "unknown", unavailable: "not measured", incomplete: "incomplete" };
+
+function measureNote(measure) {
+  if (measure.value != null || !measure.status) return null;
+  return MEASURE_STATUSES[measure.status] || measure.status;
+}
+
+// The value, or "—" with the reason underneath; a measured 0 shows as 0. One wrapper, so a
+// phone's stacked layout keeps the reason in the value column.
+function measureCell(measure, format) {
+  const note = measureNote(measure);
+  return h("div", null, measure.value != null ? format(measure.value) : "—", note ? h("span", { class: "sub" }, note) : null);
+}
+
+// The three counts in one cell, so a phone shows the breakdown without hovering.
+function findingsCell(measures) {
+  const levels = [["P0", measures.p0_findings], ["P1", measures.p1_findings], ["P2", measures.p2_findings]];
+  const reasons = levels.map(([, measure]) => measureNote(measure));
+  // One reason for all three, such as "not measured" when review did not run, is said once.
+  const note =
+    reasons.every((reason) => reason && reason === reasons[0])
+      ? reasons[0]
+      : levels.map(([level], index) => reasons[index] && `${level} ${reasons[index]}`).filter(Boolean).join(", ");
+  return h(
+    "div",
+    null,
+    h("span", { class: "findings" }, levels.map(([level, measure]) => `${level} ${measure.value ?? "—"}`).join(" · ")),
+    note ? h("span", { class: "sub" }, note) : null,
+  );
+}
+
+const RESULT_COLUMNS = [
+  "Run",
+  "Harness",
+  "Model",
+  "Effort",
+  "Task",
+  "Repeat",
+  "Arm",
+  "Correctness",
+  "Input tokens",
+  "Output tokens",
+  "Coding time",
+  "Source lines added",
+  "Test lines added",
+  "Review findings P0\u2060–\u2060P2", // Word joiners keep "P0–P2" on one line.
+  "Verification iterations (transcript count)",
+  "Net cognitive complexity added",
+  "Changed-line coverage",
+  "Mutation bug-catch rate",
+];
+// Columns from Input tokens on hold numbers.
+const FIRST_NUMBER_COLUMN = RESULT_COLUMNS.indexOf("Input tokens");
+
 function resultRow(row) {
   const correctness = OUTCOMES[row.correctness] || [row.correctness || "Unknown", ""];
+  const measures = row.measures;
+  // In RESULT_COLUMNS order.
   const cells = [
-    ["Run", h("a", { href: `#/run/${row.run_key}` }, row.run_name || "Unnamed run")],
-    ["Harness", row.runner.harness || "—"],
-    ["Model", row.runner.model || "—"],
-    ["Effort", `${row.runner.reasoning || "—"}, effective ${row.reasoning_effort || "unknown"}`],
-    ["Task", row.task],
-    ["Repeat", row.repeat],
-    ["Arm", row.reused_vanilla ? `${row.arm} (reused)` : row.arm],
-    ["Correctness", badge(correctness)],
-    ["Input tokens", count(row.tokens.input)],
-    ["Output tokens", count(row.tokens.output)],
-    ["Coding time", seconds(row.coding_seconds)],
-    ["Source lines added", lines(row.lines.source_added)],
-    ["Test lines added", lines(row.lines.test_added)],
+    h("a", { href: `#/run/${row.run_key}` }, row.run_name || "Unnamed run"),
+    row.runner.harness || "—",
+    row.runner.model || "—",
+    `${row.runner.reasoning || "—"}, effective ${row.reasoning_effort || "unknown"}`,
+    row.task,
+    row.repeat,
+    row.reused_vanilla ? `${row.arm} (reused)` : row.arm,
+    badge(correctness),
+    count(row.tokens.input),
+    count(row.tokens.output),
+    seconds(row.coding_seconds),
+    lines(row.lines.source_added),
+    lines(row.lines.test_added),
+    findingsCell(measures),
+    measureCell(measures.verification_iterations, lines),
+    measureCell(measures.net_cognitive_complexity, lines),
+    measureCell(measures.changed_line_coverage_percent, percent),
+    measureCell(measures.mutation_bug_catch_percent, percent),
   ];
   return h(
     "tr",
     null,
-    cells.map(([label, value], index) =>
-      h("td", { "data-label": label, class: index >= 8 ? "num" : null }, value),
+    cells.map((value, index) =>
+      h("td", { "data-label": RESULT_COLUMNS[index], class: index >= FIRST_NUMBER_COLUMN ? "num" : null }, value),
     ),
   );
 }
@@ -718,9 +785,7 @@ function renderResults(data) {
           h(
             "tr",
             null,
-            ["Run", "Harness", "Model", "Effort", "Task", "Repeat", "Arm", "Correctness", "Input tokens", "Output tokens", "Coding time", "Source lines added", "Test lines added"].map(
-              (label, index) => h("th", { scope: "col", class: index >= 8 ? "num" : null }, label),
-            ),
+            RESULT_COLUMNS.map((label, index) => h("th", { scope: "col", class: index >= FIRST_NUMBER_COLUMN ? "num" : null }, label)),
           ),
         ),
         h("tbody", null, shown.map(resultRow)),
