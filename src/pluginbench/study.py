@@ -1299,10 +1299,18 @@ def resume_study(
         # An invocation still open, a cached attempt's regrade included, was cut off by a crash.
         # Nothing it started may still run when its saved output is accepted or its row closed.
         cleaned = control_store.verify_crashed(ledger, path, ("coding", "grading"))
-        if cleaned or _codes_again(ledger):
-            control_store.stop_containers_left_by(
-                root, _coding_runtime(frozen, baseline_identity), progress
+        codes_again = _codes_again(root, ledger)
+        if cleaned or codes_again:
+            # A run that codes again needs its coding runtime anyway. One that only finishes
+            # keeps the runtime it was prepared with, which still pins Docker for the stop.
+            runtime = (
+                _coding_runtime(frozen, baseline_identity)
+                if codes_again
+                else native_identity(frozen.tasks[0]).get("isolation")
             )
+            if not isinstance(runtime, dict):
+                raise ValueError(f"task {frozen.tasks[0].task_id} has no saved runtime")
+            control_store.stop_containers_left_by(root, runtime, progress)
         plan, manifest, states = _reconcile(root, run, ledger)
         # After `_reconcile`, which accepts the output of any attempt with a record receipt.
         for stage in ("coding", "grading"):
@@ -1384,11 +1392,14 @@ def is_graded_run(plan: dict[str, Any]) -> bool:
     return plan.get("grade_contract") == grade.GRADE_CONTRACT
 
 
-def _codes_again(ledger: Ledger) -> bool:
-    """Whether a resume may code again: a live attempt is unfinished and its slot has
-    invocations left. A run stopped after its last attempt finished needs no coding runtime."""
+def _codes_again(root: Path, ledger: Ledger) -> bool:
+    """Whether a resume may code again: a live attempt has neither finished nor left a record
+    receipt, as `_reconcile` judges it, and its slot has invocations left. A run stopped after
+    its last attempt finished needs no coding runtime."""
     return any(
-        row["state"] != "complete" and ledger.refusal(row["slot"], "coding") is None
+        row["state"] != "complete"
+        and not (root / "records" / f"{row['id']}.json").is_file()
+        and ledger.refusal(row["slot"], "coding") is None
         for row in ledger.attempts()
         if row["state"] != "discarded-interrupted"
     )

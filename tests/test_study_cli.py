@@ -35,6 +35,7 @@ from pluginbench import (
     claude,
     cli,
     codex,
+    control_store,
     components,
     evaluation,
     harbor_backend,
@@ -138,6 +139,7 @@ def test_public_commands_cover_evaluations_reports_and_task_selection() -> None:
         "report",
         "review",
         "measure",
+        "repair",
         "tasks",
         "judge",
     }
@@ -4225,6 +4227,8 @@ def test_a_run_killed_after_its_last_attempt_finished_resumes_with_a_newer_launc
     )
     monkeypatch.setattr(codex, "invoke", backend)
     monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    # The simulated kill records no child process; test_control_store covers that check.
+    monkeypatch.setattr(control_store, "verify_invocation", lambda item: {"id": item["id"]})
     evidence = tmp_path / "run/evidence"
     killed = False
 
