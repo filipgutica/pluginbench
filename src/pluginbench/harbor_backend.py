@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from collections.abc import Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -899,18 +900,92 @@ def native_task_assets(task_dir: Path) -> str:
     ).hexdigest()
 
 
+def _normalize_native_artifacts(configuration: dict[str, object]) -> list[dict[str, object]]:
+    """Drop only children already covered by an earlier, unfiltered convention parent."""
+    config_type = importlib.import_module("harbor.models.task.config")
+    helpers = importlib.import_module("harbor.models.task.artifacts")
+    host_path = importlib.import_module("harbor.trial.artifact_handler").artifact_host_path
+    entries = TypeAdapter(list[object]).validate_python(configuration.get("artifacts", []))
+    declared = helpers.normalize_artifact_entries(
+        [
+            entry if isinstance(entry, str) else config_type.ArtifactConfig.model_validate(entry)
+            for entry in entries
+        ]
+    )
+    environment = config_type.EnvironmentConfig.model_validate(configuration.get("environment", {}))
+    convention = helpers.convention_source_for_os(environment.os)
+    collection = helpers.with_convention_entry(declared, convention_source=convention)
+    parent_index, parent = next(
+        (index, entry)
+        for index, entry in enumerate(collection)
+        if helpers.is_convention_entry(entry, convention)
+    )
+    kept = []
+    removed = []
+    for index, entry in enumerate(collection):
+        # The implicit parent is not a declaration; retain the original declaration order.
+        if index == 0 and len(collection) > len(declared):
+            continue
+        suffix = (
+            PurePosixPath(entry.source).relative_to(convention)
+            if PurePosixPath(convention) in PurePosixPath(entry.source).parents
+            else None
+        )
+        if (
+            suffix is None
+            or index < parent_index
+            or parent.exclude
+            or parent.destination is not None
+            or entry.exclude
+            or entry.destination is not None
+            or helpers.effective_artifact_service(entry)
+            != helpers.effective_artifact_service(parent)
+        ):
+            kept.append(entry.model_dump(mode="json"))
+            continue
+        if host_path(Path("artifacts"), entry) != host_path(Path("artifacts"), parent).joinpath(
+            *suffix.parts
+        ):
+            raise ValueError("Native child artifact is not at its canonical parent path")
+        removed.append(_native_object(entry.model_dump(mode="json"), "redundant artifact"))
+    if removed:
+        configuration["artifacts"] = kept
+    return removed
+
+
+def native_task_config(task_dir: Path) -> dict[str, object]:
+    """Validate a task without rewriting its assets or warning about redundant artifacts."""
+    configuration = tomllib.loads((task_dir / "task.toml").read_text())
+    _normalize_native_artifacts(configuration)
+    config = importlib.import_module("harbor.models.task.config").TaskConfig.model_validate(
+        configuration
+    )
+    paths = importlib.import_module("harbor.models.task.paths").TaskPaths(task_dir)
+    task_type = importlib.import_module("harbor.models.task.task").Task
+    # Task.__init__ validates the raw TOML immediately and has no config argument.
+    # Reuse its path/test checks after validating the normalized configuration.
+    task_type._validate_input_paths(config, paths)
+    task_type._validate_tests(config, paths)
+    if not config.steps:
+        paths.instruction_path.read_text()
+    return _native_object(config.model_dump(mode="json"), "native task configuration")
+
+
 def validate_native_task(task_dir: Path) -> dict[str, object]:
     """Admit standard tasks by execution topology, never by task name."""
     native_task_assets(task_dir)
-    task = importlib.import_module("harbor.models.task.task").Task(task_dir)
+    config = importlib.import_module("harbor.models.task.config").TaskConfig.model_validate(
+        native_task_config(task_dir)
+    )
+    paths = importlib.import_module("harbor.models.task.paths").TaskPaths(task_dir)
     modes = importlib.import_module("harbor.models.task.verifier_mode")
-    if task.has_steps or modes.resolve_task_verifier_mode(task.config).value != "separate":
+    if config.steps or modes.resolve_task_verifier_mode(config).value != "separate":
         raise ValueError("Native execution requires a single-step task with a separate verifier")
-    definition = modes.resolve_verifier_environment_definition(task.config, task.paths)
+    definition = modes.resolve_verifier_environment_definition(config, paths)
     if definition is None:
         raise ValueError("Native separate verifier definition is missing")
     for directory, configuration in (
-        (task.paths.environment_dir, task.config.environment),
+        (paths.environment_dir, config.environment),
         (definition.directory, definition.config),
     ):
         if configuration.os.value != "linux" or configuration.gpus or configuration.tpu:
@@ -930,8 +1005,8 @@ def validate_native_task(task_dir: Path) -> dict[str, object]:
             )
         if not configuration.docker_image and not (directory / "Dockerfile").is_file():
             raise ValueError("Native environment needs a Docker image or Dockerfile")
-    image = task.config.environment.docker_image
-    dockerfile = task.paths.environment_dir / "Dockerfile"
+    image = config.environment.docker_image
+    dockerfile = paths.environment_dir / "Dockerfile"
     return {
         "task_assets_sha256": native_task_assets(task_dir),
         # Agents run in a prebuilt image as published; a Dockerfile beside it is never built.
@@ -939,11 +1014,11 @@ def validate_native_task(task_dir: Path) -> dict[str, object]:
             "source": "prebuilt" if image else "dockerfile",
             "image": image,
             # Harbor resolves its paths, so a source given with `..` or a link still matches here.
-            "ignored_dockerfile": str(dockerfile.relative_to(task.paths.task_dir))
+            "ignored_dockerfile": str(dockerfile.relative_to(paths.task_dir))
             if image and dockerfile.is_file()
             else None,
         },
-        "configuration": task.config.model_dump(mode="json"),
+        "configuration": config.model_dump(mode="json"),
         "verifier_directory": str(definition.directory),
         "verifier_bundled_tests": definition.bundled_tests,
         "verifier_configuration": definition.config.model_dump(mode="json"),
@@ -1417,12 +1492,14 @@ def _native_config(
 
 
 def _native_worker_budget(*, task_dir: Path, agent_seconds: int = 0, prepare: bool = False) -> int:
-    task = importlib.import_module("harbor.models.task.task").Task(task_dir)
-    build = int(task.config.environment.build_timeout_sec)
+    config = importlib.import_module("harbor.models.task.config").TaskConfig.model_validate(
+        native_task_config(task_dir)
+    )
+    build = int(config.environment.build_timeout_sec)
     if prepare:
         return build + 600 + 360
-    collect = sum(int(item.timeout_sec or 300) for item in task.config.verifier.collect)
-    return agent_seconds + 600 + 2 * build + int(task.config.verifier.timeout_sec) + collect + 720
+    collect = sum(int(item.timeout_sec or 300) for item in config.verifier.collect)
+    return agent_seconds + 600 + 2 * build + int(config.verifier.timeout_sec) + collect + 720
 
 
 def _native_process(
@@ -1659,6 +1736,10 @@ def _prepare_native_task(
     shutil.copytree(task_dir, frozen)
     if native_task_assets(frozen) != admission["task_assets_sha256"]:
         raise ValueError("Native task changed while freezing preparation inputs")
+    config_type = importlib.import_module("harbor.models.task.config").TaskConfig
+    (frozen / "task.toml").write_text(
+        config_type.model_validate(admission["configuration"]).model_dump_toml()
+    )
     task_type = importlib.import_module("harbor.models.task.task").Task
     task = task_type(frozen)
     modes = importlib.import_module("harbor.models.task.verifier_mode")
@@ -1831,12 +1912,15 @@ def prepare_native_task(
         )
     admission = validate_native_task(task_dir)
     expected = runtime_identity(cpus=limits["cpus"], memory_mb=limits["memory_mb"], harness=harness)
-    task = importlib.import_module("harbor.models.task.task").Task(task_dir)
+    config = importlib.import_module("harbor.models.task.config").TaskConfig.model_validate(
+        admission["configuration"]
+    )
+    paths = importlib.import_module("harbor.models.task.paths").TaskPaths(task_dir)
     modes = importlib.import_module("harbor.models.task.verifier_mode")
-    definition = modes.resolve_verifier_environment_definition(task.config, task.paths)
+    definition = modes.resolve_verifier_environment_definition(config, paths)
     base = _native_image(
-        directory=task.paths.environment_dir,
-        image=task.config.environment.docker_image,
+        directory=paths.environment_dir,
+        image=config.environment.docker_image,
         expected=expected,
     )
     grader = _native_image(
@@ -1866,6 +1950,10 @@ def prepare_native_task(
             "provider_hosts": NATIVE_PROVIDER_HOSTS[harness],
         },
     }
+    configuration = tomllib.loads((task_dir / "task.toml").read_text())
+    if _normalize_native_artifacts(configuration):
+        # Only tasks with removed declarations must avoid older, unnormalized frozen configs.
+        inputs["artifact_normalization"] = 1
     # Keyed by the runtime contract, so recorded and fit runtime fields never miss the cache.
     contract = _preparation_contract(inputs)
     key = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
@@ -2915,38 +3003,23 @@ def _native_regrade_task(
     """Remove only redundant declarations whose bytes the convention parent captured."""
     if _native_artifact_hashes(source / "artifacts") != artifact_hashes:
         raise ValueError("Recorded native artifacts differ from their frozen hashes")
-    task = importlib.import_module("harbor.models.task.task").Task(task_dir)
+    configuration = tomllib.loads((task_dir / "task.toml").read_text())
+    redundant = _normalize_native_artifacts(configuration)
+    config_type = importlib.import_module("harbor.models.task.config")
+    config = config_type.TaskConfig.model_validate(native_task_config(task_dir))
     helpers = importlib.import_module("harbor.models.task.artifacts")
     host_path = importlib.import_module("harbor.trial.artifact_handler").artifact_host_path
-    convention = helpers.convention_source_for_os(task.config.environment.os)
-    declared = helpers.normalize_artifact_entries(task.config.artifacts)
+    convention = helpers.convention_source_for_os(config.environment.os)
+    declared = helpers.normalize_artifact_entries(config.artifacts)
     parent = next(
         entry
         for entry in helpers.with_convention_entry(declared, convention_source=convention)
         if helpers.is_convention_entry(entry, convention)
     )
-    kept = []
     removed: list[dict[str, object]] = []
-    for entry in declared:
-        suffix = (
-            PurePosixPath(entry.source).relative_to(convention)
-            if (PurePosixPath(convention) in PurePosixPath(entry.source).parents)
-            else None
-        )
+    for declaration in redundant:
+        entry = config_type.ArtifactConfig.model_validate(declaration)
         child = host_path(source / "artifacts", entry)
-        if (
-            suffix is None
-            or parent.exclude
-            or parent.destination is not None
-            or entry.exclude
-            or entry.destination is not None
-            or helpers.effective_artifact_service(entry)
-            != helpers.effective_artifact_service(parent)
-        ):
-            kept.append(entry)
-            continue
-        if child != host_path(source / "artifacts", parent).joinpath(*suffix.parts):
-            raise ValueError("Native regrade child artifact is not at its canonical parent path")
         if not child.is_file() or child.is_symlink():
             raise ValueError(
                 "Native regrade redundant child artifact is missing or not a regular file"
@@ -2970,8 +3043,7 @@ def _native_regrade_task(
         proof["manifest_sha256"] = artifact_hashes["manifest.json"]
         derived = directory / "regrade-task" / task_dir.name
         shutil.copytree(task_dir, derived)
-        task.config.artifacts = kept
-        (derived / "task.toml").write_text(task.config.model_dump_toml())
+        (derived / "task.toml").write_text(config.model_dump_toml())
     proof["derived_task_assets_sha256"] = native_task_assets(derived)
     return derived, proof
 

@@ -6,8 +6,11 @@ import asyncio
 import hashlib
 import importlib
 import json
+import logging
 import os
+import shutil
 import subprocess
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -49,6 +52,83 @@ def test_native_admission_uses_standard_topology_not_task_allowlist(
     receipt = harbor.validate_native_task(task)
     assert receipt["verifier_bundled_tests"] is bundled
     assert receipt["task_assets_sha256"] == harbor.native_task_assets(task)
+
+
+@pytest.mark.parametrize(
+    "declarations",
+    [
+        '"/logs/artifacts/model.patch"',
+        '{source="/logs/artifacts/model.patch", service="main"}',
+        '"/logs/artifacts/", "/logs/artifacts/model.patch"',
+    ],
+)
+def test_native_admission_normalizes_before_sdk_validation(
+    tmp_path: Path, declarations: str
+) -> None:
+    task = native_task(tmp_path)
+    path = task / "task.toml"
+    path.write_text("artifacts=[" + declarations + "]\n" + path.read_text())
+    original = harbor.native_task_assets(task)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        receipt = harbor.validate_native_task(task)
+        config_type = importlib.import_module("harbor.models.task.config").TaskConfig
+        config = config_type.model_validate(receipt["configuration"])
+        assert all(entry.source.rstrip("/") == "/logs/artifacts" for entry in config.artifacts)
+        assert harbor._native_worker_budget(task_dir=task) > 0
+    assert receipt["task_assets_sha256"] == original == harbor.native_task_assets(task)
+
+
+def test_normalized_native_artifacts_collect_identical_bytes_and_bindings(tmp_path: Path) -> None:
+    task = native_task(tmp_path)
+    path = task / "task.toml"
+    path.write_text('artifacts=["/logs/artifacts/model.patch"]\n' + path.read_text())
+    config_type = importlib.import_module("harbor.models.task.config").TaskConfig
+    with pytest.warns(UserWarning, match="Artifact sources overlap"):
+        original = config_type.model_validate_toml(path.read_text())
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        normalized = config_type.model_validate(harbor.validate_native_task(task)["configuration"])
+    published = tmp_path / "published"
+    (published / "nested").mkdir(parents=True)
+    (published / "model.patch").write_bytes(b"patch bytes\x00\xff\n")
+    (published / "nested/result.bin").write_bytes(bytes(range(256)))
+
+    async def is_dir(source: str, **kwargs: object) -> bool:
+        return source == "/logs/artifacts"
+
+    async def download_dir(*, source_dir: str, target_dir: Path, **kwargs: object) -> None:
+        assert source_dir == "/logs/artifacts"
+        shutil.copytree(published, target_dir, dirs_exist_ok=True)
+
+    environment = SimpleNamespace(
+        capabilities=SimpleNamespace(mounted=False),
+        service_is_dir=is_dir,
+        service_download_dir=download_dir,
+    )
+    handler_type = importlib.import_module("harbor.trial.artifact_handler").ArtifactHandler
+    manifests = []
+    for name, config in (("original", original), ("normalized", normalized)):
+        handler = handler_type(artifacts=config.artifacts, logger=logging.getLogger(__name__))
+        manifests.append(
+            asyncio.run(
+                handler.download_artifacts(
+                    environment, tmp_path / name, source_artifacts_dir=Path("/logs/artifacts")
+                )
+            )
+        )
+    before = harbor._native_artifact_hashes(tmp_path / "original")
+    after = harbor._native_artifact_hashes(tmp_path / "normalized")
+    # The collection report loses its skipped child row; payload paths and bytes stay identical.
+    before.pop("manifest.json")
+    after.pop("manifest.json")
+    assert before == after == {
+        "logs/artifacts/" + name: digest
+        for name, digest in harbor._native_artifact_hashes(published).items()
+    }
+    assert manifests[0].entries[0].model_dump() == manifests[1].entries[0].model_dump()
+    assert manifests[0].entries[1].status == "skipped"
+    assert len(manifests[1].entries) == 1
 
 
 @pytest.mark.parametrize("unsafe", ["shared", "compose", "symlink"])
@@ -319,10 +399,14 @@ def test_native_container_rejects_unapproved_mounts(
 
 @pytest.mark.parametrize("bundled", [True, False])
 @pytest.mark.parametrize("qualification_cleanup", ["complete", "incomplete"])
+@pytest.mark.filterwarnings("error::UserWarning")
 def test_native_preparation_freezes_both_images_and_source_without_models(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bundled: bool, qualification_cleanup: str
 ) -> None:
     task = native_task(tmp_path, bundled=bundled)
+    task_config = task / "task.toml"
+    task_config.write_text('artifacts=["/logs/artifacts/model.patch"]\n' + task_config.read_text())
+    original = harbor.native_task_assets(task)
     base = {
         "image": "sha256:" + "a" * 64,
         "image_id": "sha256:" + "a" * 64,
@@ -342,6 +426,10 @@ def test_native_preparation_freezes_both_images_and_source_without_models(
         config = kwargs["config"]
         assert isinstance(config, dict)
         assert config["install_only"] is True
+        task_definition = config["task"]
+        assert isinstance(task_definition, dict)
+        native = importlib.import_module("harbor.models.task.task").Task(task_definition["path"])
+        assert native.config.artifacts == []
         agent = config["agent"]
         assert isinstance(agent, dict)
         assert agent["model_name"] is None
@@ -402,6 +490,7 @@ def test_native_preparation_freezes_both_images_and_source_without_models(
         limits={"cpus": 1, "memory_mb": 256},
     )
     assert result["image_identity"] == installed
+    assert result["original_task_assets_sha256"] == original == harbor.native_task_assets(task)
     assert result["grader_image_identity"] == grader
     frozen = Path(str(result["task_dir"]))
     assert result["task_assets_sha256"] == harbor.native_task_assets(frozen)
@@ -878,6 +967,7 @@ def test_native_regrade_refuses_unproven_parent_or_child(tmp_path: Path, unprove
         '{source="/logs/artifacts/output.patch", exclude=["*.patch"]}',
         '{source="/logs/artifacts", exclude=["*.patch"]}, "/logs/artifacts/output.patch"',
         '{source="/logs/artifacts", destination="other"}, "/logs/artifacts/output.patch"',
+        '"/logs/artifacts/output.patch", "/logs/artifacts"',
     ],
 )
 def test_native_regrade_retains_nonredundant_artifact_policies(
@@ -897,13 +987,16 @@ def test_native_regrade_retains_nonredundant_artifact_policies(
     assert derived == task
     assert proof["removed_declarations"] == []
     assert harbor.native_task_assets(task) == original
+    config_type = importlib.import_module("harbor.models.task.config").TaskConfig
+    with pytest.warns(UserWarning, match="Artifact sources overlap"):
+        expected = config_type.model_validate_toml(config.read_text()).model_dump(mode="json")
+    with pytest.warns(UserWarning, match="Artifact sources overlap"):
+        assert harbor.validate_native_task(task)["configuration"] == expected
 
 
 def test_native_preparation_cache_reuses_exact_image_source_and_portable_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import shutil
-
     task = native_task(tmp_path)
     image: dict[str, str] = {
         "image": "sha256:" + "a" * 64,
