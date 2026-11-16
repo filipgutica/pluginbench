@@ -843,7 +843,11 @@ def judge_run(
         _error(exc)
         return
     if failed:
-        typer.echo(f"{failed} judge calls failed; run again to retry them.", err=True)
+        typer.echo(
+            f"{failed} judge calls failed; run again to retry them, up to three calls per judge "
+            "and task.",
+            err=True,
+        )
         raise typer.Exit(2)
     typer.echo(f"All judge calls complete. Tally: pluginbench judge tally {directory}")
 

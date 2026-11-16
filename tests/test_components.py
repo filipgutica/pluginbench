@@ -20,15 +20,20 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         1,
         {
             # The optional artifact destination is judge-only; coding launch behavior stays v1.
-            "codex.py": "185d0c33e1389051ddfb97a85c08978a6f65773c2378d601cdf608f4b0c17ccf",
+            # The optional spawn callback reports the reviewer's PID to the invocation ledger;
+            # no launch changes.
+            "codex.py": "b1cbb78fe3fdb2019bedd1dadc2c1c24f029ac63810106c4ea77c93ed27af796",
             # The Claude launch contract; tests/test_codex_identity.py proves Codex launches equal.
             # Measurement and regrade skip launch-only runtime fields; coding checks are unchanged.
             # Audited command hooks keep native usage; with no audited_hooks every launch is
             # unchanged, and vanilla has no hooks, so this stays v1.
             # Artifact normalization drops only redundant children and preserves collected
             # payload bytes and bindings; coding launch behavior stays v1.
-            "harbor_backend.py": "91ade93d117f6d0bb08b7e61cc2d16cd355b3126b65388fcfe669f1db2a15847",
-            "processes.py": "0170e0a4902fc610d19b50ed5656c601474adad97b9b8d6fb5b08c6ab6ad00d1",
+            # The optional spawn callback only reports the worker's PID to the invocation
+            # ledger; what is launched, and how, is unchanged, so this stays v1.
+            "harbor_backend.py": "541feaf8625fbe434099aef3e08637498969a6115345f09f06611e4a64307da4",
+            # The same spawn callback; launches are unchanged.
+            "processes.py": "eb63b5afabfa461b6a5b394388c21999f8f6dfb96b34b86db9d32318a738fc58",
             # Claude admission dispatch, and the Codex config's V2 spawn-override hide. The
             # vanilla cache refuses a cohort saved without the hide by its config, so this stays v1.
             "native_treatments.py": "3c9a617c292e0fbc93bc07b46e012ab79bd5589efc6a3e9267e4652c71ba89b3",

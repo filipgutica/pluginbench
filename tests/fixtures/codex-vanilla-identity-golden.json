@@ -1,5 +1,5 @@
 {
-  "_source": "Computed by tests/test_cache_identity.py codex_vanilla_snapshot on a source tree of fed4eba (PluginBench 0.7.1).",
+  "_source": "Computed by tests/test_cache_identity.py codex_vanilla_snapshot on a source tree of fed4eba (PluginBench 0.7.1). The key was recomputed when the cohort context gained grade contract 1; the identity is unchanged.",
   "snapshot": {
     "identity": {
       "delivery": "native-instructions-skills-plugins-v1",
@@ -202,6 +202,6 @@
         "seed": 42
       }
     },
-    "key": "20040965805edaa6418a03eb8153f2cbde16fbcef4e2b51b314418bb0571ba98"
+    "key": "29f2434fdec13f7d7e2b57c05bb681b7890cace965b00981e93cd8c9842bec0f"
   }
 }

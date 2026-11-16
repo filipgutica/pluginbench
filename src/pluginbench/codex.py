@@ -9,6 +9,7 @@ import stat
 import subprocess
 import tarfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -300,8 +301,12 @@ def invoke(
     timeout: int,
     output_schema: Path | None = None,
     artifacts: Path | None = None,
+    on_spawn: Callable[[int], None] | None = None,
 ) -> dict[str, Any]:
-    """Invoke a local reviewer with an OS-enforced read-only source packet."""
+    """Invoke a local reviewer with an OS-enforced read-only source packet.
+
+    `on_spawn` gets the reviewer's PID, which is also its group ID, once it runs.
+    """
     artifacts = area / "artifacts" if artifacts is None else artifacts
     artifacts.mkdir(exist_ok=True)
     if any((artifacts / name).exists() for name in ("invocation.json", "execution.json")):
@@ -384,6 +389,8 @@ def invoke(
                 text=True,
                 start_new_session=True,
             )
+            if on_spawn is not None:
+                on_spawn(proc.pid)  # Inside the block whose cleanup stops the group.
             try:
                 proc.communicate(prompt, timeout=timeout)
             except subprocess.TimeoutExpired:

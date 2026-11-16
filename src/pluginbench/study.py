@@ -14,7 +14,7 @@ import tempfile
 from dataclasses import dataclass, field
 from functools import partial
 from threading import Event
-from concurrent.futures import CancelledError
+from concurrent.futures import CancelledError, Future
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
@@ -43,6 +43,7 @@ from pluginbench.native_treatments import NativeCapabilities, DELIVERY_POLICY, a
 from pluginbench.claude_launch import refuse_unenforced_limits
 from pluginbench import claude_launch, claude_treatments
 from pluginbench.baselines import BaselineCache
+from pluginbench import ledger as invocation_ledger
 from pluginbench.ledger import LEDGER_NAME, Ledger
 from pluginbench.run_lock import RunMoved
 from pluginbench.parallel import run_jobs, validate_jobs
@@ -482,20 +483,34 @@ def _observed_harness_version(executions: list[dict[str, Any]]) -> str | None:
 TRUSTED_TEST_OVERLAP = "trusted verifier tests overwrite authored patch paths"
 
 
-class BackendUnavailable(ValueError):
+class _Reasoned(Exception):
+    """Gives an error a `reason`: its cause without an attempt ID, for the short-circuit."""
+
+    def __init__(self, message: str, reason: str | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason or message
+
+
+class BackendUnavailable(_Reasoned, ValueError):
     """A coding session failed before its first model turn, or stopped at its provider or
     account (a limit, an authentication failure, or an unrecovered server error); the run stops
     instead of scoring it."""
 
 
-class BuiltinsDiffer(ValueError):
+class ProviderStopped(BackendUnavailable):
+    """Positive evidence that the provider or account stopped the session: a halt, which gives
+    the slot its invocation back."""
+
+
+class BuiltinsDiffer(_Reasoned, ValueError):
     """A fresh Claude attempt's built-ins differ from the reused vanilla's; the run stops."""
 
 
-class CodingInfrastructure(ValueError):
+class CodingInfrastructure(_Reasoned, ValueError):
     """A coding attempt that ended without gradable evidence: an infrastructure error.
 
-    It is never complete, graded or cached; its slot is coded again by the next resume.
+    It is never complete, graded or cached; the next resume codes its slot again while the slot
+    has invocations left.
     """
 
 
@@ -524,6 +539,7 @@ def _execute_stage(
     on_native_start: Callable[[], None],
     expected_runtime: dict[str, object],
     guard: Callable[[], None] = lambda: None,
+    on_spawn: Callable[[int], None] | None = None,
     reused_vanilla: list[str] | None = None,
     reused_cohorts: list[str] | None = None,
     pinned_builtins: object = None,
@@ -537,6 +553,9 @@ def _execute_stage(
     `guard` runs before each write to root. A run moved during the call therefore writes
     nothing more to its old path; that call's evidence is lost with its temporary work area,
     and resume discards the attempt by its invocation receipt.
+
+    `on_native_start` commits the invocation's intent and may refuse it; `on_spawn` records the
+    spawned worker.
     """
     _assert_frozen(root)
     interrupted: KeyboardInterrupt | None = None
@@ -568,7 +587,10 @@ def _execute_stage(
             },
             prompt=prompt,
             timeout=study.recipe.timeout_seconds,
+            on_spawn=on_spawn,
         )
+    except invocation_ledger.InvocationRefused:
+        raise  # Nothing started, so there is no evidence to save.
     # A worker that raises, or overruns its budget, is infrastructure: Harbor records an agent
     # timeout or an agent error in the result it returns, so neither reaches this handler.
     except (OSError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
@@ -658,18 +680,21 @@ def _execute_stage(
             "again. Otherwise move "
             + ", ".join(reused_cohorts or [])
             + " out of the PluginBench cache root and start a new run, which codes its own "
-            "vanilla"
+            "vanilla",
+            mixed,
         )
     if provider_stop is not None:
         # Checked first: its message names the limit. Never recorded as complete, so the
         # attempt stays interrupted, a resume discards it and codes its slot again, and it never
         # reaches the vanilla cache.
-        _record_infrastructure(target, f"{study.recipe.harness} stopped on {provider_stop}")
-        raise BackendUnavailable(
-            f"{study.recipe.harness} stopped on {provider_stop} in attempt {entry['id']} "
+        reason = f"{study.recipe.harness} stopped on {provider_stop}"
+        _record_infrastructure(target, reason)
+        raise ProviderStopped(
+            f"{reason} in attempt {entry['id']} "
             f"({entry['task_id']} · {normalize_arm_name(entry['arm'])} · "
             f"repeat {entry['attempt']}). The attempt is not scored and the run stops. Resume "
-            "the run once the limit resets or the provider recovers; this attempt is coded again"
+            "the run once the limit resets or the provider recovers; this attempt is coded again",
+            reason,
         )
     # A worker that raised or artifacts that could not be copied leave no session to read.
     backend_error = (
@@ -679,15 +704,15 @@ def _execute_stage(
     )
     if backend_error is not None:
         # As above: never complete, never graded, never cached; a resume codes it again.
-        _record_infrastructure(
-            target, f"{study.recipe.harness} failed before its first model turn: {backend_error}"
-        )
+        reason = f"{study.recipe.harness} failed before its first model turn: {backend_error}"
+        _record_infrastructure(target, reason)
         raise BackendUnavailable(
             f"{study.recipe.harness} failed before its first model turn in attempt {entry['id']} "
             f"({entry['task_id']} · {normalize_arm_name(entry['arm'])} · "
             f"repeat {entry['attempt']}): {backend_error}. "
             "The attempt is not scored and the run stops. Resume the run once the backend is "
-            "reachable; this attempt is coded again"
+            "reachable; this attempt is coded again",
+            reason,
         )
     infrastructure = worker_error or artifact_error or grade.coding_infrastructure(execution)
     if infrastructure is None and execution.get("submission_collected") is not True:
@@ -855,7 +880,8 @@ def _infrastructure(target: Path, entry: dict[str, Any], reason: str) -> CodingI
     _record_infrastructure(target, reason)
     return CodingInfrastructure(
         f"{entry['task_id']} · {normalize_arm_name(entry['arm'])} · repeat {entry['attempt']}: "
-        f"{reason}"
+        f"{reason}",
+        reason,
     )
 
 
@@ -1044,7 +1070,10 @@ def run_study(
     baseline_cache: Path | None = None,
     baseline_identity: dict[str, object] | None = None,
     guard: Callable[[], None] | None = None,
+    paid_call_ceiling: int | None = None,
 ) -> Path:
+    """Code a new study. `paid_call_ceiling` bounds its model calls (by default every coding
+    slot's cap); an evaluation passes its coding plus review slots' caps."""
     validate_jobs(study.recipe.jobs)
     for treatment in study.treatments.values():
         admit(treatment, study.recipe.harness)
@@ -1066,7 +1095,9 @@ def run_study(
         "records": [_pending_record(entry) for entry in plan["entries"]],
     }
     _checkpoint(root, frozen, manifest, states, status="preflight")
-    ledger = Ledger.create(root / LEDGER_NAME, plan["entries"], states)
+    ledger = Ledger.create(
+        root / LEDGER_NAME, plan["entries"], states, paid_call_ceiling=paid_call_ceiling
+    )
     return _run_attempts(
         _Run(root, frozen, plan, manifest, states, ledger),
         progress=progress,
@@ -1228,11 +1259,14 @@ def resume_study(
     baseline_identity: dict[str, object] | None = None,
     guard: Callable[[], None] | None = None,
     before_coding: Callable[[], None] | None = None,
+    paid_call_ceiling: int | None = None,
 ) -> Path:
-    """Code every slot that has no complete attempt; keep complete attempts as they are.
+    """Code every slot that has no complete attempt and has invocations left; keep complete
+    attempts as they are.
 
     `before_coding` runs once reconciliation has found a slot left to code, and may refuse.
     A run.json older than the ledger and the record receipts cannot tell that.
+    `paid_call_ceiling` is used only by a ledger that has none yet, as in `run_study`.
     """
     root = output.resolve()
     if baseline_cache is not None and not baseline_identity:
@@ -1253,12 +1287,27 @@ def resume_study(
         admit(treatment, frozen.recipe.harness)
     path = root / LEDGER_NAME
     # Runs from before the ledger kept their states only in run.json.
-    ledger = Ledger.open(path) if path.exists() else Ledger.create(
-        path, _bound_document(root, run["plan"])["entries"], run["attempt_states"]
+    ledger = Ledger.open(
+        path, paid_call_ceiling=paid_call_ceiling, history=partial(invocation_history, root)
+    ) if path.exists() else Ledger.create(
+        path,
+        _bound_document(root, run["plan"])["entries"],
+        run["attempt_states"],
+        paid_call_ceiling=paid_call_ceiling,
+        history=invocation_history(root),
     )
     try:
         plan, manifest, states = _reconcile(root, run, ledger)
-        if before_coding is not None and any(state != "complete" for state in states.values()):
+        # After `_reconcile`, which accepts the output of any attempt with a record receipt:
+        # an invocation still open, a cached attempt's regrade included, was cut off by a crash.
+        for stage in ("coding", "grading"):
+            ledger.resolve_crashed(stage)
+        exhausted = _exhausted(ledger, plan, states)
+        if before_coding is not None and any(
+            states[entry["id"]] != "complete"
+            for slot, entry in enumerate(plan["entries"])
+            if slot not in exhausted
+        ):
             before_coding()
         if progress:
             kept = sum(state == "complete" for state in states.values())
@@ -1280,6 +1329,50 @@ def resume_study(
         guard=guard,
         resumed=True,
     )
+
+
+def invocation_history(root: Path) -> list[invocation_ledger.HistoryRow]:
+    """The invocations a run's evidence shows, for a ledger that predates its invocation rows.
+
+    Every coding call wrote `invocations/<attempt>/<stage>.json` before it started, every judge
+    call its review revision's `native-start.json`, and every verifier replay without a saved
+    grade left its `.try-*` directory. Each counts toward its slot: finished when its attempt
+    or review ended, unresolved otherwise. Evidence that names an
+    attempt this run never gave a slot raises, so no slot is granted calls it may have spent.
+    """
+    from pluginbench import source_only, study_review  # Both import this module.
+
+    run = json.loads((root / "run.json").read_text())
+    slots = {
+        entry["id"]: slot
+        for slot, entry in enumerate(_bound_document(root, run["plan"])["entries"])
+    }
+    for path in sorted((root / "discarded").glob("*.json")):
+        discarded = json.loads(path.read_text())
+        slots[discarded["id"]] = discarded["slot"]
+    complete = {key for key, state in run["attempt_states"].items() if state == "complete"}
+
+    def row(attempt: str, stage: str, state: str) -> invocation_ledger.HistoryRow:
+        if attempt not in slots:
+            raise ValueError(
+                f"cannot tell which slot attempt {attempt} belongs to, so the calls it made "
+                "cannot be counted and no further call starts; start a new run"
+            )
+        return slots[attempt], stage, attempt, state
+
+    rows = []
+    for receipt in sorted((root / "invocations").glob("*/*.json")):
+        attempt = receipt.parent.name
+        rows.append(row(attempt, "coding", "finished" if attempt in complete else "unresolved"))
+    rows += [
+        row(attempt, "review", "finished" if ended else "unresolved")
+        for attempt, ended in study_review.review_starts(root)
+    ]
+    rows += [
+        row(staging.parent.name, "grading", "unresolved")
+        for staging in sorted((root / source_only.DIRECTORY).glob("filter-*/*/*.try-*"))
+    ]
+    return rows
 
 
 def is_graded_run(plan: dict[str, Any]) -> bool:
@@ -1400,6 +1493,37 @@ def _refuse_mixed_builtins(execution: dict[str, Any], reused: list[str], version
     return reason
 
 
+def _exhausted(
+    ledger: Ledger, plan: dict[str, Any], states: dict[str, str]
+) -> dict[int, str]:
+    """Unfinished slots with no coding invocation left, each with why; none is coded again."""
+    return {
+        slot: reason
+        for slot, entry in enumerate(plan["entries"])
+        if states[entry["id"]] != "complete"
+        and (reason := ledger.refusal(slot, "coding")) is not None
+    }
+
+
+def _on_coordinator[T](emit: Callable[[Callable[[], None]], None], write: Callable[[], T]) -> T:
+    """Run a ledger write on the coordinator thread, its one writer, and wait for it.
+
+    An invocation's intent is committed before its spawn, so a worker cannot hand the write off
+    and go on. A failed write raises here, in the worker, and never in the coordinator, where
+    any error cancels the whole run.
+    """
+    done: Future[T] = Future()
+
+    def run() -> None:
+        try:
+            done.set_result(write())
+        except BaseException as error:
+            done.set_exception(error)
+
+    emit(run)
+    return done.result()
+
+
 def _run_attempts(
     run: _Run,
     *,
@@ -1422,7 +1546,12 @@ def _run_attempts(
     # A run stopped after its last attempt finished has nothing to code. It finishes without
     # the coding runtime, which may have changed since, and caches finished vanilla repeats
     # under the runtime they were coded with.
-    coding = any(state != "complete" for state in states.values())
+    exhausted = _exhausted(ledger, plan, states)
+    coding = any(
+        states[entry["id"]] != "complete"
+        for slot, entry in enumerate(plan["entries"])
+        if slot not in exhausted
+    )
     claude_version = str((baseline_identity or {}).get("harness_version"))
     pinned_builtins = baselines.CLAUDE_BUILTINS.get(claude_version)
 
@@ -1656,6 +1785,8 @@ def _run_attempts(
             stage_id = "handoff"
             completed = False
             error: str | None = None
+            invocation: str | None = None
+            spawned = False
 
             def unmoved() -> None:
                 # Workers check too: evidence they write must never recreate a moved run's path.
@@ -1663,10 +1794,16 @@ def _run_attempts(
                     guard()
 
             def started() -> None:
+                nonlocal invocation
                 if cancelled.is_set():
                     raise CancelledError("attempt cancelled before its next native invocation")
                 harbor_backend.assert_runtime(expected_runtime, jobs=frozen.recipe.jobs)
                 unmoved()
+                # Committed before anything external starts; refused at a cap or the ceiling.
+                invocation = _on_coordinator(
+                    emit,
+                    partial(ledger.intent, slot=index, stage="coding", attempt_id=entry["id"]),
+                )
                 receipt = root / "invocations" / entry["id"] / f"{stage_id}.json"
                 _write(
                     receipt,
@@ -1677,6 +1814,34 @@ def _run_attempts(
                     },
                 )
                 emit(partial(invoked, index, copy.deepcopy(record), stage_id))
+
+            def spawn(pid: int) -> None:
+                nonlocal spawned
+                spawned = True  # Set first: the child runs whether or not its record lands.
+                assert invocation is not None
+                _on_coordinator(emit, partial(ledger.invocation_started, invocation, pid))
+
+            def regrade(**arguments: Any) -> dict[str, object]:
+                """A cached attempt's verifier replay: one grading invocation of this slot,
+                committed before it starts. `commit` finishes it when the attempt completes."""
+                replay = _on_coordinator(
+                    emit,
+                    partial(ledger.intent, slot=index, stage="grading", attempt_id=entry["id"]),
+                )
+                replay_spawned = False
+
+                def replay_spawn(pid: int) -> None:
+                    nonlocal replay_spawned
+                    replay_spawned = True
+                    _on_coordinator(emit, partial(ledger.invocation_started, replay, pid))
+
+                try:
+                    return harbor_backend.regrade_native(**arguments, on_spawn=replay_spawn)
+                except BaseException as failure:
+                    if not isinstance(failure, RunMoved):
+                        ended = invocation_ledger.outcome(failure, spawned=replay_spawned)
+                        emit(partial(ledger.end, replay, *ended))
+                    raise
 
             try:
                 unmoved()
@@ -1694,6 +1859,11 @@ def _run_attempts(
                 )
                 record.update(before=before, before_evidence=before_evidence or None)
                 if imported is not None:
+                    refused = _on_coordinator(emit, partial(ledger.refusal, index, "grading"))
+                    if refused is not None:
+                        # Its replays are spent; it stays unfinished while other slots go on.
+                        error = refused
+                        return
                     for stage in record["stages"]:
                         target = attempt_dir / stage["id"]
                         execution = json.loads((target / "execution.json").read_text())
@@ -1702,7 +1872,7 @@ def _run_attempts(
                         )
                         stage["work"] = _work(execution)
                         if stage["snapshot"] is not None:
-                            regraded = harbor_backend.regrade_native(
+                            regraded = regrade(
                                 artifacts=target / "artifacts",
                                 task_dir=task.native_task,
                                 identity=native_identity(task),
@@ -1745,6 +1915,7 @@ def _run_attempts(
                             stage_id="handoff",
                             prompt="",
                             on_native_start=started,
+                            on_spawn=spawn,
                             expected_runtime=expected_runtime,
                             guard=unmoved,
                             reused_vanilla=_reused_vanilla(plan)
@@ -1754,9 +1925,20 @@ def _run_attempts(
                             pinned_builtins=pinned_builtins,
                             claude_version=claude_version,
                         )
-                    except CodingInfrastructure as infra:
+                    except BaseException as failure:
+                        # A finished invocation ends when `commit` accepts its output. A moved
+                        # run writes nothing, and its open invocation becomes unresolved.
+                        if invocation is not None and not isinstance(failure, RunMoved):
+                            state, signature = (
+                                ("halted_provider", None)
+                                if spawned and isinstance(failure, ProviderStopped)
+                                else invocation_ledger.outcome(failure, spawned=spawned)
+                            )
+                            emit(partial(ledger.end, invocation, state, signature))
+                        if not isinstance(failure, CodingInfrastructure):
+                            raise
                         # Never complete: committed as interrupted, so a resume codes it again.
-                        error = str(infra)
+                        error = str(failure)
                         return
                     record.update(
                         stages=[stage],
@@ -1787,7 +1969,7 @@ def _run_attempts(
             [
                 index
                 for index, entry in enumerate(plan["entries"])
-                if states[entry["id"]] != "complete"
+                if states[entry["id"]] != "complete" and index not in exhausted
             ],
             jobs=frozen.recipe.jobs,
             operation=attempt,
@@ -1796,7 +1978,19 @@ def _run_attempts(
         if infrastructure:
             raise CodingInfrastructure(
                 f"{len(infrastructure)} attempts ended in an infrastructure error and are not "
-                "graded; `pluginbench run <run-dir>` codes them again: " + "; ".join(infrastructure)
+                "graded; `pluginbench run <run-dir>` codes them again while their slots have "
+                "invocations left: " + "; ".join(infrastructure)
+            )
+        if exhausted:
+            raise invocation_ledger.SlotExhausted(
+                f"{len(exhausted)} attempts have no coding invocation left, so the run cannot "
+                "finish and they are not coded again; start a new run to code them: "
+                + "; ".join(
+                    f"{plan['entries'][slot]['task_id']} · "
+                    f"{normalize_arm_name(plan['entries'][slot]['arm'])} · "
+                    f"repeat {plan['entries'][slot]['attempt']}: {reason}"
+                    for slot, reason in exhausted.items()
+                )
             )
         _checkpoint(root, frozen, manifest, states, status="complete")
     except RunMoved:

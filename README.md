@@ -9,7 +9,7 @@ It then compares correctness, tokens, and the code each attempt added.
 ## What you get
 
 - **Arms.** Vanilla is always included. Each *treatment* is a named set of instruction files, skills, or plugins that you declare in the config. Every treatment is compared with vanilla.
-- **Attempts.** Each task runs once per arm and repeat, in a fresh Docker container, through Harbor 0.24.0. Each attempt passes or fails: the task's own verifier grades the submitted patch without the agent's own test files. A timeout or agent error is graded with that attribute. An attempt that cannot be graded is an infrastructure error: it counts in no total, and `pluginbench run <run-dir>` codes or grades it again. [Correctness](docs/running-evaluations.md#correctness).
+- **Attempts.** Each task runs once per arm and repeat, in a fresh Docker container, through Harbor 0.24.0. Each attempt passes or fails: the task's own verifier grades the submitted patch without the agent's own test files. A timeout or agent error is graded with that attribute. An attempt that cannot be graded is an infrastructure error: it counts in no total, and `pluginbench run <run-dir>` codes or grades it again, with at most three calls for each attempt slot. [Correctness](docs/running-evaluations.md#correctness).
 - **Measures.** You select them in the config:
 
 | Measurement | What it counts | Extra requirement |

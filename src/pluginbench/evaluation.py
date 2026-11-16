@@ -36,6 +36,7 @@ from pluginbench import (
     components,
     harbor_backend,
     isolation,
+    ledger,
     run_lock,
     submissions,
 )
@@ -1090,6 +1091,7 @@ def _code(
     # Runs prepared before vanilla identities were saved resume without the vanilla cache.
     identity = _object(json.loads(identity_path.read_text())) if identity_path.is_file() else None
     resuming = (evidence / "run.json").is_file()
+    ceiling = _paid_call_ceiling(selection, config)
 
     def same_coder() -> None:
         # Checked only once reconciliation has found a slot left to code.
@@ -1105,6 +1107,7 @@ def _code(
             baseline_identity=identity,
             guard=guard,
             before_coding=same_coder,
+            paid_call_ceiling=ceiling,
         )
     else:
         run_study(
@@ -1114,6 +1117,7 @@ def _code(
             baseline_cache=_caches(root).vanilla if identity else None,
             baseline_identity=identity,
             guard=guard,
+            paid_call_ceiling=ceiling,
         )
     if not (root / "inputs" / _PROFILES).is_file():
         return
@@ -1143,6 +1147,11 @@ def _saved_evaluation(selection: dict[str, object]) -> Evaluation:
     return Evaluation.model_validate(
         {key: normalized[key] for key in Evaluation.model_fields if key in normalized}
     )
+
+
+def _paid_call_ceiling(selection: dict[str, object], config: Evaluation) -> int:
+    """Contract C2: every coding and review slot's cap, the most model calls the run may start."""
+    return ledger.default_ceiling(_assigned(selection) * (2 if config.reviewer else 1))
 
 
 def _finish_evaluation(
@@ -1196,7 +1205,11 @@ def _finish_evaluation(
         # Also grades a run finished before the current filter existed, and grades again the
         # stages that hit an infrastructure error last time.
         selection["source_only_grades"] = record_source_only_grades(
-            evidence, requalify=partial(_requalify, evidence), progress=progress
+            evidence,
+            requalify=partial(_requalify, evidence),
+            progress=progress,
+            # A grade pass may be the first writer of a version 1 ledger, which saves this.
+            paid_call_ceiling=_paid_call_ceiling(selection, config),
         )
     _save_selection(root, selection)
     regenerate_report(root)

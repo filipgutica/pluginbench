@@ -16,6 +16,7 @@ from legacy_support import (
     copy_legacy,
     current_runtime,
     hide_spawn_model_overrides,
+    mark_grade_contract,
     legacy_json,
 )
 from native_support import synthetic_contract
@@ -270,6 +271,7 @@ class _Vanilla:
     def __init__(self, tmp_path: Path) -> None:
         self.cache = copy_legacy("vanilla", tmp_path / "cache")
         hide_spawn_model_overrides(self.cache)
+        mark_grade_contract(self.cache)
         self.config = copy_legacy("vanilla-task", tmp_path / "config")
         self.root = tmp_path / "run"
         self.saved = legacy_json("vanilla-identity.json")
@@ -348,6 +350,12 @@ def _changed(vanilla: _Vanilla, change: str) -> None:
         # The cohort as 942f12c saved it: its runs offered spawn model fields, so it is refused.
         shutil.rmtree(vanilla.cache)
         copy_legacy("vanilla", vanilla.cache)
+    elif change == "no-grade-contract":
+        # Coded before grade contract 1, whose C1 tables decide what a coded attempt is.
+        for manifest in vanilla.cache.glob("*/*/manifest.json"):
+            saved = json.loads(manifest.read_text())
+            del saved["context"]["grade_contract"]
+            manifest.write_text(json.dumps(saved))
     elif change in {"unknown-launcher-hash", "partial-launcher-hashes"}:
         for manifest in vanilla.cache.glob("*/*/manifest.json"):
             saved = json.loads(manifest.read_text())
@@ -373,6 +381,7 @@ def _changed(vanilla: _Vanilla, change: str) -> None:
         "limits",
         "jobs",
         "spawn-overrides-shown",
+        "no-grade-contract",
         "unknown-launcher-hash",
         "partial-launcher-hashes",
     ],
@@ -575,11 +584,12 @@ def _object(value: object) -> dict[str, Any]:
     return value
 
 
-def test_the_codex_vanilla_identity_and_key_are_byte_identical_to_fed4eba(
+def test_the_codex_vanilla_identity_is_byte_identical_to_fed4eba(
     tmp_path: Path,
 ) -> None:
-    # The golden was computed by codex_vanilla_snapshot on a source tree of fed4eba (0.7.1),
-    # so saved Codex cache entries keep hitting.
+    # The golden was computed by codex_vanilla_snapshot on a source tree of fed4eba (0.7.1).
+    # Its key was recomputed once the cohort context bound grade contract 1: entries cached
+    # before it miss, by design (contract C2).
     golden = json.loads(CODEX_GOLDEN.read_text())["snapshot"]
     current = json.loads(json.dumps(codex_vanilla_snapshot(tmp_path)))
     # Key order too: vanilla-identity.json is written in insertion order.

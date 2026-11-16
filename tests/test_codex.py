@@ -238,7 +238,7 @@ def test_invoke_uses_explicit_auth_and_effort_and_removes_private_data(
         },
         prompt="task",
         timeout=5,
-        **({"artifacts": artifacts} if persistent_artifacts else {}),
+        artifacts=artifacts if persistent_artifacts else None,
     )
     assert observed["effort"] == "high"
     assert result["actual_primary_models"] == ["observed-model"]
