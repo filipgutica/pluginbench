@@ -36,7 +36,8 @@ Outcome = Literal["pass", "fail", "infra", "legacy"]
 CODING_ROWS = {
     "timeout_after_first_turn": "graded; attribute timed_out; never retried",
     "agent_error_after_first_turn": "graded; attribute agent_error; never retried",
-    "failed_before_first_turn": "infrastructure; the run stops and a resume codes it again",
+    "failed_before_first_turn": "no evidence of a model turn, a timeout included: "
+    "infrastructure; the run stops and a resume codes it again",
     "provider_stop": "infrastructure; the run stops and a resume codes it again",
     "treatment_not_delivered": "infrastructure; retried",
     "worker_or_container_loss": "infrastructure; retried",
@@ -50,35 +51,53 @@ GRADE_ROWS = {
     "quoted_path": "graded: paths come from git apply --numstat -z, matched by section order",
     "policy_violation": f"healthy nop/oracle -> fail {UNSUPPORTED_SUBMISSION}:<kind>; "
     "else infrastructure",
-    "evidence_or_host_error": "infrastructure, whatever the task's health",
+    "evidence_or_host_error": "infrastructure, whatever the task's health; so is a replay "
+    "that stopped before its verifier ran",
 }
 
 
 def failed_before_first_turn(execution: Mapping[str, Any], harness: object) -> str | None:
-    """Why a coding session never reached a model turn, for either harness; else None."""
-    if harness == "claude":
-        return _claude_failed_before_first_turn(execution)
-    return codex_events.failed_before_first_turn(dict(execution))
+    """Why a coding session never reached a model turn, for either harness; else None.
 
-
-def _claude_failed_before_first_turn(execution: Mapping[str, Any]) -> str | None:
-    """Why a Claude coding session never reached a model turn, else None.
-
-    Claude names no such failure, unlike Codex's `turn.failed`, and its startup model stands in
-    for an assistant's. So a session with no timeout, usage, tool call or message counts as one.
-    A timeout is the agent's attempt, as for Codex. This reads the parsed execution only, so it
-    lives here rather than in the hashed Claude launcher.
+    Only evidence of a turn makes a session the agent's attempt: usage, a command or tool call,
+    or an agent message. Without any, whatever ended it (an outage, a CLI that failed at
+    startup, or a timeout before the first turn) left nothing to grade.
     """
-    if (
-        execution.get("timed_out") is True
-        or execution.get("usage") is not None
+    if harness == "claude":
+        if _claude_turn_observed(execution):
+            return None
+        message = next(
+            (
+                str(error["result"])
+                for error in execution.get("stream_errors") or []
+                if isinstance(error, dict) and isinstance(error.get("result"), str)
+                and error["result"]
+            ),
+            None,
+        )
+    else:
+        if codex_events.model_turn_observed(dict(execution)):
+            return None
+        message = codex_events.turn_failed_message(dict(execution))
+    if message:
+        return message
+    if execution.get("timed_out") is True:
+        return "the session timed out before any model turn"
+    harbor = execution.get("error")
+    if isinstance(harbor, Mapping) and harbor.get("exception_type"):
+        return f"{harbor['exception_type']}: {harbor.get('exception_message')}"
+    return "the session ended before any model turn"
+
+
+def _claude_turn_observed(execution: Mapping[str, Any]) -> bool:
+    """Whether a parsed Claude session shows a model turn. Claude names no pre-turn failure,
+    unlike Codex's `turn.failed`, and its startup model stands in for an assistant's, so only
+    usage, a tool call or a message counts. This reads the parsed execution only, so it lives
+    here rather than in the hashed Claude launcher."""
+    return bool(
+        execution.get("usage") is not None
         or any(execution.get(key) for key in ("command_items", "other_tools", "agent_messages"))
-    ):
-        return None
-    for error in execution.get("stream_errors") or []:
-        if isinstance(error, dict) and isinstance(error.get("result"), str) and error["result"]:
-            return str(error["result"])
-    return "the Claude session ended before any model turn"
+    )
 
 
 # Harbor exception types a graded attempt may carry: the agent's own timeout, exit or refusal,
@@ -112,6 +131,24 @@ def coding_infrastructure(execution: Mapping[str, Any]) -> str | None:
         kind, message = harbor.get("exception_type"), harbor.get("exception_message")
         return f"Harbor trial failed: {kind}: {message}"
     return None
+
+
+def replay_infrastructure(exception_info: object) -> str | None:
+    """Why a verifier replay's Harbor exception is infrastructure, else None.
+
+    Only a verifier error means the verifier ran on the submission and gave no reward, which
+    the grade stage regrades and then requalifies. Any other exception, the replay's own agent
+    included, stopped the replay before that: a host or setup failure, whatever the task's
+    health.
+    """
+    if exception_info is None:
+        return None
+    if isinstance(exception_info, Mapping):
+        kind = exception_info.get("exception_type")
+        if kind in VERIFIER_HARBOR_ERRORS:
+            return None
+        return f"{kind}: {exception_info.get('exception_message')}"
+    return f"unreadable Harbor exception: {exception_info!r}"
 
 
 def _differs(observed: object, root: set[object]) -> bool:

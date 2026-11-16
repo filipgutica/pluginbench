@@ -10,6 +10,7 @@ import io
 import json
 import hashlib
 import os
+import shlex
 import signal
 from types import SimpleNamespace
 import shutil
@@ -3700,12 +3701,19 @@ def test_source_only_replays_wait_for_the_frozen_grader_and_a_failed_try_is_clea
     monkeypatch.setattr(harbor_backend, "_assert_native_image", gone)
     result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
 
-    # The run and its report finish; the grades that need the grader say why they wait.
-    assert result.exit_code == 0, result.stderr + result.stdout
+    # The partial report is written, but the run is not finished: it exits non-zero, and
+    # status names the grading left, its reasons and the command that grades it.
+    assert result.exit_code != 0, result.stderr + result.stdout
     assert graded == []
-    waiting = [line for line in result.stdout.splitlines() if "infrastructure error" in line]
-    assert len(waiting) == 1 and str(len(packages)) in waiting[0]
-    assert "Frozen native image is unavailable" in waiting[0]
+    output = result.stderr + result.stdout
+    assert f"{len(packages)} attempts have no grade" in output
+    assert "Frozen native image is unavailable" in output
+    status = run_status.run_status(root)
+    assert status["phase"] != "complete"
+    assert status["resume_command"] == shlex.join(["pluginbench", "run", str(root)])
+    (alert,) = [item for item in status["alerts"]["items"] if item["kind"] == "grades_pending"]
+    assert alert["severity"] == "error" and alert["attempts"] == len(packages)
+    assert "Frozen native image is unavailable" in alert["message"]
     for key, row in _rows(root).items():
         grading = row["source_only_grading"]
         if key in packages:
@@ -3726,9 +3734,9 @@ def test_source_only_replays_wait_for_the_frozen_grader_and_a_failed_try_is_clea
 
     monkeypatch.setattr(harbor_backend, "regrade_native", crash)
     crashed = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
-    # A crashed replay is an infrastructure error too: the run finishes, and its failed try
-    # stays until the next run grades the attempt.
-    assert crashed.exit_code == 0, crashed.stderr + crashed.stdout
+    # A crashed replay is an infrastructure error too: the run is not finished, and its failed
+    # try stays until the next run grades the attempt.
+    assert crashed.exit_code != 0, crashed.stderr + crashed.stdout
     directory = root / "evidence/source-only" / f"filter-{source_only.FILTER_REVISION}"
     assert len(list(directory.glob("*/*.try-*"))) == 1
     assert [_rows(root)[key]["correctness"] for key in packages].count("infra") == 1
@@ -3740,6 +3748,9 @@ def test_source_only_replays_wait_for_the_frozen_grader_and_a_failed_try_is_clea
     assert {_rows(root)[key]["source_only_reward"] for key in packages} == {1}
     assert {_rows(root)[key]["correctness"] for key in packages} == {"pass"}
     assert evaluation.plan_resume(root)["verifier_replays"] == 0
+    status = run_status.run_status(root)
+    assert status["phase"] == "complete" and status["resume_command"] is None
+    assert not [item for item in status["alerts"]["items"] if item["kind"] == "grades_pending"]
 
 
 def test_a_new_filter_revision_grades_again_beside_the_earlier_one(
@@ -3808,7 +3819,7 @@ def test_status_report_and_compare_read_the_same_grade_for_every_attempt(
 
     assert set(agree().values()) == {None}  # Coded, not graded yet.
     monkeypatch.setattr(harbor_backend, "_assert_native_image", _grader_gone)
-    assert CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"]).exit_code == 0
+    assert CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"]).exit_code != 0
     assert set(agree().values()) == {"infra", "pass"}
     monkeypatch.setattr(harbor_backend, "_assert_native_image", lambda image, expected: None)
     assert CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"]).exit_code == 0
@@ -3827,8 +3838,10 @@ def test_a_reference_solution_the_patch_policy_refuses_is_an_infrastructure_erro
 
     result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
 
-    # The task, not the attempt, is broken: never a fail, and no stage is replayed.
-    assert result.exit_code == 0, result.stderr + result.stdout
+    # The task, not the attempt, is broken: never a fail, no stage is replayed, and the run
+    # is not finished while its attempts have no grade.
+    assert result.exit_code != 0, result.stderr + result.stdout
+    assert "attempts have no grade" in result.stderr + result.stdout
     assert graded == []
     for row in _rows(root).values():
         grading = row["source_only_grading"]

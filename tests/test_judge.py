@@ -95,8 +95,13 @@ def test_quoted_paths_keep_their_quotes() -> None:
     ]
 
 
-def _run(root: Path, attempts: list[dict[str, object]]) -> Path:
-    """A finished run with results.json and one review packet per attempt."""
+def _run(
+    root: Path, attempts: list[dict[str, object]], *, grade_contract: int | None = 1
+) -> Path:
+    """A finished run with results.json and one review packet per attempt.
+
+    `grade_contract` None writes a report from before grade contract 1: a legacy run.
+    """
     review = root / "evidence" / "review-revisions" / "review"
     mapping, rows = [], []
     for attempt in attempts:
@@ -135,12 +140,14 @@ def _run(root: Path, attempts: list[dict[str, object]]) -> Path:
     (review / "mapping.json").write_text(json.dumps(mapping))
     (root / "report").mkdir(parents=True)
     (root / "report" / "results.json").write_text(
-        json.dumps({"artifact_base": "evidence", "attempts": rows})
+        json.dumps({"artifact_base": "evidence", "grade_contract": grade_contract, "attempts": rows})
     )
     return root
 
 
-def _two_arms(root: Path, **overrides: dict[str, object]) -> Path:
+def _two_arms(
+    root: Path, *, grade_contract: int | None = 1, **overrides: dict[str, object]
+) -> Path:
     attempts = [
         {"id": f"{arm[0]}{task[0]}{repeat}", "task": task, "repeat": repeat, "guidance": arm}
         for arm in ("baseline", "workflow-r9")
@@ -149,7 +156,7 @@ def _two_arms(root: Path, **overrides: dict[str, object]) -> Path:
     ]
     for attempt in attempts:
         attempt.update(overrides.get(str(attempt["id"]), {}))
-    return _run(root / "run", attempts)
+    return _run(root / "run", attempts, grade_contract=grade_contract)
 
 
 def _prepare(tmp_path: Path, run: Path, **options: object) -> Path:
@@ -533,6 +540,34 @@ def test_tally_applies_correctness_first_then_a_strict_majority(tmp_path: Path) 
     assert stats["j3"]["agreement"] == pytest.approx(3 / 5)
     assert stats["j3"]["agreement_pairs"] == 5
     assert "Weighted wins over 6 pairs: vanilla 3.5, workflow-r9 2.5" in judge.format_tally(result)
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_correctness_decides_a_pair_only_when_both_sides_have_a_grade(
+    tmp_path: Path, legacy: bool
+) -> None:
+    # alpha 1: vanilla passes and the package fails. In a legacy report that is an old native
+    # result, no grade; in a current one the package side has an infrastructure error.
+    run = _two_arms(
+        tmp_path,
+        grade_contract=None if legacy else 1,
+        wa1={"correctness": "fail" if legacy else "infra"},
+    )
+    directory = _prepare(tmp_path, run)
+    key = json.loads((directory / "key.json").read_text())
+    if legacy:
+        assert {
+            side["correctness"] for entry in key["tasks"].values()
+            for pair in entry["pairs"].values() for side in pair.values()
+        } == {"legacy"}
+    v, w = "vanilla", "workflow-r9"
+    every = {(task, str(pair)): w for task in ("task-1", "task-2") for pair in (1, 2, 3)}
+    _votes(directory, {"j1": every, "j2": every, "j3": every})
+    result = tally(directory)
+    alpha = {pair["pair"]: pair for pair in result["tasks"][0]["pairs"]}
+    # The judges, not an old or missing grade, decide it.
+    assert alpha[1]["decided_by"] == "judges" and alpha[1]["wins"] == {v: 0.0, w: 1.0}
+    assert result["correctness_decided"]["pairs"] == 0
 
 
 def test_agreement_denominator_is_the_other_judges_majority_not_correctness(

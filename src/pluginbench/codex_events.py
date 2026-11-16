@@ -260,20 +260,20 @@ def _trace_model_evidence(events: list[dict[str, object]]) -> bool:
     return False
 
 
-def failed_before_first_turn(execution: dict[str, Any]) -> str | None:
-    """The error of a Codex session that failed before any model turn, else None.
+def model_turn_observed(execution: dict[str, Any]) -> bool:
+    """Whether a parsed Codex session shows any model turn: usage, a command or a message.
 
-    Such a session, typically a network or backend outage, never let the agent work, so its
-    empty submission is not an outcome. A timeout, or a failure after any usage, command, or
-    agent message, is the agent's attempt and stays scored.
+    A timeout is no such evidence: the session may have hung before its first turn.
     """
-    if (
-        execution.get("timed_out") is True
-        or execution.get("usage") is not None
+    return bool(
+        execution.get("usage") is not None
         or execution.get("observed_token_usage") is True
         or any(execution.get(key) for key in ("partial_usage", "command_items", "agent_messages"))
-    ):
-        return None
+    )
+
+
+def turn_failed_message(execution: dict[str, Any]) -> str | None:
+    """The message of the session's first `turn.failed` event, if it has one."""
     for error in execution.get("stream_errors") or []:
         if isinstance(error, dict) and error.get("type") == "turn.failed":
             detail = error.get("error")

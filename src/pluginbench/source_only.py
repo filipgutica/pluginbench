@@ -22,6 +22,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -262,6 +263,8 @@ def _replay(
         # regrade_native proves the copy equals the graded trial but for the replayed patch.
         artifact_hashes={**hashes, submissions.PATCH_ARTIFACT: record["filtered_patch_sha256"]},
     )
+    if (reason := grade.replay_infrastructure(regraded.get("exception_info"))) is not None:
+        raise ValueError(reason)  # Infrastructure, as `_grade` records any replay error.
     verifier = regraded.get("verifier_result") if regraded.get("exception_info") is None else None
     record.update(
         native_result_reused=False,
@@ -386,12 +389,6 @@ def record_source_only_grades(
                 pending.setdefault(attempt_id, {})[stage_id] = str(error)
                 continue
         records.setdefault(attempt_id, {})[stage_id] = study._reference(evidence, path)
-    if pending and progress:
-        waiting = [reason for stages in pending.values() for reason in stages.values()]
-        progress(
-            f"{len(waiting)} grades hit an infrastructure error; the next run grades them "
-            "again: " + "; ".join(sorted(set(waiting)))
-        )
     index = directory / "index.json"
     study._write(
         index,
@@ -472,6 +469,26 @@ def _verdict(reward: bool | None, crashed: str) -> dict[str, Any]:
     if reward is None:
         return {"status": "complete", "passed": False, "fail_reason": crashed}
     return {"status": "complete", "passed": reward, "fail_reason": None}
+
+
+class GradesPending(ValueError):
+    """The grade stage left attempts with an infrastructure error: the run is not finished."""
+
+
+def raise_if_pending(evidence: Path, index: object, run: Path) -> None:
+    """Raise `GradesPending` when the selected index holds any grade-stage infrastructure error.
+
+    Its attempts are no results, so a run that holds one is not finished, though its report
+    is written without them.
+    """
+    pending = study._bound_document(evidence, index).get("pending", {})
+    reasons = sorted({reason for stages in pending.values() for reason in stages.values()})
+    if pending:
+        raise GradesPending(
+            f"{len(pending)} attempts have no grade: the grade stage hit an infrastructure "
+            f"error ({'; '.join(reasons)}). The report is written without them, and the run is "
+            f"not finished; `{shlex.join(['pluginbench', 'run', str(run)])}` grades them again"
+        )
 
 
 def attach_source_only_grades(

@@ -505,6 +505,7 @@ def test_session_that_never_reached_the_model_is_not_published(tmp_path: Path) -
     execution = json.loads(receipt.read_text())
     execution.update(
         usage=None,
+        observed_token_usage=False,
         timed_out=False,
         stream_errors=[{"type": "turn.failed", "error": {"message": "backend unreachable"}}],
     )
@@ -1129,8 +1130,9 @@ def test_claude_evidence_that_differs_from_its_identity_cannot_seed_the_cache(
         receipt = json.loads((artifacts / "native-treatment.json").read_text())
         invocation = json.loads((artifacts / "invocation.json").read_text())
         if fault == "timeout-unknown-usage":
-            # A timeout leaves no result event: usage is unknown, and the attempt is scored.
-            execution.update(usage=None, timed_out=True)
+            # A timeout leaves no result event: usage is unknown. The agent's message proves a
+            # turn, so the attempt is scored.
+            execution.update(usage=None, timed_out=True, agent_messages=["Working on it."])
         elif fault == "never-reached-model":
             execution.update(usage=None, timed_out=False)
         elif fault == "builtins":

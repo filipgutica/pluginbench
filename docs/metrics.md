@@ -84,4 +84,8 @@ passing medians and aggregates, review findings, cost rows, and measurement comp
 HTML uses the same public data, labels, and vanilla-first ordering.
 Opaque attempt IDs, evidence paths, provenance, and comparison identities keep their stored values.
 Evidence files, `inputs/study.json`, run identities, and cache keys still use `baseline` internally.
-Existing runs and vanilla caches can resume and reuse without migration.
+The rename needs no migration: vanilla caches from earlier builds are still reused,
+unless an entry holds an infrastructure error or a session that never reached the model.
+A run coded before grade contract 1 is legacy: `status` and `report` read it, but
+`pluginbench run` refuses to code more of it. Start a new run instead; see
+[Correctness](running-evaluations.md#correctness).

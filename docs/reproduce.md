@@ -32,7 +32,8 @@ including `execution.json`, `artifacts/`, and snapshots when available.
 Public JSON, CSV, and HTML reports call the no-guidance arm `vanilla`.
 JSON schema version 2 also renames arm-specific fields; see the [report format](metrics.md#report-files) for the complete inventory.
 `compare`, `status`, and `judge prepare` accept version 1 reports that use `baseline` and version 2 reports that use `vanilla`.
-Evidence, `inputs/study.json`, attempt IDs, and cache identities retain their stored names, so existing runs need no migration.
+Evidence, `inputs/study.json`, attempt IDs, and cache identities retain their stored names, so the rename needs no migration.
+A run coded before grade contract 1 is legacy: `status` and `report` read it, but `pluginbench run` refuses to code more of it; see [Correctness](running-evaluations.md#correctness).
 Vanilla cache hits reuse verified attempts, so a new directory does not necessarily make fresh coding calls.
 See [running evaluations](running-evaluations.md) for cache identities and runtime drift checks.
 

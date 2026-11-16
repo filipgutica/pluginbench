@@ -671,7 +671,12 @@ def _execute_stage(
             f"repeat {entry['attempt']}). The attempt is not scored and the run stops. Resume "
             "the run once the limit resets or the provider recovers; this attempt is coded again"
         )
-    backend_error = grade.failed_before_first_turn(execution, study.recipe.harness)
+    # A worker that raised or artifacts that could not be copied leave no session to read.
+    backend_error = (
+        None
+        if worker_error or artifact_error
+        else grade.failed_before_first_turn(execution, study.recipe.harness)
+    )
     if backend_error is not None:
         # As above: never complete, never graded, never cached; a resume codes it again.
         _record_infrastructure(

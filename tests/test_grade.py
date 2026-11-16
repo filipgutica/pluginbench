@@ -65,13 +65,19 @@ def _graded(
     *,
     requalify: source_only.Requalify = HEALTHY,
     reward: int | None = 1,
+    exception: dict[str, str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str], list[bytes]]:
-    """Grade a finished run: each attempt's grade record, each infrastructure error, replays."""
+    """Grade a finished run: each attempt's grade record, each infrastructure error, replays.
+
+    Each replay returns `reward`, or no reward and Harbor's `exception` when one is given.
+    """
     replayed: list[bytes] = []
 
     def regrade(**kwargs: Any) -> dict[str, object]:
         trial = kwargs["artifacts"] / "harbor/trial/artifacts"
         replayed.append((trial / submissions.PATCH_ARTIFACT).read_bytes())
+        if exception is not None:
+            return {"verifier_result": None, "exception_info": exception}
         rewards = {"reward": reward} if reward is not None else {}
         return {"verifier_result": {"rewards": rewards}, "exception_info": None}
 
@@ -184,7 +190,54 @@ def test_a_session_that_failed_before_its_first_turn_is_found_for_either_harness
     ]}}
     worked = claude.parse_events(stream(started, answer, failed), [])
     assert grade.failed_before_first_turn(worked, "claude") is None
-    assert grade.failed_before_first_turn({**claude_session, "timed_out": True}, "claude") is None
+    assert grade.failed_before_first_turn({**worked, "timed_out": True}, "claude") is None
+    # A timeout alone proves no turn: the session may have hung before its first one.
+    silent = claude.parse_events(stream(started), [])
+    assert grade.failed_before_first_turn({**silent, "timed_out": True}, "claude") == (
+        "the session timed out before any model turn"
+    )
+
+
+@pytest.mark.parametrize("harness", ["codex", "claude"])
+def test_a_cli_that_exits_before_any_model_turn_failed_before_its_first_turn(
+    harness: str,
+) -> None:
+    # A CLI configuration error: no turn.failed, no result message, only Harbor's exit error.
+    if harness == "codex":
+        session = codex.parse_events(stream({"type": "thread.started", "thread_id": "t"}), [],
+                                     "codex")
+    else:
+        session = claude.parse_events(stream(), [])
+    session.update(timed_out=False, error=_harbor_error("NonZeroAgentExitCodeError"))
+    assert grade.failed_before_first_turn(session, harness) == (
+        "NonZeroAgentExitCodeError: NonZeroAgentExitCodeError in the fixture"
+    )
+    assert grade.failed_before_first_turn({**session, "error": None}, harness) == (
+        "the session ended before any model turn"
+    )
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_a_session_with_no_model_turn_is_never_graded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timed_out: bool
+) -> None:
+    def startup_failure(area: Path, execution: dict[str, Any]) -> None:
+        # Exited non-zero, or timed out, before any usage, message or command.
+        execution.update(
+            usage=None,
+            observed_token_usage=False,
+            agent_messages=[],
+            successful_native_completion=False,
+            timed_out=timed_out,
+            error=_harbor_error("AgentTimeoutError" if timed_out else "NonZeroAgentExitCodeError"),
+        )
+
+    with pytest.raises(study.BackendUnavailable, match="failed before its first model turn"):
+        _coded(tmp_path, monkeypatch, startup_failure)
+    root = tmp_path / "run"
+    states = json.loads((root / "run.json").read_text())["attempt_states"]
+    assert set(states.values()) <= {"interrupted", "pending"} and "interrupted" in states.values()
+    assert not list(root.glob("records/*.json"))  # Nothing complete, so nothing to grade.
 
 
 @pytest.mark.parametrize(
@@ -296,6 +349,40 @@ def test_a_reward_that_is_not_binary_is_regraded_once_then_fails_on_a_healthy_ta
     for record in records.values():
         assert (record["passed"], record["fail_reason"]) == (False, grade.VERIFIER_CRASHED)
         assert grade.outcome(record) == ("fail", grade.VERIFIER_CRASHED)
+
+
+@pytest.mark.parametrize(
+    ("kind", "graded"),
+    [
+        ("EnvironmentStartTimeoutError", False),  # The replay never reached the verifier.
+        ("DockerDaemonError", False),
+        ("AgentTimeoutError", False),  # The replay's own agent, not the attempt's.
+        ("VerifierTimeoutError", True),  # The verifier ran on the submission and crashed.
+        ("RewardFileNotFoundError", True),
+    ],
+)
+def test_a_replay_that_fails_before_its_verifier_is_infrastructure_whatever_the_task_s_health(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, graded: bool
+) -> None:
+    def crashed(area: Path, execution: dict[str, Any]) -> None:
+        execution["native_verifier_result"] = None
+
+    root, _ = _coded(tmp_path, monkeypatch, crashed)
+    asked: list[str] = []
+
+    def healthy(task: Any) -> None:
+        asked.append(task.task_id)
+
+    records, pending, replayed = _graded(
+        root, monkeypatch, requalify=healthy, exception=_harbor_error(kind)
+    )
+    if graded:
+        assert pending == {} and asked == ["task-0"] and len(replayed) == 2
+        assert {record["fail_reason"] for record in records.values()} == {grade.VERIFIER_CRASHED}
+        return
+    # A host or setup failure says nothing about the submission: never a fail, never asks.
+    assert records == {} and asked == [] and len(pending) == 2
+    assert all(f"the verifier replay failed: {kind}" in reason for reason in pending.values())
 
 
 def test_a_crashed_verifier_on_an_unhealthy_task_is_infrastructure_and_graded_again(

@@ -328,6 +328,8 @@ expose_spawn_agent_model_overrides = false
             submissions.PATCH_ARTIFACT: hashlib.sha256(patch.read_bytes()).hexdigest()
         },
         "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+        # Codex's evidence of a model turn, which survives an unknown usage total.
+        "observed_token_usage": True,
         "elapsed_seconds": 1.0,
         "actual_primary_models": ["gpt-6.1-sol"],
         "runtime_effort_evidence": ["medium"],

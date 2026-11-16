@@ -1200,6 +1200,8 @@ def _finish_evaluation(
         )
     _save_selection(root, selection)
     regenerate_report(root)
+    if selection.get("source_only_grades") is not None:
+        source_only.raise_if_pending(evidence, selection["source_only_grades"], root)
     return root
 
 

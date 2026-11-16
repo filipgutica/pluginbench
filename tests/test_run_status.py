@@ -672,7 +672,10 @@ def test_status_reads_the_one_grade_record(
     row = next(row for row in status["attempts"] if row["id"] == "a1")
 
     assert (row["outcome"], row["outcome_reason"]) == expected
-    assert status["alerts"]["items"] == []
+    # Only a grade-stage infrastructure error, which leaves the run unfinished, alerts.
+    assert [item["kind"] for item in status["alerts"]["items"]] == (
+        ["grades_pending"] if expected[0] == "infra" else []
+    )
     assert status["alerts"]["schema_version"] == run_status.ALERTS_SCHEMA_VERSION == 3
 
 

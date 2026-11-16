@@ -264,11 +264,28 @@ def _alerts(
     report: dict[str, Any] | None,
     error: str | None,
     attempts: list[dict[str, Any]],
+    ungraded: dict[str, str],
 ) -> dict[str, Any]:
     """What an operator should act on, derived from the saved state on every read."""
     items: list[dict[str, Any]] = []
     if error:
         items.append({"kind": "run_failed", "severity": "error", "message": error})
+    if ungraded:
+        reasons = sorted(set(ungraded.values()))
+        items.append(
+            {
+                "kind": "grades_pending",
+                "severity": "error",
+                "message": f"{len(ungraded)} attempts have no grade: the grade stage hit an "
+                "infrastructure error, and the next `pluginbench run` grades them again: "
+                + "; ".join(reasons),
+                "attempts": len(ungraded),
+                "tasks": sorted(
+                    {row["task"] for row in attempts if row["id"] in ungraded}
+                ),
+                "reasons": reasons,
+            }
+        )
     # Only a report built from the selected revision counts: one that names an earlier
     # revision is not rebuilt yet, and its failures may since have been measured.
     collection = (report or {}).get("measurement_collection") or {}
@@ -311,8 +328,14 @@ def _heartbeat(root: Path, evidence: Path, now: datetime) -> dict[str, Any] | No
     return {"at": at.isoformat(), "age_seconds": round((now - at).total_seconds())}
 
 
-def _pending(root: Path, selection: dict[str, Any], run: dict[str, Any] | None) -> str | None:
-    """The first phase the run has not finished, or None when nothing is left."""
+def _pending(
+    root: Path, selection: dict[str, Any], run: dict[str, Any] | None, *, grading: bool
+) -> str | None:
+    """The first phase the run has not finished, or None when nothing is left.
+
+    `grading` is whether the grade stage has attempts left: not run yet, or an attempt with
+    an infrastructure error, which is no result.
+    """
     if run is None:
         return "starting"
     if run.get("status") != "complete":
@@ -321,6 +344,8 @@ def _pending(root: Path, selection: dict[str, Any], run: dict[str, Any] | None) 
         return "measuring"
     if selection.get("reviewer") and selection.get("review_revision") is None:
         return "reviewing"
+    if grading:
+        return "grading"
     if not (root / "report/report.html").is_file():
         return "reporting"
     return None
@@ -396,7 +421,6 @@ def run_status(
         owner = {}  # Held, but its record is unreadable mid-write.
     active = owner is not None
     events = _events(root)
-    pending = _pending(root, selection, run)
     slots, source = _slots(evidence, run)
     plan = _read(evidence / "plan.json") or {}
     rebuild = (
@@ -406,6 +430,17 @@ def run_status(
     decisions = plan.get("baseline_cache") or {}
     graded_run = plan.get("grade_contract") == grade.GRADE_CONTRACT
     grades = _grades(evidence, selection)
+    ungraded = {
+        attempt: str(record.get("reason"))
+        for attempt, record in grades.items()
+        if record.get("status") == "infra"
+    }
+    pending = _pending(
+        root,
+        selection,
+        run,
+        grading=graded_run and (selection.get("source_only_grades") is None or bool(ungraded)),
+    )
     origins = (run or {}).get("baseline_origin", {})
     report = _read(root / "report/results.json")
     measured, references = _measures(report)
@@ -513,7 +548,12 @@ def run_status(
         "last_event": events[-1] if events else None,
         "error": error,
         "alerts": _alerts(
-            evidence=evidence, selection=selection, report=report, error=error, attempts=attempts
+            evidence=evidence,
+            selection=selection,
+            report=report,
+            error=error,
+            attempts=attempts,
+            ungraded=ungraded,
         ),
         "states_source": source,
         "attempts_total": len(attempts),

@@ -28,6 +28,7 @@ import yaml
 from pydantic import StrictInt, StrictStr
 
 from pluginbench import codex, study
+from pluginbench.grade import GRADE_CONTRACT
 from pluginbench.arms import normalize_arm_name
 from pluginbench.assessment import _load_manifest
 from pluginbench.assessment_models import Attempt, InputModel, Snapshot
@@ -45,6 +46,9 @@ PANEL = "panel.json"
 SCHEMA = "response-schema.json"
 # The report's one grade per attempt; anything else (infra, legacy, ungraded) is no pass.
 PASSING = {"pass"}
+# Each attempt's one grade (grade contract 1). Anything else, an infrastructure error, a legacy
+# run's correctness or none yet, is no grade, so correctness cannot decide its pair.
+GRADED = {"pass", "fail"}
 HARNESSES = {"codex", "claude"}
 # Version 2 added judge_cli_version. A binding without a version is version 1.
 BINDING_VERSION = "2"
@@ -274,6 +278,7 @@ def load_submissions(
     )
     submissions: dict[tuple[str, int], Submission] = {}
     unavailable: list[tuple[str, int]] = []
+    graded = data.get("grade_contract") == GRADE_CONTRACT
     for row in rows:
         key = (row["task"], int(row["repeat"]))
         where = f"{run} {arm} {row['task']} repeat {key[1]}"
@@ -311,7 +316,8 @@ def load_submissions(
             arm=arm,
             attempt=row["id"],
             repeat=key[1],
-            correctness=row["correctness"],
+            # A report from before grade contract 1 holds no grade, as compare reads it.
+            correctness=row["correctness"] if graded else "legacy",
             before_digest=artifacts["before_digest"],
             source=source,
         )
@@ -869,7 +875,8 @@ def tally(directory: Path, *, require_bound: bool = False) -> dict[str, Any]:
                     comparable[judge] += 1
                     agreed[judge] += vote == others
             passed = {side: sides[side]["correctness"] in PASSING for side in "AB"}
-            if passed["A"] != passed["B"]:
+            graded = all(sides[side]["correctness"] in GRADED for side in "AB")
+            if graded and passed["A"] != passed["B"]:
                 by, shares = "correctness", {"A": float(passed["A"]), "B": float(passed["B"])}
             else:
                 majority = _majority(list(pair_votes.values()))
@@ -900,7 +907,7 @@ def tally(directory: Path, *, require_bound: bool = False) -> dict[str, Any]:
     )
     return {
         "schema_version": 1,
-        "rule": "If exactly one side passed, it wins without a vote. "
+        "rule": "If both sides have a grade and exactly one passed, it wins without a vote. "
         "Otherwise the side more than half of the judges prefer wins; anything else is half each.",
         "judges": judges,
         "unbound": len(unbound),
