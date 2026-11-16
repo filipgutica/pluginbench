@@ -438,7 +438,7 @@ class Ledger:
             self._db.execute("BEGIN IMMEDIATE")
             if (reason := self.refusal(slot, stage)) is not None:
                 raise SlotExhausted(reason)
-            if stage in PAID_STAGES and self._paid_room() <= 0:
+            if stage in PAID_STAGES and self.paid_room() <= 0:
                 raise CeilingReached(
                     f"the run reached its ceiling of {self._ceiling()} paid invocations, so no "
                     "further model call starts"
@@ -449,16 +449,13 @@ class Ledger:
         ceiling: int = self._db.execute("SELECT paid_call_ceiling FROM budget").fetchone()[0]
         return ceiling
 
-    def _paid_room(self) -> int:
+    def paid_room(self) -> int:
+        """Paid invocations the ceiling still allows. Every paid row counts, in every state:
+        coding and review read this one figure."""
         spent: int = self._db.execute(
             f"SELECT COUNT(*) FROM invocations WHERE stage IN {PAID_STAGES}"
         ).fetchone()[0]
         return self._ceiling() - spent
-
-    def paid_room(self) -> int | None:
-        """Paid invocations the ceiling still allows; None for a version 1 ledger, whose run
-        was coded before ceilings existed."""
-        return None if self._version == 1 else self._paid_room()
 
     def invocation_started(self, invocation: str, pid: int) -> None:
         """Record the spawned child's identity: the invocation is `started`."""

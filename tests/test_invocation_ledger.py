@@ -8,7 +8,10 @@ behaviour depends on time.
 from __future__ import annotations
 
 import os
+import signal
 import sqlite3
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -20,7 +23,7 @@ import test_baselines
 import test_study_review
 from native_support import execution as native_execution, runtime_identity, synthetic_contract
 from pluginbench import harbor_backend, processes, provider_stops, source_only, study, study_review
-from pluginbench import submissions, trial_containers
+from pluginbench import codex, submissions, trial_containers
 from pluginbench.ledger import (
     LEDGER_NAME,
     SCHEMA_VERSION,
@@ -29,7 +32,7 @@ from pluginbench.ledger import (
     SlotExhausted,
 )
 from test_grade import HEALTHY, _coded
-from test_resume import _killed_resume, _killed_run
+from test_resume import _PATH, _killed_resume, _killed_run
 
 
 def _invocations(root: Path) -> list[dict[str, Any]]:
@@ -493,3 +496,116 @@ def test_a_replay_whose_grade_is_not_saved_is_not_finished(
         ["failed_transient", "failed_transient", "finished"],
         ["finished"],
     ]
+
+
+# Every judge call is a ledger row (the re-review findings).
+
+
+def test_reviews_of_a_version_1_run_are_migrated_and_capped_per_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    _as_version_1(root)
+    calls = test_study_review._judge(monkeypatch, root)
+    for revision in ("first", "second", "third"):
+        study_review.review_study(root, revision=revision)
+    with pytest.raises(SlotExhausted, match="used its 3 review invocations"):
+        study_review.review_study(root, revision="fourth")
+    assert len(calls) == 6 and not (root / "review-revisions/fourth").exists()
+    assert _states(root, "review") == ["finished"] * 6
+    connection = sqlite3.connect(root / LEDGER_NAME)
+    try:
+        # Two slots, each coded and reviewed: the default ceiling of a reviewed run.
+        assert connection.execute("SELECT paid_call_ceiling FROM budget").fetchone()[0] == 12
+    finally:
+        connection.close()
+
+
+def test_a_run_without_a_ledger_is_not_reviewed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    (root / LEDGER_NAME).unlink()
+    calls = test_study_review._judge(monkeypatch, root)
+    with pytest.raises(ValueError, match="no invocation ledger"):
+        study_review.review_study(root)
+    assert calls == [] and not (root / "review-revisions/review").exists()
+
+
+def _review_child() -> None:
+    """argv: run. Reviews it with a judge call that SIGKILLs this process as it starts."""
+    patch = pytest.MonkeyPatch()
+    patch.setattr(submissions, "reviewed_contract", synthetic_contract)
+    patch.setattr(codex, "invoke", lambda **kwargs: os.kill(os.getpid(), signal.SIGKILL))
+    study_review.review_study(Path(sys.argv[1]))
+    raise SystemExit("the review finished without reaching its judge call")
+
+
+def test_a_judge_call_killed_as_it_starts_still_counts_toward_the_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    ledger = Ledger.open(root / LEDGER_NAME)
+    try:
+        for slot in (0, 1):  # Two halts beside the two coding calls: 4 of the ceiling of 6.
+            ledger.end(ledger.intent(slot=slot, stage="coding", attempt_id="halt"), "halted_provider")
+    finally:
+        ledger.close()
+    child = subprocess.run(
+        [sys.executable, "-c", "import test_invocation_ledger as t; t._review_child()", str(root)],
+        env={**os.environ, "PYTHONPATH": _PATH},
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert child.returncode == -signal.SIGKILL, child.stderr
+    calls = test_study_review._judge(monkeypatch, root)
+    # The killed call is the fifth paid invocation, so two more reviews would make seven.
+    with pytest.raises(CeilingReached):
+        study_review.review_study(root, revision="second")
+    assert calls == [] and _states(root, "review") == ["unresolved"]
+
+
+def test_coding_resumed_after_a_review_counts_the_review_s_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+
+    def vanilla_fails(**kwargs: Any) -> dict[str, Any]:
+        calls.append(str(kwargs["entry"]["id"]))
+        kwargs["on_spawn"](os.getpid())
+        area = kwargs["area"]
+        (area / "workspace/src/answer.py").write_text("answer = 1\n")
+        execution = native_execution(area, kwargs["protocol"]["native_task_identity"], reward=1)
+        if kwargs["entry"]["arm"] == "baseline":
+            return {**execution, "treatment_error": f"missing skill {len(calls)}"}
+        return execution
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", vanilla_fails)
+    recipe = resume_support.recipe(tmp_path / "config", tasks=1, treatments=1, repeats=1, jobs=1)
+    root = tmp_path / "run"
+    with pytest.raises(study.CodingInfrastructure):
+        study.run_study(study.load_study(recipe), root, paid_call_ceiling=3)
+    reviews = test_study_review._judge(monkeypatch, root)
+    study_review.review_study(root)  # The package attempt's review: the third paid call.
+    assert len(reviews) == 1
+    with pytest.raises(CeilingReached):
+        study.resume_study(root)
+    assert len(calls) == 2
+
+
+def test_a_derived_citation_revision_adds_no_review_spend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    calls = test_study_review._judge(
+        monkeypatch, root, citation_evidence="\tanswer = 1", citation_line=1, severity="P2"
+    )
+    study_review.review_study(root, revision="fixed")
+    study_review.recover_review_citations(root, "fixed")
+    assert (root / "review-revisions/fixed-citations").is_dir()
+    # 2 coding and 2 review calls of the ceiling of 6; the recovery made none.
+    study_review.review_study(root, revision="second")
+    # Each review's citation fails validation, an infrastructure error under C1; it still counts.
+    assert len(calls) == 4 and _states(root, "review") == ["failed_transient"] * 4

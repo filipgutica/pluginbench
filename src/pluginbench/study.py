@@ -1334,12 +1334,13 @@ def resume_study(
 def invocation_history(root: Path) -> list[invocation_ledger.HistoryRow]:
     """The invocations a run's evidence shows, for a ledger that predates its invocation rows.
 
-    Every coding call wrote `invocations/<attempt>/<stage>.json` before it started, and every
-    verifier replay without a saved grade left its `.try-*` directory. Each counts toward its
-    slot: finished when its attempt completed, unresolved otherwise. Evidence that names an
+    Every coding call wrote `invocations/<attempt>/<stage>.json` before it started, every judge
+    call its review revision's `native-start.json`, and every verifier replay without a saved
+    grade left its `.try-*` directory. Each counts toward its slot: finished when its attempt
+    or review ended, unresolved otherwise. Evidence that names an
     attempt this run never gave a slot raises, so no slot is granted calls it may have spent.
     """
-    from pluginbench import source_only  # It imports this module.
+    from pluginbench import source_only, study_review  # Both import this module.
 
     run = json.loads((root / "run.json").read_text())
     slots = {
@@ -1363,6 +1364,10 @@ def invocation_history(root: Path) -> list[invocation_ledger.HistoryRow]:
     for receipt in sorted((root / "invocations").glob("*/*.json")):
         attempt = receipt.parent.name
         rows.append(row(attempt, "coding", "finished" if attempt in complete else "unresolved"))
+    rows += [
+        row(attempt, "review", "finished" if ended else "unresolved")
+        for attempt, ended in study_review.review_starts(root)
+    ]
     rows += [
         row(staging.parent.name, "grading", "unresolved")
         for staging in sorted((root / source_only.DIRECTORY).glob("filter-*/*/*.try-*"))

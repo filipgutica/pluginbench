@@ -20,7 +20,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         1,
         {
             # The optional artifact destination is judge-only; coding launch behavior stays v1.
-            "codex.py": "185d0c33e1389051ddfb97a85c08978a6f65773c2378d601cdf608f4b0c17ccf",
+            # The optional spawn callback reports the reviewer's PID to the invocation ledger;
+            # no launch changes.
+            "codex.py": "b1cbb78fe3fdb2019bedd1dadc2c1c24f029ac63810106c4ea77c93ed27af796",
             # The Claude launch contract; tests/test_codex_identity.py proves Codex launches equal.
             # Measurement and regrade skip launch-only runtime fields; coding checks are unchanged.
             # Audited command hooks keep native usage; with no audited_hooks every launch is
