@@ -734,6 +734,18 @@ def review_study(
             # is saved with an accepted response.
             ending: tuple[str, str | None] | None = None
 
+            def provider_stop(area: Path) -> study.ProviderStopped | None:
+                """The stop the judge's saved trace records: a limit, auth or provider error."""
+                stop = provider_stops.saved_stop(area / "artifacts", harness)
+                if stop is None:
+                    return None
+                return study.ProviderStopped(
+                    f"the {harness} reviewer stopped on {stop}. No further review call starts in "
+                    "this pass. Once the limit resets or the provider recovers, review again into "
+                    "a new revision with `pluginbench review <run-dir> --revision <name>`",
+                    f"{harness} stopped on {stop}",
+                )
+
             def spawn(pid: int) -> None:
                 nonlocal spawned
                 spawned = True  # Set first: the judge runs whether or not its record lands.
@@ -818,13 +830,8 @@ def review_study(
                             output_schema=area / "workspace/response-schema.json",
                             on_spawn=spawn,
                         )
-                        if (stop := provider_stops.saved_stop(area / "artifacts", harness)):
-                            raise study.ProviderStopped(
-                                f"the {harness} reviewer stopped on {stop}. No further review call "
-                                "starts in this pass; review again once the limit resets or the "
-                                "provider recovers",
-                                f"{harness} stopped on {stop}",
-                            )
+                        if (stopped := provider_stop(area)) is not None:
+                            raise stopped
                         if (
                             study._inventory(area / "workspace") != inventory
                             or study._inventory(packet) != inventory
@@ -855,6 +862,9 @@ def review_study(
                     except invocation_ledger.InvocationRefused as refused:
                         row.update(status="unavailable", reason=f"no judge call: {refused}")
                     except (Exception, KeyboardInterrupt) as exc:
+                        if spawned and not isinstance(exc, (KeyboardInterrupt, study.ProviderStopped)):
+                            # The launcher can raise after the trace that records a stop is saved.
+                            exc = provider_stop(area) or exc
                         if spawned and isinstance(exc, study.ProviderStopped):
                             # Given back to the slot, still counted by the ceiling, and the
                             # pass admits no further call, as coding does.

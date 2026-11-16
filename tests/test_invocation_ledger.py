@@ -616,8 +616,9 @@ def test_a_derived_citation_revision_adds_no_review_spend(
 # Review outcomes and inputs (the second re-review findings).
 
 
+@pytest.mark.parametrize("raises", [False, True])
 def test_a_provider_halt_in_review_gives_the_call_back_and_stops_the_pass(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raises: bool
 ) -> None:
     root = test_study_review._existing_study(tmp_path, monkeypatch)
     calls = test_study_review._judge(monkeypatch, root)
@@ -627,6 +628,8 @@ def test_a_provider_halt_in_review_gives_the_call_back_and_stops_the_pass(
         execution = judged(**kwargs)
         trace = kwargs["area"] / "artifacts/host-trace-0.jsonl"
         trace.write_text(codex_rollout("usage_limit_exceeded"))
+        if raises:  # As the launcher can, once the trace is saved.
+            raise ValueError("native artifacts failed validation")
         return execution
 
     monkeypatch.setattr(codex, "invoke", limited)
