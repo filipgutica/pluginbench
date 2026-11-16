@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.9.0](https://github.com/filipgutica/pluginbench/compare/v0.8.0...v0.9.0) (2026-11-16)
+
+
+### Features
+
+* block the check when a measure is not ready on too many tasks ([#113](https://github.com/filipgutica/pluginbench/issues/113)) ([8725ec8](https://github.com/filipgutica/pluginbench/commit/8725ec87bb7db545850b554786f76d901cdc059b))
+* derive decision-line execution coverage from bound evidence ([#107](https://github.com/filipgutica/pluginbench/issues/107)) ([bf61038](https://github.com/filipgutica/pluginbench/commit/bf6103818de2dade8d8e7e28d712e28b7cb050d8))
+* Go changed-line coverage from coverprofile blocks ([#104](https://github.com/filipgutica/pluginbench/issues/104)) ([9015f1e](https://github.com/filipgutica/pluginbench/commit/9015f1e55f248087aae01a0408ad49f6427c9b89))
+* grade each submission again without its test files, beside the native grade ([#98](https://github.com/filipgutica/pluginbench/issues/98)) ([2d2af54](https://github.com/filipgutica/pluginbench/commit/2d2af54cfabdca8a2ed48b2112e47f401000bfb3))
+* keep usage for attempts whose command hooks are all audited ([#117](https://github.com/filipgutica/pluginbench/issues/117)) ([efd7ee3](https://github.com/filipgutica/pluginbench/commit/efd7ee3eea4aa09267d6db55864570f3f2fce439))
+* let LCOV files Jest's istanbul found nothing in leave coverage completeness ([#100](https://github.com/filipgutica/pluginbench/issues/100)) ([68a6425](https://github.com/filipgutica/pluginbench/commit/68a642583252c292e524d05be2ab1f9a5664188e))
+* limit mutation measurement revisions to selected tasks ([#108](https://github.com/filipgutica/pluginbench/issues/108)) ([bb888c3](https://github.com/filipgutica/pluginbench/commit/bb888c3cd9d263b2553a00fda74d4731a05c9578))
+* measure mutation bug-catch rate on saved submissions ([#105](https://github.com/filipgutica/pluginbench/issues/105)) ([3d39b49](https://github.com/filipgutica/pluginbench/commit/3d39b49825b60ad35aa6cddd085fe2dd63ce5ef5))
+* measure verification iterations from saved agent traces ([#102](https://github.com/filipgutica/pluginbench/issues/102)) ([81a404e](https://github.com/filipgutica/pluginbench/commit/81a404eff099c70ab99ca5a307ec41cb0f0e7256))
+* review a finished run again with another reviewer ([#103](https://github.com/filipgutica/pluginbench/issues/103)) ([4867ef8](https://github.com/filipgutica/pluginbench/commit/4867ef8a9ee5721cdb327044ce8bd9c1b91febc1))
+* scope Go coverage completeness to the files the build compiles ([#96](https://github.com/filipgutica/pluginbench/issues/96)) ([b2ba7f8](https://github.com/filipgutica/pluginbench/commit/b2ba7f8dc7acb165ee70805739d948010a0f319e))
+* show alerts in run status ([#112](https://github.com/filipgutica/pluginbench/issues/112)) ([48ce61d](https://github.com/filipgutica/pluginbench/commit/48ce61d8ef03fd164b5da1ec2a49b313e1377bb4))
+* show review, verification, complexity, coverage and mutation measures in Results ([#123](https://github.com/filipgutica/pluginbench/issues/123)) ([f40426b](https://github.com/filipgutica/pluginbench/commit/f40426b46386d1247536efe3fe6313201f5362c5))
+* show run alerts in the dashboard ([#122](https://github.com/filipgutica/pluginbench/issues/122)) ([d75d2f6](https://github.com/filipgutica/pluginbench/commit/d75d2f6a52dc51f1c7ddd9363002c9d5f51d7500))
+
+
+### Bug Fixes
+
+* admit Codex plugin hooks registered with their root placeholders expanded ([#95](https://github.com/filipgutica/pluginbench/issues/95)) ([b951883](https://github.com/filipgutica/pluginbench/commit/b951883e6b7eef7e85aeb2e69ac3460de71f7249))
+* admit fallow-discovered html and css assets in the scoped file population ([#111](https://github.com/filipgutica/pluginbench/issues/111)) ([9e74dfd](https://github.com/filipgutica/pluginbench/commit/9e74dfd61f107b68227ce165c887a7878d8c3423))
+* count a built-in command a treatment replaces as pinned ([#120](https://github.com/filipgutica/pluginbench/issues/120)) ([e3bce63](https://github.com/filipgutica/pluginbench/commit/e3bce63515fe62a9b3f8cb07d30dc87a481ad4c8))
+* count forked subagent usage from Codex 0.167.2 rollouts ([#116](https://github.com/filipgutica/pluginbench/issues/116)) ([45cbe20](https://github.com/filipgutica/pluginbench/commit/45cbe20301f46cf9a043a0d52d9ca362e6efab57))
+* count Go blocks named after a //line target for the one file naming it ([#101](https://github.com/filipgutica/pluginbench/issues/101)) ([cd6eb48](https://github.com/filipgutica/pluginbench/commit/cd6eb487659e831068ce77b4635c1760ad01046e))
+* keep complexity when an untouched file does not parse ([#110](https://github.com/filipgutica/pluginbench/issues/110)) ([b673370](https://github.com/filipgutica/pluginbench/commit/b67337036a11e20110b98fcf4d307fae990a856a))
+* load saved selections after adding mutation ([#109](https://github.com/filipgutica/pluginbench/issues/109)) ([0a46dd8](https://github.com/filipgutica/pluginbench/commit/0a46dd8a5ba7189969f73e77af5f26f5ee7594e3))
+* make Codex attempts with a child on another model or effort ineligible ([#94](https://github.com/filipgutica/pluginbench/issues/94)) ([e411aad](https://github.com/filipgutica/pluginbench/commit/e411aada8be83d758a8d6beb9c212249a48f5230))
+* measure Go dead code on the files the host build compiles ([#114](https://github.com/filipgutica/pluginbench/issues/114)) ([866708c](https://github.com/filipgutica/pluginbench/commit/866708cccacf8b7eccbd96685fc07d7d50a28c22))
+* name a Claude startup hook by its status message in the transcript ([#118](https://github.com/filipgutica/pluginbench/issues/118)) ([7390520](https://github.com/filipgutica/pluginbench/commit/739052059ac3abb17db028f30885be8b27283d6d))
+* read coverage.py 7.2.x JSON, which has no meta.format, as format 2 ([#99](https://github.com/filipgutica/pluginbench/issues/99)) ([84e7146](https://github.com/filipgutica/pluginbench/commit/84e7146a8fe6c12dff7bdbe6e18f74f0d60d0066))
+* show attempts that failed native completion in run status ([#119](https://github.com/filipgutica/pluginbench/issues/119)) ([54432cd](https://github.com/filipgutica/pluginbench/commit/54432cde84736b0e5204aba990a5308d1e74e63e))
+* stop the run on provider and account stops instead of scoring them ([#97](https://github.com/filipgutica/pluginbench/issues/97)) ([f355c58](https://github.com/filipgutica/pluginbench/commit/f355c582e0851a498a4f049945185e2b07c7cd84))
+* widen verification command matching and status masking ([#106](https://github.com/filipgutica/pluginbench/issues/106)) ([eb7f63c](https://github.com/filipgutica/pluginbench/commit/eb7f63c1bb9089eff395a59e1ec10f6ab195e7c2))
+
 ## [0.8.0](https://github.com/filipgutica/pluginbench/compare/v0.7.1...v0.8.0) (2026-11-13)
 
 
