@@ -80,6 +80,10 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 .results td:first-child { min-width: 12rem; }
 .results td:nth-child(5) { min-width: 10rem; }
+.badges { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-top: var(--space-1); }
+.alerts { margin-bottom: var(--space-4); }
+.alerts li { align-items: flex-start; }
+.alerts li > span:last-child { min-width: 0; overflow-wrap: anywhere; }
 .roots { margin: 0 0 var(--space-4); font-size: var(--text-sm); overflow-wrap: anywhere; }
 
 @media (max-width: 40rem) {

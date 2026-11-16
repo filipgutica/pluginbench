@@ -93,6 +93,34 @@ function tally(counts, labels) {
   return parts.length ? parts.join(", ") : "—";
 }
 
+const SEVERITIES = { error: ["Error", "danger"], warning: ["Warning", "warning"] };
+
+// Alert counts by severity, worst first, such as "2 errors"; null when there are none.
+function alertCounts(alerts) {
+  const items = (alerts && alerts.items) || [];
+  const badges = Object.entries(SEVERITIES)
+    .map(([severity, [label, tone]]) => {
+      const count = items.filter((item) => item.severity === severity).length;
+      return count ? badge([`${count} ${label.toLowerCase()}${count === 1 ? "" : "s"}`, tone]) : null;
+    })
+    .filter(Boolean);
+  return badges.length ? h("span", { class: "badges" }, badges) : null;
+}
+
+// Every alert, worst first, as run_status lists them: severity, then its message.
+function alertList(alerts) {
+  const items = (alerts && alerts.items) || [];
+  if (!items.length) return null;
+  return [
+    h("h2", null, "Alerts"),
+    h(
+      "ul",
+      { class: "cell-list alerts" },
+      items.map((item) => h("li", null, badge(SEVERITIES[item.severity] || [item.severity, ""]), h("span", null, item.message))),
+    ),
+  ];
+}
+
 function runner(value) {
   if (!value) return "—";
   const parts = [value.harness, value.model, value.reasoning && `${value.reasoning} effort`];
@@ -109,8 +137,9 @@ async function getJSON(url) {
 function setMain(...children) {
   // A poll redraws the view; keep focus on the control the reader was using.
   const focused = document.activeElement && document.activeElement.id;
-  // replaceChildren would show a skipped (null) section as the text "null".
-  document.getElementById("main").replaceChildren(...children.filter(Boolean));
+  // replaceChildren would show a skipped (null) section as the text "null", and an array
+  // of sections as its joined text.
+  document.getElementById("main").replaceChildren(...children.flat().filter(Boolean));
   const again = focused && document.getElementById(focused);
   if (again && again !== document.getElementById("main")) again.focus({ preventScroll: true });
 }
@@ -167,6 +196,7 @@ function runRow(run) {
       "td",
       { "data-label": RUN_COLUMNS[1] },
       run.phase ? phaseBadge(run.phase) : badge(["Unreadable", "warning"]),
+      alertCounts(run.alerts),
       run.stale
         ? h("span", { class: "sub" }, run.phase ? `Last good read shown; the latest failed: ${run.error}` : `Not read yet: ${run.error}`)
         : null,
@@ -505,7 +535,7 @@ function renderRun(data) {
     data.stale
       ? h("div", { class: "alert warning", role: "status" }, h("p", null, `Showing the last good read. The latest read failed: ${data.error}. The page keeps trying.`))
       : null,
-    status.error ? h("div", { class: "alert danger" }, h("p", null, `The run failed: ${status.error}`)) : null,
+    alertList(status.alerts),
     h(
       "dl",
       { class: "facts" },
