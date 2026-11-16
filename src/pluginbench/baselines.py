@@ -477,6 +477,9 @@ def cohort_contexts(
             # v4 caches each repeat in its own entry under the cohort key.
             "protocol": "native-harbor-baseline-cohort-v4",
             "source_policy": submissions.SOURCE_POLICY,
+            # The C1 tables decide which coding outcomes are graded, so a cohort coded under
+            # another contract is a miss. `GRADE_CONTRACT` versions those tables.
+            "grade_contract": grade.GRADE_CONTRACT,
             "coding": coding,
             "task_id": task.task_id,
             "task_digest": task.digest,

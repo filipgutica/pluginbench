@@ -33,6 +33,7 @@ from typing import Any
 from uuid import uuid4
 
 from pluginbench import grade, harbor_backend, isolation, study, submissions
+from pluginbench import ledger as invocation_ledger
 from pluginbench.code_diff import TestRename, _is_test_path, without_test_files
 from pluginbench.datasets import TaskSpec, load_tasks, native_identity
 
@@ -58,7 +59,8 @@ def _directory(evidence: Path) -> Path:
 
 
 class _Infrastructure(Exception):
-    """This pass cannot grade the stage; the next run grades it again. Never a result."""
+    """This pass cannot grade the stage; the next run grades it again while its slot has
+    grading invocations left. Never a result."""
 
 
 @dataclass(frozen=True)
@@ -246,25 +248,52 @@ def _replay_unavailable(identity: dict[str, object]) -> str | None:
 
 
 def _replay(
-    *, record: dict[str, Any], patch: bytes, execution: Path, task: TaskSpec, target: Path
+    *,
+    record: dict[str, Any],
+    patch: bytes,
+    execution: Path,
+    task: TaskSpec,
+    target: Path,
+    ledger: invocation_ledger.Ledger,
+    slot: int,
 ) -> Path:
-    """Grade `patch` in a staging directory beside `target`; return that directory."""
+    """Grade `patch` in a staging directory beside `target`; return that directory.
+
+    The replay is one grading invocation of `slot`, committed before its worker starts.
+    """
     artifacts = execution.parent / "artifacts"
     hashes = json.loads(execution.read_text())["native_artifact_hashes"]
     staging = target.with_name(f"{target.name}.try-{uuid4().hex[:12]}")
     trial = staging / "source/harbor/trial"
     shutil.copytree(artifacts / "harbor/trial", trial, symlinks=True)
     (trial / "artifacts" / submissions.PATCH_ARTIFACT).write_bytes(patch)
-    regraded = harbor_backend.regrade_native(
-        artifacts=staging / "source",
-        task_dir=task.native_task,
-        identity=native_identity(task),
-        directory=staging / "regrade",
-        # regrade_native proves the copy equals the graded trial but for the replayed patch.
-        artifact_hashes={**hashes, submissions.PATCH_ARTIFACT: record["filtered_patch_sha256"]},
-    )
-    if (reason := grade.replay_infrastructure(regraded.get("exception_info"))) is not None:
-        raise ValueError(reason)  # Infrastructure, as `_grade` records any replay error.
+    invocation = ledger.intent(slot=slot, stage="grading", attempt_id=record["attempt_id"])
+    spawned = False
+
+    def spawn(pid: int) -> None:
+        nonlocal spawned
+        spawned = True  # Set first: the worker runs whether or not its record lands.
+        ledger.invocation_started(invocation, pid)
+
+    try:
+        regraded = harbor_backend.regrade_native(
+            artifacts=staging / "source",
+            task_dir=task.native_task,
+            identity=native_identity(task),
+            directory=staging / "regrade",
+            # regrade_native proves the copy equals the graded trial but for the replayed patch.
+            artifact_hashes={
+                **hashes,
+                submissions.PATCH_ARTIFACT: record["filtered_patch_sha256"],
+            },
+            on_spawn=spawn,
+        )
+        if (reason := grade.replay_infrastructure(regraded.get("exception_info"))) is not None:
+            raise ValueError(reason)  # Infrastructure, as `_grade` records any replay error.
+    except BaseException as error:
+        ledger.end(invocation, *invocation_ledger.outcome(error, spawned=spawned))
+        raise
+    ledger.end(invocation, "finished")
     verifier = regraded.get("verifier_result") if regraded.get("exception_info") is None else None
     record.update(
         native_result_reused=False,
@@ -363,32 +392,42 @@ def record_source_only_grades(
             health[task.task_id] = requalify(task)
         return health[task.task_id]
 
-    for attempt_id, stage_id, run, task in _stages(evidence):
-        target = directory / attempt_id / stage_id
-        path = target / "grade.json"
-        if not path.is_file():
-            try:
-                record, staging = _grade(
-                    evidence=evidence,
-                    attempt_id=attempt_id,
-                    stage_id=stage_id,
-                    run=run,
-                    task=task,
-                    target=target,
-                    progress=progress,
-                )
-                if record.get("fail_reason") is not None:
-                    reason = unhealthy(task)
-                    if reason is not None:
-                        raise _Infrastructure(
-                            f"{record['fail_reason']}, but the task's nop and oracle did not "
-                            f"requalify: {reason}"
-                        )
-                _keep(staging, target, record)
-            except _Infrastructure as error:
-                pending.setdefault(attempt_id, {})[stage_id] = str(error)
-                continue
-        records.setdefault(attempt_id, {})[stage_id] = study._reference(evidence, path)
+    ledger = invocation_ledger.Ledger.open(evidence / invocation_ledger.LEDGER_NAME)
+    try:
+        # A grade pass runs alone in its run, so a grading invocation still open was cut off by
+        # a crash.
+        ledger.resolve_crashed("grading")
+        slots = {row["id"]: row["slot"] for row in ledger.attempts()}
+        for attempt_id, stage_id, run, task in _stages(evidence):
+            target = directory / attempt_id / stage_id
+            path = target / "grade.json"
+            if not path.is_file():
+                try:
+                    record, staging = _grade(
+                        evidence=evidence,
+                        attempt_id=attempt_id,
+                        stage_id=stage_id,
+                        run=run,
+                        task=task,
+                        target=target,
+                        progress=progress,
+                        ledger=ledger,
+                        slot=slots[attempt_id],
+                    )
+                    if record.get("fail_reason") is not None:
+                        reason = unhealthy(task)
+                        if reason is not None:
+                            raise _Infrastructure(
+                                f"{record['fail_reason']}, but the task's nop and oracle did not "
+                                f"requalify: {reason}"
+                            )
+                    _keep(staging, target, record)
+                except _Infrastructure as error:
+                    pending.setdefault(attempt_id, {})[stage_id] = str(error)
+                    continue
+            records.setdefault(attempt_id, {})[stage_id] = study._reference(evidence, path)
+    finally:
+        ledger.close()
     index = directory / "index.json"
     study._write(
         index,
@@ -413,6 +452,8 @@ def _grade(
     task: TaskSpec,
     target: Path,
     progress: Callable[[str], None] | None,
+    ledger: invocation_ledger.Ledger,
+    slot: int,
 ) -> tuple[dict[str, Any], Path | None]:
     """One stage's grade record and the staging directory a replay left, if any.
 
@@ -441,6 +482,8 @@ def _grade(
         return {**record, **_verdict(None, fail)}, None
     record, staging = prepared.grade, None
     if prepared.replay is not None:
+        if (reason := ledger.refusal(slot, "grading")) is not None:
+            raise _Infrastructure(reason)
         if (reason := _replay_unavailable(native_identity(task))) is not None:
             raise _Infrastructure(reason)
         if progress:
@@ -456,6 +499,8 @@ def _grade(
                     execution=study._bound_path(evidence, run["executions"][attempt_id][stage_id]),
                     task=task,
                     target=target,
+                    ledger=ledger,
+                    slot=slot,
                 )
                 if record["reward"] is not None:
                     break
@@ -487,7 +532,8 @@ def raise_if_pending(evidence: Path, index: object, run: Path) -> None:
         raise GradesPending(
             f"{len(pending)} attempts have no grade: the grade stage hit an infrastructure "
             f"error ({'; '.join(reasons)}). The report is written without them, and the run is "
-            f"not finished; `{shlex.join(['pluginbench', 'run', str(run)])}` grades them again"
+            f"not finished; `{shlex.join(['pluginbench', 'run', str(run)])}` grades them again "
+            "while their slots have grading invocations left"
         )
 
 

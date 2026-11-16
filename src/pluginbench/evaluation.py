@@ -36,6 +36,7 @@ from pluginbench import (
     components,
     harbor_backend,
     isolation,
+    ledger,
     run_lock,
     submissions,
 )
@@ -1090,6 +1091,8 @@ def _code(
     # Runs prepared before vanilla identities were saved resume without the vanilla cache.
     identity = _object(json.loads(identity_path.read_text())) if identity_path.is_file() else None
     resuming = (evidence / "run.json").is_file()
+    # Contract C2: every coding and review slot's cap, the most model calls the run may start.
+    ceiling = ledger.default_ceiling(_assigned(selection) * (2 if config.reviewer else 1))
 
     def same_coder() -> None:
         # Checked only once reconciliation has found a slot left to code.
@@ -1105,6 +1108,7 @@ def _code(
             baseline_identity=identity,
             guard=guard,
             before_coding=same_coder,
+            paid_call_ceiling=ceiling,
         )
     else:
         run_study(
@@ -1114,6 +1118,7 @@ def _code(
             baseline_cache=_caches(root).vanilla if identity else None,
             baseline_identity=identity,
             guard=guard,
+            paid_call_ceiling=ceiling,
         )
     if not (root / "inputs" / _PROFILES).is_file():
         return

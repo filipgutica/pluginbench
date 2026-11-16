@@ -31,6 +31,7 @@ from pluginbench.datasets import native_identity, portable_native_identity
 BOUNDARIES = {
     "before-receipt": "before the invocation receipt is written",
     "during-call": "during the native call, after its invocation receipt",
+    "after-identity": "after the spawned worker's identity is recorded, before any output",
     "after-execution": "after execution.json, before the record receipt",
     "after-record": "after the record receipt, before the ledger marks it complete",
     "after-ledger": "after the ledger marks it complete, before run.json is rewritten",
@@ -112,6 +113,10 @@ def install(
             calls.append(str(kwargs["entry"]["id"]))
             ordinal = len(calls)
         if boundary == "during-call" and ordinal == at:
+            _kill()
+        # As the real worker does once it runs; this process stands in for it.
+        kwargs["on_spawn"](os.getpid())
+        if boundary == "after-identity" and ordinal == at:
             _kill()
         if boundary == "two-in-flight" and ordinal in (at, at + 1):
             pair.wait(timeout=10)

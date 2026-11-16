@@ -6,7 +6,7 @@ import os
 import signal
 import subprocess
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 _CLEANUP_TIMEOUT = 1.0
@@ -48,11 +48,14 @@ def run_command(
     cwd: str | Path,
     env: Mapping[str, str],
     timeout: float | None,
+    on_spawn: Callable[[int], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Capture UTF-8 output and clean the command's group, including on failure.
 
     TimeoutExpired retains byte output. The final drain is bounded because an
     escaped descendant can keep pipes open after the owned group has stopped.
+    `on_spawn` gets the child's PID, which is also its group ID, once it runs; if
+    it raises, the group is stopped like on any other failure.
     """
     proc = subprocess.Popen(
         argv,
@@ -67,6 +70,8 @@ def run_command(
     failure: BaseException | None = None
     try:
         try:
+            if on_spawn is not None:
+                on_spawn(proc.pid)
             stdout, stderr = proc.communicate(timeout=timeout)
         except BaseException as error:
             failure = error

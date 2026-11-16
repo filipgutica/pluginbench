@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from pluginbench import baselines, components
+from pluginbench import baselines, components, grade
 
 LEGACY = Path(__file__).parent / "fixtures/legacy-942f12c"
 
@@ -60,4 +60,16 @@ def hide_spawn_model_overrides(cache: Path) -> None:
             execution_path.write_text(json.dumps(execution))
         manifest = json.loads(manifest_path.read_text())
         manifest["inventory"] = baselines._inventory(entry)
+        manifest_path.write_text(json.dumps(manifest))
+
+
+def mark_grade_contract(cache: Path) -> None:
+    """Record a copied vanilla cohort as coded under this build's grade contract.
+
+    942f12c predates grade contracts, so the cache key, which binds the contract, misses its
+    cohorts as saved. Lookup tests need a cohort it admits.
+    """
+    for manifest_path in cache.glob("*/*/manifest.json"):
+        manifest = json.loads(manifest_path.read_text())
+        manifest["context"]["grade_contract"] = grade.GRADE_CONTRACT
         manifest_path.write_text(json.dumps(manifest))

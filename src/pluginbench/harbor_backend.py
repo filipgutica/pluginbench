@@ -25,7 +25,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -1511,6 +1511,7 @@ def _native_process(
     timeout: int,
     install_only: bool,
     auth_file: Path | None = None,
+    on_spawn: Callable[[int], None] | None = None,
 ) -> dict[str, object]:
     private = area / "private"
     artifacts = area / "artifacts"
@@ -1566,6 +1567,7 @@ def _native_process(
             cwd=private,
             env=env,
             timeout=timeout,
+            on_spawn=on_spawn,
         )
         (artifacts / "harbor-worker.stdout").write_text(result.stdout)
         (artifacts / "harbor-worker.stderr").write_text(result.stderr)
@@ -2579,8 +2581,12 @@ def invoke_native(
     protocol: dict[str, object],
     prompt: str,
     timeout: int,
+    on_spawn: Callable[[int], None] | None = None,
 ) -> dict[str, object]:
-    """Run the frozen standard task and its native separate verifier."""
+    """Run the frozen standard task and its native separate verifier.
+
+    `on_spawn` gets the Harbor worker's PID once it runs; nothing external starts before it.
+    """
     identity = _native_object(protocol.get("native_task_identity"), "prepared native task")
     host = str(entry["host"])
     treatment = Treatment.model_validate(protocol.get("treatment", {}))
@@ -2708,6 +2714,7 @@ def invoke_native(
             timeout=_native_worker_budget(task_dir=task_dir, agent_seconds=timeout),
             install_only=False,
             auth_file=Path(str(protocol["auth_file"])) if protocol.get("auth_file") else None,
+            on_spawn=on_spawn,
         )
         if worker.get("session_id") != name + "__env":
             raise ValueError("Native worker returned a foreign project identity")
@@ -3093,8 +3100,12 @@ def regrade_native(
     identity: dict[str, object],
     directory: Path,
     artifact_hashes: dict[str, str],
+    on_spawn: Callable[[int], None] | None = None,
 ) -> dict[str, object]:
-    """Replay only the standard native verifier over recorded immutable artifacts."""
+    """Replay only the standard native verifier over recorded immutable artifacts.
+
+    `on_spawn` gets the Harbor worker's PID once it runs, as in `invoke_native`.
+    """
     source = artifacts / "harbor/trial"
     source_digest = native_task_assets(source)
     if native_task_assets(task_dir) != identity["task_assets_sha256"]:
@@ -3146,6 +3157,7 @@ def regrade_native(
             harness=str(toolchain["harness"]),
             timeout=_native_worker_budget(task_dir=task_dir),
             install_only=True,
+            on_spawn=on_spawn,
         )
         if worker.get("session_id") != name + "__env":
             raise ValueError("Native regrade returned a foreign trial identity")
