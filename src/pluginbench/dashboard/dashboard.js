@@ -195,11 +195,16 @@ function runRow(run) {
     h(
       "td",
       { "data-label": RUN_COLUMNS[1] },
-      run.phase ? phaseBadge(run.phase) : badge(["Unreadable", "warning"]),
-      alertCounts(run.alerts),
-      run.stale
-        ? h("span", { class: "sub" }, run.phase ? `Last good read shown; the latest failed: ${run.error}` : `Not read yet: ${run.error}`)
-        : null,
+      // One wrapper, so a phone's stacked layout keeps it all in the value column.
+      h(
+        "div",
+        null,
+        run.phase ? phaseBadge(run.phase) : badge(["Unreadable", "warning"]),
+        alertCounts(run.alerts),
+        run.stale
+          ? h("span", { class: "sub" }, run.phase ? `Last good read shown; the latest failed: ${run.error}` : `Not read yet: ${run.error}`)
+          : null,
+      ),
     ),
     h("td", { class: "num", "data-label": RUN_COLUMNS[2] }, typeof total === "number" ? `${complete} of ${total}` : "—"),
     h("td", { "data-label": RUN_COLUMNS[3] }, tally(run.outcomes, OUTCOMES)),
