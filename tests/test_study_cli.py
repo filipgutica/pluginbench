@@ -2440,6 +2440,28 @@ def test_an_evaluation_ceiling_holds_every_coding_and_review_slot_s_cap(
     assert len(reviews) == 9 and ceiling == 3 * (9 + 9)
 
 
+def test_a_grade_pass_that_migrates_a_version_1_ledger_saves_the_evaluation_ceiling(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = _reviewed_run(config, tmp_path, monkeypatch)
+    path = root / "evidence/ledger.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript("DROP TABLE invocations; DROP TABLE budget; PRAGMA user_version = 1;")
+    connection.close()
+    # A run reviewed before invocation rows existed, graded again: the grade pass migrates first.
+    selection = evaluation._load_selection(root)
+    selection["source_only_grades"] = None
+    evaluation._finish_evaluation(
+        root, selection=selection, profiles={}, guidance=[], progress=None
+    )
+    connection = sqlite3.connect(path)
+    try:
+        [(ceiling,)] = connection.execute("SELECT paid_call_ceiling FROM budget").fetchall()
+    finally:
+        connection.close()
+    assert ceiling == 3 * (9 + 9)
+
+
 def test_review_with_another_reviewer_records_and_reports_that_reviewer(
     config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

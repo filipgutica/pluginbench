@@ -390,6 +390,7 @@ def record_source_only_grades(
     *,
     requalify: Requalify,
     progress: Callable[[str], None] | None = None,
+    paid_call_ceiling: int | None = None,
 ) -> dict[str, str]:
     """Grade every stage of a finished run's complete attempts; return the bound index.
 
@@ -397,7 +398,8 @@ def record_source_only_grades(
     call cannot grade is an infrastructure error, held in `pending` with its reason and graded
     again on a later call; `progress` gets one line naming how many wait and why. `requalify`
     runs the task's nop and oracle at most once per task in a call, and only for a fail that
-    needs a healthy task.
+    needs a healthy task. `paid_call_ceiling` is the run's ceiling, saved if this call migrates
+    a version 1 ledger.
     """
     directory = _directory(evidence)
     records: dict[str, dict[str, dict[str, str]]] = {}
@@ -411,6 +413,7 @@ def record_source_only_grades(
 
     ledger = invocation_ledger.Ledger.open(
         evidence / invocation_ledger.LEDGER_NAME,
+        paid_call_ceiling=paid_call_ceiling,
         history=partial(study.invocation_history, evidence),
     )
     try:
