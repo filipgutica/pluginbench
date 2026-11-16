@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from pluginbench import claude, claude_treatments, components, harbor_backend, provider_stops
-from pluginbench import grade, submissions
+from pluginbench import grade, saved_usage, submissions
 from pluginbench.native_treatments import DELIVERY_POLICY, NativeCapabilities
 from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.assessment_models import AttemptInput
@@ -392,7 +392,12 @@ def _not_a_baseline(attempt: Path, record: dict[str, Any], harness: object) -> s
     for stage in record["stages"]:
         target = attempt / stage["id"]
         execution = json.loads((target / "execution.json").read_text())
-        if grade.failed_before_first_turn(execution, harness) is not None:
+        # Transcript tokens show a turn only as this build reads the saved transcripts: an
+        # earlier one counted another session's messages. The recorded usage total already
+        # required the session's identity.
+        current = saved_usage.revalidate_usage(execution, target / "execution.json")
+        evidence = {**execution, "usage_accounting": current["usage_accounting"]}
+        if grade.failed_before_first_turn(evidence, harness) is not None:
             return "its session never reached the model"
         stop = provider_stops.saved_stop(target / "artifacts", harness)
         if stop is not None:

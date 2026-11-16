@@ -14,6 +14,7 @@ from pluginbench import (
     claude,
     claude_launch,
     claude_treatments,
+    claude_usage,
     evaluation,
     grade,
     harbor_backend,
@@ -1189,6 +1190,50 @@ def test_claude_evidence_that_differs_from_its_identity_cannot_seed_the_cache(
         if fault == "never-reached-model"
         else "its saved evidence does not match the vanilla cache identity"
     ] * 2
+
+
+def _stale_foreign_transcripts(cache: baselines.BaselineCache) -> None:
+    """Each saved Claude attempt as an earlier build recorded it: a stream cut after
+    system/init, transcript rows from another session, and their tokens in `per_model`."""
+    plain = CLAUDE_FIXTURES / "coding/plain"
+    init = (plain / "stream.jsonl").read_text().splitlines()[0]
+    # The earlier parser added the rows' tokens whatever their session.
+    counted = claude_usage.coding_usage(
+        init, plain / "sessions", runner_model=CLAUDE_RUNNER["model"],
+        cli_version=CLAUDE_RUNNER["harness_version"],
+    )["usage_accounting"]
+    for target in cache.root.glob("attempts/*/handoff"):
+        artifacts = target / "artifacts"
+        (artifacts / "stdout.jsonl").write_text(init + "\n")
+        sessions = artifacts / "harbor/trial/agent/sessions"
+        shutil.copytree(plain / "sessions", sessions)
+        (transcript,) = sessions.rglob("*.jsonl")
+        rows = [json.loads(line) for line in transcript.read_text().splitlines()]
+        transcript.write_text(
+            "".join(json.dumps({**row, "sessionId": "earlier-session"}) + "\n" for row in rows)
+        )
+        execution = json.loads((target / "execution.json").read_text())
+        execution.update(usage=None, timed_out=True, usage_accounting={
+            **counted, "reasons": [f"transcript {transcript.name} belongs to another session"],
+        })
+        (target / "execution.json").write_text(json.dumps(execution))
+
+
+def test_a_cached_claude_attempt_whose_only_turn_is_another_session_s_is_no_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "cache"
+    first, _, records = _claude_cohort(tmp_path / "first", path)
+    _stale_foreign_transcripts(first)
+    # This build refuses to cache it.
+    assert _publish(first, records) == ["its session never reached the model"] * 2
+    # An earlier build cached it; reuse must not import it, so it never reaches grading.
+    with monkeypatch.context() as earlier:
+        earlier.setattr(baselines, "_not_a_baseline", lambda *args: None)
+        assert _publish(first, records) == [None, None]
+    second, _, _ = _claude_cohort(tmp_path / "second", path)
+    with pytest.raises(ValueError, match="is no baseline: its session never reached the model"):
+        _statuses(second)
 
 
 def test_the_claude_vanilla_identity_binds_subagents_to_the_runner_model() -> None:
