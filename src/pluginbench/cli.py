@@ -428,65 +428,64 @@ def run(
     Checks run first, in this process. The run then continues in the background unless
     --foreground is set. Every setting comes from the config; a resume uses the saved one.
     """
-    owned = ExitStack()
     lock: run_lock.RunLock | None = None
     try:
-        if as_json and not dry_run:
-            raise ValueError("--json prints the dry-run plan; add --dry-run")
-        if not target.exists():
-            raise ValueError(
-                f"{target} does not exist; give an evaluation YAML or JSON, or a run directory"
-            )
-        evaluation = None
-        if target.is_dir():
-            if output is not None:
+        # A `with`, so the host lock sees an exception that leaves it and stays fenced.
+        with ExitStack() as owned:
+            if as_json and not dry_run:
+                raise ValueError("--json prints the dry-run plan; add --dry-run")
+            if not target.exists():
                 raise ValueError(
-                    f"{target} is a run directory, which resumes in place; "
-                    "--output names the directory for a new run from a config"
+                    f"{target} does not exist; give an evaluation YAML or JSON, or a run directory"
                 )
-            if not dry_run:
-                owned.enter_context(_execution("run", target))
-            if foreground and not dry_run:
-                # Own the run before planning, so a background start never races its parent.
-                lock = owned.enter_context(run_lock.hold(target))
-            plan = plan_resume(target)
-        else:
-            evaluation = load_evaluation(target)
-            plan = plan_evaluation(evaluation)
-        if dry_run:
-            typer.echo(json.dumps(plan, indent=2) if as_json else _plan_summary(plan))
-            return
-        typer.echo(_plan_summary(plan))
-        if notify and shutil.which(_notifier()) is None:
-            typer.echo(
-                f"Warning: --notify needs {_notifier()}, which is not on PATH; "
-                "no notification will be sent.",
-                err=True,
-            )
-        if not yes and not _confirm("Start evaluation?"):
-            raise typer.Exit()
-        progress = _notifying_progress(plan["coding_calls"]) if notify else typer.echo
-        if evaluation is None:
-            root = target.expanduser().resolve()
-        else:
-            destination = output or _new_run_directory()
-            owned.enter_context(_execution("run", target, destination))
-            try:
-                root = prepare_evaluation(evaluation, destination, progress=typer.echo)
-            except BaseException as exc:
-                if notify:
-                    _notify(f"Run failed: {str(exc) or type(exc).__name__}")
-                raise
-        if foreground:
-            _work(root, lock=lock, progress=progress, notify=notify)
-        else:
-            # The background run takes the host execution lock itself.
-            owned.close()
-            _detach(root, notify=notify)
+            evaluation = None
+            if target.is_dir():
+                if output is not None:
+                    raise ValueError(
+                        f"{target} is a run directory, which resumes in place; "
+                        "--output names the directory for a new run from a config"
+                    )
+                if not dry_run:
+                    owned.enter_context(_execution("run", target))
+                if foreground and not dry_run:
+                    # Own the run before planning, so a background start never races its parent.
+                    lock = owned.enter_context(run_lock.hold(target))
+                plan = plan_resume(target)
+            else:
+                evaluation = load_evaluation(target)
+                plan = plan_evaluation(evaluation)
+            if dry_run:
+                typer.echo(json.dumps(plan, indent=2) if as_json else _plan_summary(plan))
+                return
+            typer.echo(_plan_summary(plan))
+            if notify and shutil.which(_notifier()) is None:
+                typer.echo(
+                    f"Warning: --notify needs {_notifier()}, which is not on PATH; "
+                    "no notification will be sent.",
+                    err=True,
+                )
+            if not yes and not _confirm("Start evaluation?"):
+                raise typer.Exit()
+            progress = _notifying_progress(plan["coding_calls"]) if notify else typer.echo
+            if evaluation is None:
+                root = target.expanduser().resolve()
+            else:
+                destination = output or _new_run_directory()
+                owned.enter_context(_execution("run", target, destination))
+                try:
+                    root = prepare_evaluation(evaluation, destination, progress=typer.echo)
+                except BaseException as exc:
+                    if notify:
+                        _notify(f"Run failed: {str(exc) or type(exc).__name__}")
+                    raise
+            if foreground:
+                _work(root, lock=lock, progress=progress, notify=notify)
+            else:
+                # The background run takes the host execution lock itself.
+                owned.close()
+                _detach(root, notify=notify)
     except _EXPECTED_RUN_ERRORS as exc:
         _error(exc)
-    finally:
-        owned.close()
 
 
 @app.command("check")
@@ -600,17 +599,18 @@ def stop(
 
 @app.command("repair")
 def repair(
-    run: Path = typer.Argument(..., help="The run whose crashed calls blocked this host."),
+    run: Path = typer.Argument(..., help="The root the host block names."),
     confirm_stopped: bool = typer.Option(
         False,
         "--confirm-stopped",
         help="Confirm you checked that nothing the run's crashed calls started still runs.",
     ),
 ) -> None:
-    """Lift the host block that a run's unverifiable cleanup left, on your confirmation.
+    """Lift a host block that PluginBench cannot verify, on your confirmation.
 
-    Use it only after checking that no process or container of that run's crashed calls still
-    runs. The confirmation and its time are recorded.
+    RUN must be exactly the root the block names. Every check runs again first; only checks that
+    still cannot tell are confirmed, never one that finds something running. Each confirmation
+    is recorded with its time.
     """
     try:
         if not confirm_stopped:
@@ -621,19 +621,18 @@ def repair(
         target = str(run.resolve())
         owner = run_lock.ExecutionOwner(kind="recovery", eval=target, root=target)
         with run_lock.hold_execution(owner) as lock:
-            confirmed, lifted = control_store.confirm_stopped(lock, run)
+            confirmed, at, remaining = control_store.confirm_stopped(lock, run)
     except (OSError, ValueError) as exc:
         _error(exc)
         return
-    for item in confirmed:
-        what = item["detail"].get("stage", "trial containers")
-        typer.echo(f"Confirmed stopped: {what} {item['id']} of {item['run']}")
+    for check, reason in confirmed:
+        typer.echo(f"Confirmed stopped at {at}: {check['id']} ({reason.split('. Once')[0]})")
     if not confirmed:
-        typer.echo(f"Nothing of {run.resolve()} was waiting for cleanup.")
+        typer.echo(f"Every check for {run.resolve()} passed; nothing needed confirming.")
     typer.echo(
-        "The host is unblocked."
-        if lifted
-        else "Another run's cleanup is still unverified, so the host stays blocked."
+        f"{remaining} other run{'s' if remaining != 1 else ''} still wait for cleanup."
+        if remaining
+        else "The host is unblocked."
     )
 
 

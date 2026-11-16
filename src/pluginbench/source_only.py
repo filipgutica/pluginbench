@@ -34,7 +34,7 @@ from typing import Any
 from uuid import uuid4
 
 from pluginbench import grade, harbor_backend, isolation, study, submissions
-from pluginbench import control_store, ledger as invocation_ledger
+from pluginbench import control_store, ledger as invocation_ledger, run_lock
 from pluginbench.code_diff import TestRename, _is_test_path, without_test_files
 from pluginbench.datasets import TaskSpec, load_tasks, native_identity
 
@@ -253,6 +253,8 @@ def _replay_unavailable(identity: dict[str, object]) -> str | None:
         )
     except isolation.RuntimeDriftError as error:
         return str(error)
+    # Before the replay starts: recovery stops its containers through this daemon.
+    run_lock.note_runtime(expected)
     grader = harbor_backend._native_object(identity["grader_image_identity"], "grader")
     try:
         harbor_backend._assert_native_image(grader, expected)
@@ -420,7 +422,13 @@ def record_source_only_grades(
     try:
         # A grade pass runs alone in its run, so a grading invocation still open was cut off by
         # a crash.
-        cleaned = control_store.verify_crashed(ledger, path, ("grading",))
+        cleaned = control_store.verify_crashed(
+            ledger,
+            path,
+            ("grading",),
+            runtime=lambda: study.prepared_runtime(study._frozen_study(evidence)),
+            progress=progress,
+        )
         ledger.resolve_crashed("grading", cleaned=cleaned)
         slots = {row["id"]: row["slot"] for row in ledger.attempts()}
         for attempt_id, stage_id, run, task in _stages(evidence):

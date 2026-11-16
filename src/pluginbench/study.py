@@ -32,6 +32,7 @@ from pydantic import (
 
 from pluginbench import baselines, claude, codex, grade, harbor_backend, provider_stops
 from pluginbench import submissions
+from pluginbench import trial_containers
 from pluginbench.arms import normalize_arm_name
 from pluginbench.saved_usage import AuditedHook, revalidate_usage
 from pluginbench.harbor_backend import binary_native_reward as _binary_native_reward
@@ -44,6 +45,7 @@ from pluginbench import claude_launch, claude_treatments
 from pluginbench.baselines import BaselineCache
 from pluginbench import control_store, ledger as invocation_ledger
 from pluginbench.ledger import LEDGER_NAME, Ledger
+from pluginbench import run_lock
 from pluginbench.run_lock import RunMoved
 from pluginbench.parallel import run_jobs, validate_jobs
 from pluginbench.assessment import build_assessment, write_assessment
@@ -1298,19 +1300,13 @@ def resume_study(
     try:
         # An invocation still open, a cached attempt's regrade included, was cut off by a crash.
         # Nothing it started may still run when its saved output is accepted or its row closed.
-        cleaned = control_store.verify_crashed(ledger, path, ("coding", "grading"))
-        codes_again = _codes_again(root, ledger)
-        if cleaned or codes_again:
-            # A run that codes again needs its coding runtime anyway. One that only finishes
-            # keeps the runtime it was prepared with, which still pins Docker for the stop.
-            runtime = (
-                _coding_runtime(frozen, baseline_identity)
-                if codes_again
-                else native_identity(frozen.tasks[0]).get("isolation")
-            )
-            if not isinstance(runtime, dict):
-                raise ValueError(f"task {frozen.tasks[0].task_id} has no saved runtime")
-            control_store.stop_containers_left_by(root, runtime, progress)
+        cleaned = control_store.verify_crashed(
+            ledger,
+            path,
+            ("coding", "grading"),
+            runtime=partial(prepared_runtime, frozen),
+            progress=progress,
+        )
         plan, manifest, states = _reconcile(root, run, ledger)
         # After `_reconcile`, which accepts the output of any attempt with a record receipt.
         for stage in ("coding", "grading"):
@@ -1340,6 +1336,7 @@ def resume_study(
         baseline_cache=baseline_cache,
         baseline_identity=baseline_identity,
         guard=guard,
+        resumed=True,
     )
 
 
@@ -1392,36 +1389,12 @@ def is_graded_run(plan: dict[str, Any]) -> bool:
     return plan.get("grade_contract") == grade.GRADE_CONTRACT
 
 
-def _codes_again(root: Path, ledger: Ledger) -> bool:
-    """Whether a resume may code again: a live attempt has neither finished nor left a record
-    receipt, as `_reconcile` judges it, and its slot has invocations left. A run stopped after
-    its last attempt finished needs no coding runtime."""
-    return any(
-        row["state"] != "complete"
-        and not (root / "records" / f"{row['id']}.json").is_file()
-        and ledger.refusal(row["slot"], "coding") is None
-        for row in ledger.attempts()
-        if row["state"] != "discarded-interrupted"
-    )
-
-
-def _coding_runtime(
-    frozen: ResolvedStudy, baseline_identity: dict[str, object] | None
-) -> dict[str, object]:
-    """The runtime new attempts code with: a reused vanilla cohort's, verified, or this host's.
-    Each task's saved runtime must still hold."""
-    requested = baseline_identity.get("isolation") if baseline_identity else None
-    if baseline_identity is None:
-        runtime = harbor_backend.runtime_identity(
-            cpus=frozen.recipe.container_cpus,
-            memory_mb=frozen.recipe.container_memory_mb,
-            harness=frozen.recipe.harness,
-        )
-    elif isinstance(requested, dict):
-        runtime = harbor_backend.assert_runtime(requested, jobs=frozen.recipe.jobs)
-    else:
-        raise ValueError("baseline reuse requires a fixed filesystem isolation identity")
-    _assert_task_runtimes(frozen, runtime)
+def prepared_runtime(frozen: ResolvedStudy) -> dict[str, object]:
+    """The Docker runtime the run was prepared with, which its trials ran under unless a
+    resume moved them to another engine."""
+    runtime = native_identity(frozen.tasks[0]).get("isolation")
+    if not isinstance(runtime, dict):
+        raise ValueError(f"task {frozen.tasks[0].task_id} has no saved runtime")
     return runtime
 
 
@@ -1576,10 +1549,11 @@ def _run_attempts(
     baseline_cache: Path | None,
     baseline_identity: dict[str, object] | None,
     guard: Callable[[], None] | None,
+    resumed: bool = False,
 ) -> Path:
     """Code every slot whose attempt is not complete, checkpointing each state change.
 
-    A resume has already stopped the containers a killed attempt left running.
+    A resumed pass first stops the containers a killed attempt left running.
     """
     root, frozen, plan, manifest, states, ledger = (
         run.root, run.study, run.plan, run.manifest, run.states, run.ledger
@@ -1616,8 +1590,25 @@ def _run_attempts(
         requested_runtime = baseline_identity.get("isolation") if baseline_identity else None
         if isinstance(requested_runtime, dict):
             expected_runtime = requested_runtime
+        elif baseline_identity is not None and coding:
+            raise ValueError("baseline reuse requires a fixed filesystem isolation identity")
         if coding:
-            expected_runtime = _coding_runtime(frozen, baseline_identity)
+            expected_runtime = (
+                harbor_backend.assert_runtime(expected_runtime, jobs=frozen.recipe.jobs)
+                if baseline_identity is not None
+                else harbor_backend.runtime_identity(
+                    cpus=frozen.recipe.container_cpus,
+                    memory_mb=frozen.recipe.container_memory_mb,
+                    harness=frozen.recipe.harness,
+                )
+            )
+            _assert_task_runtimes(frozen, expected_runtime)
+            # Before any trial starts: recovery stops its containers through this daemon.
+            run_lock.note_runtime(expected_runtime)
+            if resumed:
+                trial_containers.stop_left_running(
+                    root, expected_runtime=expected_runtime, progress=progress
+                )
         if baseline_cache is not None:
             assert baseline_identity is not None
             try:

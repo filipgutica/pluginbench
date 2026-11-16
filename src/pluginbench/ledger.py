@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from pluginbench.run_lock import boot_id, pid_namespace, process_start
+from pluginbench.run_lock import boot_id, note_work, pid_namespace, process_start
 
 # Version 2 adds `invocations` and `budget`; a writable open migrates version 1 in place.
 SCHEMA_VERSION = 2
@@ -465,7 +465,7 @@ class Ledger:
                     f"the run reached its ceiling of {self._ceiling()} paid invocations, so no "
                     "further model call starts"
                 )
-            return _insert(
+            invocation = _insert(
                 self._db,
                 slot=slot,
                 stage=stage,
@@ -473,6 +473,9 @@ class Ledger:
                 state="intent",
                 inputs=inputs,
             )
+        # Something may start from here, so only a clean exit releases the host lock.
+        note_work()
+        return invocation
 
     def _ceiling(self) -> int:
         ceiling: int = self._db.execute("SELECT paid_call_ceiling FROM budget").fetchone()[0]

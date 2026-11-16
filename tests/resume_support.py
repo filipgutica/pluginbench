@@ -98,6 +98,8 @@ def install(
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
     # No killed attempt left a container running; test_resume covers the ones that did.
     monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
+    # The Docker daemon is the one the run recorded.
+    monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime: None)
     lock = threading.Lock()
     pair = threading.Barrier(2)
     counts = {"receipt": 0, "verify": 0, "complete": 0, "publish": 0}

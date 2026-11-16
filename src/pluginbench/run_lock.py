@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
 from types import FrameType
+from typing import Any
 
 from pluginbench import __version__
 
@@ -33,8 +34,9 @@ _PROBE_GRACE = 0.5
 EXECUTION_LOCK = "execution.lock"
 EXECUTION_OWNER = "execution-owner.json"
 EXECUTION_KINDS = ("run", "review", "measure", "preflight", "judge", "recovery")
-# The owner record is diagnostic: the flock and the control store authorize work.
-OWNER_STATES = ("acquiring", "active", "reconciling", "blocked")
+# The flock authorizes work. The owner record is also the fence recovery reads: until its owner
+# records `released`, a dead owner may have left something running at its root.
+OWNER_STATES = ("acquiring", "active", "reconciling", "blocked", "released")
 
 
 class RunMoved(ValueError):
@@ -445,7 +447,11 @@ class ExecutionLock:
 
     state: Path
     fd: int
-    record: dict[str, object]
+    record: dict[str, Any]
+    # Set once this owner records work it must clean up, or knows of cleanup it could not
+    # verify. Until a clean exit clears it, its release stays unrecorded, so the next owner
+    # recovers its root.
+    dirty: bool = False
 
     def assert_owned(self) -> None:
         """Raise ExecutionLost unless the lock path still leads to the inode this process holds
@@ -464,8 +470,24 @@ class ExecutionLock:
         """Atomically replace the owner record with this one in `state`."""
         if state not in OWNER_STATES:
             raise ValueError(f"unknown owner state {state}")
-        self.record = {**self.record, "state": state}
-        _write_atomic(self.state / EXECUTION_OWNER, self.record)
+        self._write({**self.record, "state": state})
+
+    def settle(self, pending: list[dict[str, Any]]) -> None:
+        """Replace the obligations this owner carries; the only write recovery makes."""
+        self._write({**self.record, "pending": pending})
+
+    def note_runtime(self, runtime: dict[str, object]) -> None:
+        """Record a Docker runtime before any container starts under it. If the record cannot be
+        written, this raises and nothing may start."""
+        docker = {key: runtime[key] for key in ("docker_cli", "docker_engine") if key in runtime}
+        self.dirty = True
+        if docker not in self.record["runtimes"]:
+            self._write({**self.record, "runtimes": [*self.record["runtimes"], docker]})
+
+    def _write(self, record: dict[str, Any]) -> None:
+        # Adopt the record only once it is on disk, so a failed write never reaches it later.
+        _write_atomic(self.state / EXECUTION_OWNER, record)
+        self.record = record
 
 
 # The lock this process holds now, so recovery deep in a run can require it.
@@ -477,13 +499,46 @@ def held_execution() -> ExecutionLock | None:
     return _execution
 
 
+def note_work() -> None:
+    """Mark that the owner is about to start something it must clean up, such as a recorded
+    call. Without the host lock there is nothing to mark."""
+    if _execution is not None:
+        _execution.dirty = True
+
+
+def note_runtime(runtime: dict[str, object]) -> None:
+    """Record the Docker runtime containers are about to start under; without the host lock
+    there is no owner record, and nothing to record."""
+    if _execution is not None:
+        _execution.note_runtime(runtime)
+
+
+def _carried(state: Path) -> list[dict[str, Any]]:
+    """The obligations the last owner left: those it carried, and itself unless it recorded a
+    clean release. A record from before releases were recorded counts as unreleased, and an
+    unreadable one is an obligation whose root is the state directory."""
+    path = state / EXECUTION_OWNER
+    if not path.exists():
+        return []
+    previous = _read_record(path)
+    if previous is None:
+        return [{"kind": "unknown", "root": str(state), "pid": None, "acquired_at": None}]
+    carried = previous.get("pending")
+    pending = [item for item in carried if isinstance(item, dict)] if isinstance(carried, list) else []
+    if previous.get("state") != "released":
+        pending.append({key: value for key, value in previous.items() if key != "pending"})
+    return pending
+
+
 @contextmanager
 def hold_execution(owner: ExecutionOwner, *, state: Path | None = None) -> Iterator[ExecutionLock]:
     """Own this account's host execution lock while the block runs, or raise ExecutionBusy.
 
     The lock file is never unlinked or replaced: its inode is the lock. The flock ends with the
     process, even on SIGKILL, and is never inherited by a child. The owner record is published
-    before the block starts any work.
+    before the block starts any work, and carries every obligation the last owner left, so that
+    write either fences them again or fails with nothing started. Leaving the block records a
+    clean release, unless the owner knows of unverified cleanup.
     """
     global _execution
     if _execution is not None:
@@ -496,7 +551,7 @@ def hold_execution(owner: ExecutionOwner, *, state: Path | None = None) -> Itera
             state,
             fd,
             {
-                "schema": 1,
+                "schema": 2,
                 "pid": os.getpid(),
                 "start_time": process_start(os.getpid()),
                 "boot_id": boot_id(),
@@ -508,6 +563,8 @@ def hold_execution(owner: ExecutionOwner, *, state: Path | None = None) -> Itera
                 "version": execution_version(),
                 "state": "acquiring",
                 "acquired_at": datetime.now(UTC).isoformat(),
+                "runtimes": [],
+                "pending": _carried(state),
             },
         )
         lock.publish("acquiring")
@@ -516,5 +573,12 @@ def hold_execution(owner: ExecutionOwner, *, state: Path | None = None) -> Itera
             yield lock
         finally:
             _execution = None
+            if not lock.dirty:
+                try:
+                    lock.publish("released")
+                except OSError:
+                    # The record stays unreleased, so the next owner recovers this root: safe,
+                    # and an exception already leaving the block is not hidden.
+                    pass
     finally:
         os.close(fd)

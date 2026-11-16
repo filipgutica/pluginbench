@@ -1,90 +1,78 @@
-"""Host execution control: the recovery barrier, cleanups left to verify, an unknown lock holder.
+"""Host recovery: what a dead owner may have left running is verified before any work starts.
 
-One small SQLite database beside the host execution lock. Each run's ledger stays the only
-authority on retries and spend; this store records only what blocks the whole host: a cleanup
-not yet verified, whichever run it belongs to. While such a barrier stands, every execution entry
-point first verifies that cleanup again and refuses to run until it passes.
+The host execution lock's owner record is the fence. Its owner writes it before starting any
+work, and records `released` only when it leaves cleanly. The next owner carries every unreleased
+record forward as an obligation, in that same write (`run_lock.hold_execution`). Before any other
+work, `execute` checks every obligation and clears them with one write, only once every check
+passes. Whatever a check cannot prove is unknown: the obligation stays, and nothing runs.
 
-Recovery fences before it checks. It records every cleanup it is about to verify, first in a
-marker file and then in the barrier, so a recovery that dies or cannot finish its writes still
-leaves the host blocked. A crashed invocation is marked `unresolved`, or its saved output
-accepted, only after cleanup of everything it started is verified (`verify_crashed`).
+The checks for an obligation at root R:
+- processes: each invocation R's ledger still has open. No live process may remain in the process
+  group the ledger recorded for it (`verify_invocation`).
+- containers: for each Docker runtime the owner recorded before starting containers, and only
+  once every process is proven gone. The daemon at the runtime's endpoint must still be the one
+  it recorded, the trial containers R left running are stopped, and two inventories at least a
+  second apart find none (`verify_containers`).
+- unrecorded work: `check`, `measure` and `judge run` start processes no ledger records, so until
+  per-invocation systemd scopes exist their obligations are unknown.
 
-Two cleanups are checked now: the process group the ledger recorded for each crashed invocation
-(`verify_invocation`), and the containers a run's killed trials left running
-(`stop_left_containers`). Per-invocation systemd scopes and container labels will replace the
-process check. Whatever cannot be checked is unknown and blocks, until the operator confirms with
-`pluginbench repair --confirm-stopped` that nothing still runs (`confirm_stopped`).
+A resume repeats the process and container checks for its own crashed calls before it accepts
+saved output or marks a call unresolved (`verify_crashed`). Only `pluginbench repair
+--confirm-stopped ROOT` lifts an unknown check, after verifying again, and only for checks that
+remain unknown (`confirm_stopped`).
 """
 
 from __future__ import annotations
 
-import json
 import sqlite3
 import subprocess
-import sys
 import time
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
-from pluginbench import run_lock, trial_containers
-from pluginbench.ledger import OPEN_STATES, Ledger
-from pluginbench.run_lock import ExecutionLock, ExecutionOwner, process_start
+from pluginbench import harbor_backend, isolation, run_lock, trial_containers
+from pluginbench.ledger import LEDGER_NAME, OPEN_STATES, Ledger
+from pluginbench.run_lock import ExecutionLock, ExecutionOwner
 
 CONTROL_NAME = "control.sqlite"
-# Written before the barrier and removed only after it lifts: a fence that survives a store
-# that cannot be written.
-MARKER_NAME = "recovery-pending.json"
 SCHEMA_VERSION = 1
 # How long a held lock may name no verifiable owner before observers report `reconciling`.
 UNKNOWN_OWNER_GRACE = 30.0
-HOST_CLEANUP = "host_cleanup"
-OPERATOR = "operator"
+# Seconds between the two container inventories that must both find nothing.
+INVENTORY_INTERVAL = 1.0
+# Kinds whose external processes no ledger records.
+UNRECORDED_KINDS = ("preflight", "measure", "judge", "unknown")
 
-# Only cleanup state: references into runs, never a second cap or spend counter. An item is an
-# invocation's processes (`invocation`) or the trial containers a run left running (`containers`).
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS host_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    revision INTEGER NOT NULL,
-    -- Why no work may start until recovery verifies cleanup, such as host_cleanup.
-    barrier TEXT,
-    detail TEXT,
     -- Set while an observer sees the lock held by an owner it cannot verify.
     reconciling TEXT,
     updated_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS operations (
-    id TEXT PRIMARY KEY,
-    run TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('invocation', 'containers')),
-    detail TEXT NOT NULL,
-    status TEXT NOT NULL
-        CHECK (status IN ('intent', 'launching', 'active', 'cleaning', 'clean')),
-    proof TEXT,
-    updated_at TEXT NOT NULL
+-- The operator's word that an unknown check left nothing running. Each covers one check.
+CREATE TABLE IF NOT EXISTS confirmations (
+    check_id TEXT PRIMARY KEY,
+    root TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    confirmed_at TEXT NOT NULL
 );
 """
 
-# An item to clean up: {"id", "run", "kind", "detail"}.
-Item = dict[str, Any]
+# One thing to verify: {"id", "root", "kind": "invocation" | "containers" | "unrecorded", ...}.
+Check = dict[str, Any]
 
 
 class CleanupBlocked(ValueError):
-    """Cleanup of a crashed invocation is not verified, so no work starts on this host."""
+    """Something a crashed owner or call started still runs, so no work starts on this host."""
 
 
-@dataclass(frozen=True)
-class HostState:
-    revision: int
-    barrier: str | None
-    detail: str | None
-    reconciling: str | None
+class CleanupUnknown(CleanupBlocked):
+    """PluginBench cannot tell whether something still runs; only the operator can confirm."""
 
 
 def _now() -> str:
@@ -92,8 +80,7 @@ def _now() -> str:
 
 
 class ControlStore:
-    """The host control database. Short `BEGIN IMMEDIATE` transactions; never held across a
-    process launch or an external command."""
+    """The host control database. Short transactions; never held across an external command."""
 
     def __init__(self, path: Path) -> None:
         self._db = sqlite3.connect(path, timeout=5)
@@ -103,8 +90,7 @@ class ControlStore:
             self._db.executescript(f"PRAGMA user_version = {SCHEMA_VERSION};" + _SCHEMA)
             with self._db:
                 self._db.execute(
-                    "INSERT OR IGNORE INTO host_state (id, revision, updated_at) VALUES (1, 0, ?)",
-                    (_now(),),
+                    "INSERT OR IGNORE INTO host_state (id, updated_at) VALUES (1, ?)", (_now(),)
                 )
         except BaseException:
             self._db.close()
@@ -119,99 +105,35 @@ class ControlStore:
         finally:
             store._db.close()
 
-    def host(self) -> HostState:
-        row = self._db.execute(
-            "SELECT revision, barrier, detail, reconciling FROM host_state"
-        ).fetchone()
-        return HostState(*row)
-
-    def items(self, *, unclean: bool) -> list[Item]:
-        """Registered items: those whose cleanup is not yet verified, or every one."""
-        rows = self._db.execute(
-            "SELECT id, run, kind, detail, status, proof FROM operations"
-            + (" WHERE status != 'clean'" if unclean else "")
-            + " ORDER BY id"
-        ).fetchall()
-        return [
-            {
-                "id": row[0],
-                "run": row[1],
-                "kind": row[2],
-                "detail": json.loads(row[3]),
-                "status": row[4],
-                "proof": json.loads(row[5] or "null"),
-            }
-            for row in rows
-        ]
-
-    def operator_confirmed(self) -> set[str]:
-        """Items the operator confirmed stopped; recovery does not check them again."""
-        return {
-            item["id"]
-            for item in self.items(unclean=False)
-            if (item["proof"] or {}).get("confirmed_by") == OPERATOR
-        }
-
-    def fence(self, items: Sequence[Item], detail: str) -> None:
-        """Persist the barrier and the items to verify, in one transaction, before any check.
-
-        An item the operator confirmed stopped stays clean.
-        """
-        with self._db:
-            self._db.execute("BEGIN IMMEDIATE")
-            for item in items:
-                self._db.execute(
-                    "INSERT INTO operations (id, run, kind, detail, status, updated_at)"
-                    " VALUES (?, ?, ?, ?, 'cleaning', ?)"
-                    " ON CONFLICT (id) DO UPDATE SET status = 'cleaning', proof = NULL,"
-                    " updated_at = excluded.updated_at"
-                    " WHERE json_extract(proof, '$.confirmed_by') IS NOT ?",
-                    (
-                        item["id"],
-                        item["run"],
-                        item["kind"],
-                        json.dumps(item["detail"], sort_keys=True),
-                        _now(),
-                        OPERATOR,
-                    ),
-                )
-            self._db.execute(
-                "UPDATE host_state SET revision = revision + 1, barrier = ?, detail = ?,"
-                " updated_at = ?",
-                (HOST_CLEANUP, detail, _now()),
-            )
-
-    def record_clean(self, item_id: str, proof: Mapping[str, Any]) -> None:
-        """Mark one item clean; only with the proof that verified it."""
-        with self._db:
-            changed = self._db.execute(
-                "UPDATE operations SET status = 'clean', proof = ?, updated_at = ?"
-                " WHERE id = ? AND status != 'clean'",
-                (json.dumps(proof, sort_keys=True), _now(), item_id),
-            ).rowcount
-        if changed != 1:
-            raise ValueError(f"control store cannot mark {item_id} clean")
-
-    def clear_barrier(self) -> bool:
-        """Lift the barrier once nothing is left unclean; return whether it lifted."""
-        with self._db:
-            self._db.execute("BEGIN IMMEDIATE")
-            if self.items(unclean=True):
-                return False
-            self._db.execute(
-                "UPDATE host_state SET revision = revision + 1, barrier = NULL, detail = NULL,"
-                " reconciling = NULL, updated_at = ?",
-                (_now(),),
-            )
-        return True
+    def reconciling(self) -> str | None:
+        reason: str | None = self._db.execute("SELECT reconciling FROM host_state").fetchone()[0]
+        return reason
 
     def set_reconciling(self, reason: str | None) -> None:
         with self._db:
             self._db.execute(
-                "UPDATE host_state SET revision = revision + 1, reconciling = ?, updated_at = ?"
-                " WHERE reconciling IS NOT ?",
+                "UPDATE host_state SET reconciling = ?, updated_at = ? WHERE reconciling IS NOT ?",
                 (reason, _now(), reason),
             )
+
+    def confirmed(self) -> set[str]:
+        return {row[0] for row in self._db.execute("SELECT check_id FROM confirmations")}
+
+    def confirmations(self) -> list[dict[str, str]]:
+        keys = ("check_id", "root", "reason", "confirmed_at")
+        rows = self._db.execute(f"SELECT {', '.join(keys)} FROM confirmations ORDER BY check_id")
+        return [dict(zip(keys, row, strict=True)) for row in rows]
+
+    def confirm(self, checks: Sequence[tuple[Check, str]], root: str) -> str:
+        """Record the operator's confirmation of each unknown check, with its reason; return
+        the time recorded."""
+        at = _now()
+        with self._db:
+            self._db.executemany(
+                "INSERT OR REPLACE INTO confirmations VALUES (?, ?, ?, ?)",
+                [(check["id"], root, reason, at) for check, reason in checks],
+            )
+        return at
 
 
 def _group_members(group: int) -> list[int]:
@@ -230,186 +152,232 @@ def _group_members(group: int) -> list[int]:
     return members
 
 
-def _unknown(item: Item, why: str) -> CleanupBlocked:
-    return CleanupBlocked(
-        f"{item['detail']['stage']} invocation {item['id']} {why}, so PluginBench cannot tell "
-        "whether what it started still runs. Once you have checked that nothing of it runs, "
-        f"confirm with `pluginbench repair --confirm-stopped {item['run']}`"
+def _leader_runs(pid: int, start: object) -> bool:
+    """Whether `pid` is still the recorded process, started at `start`, and not a zombie."""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    except OSError:
+        return False
+    return fields[0] != "Z" and fields[19] == start
+
+
+def _repair(root: str) -> str:
+    return (
+        "Once you have checked that nothing of it runs, confirm with "
+        f"`pluginbench repair --confirm-stopped {root}`"
     )
 
 
-def verify_invocation(item: Item) -> dict[str, Any]:
-    """Prove nothing the invocation started still runs, or raise CleanupBlocked.
+def verify_invocation(check: Check) -> dict[str, Any]:
+    """Prove that nothing in the invocation's recorded process group still runs.
 
-    Checks the process group the ledger recorded, conservatively: any live member blocks, even
-    after the leader exits. A missing record, or one from another PID namespace, is unknown and
-    blocks. A record from an earlier boot is gone with that boot. Children that left the group
-    with `setsid` are not found; systemd scopes will cover them.
+    A live member blocks, even after the leader exits. A missing record, a record without its
+    boot, or one from another PID namespace is unknown. A record from an earlier boot is gone
+    with that boot. Children that left the group with `setsid` are not seen; systemd scopes
+    will cover them.
     """
-    identity = item["detail"]["identity"] or {}
+    identity = check["identity"] or {}
     pid, group = identity.get("pid"), identity.get("process_group")
+    name = f"{check['stage']} invocation {check['id']}"
     if type(pid) is not int or type(group) is not int or "boot_id" not in identity:
-        raise _unknown(item, "has no verifiable process record")
-    proof = {"id": item["id"], "checked": "process group", "at": _now()}
+        raise CleanupUnknown(f"{name} has no verifiable process record. {_repair(check['root'])}")
+    proof = {"id": check["id"], "checked": "process group", "at": _now()}
     if identity["boot_id"] != run_lock.boot_id():
         return {**proof, "checked": "earlier boot"}
     namespace = identity.get("pid_namespace")
     if not namespace or namespace != run_lock.pid_namespace():
-        raise _unknown(item, "was recorded in another PID namespace")
+        raise CleanupUnknown(
+            f"{name} was recorded in another PID namespace. {_repair(check['root'])}"
+        )
     members = set(_group_members(group))
-    try:
-        if identity.get("start_time") is not None and process_start(pid) == identity["start_time"]:
-            members.add(pid)
-    except ProcessLookupError:
-        pass
+    if _leader_runs(pid, identity.get("start_time")):
+        members.add(pid)
     if members:
         raise CleanupBlocked(
-            f"process group {group} of {item['detail']['stage']} invocation {item['id']} still "
-            f"has processes {', '.join(map(str, sorted(members)))}; stop them with "
-            f"`kill -TERM -- -{group}`"
+            f"process group {group} of {name} still has processes "
+            f"{', '.join(map(str, sorted(members)))}; stop them with `kill -TERM -- -{group}`"
         )
     return proof
 
 
-def stop_left_containers(
-    item: Item, progress: Callable[[str], None] | None = None
+def verify_containers(
+    check: Check, progress: Callable[[str], None] | None = None
 ) -> dict[str, Any]:
-    """Stop the trial containers the item's run left running and confirm none still runs."""
-    evidence = Path(item["run"])
-    if not (evidence / "frozen" / "suite").is_dir():
-        raise CleanupBlocked(
-            f"run {evidence} moved or was deleted, so the trial containers it left cannot be "
-            "found. Once you have checked that none still runs, confirm with "
-            f"`pluginbench repair --confirm-stopped {evidence}`"
-        )
-    try:
-        trial_containers.stop_left_running(
-            evidence, expected_runtime=item["detail"]["runtime"], progress=progress
-        )
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        raise CleanupBlocked(
-            f"trial containers that {evidence} left running could not be stopped: {exc}"
-        ) from exc
-    return {"id": item["id"], "checked": "trial containers", "at": _now()}
+    """Stop the trial containers the run left running, and prove none still runs.
+
+    Each inventory first proves the daemon is the one the runtime recorded. After the stop, two
+    inventories at least INVENTORY_INTERVAL apart must both be empty, which catches a container
+    created late, such as a sidecar.
+    """
+    runtime, evidence = check["runtime"], Path(check["evidence"])
+    where = f"the trial containers of {evidence}"
+    if runtime is None:
+        missing = check.get("missing", "no Docker runtime is known")
+        raise CleanupUnknown(f"{missing} for {where}. {_repair(check['root'])}")
+
+    def inventory() -> list[dict[str, str]]:
+        try:
+            harbor_backend._assert_daemon(runtime)
+            return trial_containers.running(evidence, expected_runtime=runtime)
+        except (
+            OSError, ValueError, subprocess.SubprocessError, isolation.RuntimeDriftError
+        ) as exc:
+            raise CleanupUnknown(
+                f"Docker could not be checked for {where}: {exc}. {_repair(check['root'])}"
+            ) from exc
+
+    if inventory():
+        try:
+            trial_containers.stop_left_running(
+                evidence, expected_runtime=runtime, progress=progress
+            )
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise CleanupBlocked(f"{where} could not be stopped: {exc}") from exc
+    for _ in range(2):
+        time.sleep(INVENTORY_INTERVAL)
+        if left := inventory():
+            names = ", ".join(container["name"] for container in left)
+            raise CleanupBlocked(f"{where} still run after the stop: {names}")
+    return {"id": check["id"], "checked": "trial containers", "at": _now()}
+
+
+def _verify(
+    checks: Sequence[Check], confirmed: Collection[str], progress: Callable[[str], None] | None
+) -> tuple[list[str], list[tuple[Check, str]]]:
+    """Run every check; return the blocking failures and the unknown checks with their reasons.
+
+    Containers are checked only after every process is proven gone or confirmed: until then a
+    create may still be in flight.
+    """
+    blocked: list[str] = []
+    unknown: list[tuple[Check, str]] = []
+    for check in checks:
+        if check["id"] in confirmed:
+            continue
+        try:
+            if check["kind"] == "invocation":
+                verify_invocation(check)
+            elif check["kind"] == "unrecorded":
+                raise CleanupUnknown(f"{check['reason']}. {_repair(check['root'])}")
+            elif blocked or unknown:
+                raise CleanupUnknown(
+                    f"processes of {check['evidence']} are not proven gone, so a container may "
+                    f"still be created. {_repair(check['root'])}"
+                )
+            else:
+                verify_containers(check, progress)
+        except CleanupUnknown as exc:
+            unknown.append((check, str(exc)))
+        except CleanupBlocked as exc:
+            blocked.append(str(exc))
+    return blocked, unknown
 
 
 def _refusal(failures: Sequence[str]) -> CleanupBlocked:
-    count = f"{len(failures)} crashed call{'s' if len(failures) != 1 else ''}"
     return CleanupBlocked(
-        f"cleanup of {count} is not verified, so nothing starts on this host: "
+        "cleanup after a crash is not verified, so nothing starts on this host: "
         f"{'; '.join(failures)}. Then run the command again"
     )
 
 
-def _write_marker(state: Path, items: Sequence[Item]) -> None:
-    pending = {item["id"]: item for item in [*_marker(state), *items]}
-    run_lock._write_atomic(
-        state / MARKER_NAME, {"items": list(pending.values()), "written_at": _now()}
-    )
+def _ledger(root: Path) -> Path | None:
+    candidates = (root / LEDGER_NAME, root / "evidence" / LEDGER_NAME)
+    return next((path for path in candidates if path.is_file()), None)
 
 
-def _marker(state: Path) -> list[Item]:
-    try:
-        items: list[Item] = json.loads((state / MARKER_NAME).read_text())["items"]
-    except FileNotFoundError:
-        return []
-    return items
+def _open(ledger: Ledger, stages: Collection[str] | None = None) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in ledger.invocations()
+        if row["state"] in OPEN_STATES and (stages is None or row["stage"] in stages)
+    ]
 
 
-def _hold_after_exit(lock: ExecutionLock) -> int:
-    """Keep the host lock held after this process exits: a detached sleeper inherits it."""
-    sleeper = subprocess.Popen(
-        [sys.executable, "-c", "import signal; signal.pause()"],
-        pass_fds=(lock.fd,),
-        start_new_session=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    return sleeper.pid
+def _invocations(rows: Sequence[dict[str, Any]], root: str) -> list[Check]:
+    return [
+        {
+            "id": row["id"],
+            "root": root,
+            "kind": "invocation",
+            "stage": row["stage"],
+            "identity": row["identity"],
+        }
+        for row in rows
+    ]
 
 
-def _fence(lock: ExecutionLock, store: ControlStore, items: Sequence[Item]) -> None:
-    """Record `items` as pending before any check: the marker first, then the barrier.
-
-    If neither write lands, the host stays locked after this process exits, rather than look
-    free while a crashed call may still run.
-    """
-    try:
-        _write_marker(lock.state, items)
-        marked = True
-    except Exception:
-        marked = False
-    try:
-        store.fence(items, "recovery in progress")
-    except Exception as exc:
-        if marked:
-            raise  # The marker fences the host; the next owner moves it into the barrier.
-        sleeper = _hold_after_exit(lock)
-        raise CleanupBlocked(
-            f"PluginBench could not record the cleanup it must verify ({exc}), so process "
-            f"{sleeper} keeps the host execution lock and nothing starts. Fix {lock.state}, "
-            f"then stop that process with `kill {sleeper}` and run the command again"
-        ) from exc
-    lock.publish("reconciling")
-
-
-def _settle(
-    lock: ExecutionLock,
-    store: ControlStore,
-    items: Sequence[Item],
-    progress: Callable[[str], None] | None = None,
-) -> None:
-    """Verify the fenced `items`; lift the barrier when nothing is left unclean, or raise."""
-    confirmed = store.operator_confirmed()
-    failures = []
-    for item in items:
-        if item["id"] in confirmed:
-            continue
+def _obligation_checks(obligation: dict[str, Any]) -> list[Check]:
+    """Everything to verify before a dead owner's root is known to have nothing running."""
+    root = str(obligation["root"])
+    name = f"{obligation.get('pid')}-{obligation.get('acquired_at')}"
+    if obligation.get("kind") in UNRECORDED_KINDS:
+        reason = (
+            f"`{obligation.get('kind')}` for {root} ended without a clean release, and no "
+            "ledger records its processes"
+        )
+    elif not Path(root).is_dir():
+        reason = f"{root}, whose owner ended without a clean release, was moved or deleted"
+    else:
+        reason = ""
+    if reason:
+        return [{"id": f"{name}:unrecorded", "root": root, "kind": "unrecorded", "reason": reason}]
+    checks: list[Check] = []
+    path = _ledger(Path(root))
+    if path is not None:
+        ledger = Ledger.read(path)
         try:
-            proof = (
-                verify_invocation(item)
-                if item["kind"] == "invocation"
-                else stop_left_containers(item, progress)
-            )
-        except CleanupBlocked as exc:
-            failures.append(str(exc))
-            continue
-        store.record_clean(item["id"], proof)
-    if failures:
-        store.fence([], "; ".join(failures))
-        lock.publish("blocked")
-        raise _refusal(failures)
-    lock.publish("active")
-    if store.clear_barrier():
-        (lock.state / MARKER_NAME).unlink(missing_ok=True)
+            checks += _invocations(_open(ledger), root)
+        finally:
+            ledger.close()
+    evidence = path.parent if path else Path(root) / "evidence"
+    if obligation.get("kind") != "run" or not (evidence / "frozen" / "suite").is_dir():
+        return checks  # No trial of this owner can have started a container.
+    runtimes: list[dict[str, Any] | None] = list(obligation.get("runtimes") or [])
+    missing = "no Docker runtime is known"
+    if not runtimes:
+        # The owner died before it recorded the runtime its trials use: the run's own.
+        from pluginbench import study
 
-
-def _recover(store: ControlStore, lock: ExecutionLock) -> None:
-    """Verify again the cleanup a barrier or marker left; lift it, or keep it and raise."""
-    pending = _marker(lock.state)
-    if pending:
-        store.fence(pending, "recovery in progress")
-    if store.host().barrier is None:
-        return
-    lock.publish("reconciling")
-    _settle(lock, store, store.items(unclean=True))
+        try:
+            runtimes = [study.prepared_runtime(study._frozen_study(evidence))]
+        except (OSError, ValueError) as exc:
+            runtimes, missing = [None], f"the Docker runtime could not be found ({exc})"
+    return checks + [
+        {
+            "id": f"{name}:containers:{index}",
+            "root": root,
+            "kind": "containers",
+            "evidence": str(evidence),
+            "runtime": runtime,
+            "missing": missing,
+        }
+        for index, runtime in enumerate(runtimes)
+    ]
 
 
 @contextmanager
 def execute(owner: ExecutionOwner, *, state: Path | None = None) -> Iterator[ExecutionLock]:
-    """Take the host execution lock, finish any pending recovery, then run the block.
+    """Take the host execution lock, verify every obligation it carries, then run the block.
 
-    Every execution entry point enters here, before any run lock. A barrier left by failed
-    cleanup is verified again first, whichever run left it; while it fails, nothing runs.
+    Every execution entry point enters here, before any run lock. While an obligation fails,
+    nothing runs, whatever this command targets. Clearing them is one write, made only once
+    every check passes.
     """
     with run_lock.hold_execution(owner, state=state) as lock:
         with ControlStore.open(lock.state) as store:
-            _recover(store, lock)
+            if pending := lock.record["pending"]:
+                checks = [check for item in pending for check in _obligation_checks(item)]
+                blocked, unknown = _verify(checks, store.confirmed(), None)
+                if blocked or unknown:
+                    raise _refusal([*blocked, *(reason for _, reason in unknown)])
+                lock.settle([])
             # Holding the lock proves any holder an observer could not verify is gone.
             store.set_reconciling(None)
         lock.publish("active")
         yield lock
+        # Returning is a clean exit. Left by an exception after it recorded work (see
+        # ExecutionLock.dirty), the owner stays unreleased, so the next one verifies this root.
+        lock.dirty = False
 
 
 def _held() -> ExecutionLock:
@@ -420,79 +388,90 @@ def _held() -> ExecutionLock:
     return lock
 
 
-def verify_crashed(ledger: Ledger, path: Path, stages: Collection[str]) -> frozenset[str]:
+def verify_crashed(
+    ledger: Ledger,
+    path: Path,
+    stages: Collection[str],
+    *,
+    runtime: Callable[[], dict[str, object]] | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> frozenset[str]:
     """Verify cleanup of every open `stages` invocation in `ledger`; return their IDs.
 
     Call before accepting a crashed invocation's saved output or marking it unresolved, and pass
-    the result to `Ledger.resolve_crashed`. Needs the host execution lock. A failure keeps the
-    host barrier with the failing invocations, leaves every row open, and raises CleanupBlocked.
+    the result to `Ledger.resolve_crashed`. With `runtime`, which finds the Docker runtime the
+    run's trial containers ran under, those containers are verified too. Needs the host
+    execution lock. Until the execution block returns, this owner's release stays unrecorded,
+    so if a check fails the next owner verifies this run again.
     """
-    items = [
-        {
-            "id": row["id"],
-            "run": str(path.parent),
-            "kind": "invocation",
-            "detail": {
-                "stage": row["stage"],
-                "scope": row["scope"],
-                "label": row["container_label"],
-                "identity": row["identity"],
-            },
-        }
-        for row in ledger.invocations()
-        if row["stage"] in stages and row["state"] in OPEN_STATES
-    ]
-    if not items:
+    rows = _open(ledger, stages)
+    if not rows:
         return frozenset()
     lock = _held()
+    lock.dirty = True  # Until the check passes and the block returns, this root stays fenced.
+    root = str(lock.record["root"])
+    checks = _invocations(rows, root)
+    if runtime is not None:
+        try:
+            known: dict[str, object] | None = runtime()
+            missing = "no Docker runtime is known"
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            known, missing = None, f"the Docker runtime could not be found ({exc})"
+        checks.append(
+            {
+                "id": f"resume-{uuid4().hex}:containers",
+                "root": root,
+                "kind": "containers",
+                "evidence": str(path.parent),
+                "runtime": known,
+                "missing": missing,
+            }
+        )
     with ControlStore.open(lock.state) as store:
-        _fence(lock, store, items)
-        _settle(lock, store, items)
-    return frozenset(item["id"] for item in items)
+        confirmed = store.confirmed()
+    blocked, unknown = _verify(checks, confirmed, progress)
+    if blocked or unknown:
+        raise _refusal([*blocked, *(reason for _, reason in unknown)])
+    return frozenset(check["id"] for check in checks if check["kind"] == "invocation")
 
 
-def stop_containers_left_by(
-    evidence: Path, runtime: dict[str, object], progress: Callable[[str], None] | None
-) -> None:
-    """Stop the trial containers a killed run left running, before its crashed calls close.
+def confirm_stopped(
+    lock: ExecutionLock, root: Path
+) -> tuple[list[tuple[Check, str]], str, int]:
+    """Verify the obligations that name exactly `root` again, then record the operator's word
+    for each check that is still unknown. Refuses while any check finds a survivor.
 
-    Needs the host execution lock. A failure keeps the host barrier and raises CleanupBlocked.
+    Returns the confirmed checks, the time recorded, and how many obligations of other roots
+    remain.
     """
-    lock = _held()
-    item = {
-        "id": f"containers-{uuid4().hex}",
-        "run": str(evidence),
-        "kind": "containers",
-        "detail": {"runtime": runtime},
-    }
+    target = str(root.resolve())
+    pending: list[dict[str, Any]] = lock.record["pending"]
+    matching = [item for item in pending if item.get("root") == target]
+    if not matching:
+        roots = sorted({str(item.get("root")) for item in pending}) or ["none"]
+        raise ValueError(
+            f"no open obligation names {target}; repair takes one of: {', '.join(roots)}"
+        )
+    checks = [check for item in matching for check in _obligation_checks(item)]
     with ControlStore.open(lock.state) as store:
-        _fence(lock, store, [item])
-        _settle(lock, store, [item], progress)
-
-
-def confirm_stopped(lock: ExecutionLock, run: Path) -> tuple[list[Item], bool]:
-    """Record the operator's word that nothing `run`'s unverified cleanups started still runs.
-
-    Marks each clean with that confirmation and its time. Returns them and whether the barrier
-    lifted; another run's unverified cleanup keeps it.
-    """
-    run = run.resolve()
-    with ControlStore.open(lock.state) as store:
-        pending = _marker(lock.state)
-        if pending:
-            store.fence(pending, "recovery in progress")
-        confirmed = [
-            item for item in store.items(unclean=True) if Path(item["run"]).is_relative_to(run)
-        ]
-        at = _now()
-        for item in confirmed:
-            store.record_clean(
-                item["id"], {"id": item["id"], "confirmed_by": OPERATOR, "at": at}
+        confirmed = store.confirmed()
+        blocked, unknown = _verify(checks, confirmed, None)
+        # Containers were unknown only because a process was; with the operator's word for the
+        # processes, check the containers for real before confirming anything.
+        processes = [(check, reason) for check, reason in unknown if check["kind"] != "containers"]
+        if not blocked and len(processes) < len(unknown):
+            vouched = {*confirmed, *(check["id"] for check, _ in processes)}
+            blocked, containers = _verify(checks, vouched, None)
+            unknown = [*processes, *containers]
+        if blocked:
+            raise CleanupBlocked(
+                f"{'; '.join(blocked)}. repair confirms only what cannot be checked, so nothing "
+                "was confirmed"
             )
-        lifted = store.host().barrier is None or store.clear_barrier()
-        if lifted:
-            (lock.state / MARKER_NAME).unlink(missing_ok=True)
-    return confirmed, lifted
+        at = store.confirm(unknown, target)
+    rest = [item for item in pending if item.get("root") != target]
+    lock.settle(rest)
+    return unknown, at, len(rest)
 
 
 Observation = Literal["free", "verified", "unknown", "reconciling"]

@@ -550,11 +550,16 @@ On interruption or fatal failure, new jobs stop. Active jobs finish or time out;
 
 Only one PluginBench command executes on a host at a time. `run`, `check`, `review`, `measure`, and `judge run` share one execution lock for your user account, whatever run they target. While one runs, another fails at once and names the run and process that hold the host.
 
-After a crash, a resume first checks that the crashed calls left nothing running. It checks every process in each call's recorded process group, then stops the trial containers that the run left running. Only then does it accept saved output or mark a call unresolved.
+A command that does not finish cleanly fences the host. A crash or a kill always does. Ctrl-C or an error does once the command has recorded a model call or the Docker runtime its containers use. The next execution command, whatever run it targets, first checks that the fenced command left nothing running:
 
-If something still runs, or a stop fails, the resume refuses to start. Every execution command refuses too, whatever run it targets. The error names what still runs and how to stop it. Run your command again once it has stopped.
+- every process in each recorded call's process group;
+- the run's trial containers, against the Docker daemon the run recorded. Any it finds are stopped, and two later checks at least a second apart must find none.
 
-Sometimes PluginBench cannot check a call: the call was killed before its process was recorded, or the run was moved. Check by hand that nothing of that run still runs. Then confirm with `pluginbench repair --confirm-stopped RUN_DIR`. This command records your confirmation and its time, and lifts the block.
+Containers are checked only once every process is known to be gone, because a live process could still start one. A resume runs the same checks on its own run before it accepts saved output or marks a call unresolved.
+
+If something still runs, the command refuses to start. The error names what still runs and how to stop it. Run your command again once it has stopped.
+
+Sometimes PluginBench cannot check what a command left. The call may have been killed before its process was recorded, Docker may be unreachable, or the command may not record its processes. In that case, check by hand that nothing of it still runs. Then confirm with `pluginbench repair --confirm-stopped ROOT`, with the root exactly as the error names it. Repair runs every check again first. It confirms only what still cannot be checked, never something it finds running, and it prints and records each confirmation with its time.
 
 A Codex session that fails before its first model turn is a fatal failure, not an outcome. This is a `turn.failed` event with no usage, commands, or agent messages, as when a network or backend outage cuts the container off from Codex. The run stops after the first one with an error that names the attempt and Codex's message. The attempt stays `interrupted` and never enters the vanilla cache. Resume once Codex is reachable: the attempt is discarded and its slot is coded again. Timeouts, and failures after the agent has used tokens, run a command, or sent a message, stay scored.
 
