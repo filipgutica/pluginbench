@@ -76,6 +76,25 @@ def picker(
     monkeypatch.setattr(subprocess, "run", run)
 
 
+@pytest.mark.filterwarnings("error::UserWarning")
+def test_remote_task_with_redundant_artifacts_preserves_assets_before_native_admission(
+    assets: dict[str, Path],
+) -> None:
+    source = assets[NAMES[0]]
+    path = source / "task.toml"
+    path.write_text('artifacts=["/logs/artifacts/model.patch"]\n' + path.read_text())
+    original = harbor_backend.native_task_assets(source)
+    root = sources.Tasks(dataset="datacurve/deep-swe-1-1", ids=[NAMES[0]]).resolve()
+    frozen = root / "tasks" / NAMES[0]
+    assert harbor_backend.native_task_assets(frozen) == original
+    assert (frozen / "task.toml").read_bytes() == path.read_bytes()
+    receipt = harbor_backend.validate_native_task(frozen)
+    assert receipt["task_assets_sha256"] == original
+    configuration = receipt["configuration"]
+    assert isinstance(configuration, dict)
+    assert configuration["artifacts"] == []
+
+
 def test_picker_yaml_can_be_used_by_the_actual_evaluation_planner(
     assets: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

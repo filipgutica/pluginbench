@@ -114,6 +114,31 @@ def test_a_942f12c_prepared_entry_and_its_reference_agents_are_reused(
     assert {name: row["state"] for name, row in rows.items()} == {"oracle": "ready", "nop": "ready"}
 
 
+@pytest.mark.filterwarnings("error::UserWarning")
+def test_prepared_entry_with_redundant_artifacts_is_rebuilt_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preparation = _Preparation(tmp_path, monkeypatch)
+    cached = preparation.cache / PREPARED_KEY
+    for task in (preparation.task, cached / "task"):
+        path = task / "task.toml"
+        path.write_text('artifacts=["/logs/artifacts/model.patch"]\n' + path.read_text())
+    receipt_path = cached / "artifacts/native-preparation.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["task_assets_sha256"] = harbor_backend.native_task_assets(cached / "task")
+    receipt_path.write_text(json.dumps(receipt))
+    packet_path = cached / "cache.json"
+    packet = json.loads(packet_path.read_text())
+    packet["inputs"]["task_assets_sha256"] = harbor_backend.native_task_assets(preparation.task)
+    packet["files"] = harbor_backend._native_asset_inventory(cached, exclude="cache.json")
+    packet_path.write_text(json.dumps(packet))
+    first = preparation.run()
+    second = preparation.run()
+    assert len(preparation.preparations) == 1
+    assert first["preparation_key"] != PREPARED_KEY
+    assert second["preparation_key"] == first["preparation_key"]
+
+
 @pytest.mark.parametrize(
     "change", ["base-image", "harness-version", "memory-limit", "setup-timeout", "corrupt-file"]
 )

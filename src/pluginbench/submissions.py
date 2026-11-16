@@ -164,8 +164,13 @@ def reviewed_contract(task_dir: Path) -> dict[str, object]:
     if isinstance(collect, list) and all(isinstance(entry, dict) for entry in collect):
         # Harbor runs a collect command in the main service when the task names none.
         collect = [{"service": "main", **entry} for entry in collect]
+    artifacts = task.get("artifacts", [])
+    # Normalization removes the child declaration; Linux's implicit parent still collects it.
+    implicit_patch_artifact = (
+        artifacts == [] and task.get("environment", {}).get("os", "linux") == "linux"
+    )
     if (
-        task.get("artifacts") != ["/logs/artifacts/model.patch"]
+        (artifacts != ["/logs/artifacts/model.patch"] and not implicit_patch_artifact)
         or verifier.get("environment_mode") != "separate"
         or verifier.get("network_mode") != "no-network"
         or collect != collection

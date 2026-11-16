@@ -25,7 +25,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # Measurement and regrade skip launch-only runtime fields; coding checks are unchanged.
             # Audited command hooks keep native usage; with no audited_hooks every launch is
             # unchanged, and vanilla has no hooks, so this stays v1.
-            "harbor_backend.py": "f184e4a2fca458967010849d574424cd8bd4fb75cf98f0371060941544260af4",
+            # Artifact normalization drops only redundant children and preserves collected
+            # payload bytes and bindings; coding launch behavior stays v1.
+            "harbor_backend.py": "91ade93d117f6d0bb08b7e61cc2d16cd355b3126b65388fcfe669f1db2a15847",
             "processes.py": "0170e0a4902fc610d19b50ed5656c601474adad97b9b8d6fb5b08c6ab6ad00d1",
             # Claude admission dispatch, and the Codex config's V2 spawn-override hide. The
             # vanilla cache refuses a cohort saved without the hide by its config, so this stays v1.

@@ -23,6 +23,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, TypeAdapter, model_validator
 
 from pluginbench.harbor_backend import native_task_assets as task_fingerprint
+from pluginbench.harbor_backend import native_task_config
 
 
 class _CatalogMetadata(BaseModel):
@@ -184,7 +185,7 @@ def materialize_tasks(downloads: list[tuple[Path, dict[str, str]]]) -> Path:
         for source, ref in downloads:
             name = task_name(ref)
             fingerprint = task_fingerprint(source)
-            importlib.import_module("harbor.models.task.task").Task(source)
+            native_task_config(source)
             target = staging / "tasks" / name
             shutil.copytree(source, target, symlinks=True)
             if task_fingerprint(target) != fingerprint or task_fingerprint(source) != fingerprint:
