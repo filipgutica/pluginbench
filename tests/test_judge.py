@@ -724,6 +724,20 @@ def test_unable_answers_fail_by_pair_and_retry_without_losing_raw_evidence(
     assert tally(directory)["weighted_wins"] == {"vanilla": 3.0, "workflow-r9": 3.0}
 
 
+def test_a_judge_makes_at_most_three_calls_per_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    calls = _fake_judge(monkeypatch, {"m1": "unable"}, root=tmp_path)
+    messages: list[str] = []
+    for _ in range(4):
+        judge.run(directory, judges=["codex:m1:high"], timeout=60, jobs=1, progress=messages.append)
+    # Two tasks, three calls each; the fourth run reserves no folder and calls nothing.
+    assert len(calls) == 6
+    assert not list((directory / "results/codex-m1-high").glob("*/call-4"))
+    assert sum("made its 3 calls for" in line for line in messages) == 2
+
+
 def test_saved_unable_blocks_tally_and_is_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

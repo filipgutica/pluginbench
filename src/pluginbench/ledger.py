@@ -89,6 +89,9 @@ CREATE TABLE invocations (
     container_label TEXT NOT NULL,
     identity TEXT,
     error TEXT,
+    -- A fingerprint of what a review call was given, so the short-circuit compares only calls
+    -- with the same inputs. NULL for coding and grading, whose slot fixes theirs.
+    inputs TEXT,
     updated_at TEXT NOT NULL,
     UNIQUE (slot, stage, n)
 );
@@ -113,7 +116,15 @@ class CeilingReached(InvocationRefused):
 HistoryRow = tuple[int, str, str, str]
 
 
-def _insert(db: sqlite3.Connection, *, slot: int, stage: str, attempt_id: str, state: str) -> str:
+def _insert(
+    db: sqlite3.Connection,
+    *,
+    slot: int,
+    stage: str,
+    attempt_id: str,
+    state: str,
+    inputs: str | None = None,
+) -> str:
     """Add the next invocation of `slot` and `stage`; return its ID."""
     n = db.execute(
         "SELECT COUNT(*) FROM invocations WHERE slot = ? AND stage = ?", (slot, stage)
@@ -122,7 +133,7 @@ def _insert(db: sqlite3.Connection, *, slot: int, stage: str, attempt_id: str, s
     invocation = uuid4().hex
     db.execute(
         "INSERT INTO invocations (id, slot, stage, n, attempt_id, state, scope,"
-        " container_label, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " container_label, inputs, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             invocation,
             slot,
@@ -132,6 +143,7 @@ def _insert(db: sqlite3.Connection, *, slot: int, stage: str, attempt_id: str, s
             state,
             f"pb-inv-{invocation}.scope",
             f"pluginbench.invocation={invocation}",
+            inputs,
             _now(),
         ),
     )
@@ -407,11 +419,12 @@ class Ledger:
             for row in rows
         ]
 
-    def refusal(self, slot: int, stage: str) -> str | None:
+    def refusal(self, slot: int, stage: str, inputs: str | None = None) -> str | None:
         """Why `slot` may start no further `stage` invocation, or None while it may.
 
         Deterministic short-circuit: two transient failures with one signature on the same
-        frozen input end the slot, with no third identical try.
+        frozen `inputs` end the slot for those inputs, with no third identical try. The cap
+        counts every input.
         """
         used = self._db.execute(
             "SELECT COUNT(*) FROM invocations WHERE slot = ? AND stage = ?"
@@ -422,28 +435,37 @@ class Ledger:
             return f"slot {slot} used its {SLOT_CAP} {stage} invocations"
         repeated = self._db.execute(
             "SELECT error FROM invocations WHERE slot = ? AND stage = ?"
-            " AND state = 'failed_transient' GROUP BY error HAVING COUNT(*) >= 2",
-            (slot, stage),
+            " AND inputs IS ? AND state = 'failed_transient' GROUP BY error HAVING COUNT(*) >= 2",
+            (slot, stage, inputs),
         ).fetchone()
         if repeated is not None:
             return f"slot {slot} failed its {stage} twice with the same error: {repeated[0]}"
         return None
 
-    def intent(self, *, slot: int, stage: str, attempt_id: str) -> str:
+    def intent(
+        self, *, slot: int, stage: str, attempt_id: str, inputs: str | None = None
+    ) -> str:
         """Commit a new invocation before anything external starts; return its ID.
 
         The cap, short-circuit and ceiling checks share the insert's transaction.
         """
         with self._db:
             self._db.execute("BEGIN IMMEDIATE")
-            if (reason := self.refusal(slot, stage)) is not None:
+            if (reason := self.refusal(slot, stage, inputs)) is not None:
                 raise SlotExhausted(reason)
             if stage in PAID_STAGES and self.paid_room() <= 0:
                 raise CeilingReached(
                     f"the run reached its ceiling of {self._ceiling()} paid invocations, so no "
                     "further model call starts"
                 )
-            return _insert(self._db, slot=slot, stage=stage, attempt_id=attempt_id, state="intent")
+            return _insert(
+                self._db,
+                slot=slot,
+                stage=stage,
+                attempt_id=attempt_id,
+                state="intent",
+                inputs=inputs,
+            )
 
     def _ceiling(self) -> int:
         ceiling: int = self._db.execute("SELECT paid_call_ceiling FROM budget").fetchone()[0]

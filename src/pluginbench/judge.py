@@ -29,6 +29,7 @@ from pydantic import StrictInt, StrictStr
 
 from pluginbench import codex, study
 from pluginbench.grade import GRADE_CONTRACT
+from pluginbench.ledger import SLOT_CAP
 from pluginbench.arms import normalize_arm_name
 from pluginbench.assessment import _load_manifest
 from pluginbench.assessment_models import Attempt, InputModel, Snapshot
@@ -584,13 +585,18 @@ def _judge_host(judge: str) -> str:
     return harness if harness in HARNESSES else "codex"
 
 
-def _latest_call(verdict: Path) -> Path | None:
-    """The raw folder of the call that produced the verdict; earlier calls failed or retried."""
-    calls = [
+def _calls(verdict: Path) -> list[Path]:
+    """The raw folder of every call reserved for a verdict, in any state."""
+    return [
         call
         for call in verdict.with_suffix("").glob("call-*")
         if call.is_dir() and call.name.removeprefix("call-").isdigit()
     ]
+
+
+def _latest_call(verdict: Path) -> Path | None:
+    """The raw folder of the call that produced the verdict; earlier calls failed or retried."""
+    calls = _calls(verdict)
     return max(calls, key=lambda call: int(call.name.removeprefix("call-"))) if calls else None
 
 
@@ -676,8 +682,17 @@ def run(
 def _judge_task(
     directory: Path, judge: Judge, task: str, *, expected: set[str], timeout: int
 ) -> None:
-    """One read-only call; raw evidence goes to a new call-N folder, the verdict file last."""
+    """One read-only call; raw evidence goes to a new call-N folder, the verdict file last.
+
+    A judge gets at most `ledger.SLOT_CAP` calls for a task (contract C2). Its call folders,
+    each reserved before its call starts, are the count, so a crash cannot hide one.
+    """
     verdict = _verdict_path(directory, judge.label, task)
+    if len(_calls(verdict)) >= SLOT_CAP:
+        raise ValueError(
+            f"{judge.label} made its {SLOT_CAP} calls for {task}, so no further call starts; "
+            "prepare a new judge directory to judge it again"
+        )
     # A rejected saved result must not survive a failed retry as an apparently completed call.
     verdict.unlink(missing_ok=True)
     raw = verdict.with_suffix("")
@@ -752,11 +767,7 @@ def _judge_usage(directory: Path, judge: str, tasks: Sequence[str]) -> dict[str,
     known: list[dict[str, int]] = []
     unknown = 0
     for task in tasks:
-        calls = sorted(
-            path
-            for path in _verdict_path(directory, judge, task).with_suffix("").glob("call-*")
-            if path.is_dir() and path.name.removeprefix("call-").isdigit()
-        )
+        calls = sorted(_calls(_verdict_path(directory, judge, task)))
         # Hand-written/legacy verdicts may have no recorded calls at all.
         if not calls:
             unknown += 1

@@ -20,7 +20,7 @@ from typing import Literal
 
 from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
 
-from pluginbench import codex, study
+from pluginbench import codex, provider_stops, study
 from pluginbench import ledger as invocation_ledger
 from pluginbench.ledger import LEDGER_NAME, CeilingReached, Ledger, SlotExhausted, default_ceiling
 from pluginbench.parallel import run_jobs, validate_jobs
@@ -241,6 +241,8 @@ def validate_review_revision(root: Path, revision: str, *, allow_active: bool = 
             if study._inventory(packet_directory) != packet["files"]:
                 raise ValueError("archived review packet changed after review")
             bindings.append(packet)
+        if row.get("status") == "reviewed" and not row.get("observation"):
+            raise ValueError("a reviewed row has no bound observation")
         if row.get("observation"):
             observation = study._bound_document(root, row["observation"])
             if not row.get("packet") or observation.get("packet") != row["packet"]:
@@ -494,15 +496,37 @@ def _review_ledger(root: Path, slots: int) -> Ledger:
     )
 
 
-def _admit_review(ledger: Ledger, planned: dict[str, int]) -> None:
+def _review_inputs(
+    *, harness: str, model: str, effort: str, prompt: str, task_id: str, before: str, after: str
+) -> str:
+    """A fingerprint of what one judge call is given: the reviewer and its frozen inputs.
+
+    The ledger's short-circuit compares failures only between calls with the same fingerprint,
+    so another reviewer, or other guidance, may still try a slot that failed twice.
+    """
+    inputs = {
+        "harness": harness,
+        "model": model,
+        "effort": effort,
+        "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+        "task_id": task_id,
+        "before_digest": before,
+        "submission_digest": after,
+    }
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+
+
+def _admit_review(ledger: Ledger, planned: dict[str, tuple[int, str]]) -> None:
     """Refuse, before the revision exists, a pass the ledger cannot fund (contract C2).
 
-    `planned` maps each attempt to review to its slot. A slot that used its review calls is
-    skipped in the pass; a pass with nothing left to call, or more calls than the paid-call
-    ceiling allows, starts none and leaves its revision name free.
+    `planned` maps each attempt to review to its slot and its inputs' fingerprint. A slot that
+    used its review calls is skipped in the pass; a pass with nothing left to call, or more
+    calls than the paid-call ceiling allows, starts none and leaves its revision name free.
     """
     refused = [
-        reason for slot in planned.values() if (reason := ledger.refusal(slot, "review"))
+        reason
+        for slot, inputs in planned.values()
+        if (reason := ledger.refusal(slot, "review", inputs))
     ]
     if planned and len(refused) == len(planned):
         raise SlotExhausted("no attempt has a review call left: " + "; ".join(refused))
@@ -567,15 +591,23 @@ def review_study(
             for row in ledger.attempts()
             if row["state"] != "discarded-interrupted"
         }
-        _admit_review(
-            ledger,
-            {
-                record.id: slots[record.id]
-                for record in records
-                if record.before is not None and selections[record.id].snapshot is not None
-            },
-        )
         contents = [path.read_text() for path in guidance]
+        prompt = _fixed_review_prompt(contents)
+        inputs = {
+            record.id: _review_inputs(
+                harness=harness,
+                model=model,
+                effort=effort,
+                prompt=prompt,
+                task_id=record.task_id,
+                before=record.before.digest,
+                after=snapshot.digest,
+            )
+            for record in records
+            if record.before is not None
+            and (snapshot := selections[record.id].snapshot) is not None
+        }
+        _admit_review(ledger, {record: (slots[record], inputs[record]) for record in inputs})
         directory.mkdir(parents=True)
         shutil.copyfile(root / "run.json", directory / "original-run.json")
         limitations = list(LIMITATIONS)
@@ -624,7 +656,6 @@ def review_study(
             criteria=study._reference(root, criteria_path),
             criteria_sha256=_criteria_digest(criteria),
         )
-        prompt = _fixed_review_prompt(contents)
         study._write(directory / "protocol.json", protocol)
         shutil.copyfile(Path(__file__), directory / "adapter.py")
         rows: list[dict[str, object]] = [
@@ -699,7 +730,9 @@ def review_study(
             # The judge call's ledger row, once committed, and the state it ends in.
             invocation: str | None = None
             spawned = False
-            ending: tuple[str, str | None] = ("finished", None)
+            # Set once the call's outcome is known; it is `finished` only after its observation
+            # is saved with an accepted response.
+            ending: tuple[str, str | None] | None = None
 
             def spawn(pid: int) -> None:
                 nonlocal spawned
@@ -745,6 +778,7 @@ def review_study(
                 execution: dict[str, object] = {}
                 response = None
                 call_interrupted: KeyboardInterrupt | None = None
+                halted: study.ProviderStopped | None = None
                 row["status"] = "running"
                 with tempfile.TemporaryDirectory(prefix="pluginbench-judge-") as temporary:
                     area = Path(temporary)
@@ -760,6 +794,7 @@ def review_study(
                                 slot=slots[record.id],
                                 stage="review",
                                 attempt_id=record.id,
+                                inputs=inputs[record.id],
                             ),
                         )
                         study._write(
@@ -783,6 +818,13 @@ def review_study(
                             output_schema=area / "workspace/response-schema.json",
                             on_spawn=spawn,
                         )
+                        if (stop := provider_stops.saved_stop(area / "artifacts", harness)):
+                            raise study.ProviderStopped(
+                                f"the {harness} reviewer stopped on {stop}. No further review call "
+                                "starts in this pass; review again once the limit resets or the "
+                                "provider recovers",
+                                f"{harness} stopped on {stop}",
+                            )
                         if (
                             study._inventory(area / "workspace") != inventory
                             or study._inventory(packet) != inventory
@@ -813,7 +855,12 @@ def review_study(
                     except invocation_ledger.InvocationRefused as refused:
                         row.update(status="unavailable", reason=f"no judge call: {refused}")
                     except (Exception, KeyboardInterrupt) as exc:
-                        ending = invocation_ledger.outcome(exc, spawned=spawned)
+                        if spawned and isinstance(exc, study.ProviderStopped):
+                            # Given back to the slot, still counted by the ceiling, and the
+                            # pass admits no further call, as coding does.
+                            ending, halted = ("halted_provider", None), exc
+                        else:
+                            ending = invocation_ledger.outcome(exc, spawned=spawned)
                         row.update(
                             status="interrupted" if isinstance(exc, KeyboardInterrupt) else "unknown",
                             reason=f"judge review failed: {type(exc).__name__}: {exc}",
@@ -853,10 +900,26 @@ def review_study(
                         observation_path = observed / "observation.json"
                         study._write(observation_path, observation)
                         row["observation"] = study._reference(root, observation_path)
+                        if ending is None:
+                            ending = (
+                                ("finished", None)
+                                if response is not None
+                                else ("failed_transient", str(row.get("reason")))
+                            )
                 if call_interrupted is not None:
                     raise call_interrupted
+                if halted is not None:
+                    raise halted
             finally:
-                ended = None if invocation is None else (invocation, *ending)
+                if invocation is not None and ending is None:
+                    # Its observation was not saved, so its response is not accepted.
+                    ending = ("failed_transient", "the judge call's observation was not saved")
+                    row.update(
+                        status="unknown",
+                        reason="judge review failed: its observation was not saved",
+                        observation=None,
+                    )
+                ended = None if invocation is None or ending is None else (invocation, *ending)
                 emit(partial(commit_review, index, copy.deepcopy(row), ended=ended))
 
         try:

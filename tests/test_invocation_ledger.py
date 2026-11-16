@@ -7,6 +7,7 @@ behaviour depends on time.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import sqlite3
@@ -33,6 +34,7 @@ from pluginbench.ledger import (
 )
 from test_grade import HEALTHY, _coded
 from test_resume import _PATH, _killed_resume, _killed_run
+from test_provider_stops import codex_rollout
 
 
 def _invocations(root: Path) -> list[dict[str, Any]]:
@@ -609,3 +611,100 @@ def test_a_derived_citation_revision_adds_no_review_spend(
     study_review.review_study(root, revision="second")
     # Each review's citation fails validation, an infrastructure error under C1; it still counts.
     assert len(calls) == 4 and _states(root, "review") == ["failed_transient"] * 4
+
+
+# Review outcomes and inputs (the second re-review findings).
+
+
+def test_a_provider_halt_in_review_gives_the_call_back_and_stops_the_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    calls = test_study_review._judge(monkeypatch, root)
+    judged = codex.invoke
+
+    def limited(**kwargs: Any) -> dict[str, object]:
+        execution = judged(**kwargs)
+        trace = kwargs["area"] / "artifacts/host-trace-0.jsonl"
+        trace.write_text(codex_rollout("usage_limit_exceeded"))
+        return execution
+
+    monkeypatch.setattr(codex, "invoke", limited)
+    with pytest.raises(study.ProviderStopped, match="usage_limit_exceeded"):
+        study_review.review_study(root)
+    # The halt stops the pass: the other attempt's judge is never called.
+    assert len(calls) == 1 and _states(root, "review") == ["halted_provider"]
+    [halted] = _invocations(root)[-1:]
+    ledger = Ledger.open(root / LEDGER_NAME)
+    try:
+        assert ledger.refusal(halted["slot"], "review") is None
+        assert ledger.paid_room() == 6 - 2 - 1  # Two coding calls and the halt.
+    finally:
+        ledger.close()
+
+
+def test_a_slot_that_failed_twice_for_one_reviewer_is_still_reviewed_by_another(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    connection = sqlite3.connect(root / LEDGER_NAME)
+    with connection:  # Room for every call, so only the cap and short-circuit refuse.
+        connection.execute("UPDATE budget SET paid_call_ceiling = 100")
+    connection.close()
+    calls = test_study_review._judge(
+        monkeypatch, root, citation_evidence="\tanswer = 1", citation_line=1, severity="P2"
+    )
+    judged = codex.invoke
+    # The fake answers as the frozen reviewer; another model's answer then fails validation.
+    monkeypatch.setattr(
+        codex,
+        "invoke",
+        lambda **kwargs: judged(
+            **{**kwargs, "protocol": {**kwargs["protocol"], "models": {"codex": "gpt-6-astra"}}}
+        ),
+    )
+    for revision in ("first", "second"):
+        study_review.review_study(root, revision=revision)
+    # The same error twice ends each slot for this reviewer, not for another.
+    with pytest.raises(SlotExhausted, match="twice with the same error"):
+        study_review.review_study(root, revision="third")
+    study_review.review_study(root, revision="other", model="gpt-6-luna")
+    assert len(calls) == 6
+    # The three-call cap is shared by every reviewer and revision.
+    with pytest.raises(SlotExhausted, match="used its 3 review invocations"):
+        study_review.review_study(root, revision="last", model="gpt-6.1-sol")
+    assert len(calls) == 6
+
+
+def test_a_judge_call_whose_observation_is_not_saved_is_not_finished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    test_study_review._judge(monkeypatch, root)
+    write = study._write
+
+    def failing(path: Path, value: object) -> None:
+        if path.name == "observation.json":
+            raise OSError("disk full")
+        write(path, value)
+
+    monkeypatch.setattr(study, "_write", failing)
+    with pytest.raises(OSError, match="disk full"):
+        study_review.review_study(root)
+    assert _states(root, "review") == ["failed_transient"]
+    state = json.loads((root / "review-revisions/review/review-state.json").read_text())
+    assert "reviewed" not in [row["status"] for row in state["records"]]
+
+
+def test_a_reviewed_row_without_an_observation_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    test_study_review._judge(monkeypatch, root)
+    study_review.review_study(root)
+    path = root / "review-revisions/review/review-state.json"
+    state = json.loads(path.read_text())
+    state["records"][0]["observation"] = None
+    path.write_text(json.dumps(state))
+    with pytest.raises(ValueError, match="reviewed row has no bound observation"):
+        study_review.validate_review_revision(root, "review")
