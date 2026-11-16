@@ -594,6 +594,13 @@ def _calls(verdict: Path) -> list[Path]:
     ]
 
 
+def _cap_reached(judge: str, task: str) -> ValueError:
+    return ValueError(
+        f"{judge} made its {SLOT_CAP} calls for {task}, so no further call starts; "
+        "prepare a new judge directory to judge it again"
+    )
+
+
 def _latest_call(verdict: Path) -> Path | None:
     """The raw folder of the call that produced the verdict; earlier calls failed or retried."""
     calls = _calls(verdict)
@@ -689,10 +696,7 @@ def _judge_task(
     """
     verdict = _verdict_path(directory, judge.label, task)
     if len(_calls(verdict)) >= SLOT_CAP:
-        raise ValueError(
-            f"{judge.label} made its {SLOT_CAP} calls for {task}, so no further call starts; "
-            "prepare a new judge directory to judge it again"
-        )
+        raise _cap_reached(judge.label, task)
     # A rejected saved result must not survive a failed retry as an apparently completed call.
     verdict.unlink(missing_ok=True)
     raw = verdict.with_suffix("")
@@ -714,18 +718,20 @@ def _judge_task(
             launch_judge=judge,
         )
         binding["brief"] = "sha256:" + hashlib.sha256(prompt.encode()).hexdigest()
-        # mkdir is the reservation: even SIGKILL leaves an attempt with unknown usage.
-        # Number past the highest call so _latest_call rereads this call's evidence.
+        # mkdir is the reservation: even SIGKILL leaves an attempt with unknown usage, and of
+        # two runs that try one number at once, only one gets it. Number past the highest call,
+        # so _latest_call rereads this call's evidence, and never past the cap.
         latest = _latest_call(verdict)
-        number = int(latest.name.removeprefix("call-")) + 1 if latest is not None else 1
-        while True:
+        first = int(latest.name.removeprefix("call-")) + 1 if latest is not None else 1
+        for number in range(first, SLOT_CAP + 1):
             attempt = raw / f"call-{number}"
             try:
                 attempt.mkdir()
             except FileExistsError:
-                number += 1
-            else:
-                break
+                continue
+            break
+        else:
+            raise _cap_reached(judge.label, task)
         execution = codex.invoke(
             area=area,
             artifacts=attempt,

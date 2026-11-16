@@ -9,12 +9,14 @@ import signal
 import subprocess
 import sys
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
+from threading import Barrier, Thread
 
 import pytest
 from typer.testing import CliRunner
 
-from pluginbench import claude, cli, codex, judge
+from pluginbench import claude, cli, codex, judge, study
 from pluginbench.assessment_models import Attempt, Stage
 from pluginbench.judge import normalize_diff, prepare, tally
 
@@ -736,6 +738,50 @@ def test_a_judge_makes_at_most_three_calls_per_task(
     assert len(calls) == 6
     assert not list((directory / "results/codex-m1-high").glob("*/call-4"))
     assert sum("made its 3 calls for" in line for line in messages) == 2
+
+
+def test_two_judge_runs_at_once_reserve_at_most_the_third_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _prepare(tmp_path, _two_arms(tmp_path))
+    raw = directory / "results/codex-m1-high/task-1"
+    for number in (1, 2):
+        (raw / f"call-{number}").mkdir(parents=True)
+    calls = _fake_judge(monkeypatch, {"m1": "A"}, root=tmp_path)
+    spec = judge.parse_judge("codex:m1:high")
+    study._write(directory / "judge-specs" / f"{spec.label}.json", asdict(spec))  # As run does.
+    # Both runs read the existing calls before either reserves one.
+    barrier = Barrier(2, timeout=30)
+    latest = judge._latest_call
+    reading = iter(range(2))  # The two reservations' reads; a later binding check reads too.
+
+    def together(verdict: Path) -> Path | None:
+        found = latest(verdict)
+        if next(reading, None) is not None:
+            barrier.wait()
+        return found
+
+    monkeypatch.setattr(judge, "_latest_call", together)
+    pairs = set(json.loads((directory / "key.json").read_text())["tasks"]["task-1"]["pairs"])
+    errors: list[Exception] = []
+
+    def reserve() -> None:
+        try:
+            judge._judge_task(directory, spec, "task-1", expected=pairs, timeout=60)
+        except Exception as error:
+            errors.append(error)
+
+    runs = [Thread(target=reserve) for _ in range(2)]
+    for run in runs:
+        run.start()
+    for run in runs:
+        run.join()
+    assert len(calls) == 1, errors
+    assert [str(error) for error in errors] == [
+        "codex-m1-high made its 3 calls for task-1, so no further call starts; "
+        "prepare a new judge directory to judge it again"
+    ]
+    assert sorted(path.name for path in raw.glob("call-*")) == ["call-1", "call-2", "call-3"]
 
 
 def test_saved_unable_blocks_tally_and_is_retried(
