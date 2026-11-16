@@ -287,6 +287,23 @@ def _work(
     typer.echo(f"Graphable data: {root / 'report/results.json'}")
 
 
+@contextmanager
+def _execution(
+    kind: str, target: Path, root: Path | None = None
+) -> Iterator[run_lock.ExecutionLock]:
+    """Own this host's execution lock for `kind` work on `target`, whose evidence is in `root`.
+
+    Every command that runs containers or models takes it, before any run lock. It fails at once
+    while another command runs, whatever run that targets.
+    """
+    owner = run_lock.ExecutionOwner(
+        kind=kind, eval=str(target.resolve()), root=str((root or target).resolve())
+    )
+    with run_lock.hold_execution(owner) as lock:
+        lock.publish("active")
+        yield lock
+
+
 def _worker_argv(root: Path, *, notify: bool) -> list[str]:
     return [
         sys.executable,
@@ -430,6 +447,8 @@ def run(
                     f"{target} is a run directory, which resumes in place; "
                     "--output names the directory for a new run from a config"
                 )
+            if not dry_run:
+                owned.enter_context(_execution("run", target))
             if foreground and not dry_run:
                 # Own the run before planning, so a background start never races its parent.
                 lock = owned.enter_context(run_lock.hold(target))
@@ -454,6 +473,7 @@ def run(
             root = target.expanduser().resolve()
         else:
             destination = output or _new_run_directory()
+            owned.enter_context(_execution("run", target, destination))
             try:
                 root = prepare_evaluation(evaluation, destination, progress=typer.echo)
             except BaseException as exc:
@@ -463,6 +483,8 @@ def run(
         if foreground:
             _work(root, lock=lock, progress=progress, notify=notify)
         else:
+            # The background run takes the host execution lock itself.
+            owned.close()
             _detach(root, notify=notify)
     except _EXPECTED_RUN_ERRORS as exc:
         _error(exc)
@@ -482,7 +504,8 @@ def check(
     """Prepare tasks and run every no-model check; exit 2 if the run would fail or lose data."""
     try:
         destination = output or _new_run_directory("check-")
-        report = check_evaluation(load_evaluation(config), destination, progress=typer.echo)
+        with _execution("preflight", config, destination):
+            report = check_evaluation(load_evaluation(config), destination, progress=typer.echo)
         typer.echo("\n".join(_vanilla_cache_lines(report)))
         typer.echo(_readiness_table(report))
         typer.echo(f"Ready. Check: {destination / 'check.json'}")
@@ -653,7 +676,7 @@ def review(
             reviewer = Runner.model_validate(
                 {"harness": reviewer_harness, "model": reviewer_model, "reasoning": reviewer_effort}
             )
-        with run_lock.hold(run):
+        with _execution("review", run), run_lock.hold(run):
             plan = plan_review(run, revision)
             by = (
                 f" by {reviewer.harness} {reviewer.model} ({reviewer.reasoning})"
@@ -728,7 +751,7 @@ def measure(
         if tasks is not None else None
     )
     try:
-        with run_lock.hold(run):
+        with _execution("measure", run), run_lock.hold(run):
             plan = plan_measure(run, names, revision, coverage_profiles, tasks=task_ids)
             collected, carried = plan["collected"], plan["carried"]
             assert isinstance(collected, list) and isinstance(carried, list)
@@ -836,9 +859,10 @@ def judge_run(
     from pluginbench.judge import run as run_judges
 
     try:
-        failed = run_judges(
-            directory, judges=judges, timeout=timeout, jobs=jobs, progress=typer.echo
-        )
+        with _execution("judge", directory):
+            failed = run_judges(
+                directory, judges=judges, timeout=timeout, jobs=jobs, progress=typer.echo
+            )
     except (OSError, ValueError, KeyError) as exc:
         _error(exc)
         return

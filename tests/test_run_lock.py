@@ -11,7 +11,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -258,3 +258,133 @@ def test_an_error_leaving_the_block_still_restores_handlers_and_delivers_the_sto
     assert isinstance(raised.value.__context__, OSError)
     assert signal.getsignal(signal.SIGTERM) is _stopped
     assert signal.getsignal(signal.SIGINT) is _stopped
+
+
+# The host execution lock. Holders get the state directory explicitly, since only this process
+# has the test's replacement for run_lock.state_root.
+
+# Holds the execution lock for argv[2] and reports readiness. With "inherit", it hands its lock
+# descriptor to a sleeping child, reports that child's PID, and exits without unlocking.
+_EXECUTION_HOLDER = """
+import os, subprocess, sys, time
+from pathlib import Path
+from pluginbench import run_lock
+state, root, mode = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+owner = run_lock.ExecutionOwner(kind="run", eval=root, root=root)
+with run_lock.hold_execution(owner, state=state) as lock:
+    if mode == "inherit":
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            pass_fds=(lock.fd,), start_new_session=True,
+        )
+        (state / "ready").write_text(str(child.pid))
+        os._exit(0)
+    (state / "ready").write_text(str(os.getpid()))
+    time.sleep(30)
+"""
+
+
+def _execution_holder(
+    state: Path, root: Path, mode: str = "hold"
+) -> tuple[subprocess.Popen[bytes], int]:
+    """Start a holder; return it and the PID that keeps the lock."""
+    state.mkdir(exist_ok=True)
+    child = subprocess.Popen(
+        [sys.executable, "-c", _EXECUTION_HOLDER, str(state), str(root), mode],
+        env={**os.environ, "PYTHONPATH": _SOURCE},
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 10
+    while not (state / "ready").is_file() or not (state / "ready").read_text():
+        assert time.monotonic() < deadline, "execution lock holder never became ready"
+        time.sleep(0.02)
+    return child, int((state / "ready").read_text())
+
+
+def _owner(kind: str, root: Path) -> run_lock.ExecutionOwner:
+    return run_lock.ExecutionOwner(kind=kind, eval=str(root), root=str(root))
+
+
+def test_one_execution_lock_excludes_work_on_any_other_run(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    child, pid = _execution_holder(state, tmp_path / "run-a")
+    try:
+        # Another run, another kind: still refused, naming what holds the host.
+        busy = rf"run for {tmp_path / 'run-a'} \(process {pid}\)"
+        with pytest.raises(run_lock.ExecutionBusy, match=busy):
+            with run_lock.hold_execution(_owner("review", tmp_path / "run-b"), state=state):
+                pass
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+    # SIGKILL released it; the next owner publishes its own record.
+    with run_lock.hold_execution(_owner("review", tmp_path / "run-b"), state=state) as lock:
+        lock.assert_owned()
+        snapshot = run_lock.execution_owner(state)
+        assert snapshot.verified and snapshot.record == lock.record
+        assert lock.record["root"] == str(tmp_path / "run-b") and lock.record["pid"] == os.getpid()
+
+
+def _dead_pid() -> int:
+    child = subprocess.Popen([sys.executable, "-c", ""])
+    child.wait(timeout=10)
+    return child.pid
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        lambda record: {**record, "start_time": "0"},
+        lambda record: {**record, "boot_id": "another-boot"},
+        lambda record: {**record, "lock_fd": 0},
+        lambda record: {**record, "pid": _dead_pid()},
+        # A live process with its true start time and boot that does not hold the lock.
+        lambda record: {
+            **record, "pid": os.getpid(), "start_time": run_lock.process_start(os.getpid())
+        },
+        lambda record: None,
+    ],
+    ids=["reused-pid", "other-boot", "other-fd", "dead-pid", "live-non-holder", "malformed"],
+)
+def test_a_held_lock_whose_record_does_not_prove_its_holder_is_unknown(
+    tmp_path: Path, tamper: Callable[[dict[str, Any]], dict[str, Any] | None]
+) -> None:
+    state = tmp_path / "state"
+    child, _ = _execution_holder(state, tmp_path / "run")
+    try:
+        assert run_lock.execution_owner(state).verified
+        record = json.loads((state / run_lock.EXECUTION_OWNER).read_text())
+        changed = tamper(record)
+        (state / run_lock.EXECUTION_OWNER).write_text(json.dumps(changed) if changed else "{")
+        snapshot = run_lock.execution_owner(state)
+        assert snapshot.held and not snapshot.verified
+        with pytest.raises(run_lock.ExecutionBusy, match="cannot verify"):
+            with run_lock.hold_execution(_owner("run", tmp_path / "other"), state=state):
+                pass
+        assert child.poll() is None
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+
+
+def test_an_inherited_lock_descriptor_keeps_the_host_held_by_an_unknown_owner(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    holder, inheritor = _execution_holder(state, tmp_path / "run", mode="inherit")
+    holder.wait(timeout=10)
+    try:
+        # The recorded owner is gone, but its lock is not free.
+        snapshot = run_lock.execution_owner(state)
+        assert snapshot.held and not snapshot.verified
+        with pytest.raises(run_lock.ExecutionBusy, match="cannot verify"):
+            with run_lock.hold_execution(_owner("run", tmp_path / "other"), state=state):
+                pass
+    finally:
+        os.kill(inheritor, signal.SIGKILL)
+    deadline = time.monotonic() + 10
+    while run_lock.execution_owner(state).held:
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    with run_lock.hold_execution(_owner("run", tmp_path / "other"), state=state):
+        pass
