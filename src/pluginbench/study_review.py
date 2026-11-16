@@ -20,7 +20,7 @@ from typing import Literal
 
 from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
 
-from pluginbench import codex, provider_stops, study
+from pluginbench import codex, control_store, provider_stops, study
 from pluginbench import ledger as invocation_ledger
 from pluginbench.ledger import LEDGER_NAME, CeilingReached, Ledger, SlotExhausted, default_ceiling
 from pluginbench.parallel import run_jobs, validate_jobs
@@ -584,7 +584,8 @@ def review_study(
     ledger = _review_ledger(root, len(plan["entries"]))
     try:
         # A review pass runs alone in its run, so a judge call still open was cut off by a crash.
-        ledger.resolve_crashed("review")
+        cleaned = control_store.verify_crashed(ledger, root / LEDGER_NAME, ("review",))
+        ledger.resolve_crashed("review", cleaned=cleaned)
         # A review slot is the coding slot of the attempt it reviews.
         slots = {
             row["id"]: row["slot"]

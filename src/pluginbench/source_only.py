@@ -34,7 +34,7 @@ from typing import Any
 from uuid import uuid4
 
 from pluginbench import grade, harbor_backend, isolation, study, submissions
-from pluginbench import ledger as invocation_ledger
+from pluginbench import control_store, ledger as invocation_ledger
 from pluginbench.code_diff import TestRename, _is_test_path, without_test_files
 from pluginbench.datasets import TaskSpec, load_tasks, native_identity
 
@@ -411,15 +411,17 @@ def record_source_only_grades(
             health[task.task_id] = requalify(task)
         return health[task.task_id]
 
+    path = evidence / invocation_ledger.LEDGER_NAME
     ledger = invocation_ledger.Ledger.open(
-        evidence / invocation_ledger.LEDGER_NAME,
+        path,
         paid_call_ceiling=paid_call_ceiling,
         history=partial(study.invocation_history, evidence),
     )
     try:
         # A grade pass runs alone in its run, so a grading invocation still open was cut off by
         # a crash.
-        ledger.resolve_crashed("grading")
+        cleaned = control_store.verify_crashed(ledger, path, ("grading",))
+        ledger.resolve_crashed("grading", cleaned=cleaned)
         slots = {row["id"]: row["slot"] for row in ledger.attempts()}
         for attempt_id, stage_id, run, task in _stages(evidence):
             target = directory / attempt_id / stage_id

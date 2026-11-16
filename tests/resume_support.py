@@ -24,7 +24,9 @@ from native_support import (
     synthetic_contract,
     task_entry,
 )
-from pluginbench import baselines, harbor_backend, ledger, study, submissions, trial_containers
+from pluginbench import baselines, control_store, harbor_backend, ledger, study, submissions
+from pluginbench import trial_containers
+from pluginbench.run_lock import ExecutionOwner
 from pluginbench.datasets import native_identity, portable_native_identity
 
 # Where the child kills itself, relative to its Nth native call or Nth completed attempt.
@@ -224,5 +226,8 @@ def child_resume() -> None:
     """argv: run, boundary. Resumes a study and kills itself at `boundary`."""
     root, boundary = sys.argv[1:3]
     install(pytest.MonkeyPatch(), [], boundary=boundary, at=1)
-    study.resume_study(Path(root))
+    # As the CLI does: recovering what the last crash left needs the host execution lock.
+    owner = ExecutionOwner(kind="run", eval=root, root=root)
+    with control_store.execute(owner, state=Path(root).parent / "host-state"):
+        study.resume_study(Path(root))
     raise SystemExit("the resume finished without reaching its kill boundary")

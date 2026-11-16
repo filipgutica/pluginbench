@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -503,13 +503,28 @@ class Ledger:
         if changed != 1:
             raise ValueError(f"ledger cannot end invocation {invocation} as {state}")
 
-    def resolve_crashed(self, stage: str) -> int:
+    def resolve_crashed(self, stage: str, *, cleaned: Collection[str]) -> int:
         """Mark the `stage` invocations a dead process left open `unresolved`; return how many.
 
-        Call it only while no live process of this run can own that stage. Their usage is
-        unknown, and each still counts toward its slot's cap.
+        `cleaned` holds the invocations whose cleanup was verified under the host execution lock
+        (`control_store.verify_crashed`); an open row outside it is refused and stays open. Their
+        usage is unknown, and each still counts toward its slot's cap.
         """
         with self._db:
+            self._db.execute("BEGIN IMMEDIATE")
+            unverified = sorted(
+                row[0]
+                for row in self._db.execute(
+                    f"SELECT id FROM invocations WHERE stage = ? AND state IN {OPEN_STATES}",
+                    (stage,),
+                )
+                if row[0] not in cleaned
+            )
+            if unverified:
+                raise ValueError(
+                    f"cleanup of {stage} invocations {', '.join(unverified)} is not verified, "
+                    "so none is marked unresolved"
+                )
             return self._db.execute(
                 "UPDATE invocations SET state = 'unresolved', updated_at = ?"
                 f" WHERE stage = ? AND state IN {OPEN_STATES}",

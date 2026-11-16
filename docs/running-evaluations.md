@@ -548,6 +548,10 @@ Coding attempts, measurement inputs, and reviews run concurrently within their p
 
 On interruption or fatal failure, new jobs stop. Active jobs finish or time out; their receipts remain, and an attempt that finishes while the run drains is kept as complete.
 
+Only one PluginBench command executes on a host at a time. `run`, `check`, `review`, `measure`, and `judge run` share one execution lock for your user account, whatever run they target. While one runs, another fails at once and names the run and process that hold the host.
+
+A resume marks a call cut off by a crash as unresolved only after it confirms that the recorded process of that call has stopped. If that process still runs, the resume refuses to start. Every execution command refuses too, whatever run it targets. The error names the process and the command that stops it. Run your command again after that process stops.
+
 A Codex session that fails before its first model turn is a fatal failure, not an outcome. This is a `turn.failed` event with no usage, commands, or agent messages, as when a network or backend outage cuts the container off from Codex. The run stops after the first one with an error that names the attempt and Codex's message. The attempt stays `interrupted` and never enters the vanilla cache. Resume once Codex is reachable: the attempt is discarded and its slot is coded again. Timeouts, and failures after the agent has used tokens, run a command, or sent a message, stay scored.
 
 A session that stops at its provider or account is not an outcome either, at any point in the session. The run stops after the first one with an error that names the attempt and the cause:

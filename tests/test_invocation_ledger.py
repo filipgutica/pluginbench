@@ -58,6 +58,7 @@ def _one_slot(tmp_path: Path) -> study.ResolvedStudy:
 # Crash boundaries.
 
 
+@pytest.mark.usefixtures("host_execution")
 @pytest.mark.parametrize("boundary", ["during-call", "after-identity", "after-execution"])
 def test_a_slot_killed_three_times_after_its_intent_never_gets_a_fourth_invocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
@@ -79,6 +80,7 @@ def test_a_slot_killed_three_times_after_its_intent_never_gets_a_fourth_invocati
     assert all((row["identity"] is not None) is started for row in rows)
 
 
+@pytest.mark.usefixtures("host_execution")
 def test_a_kill_before_acceptance_keeps_the_saved_output_as_the_finished_invocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -228,7 +230,9 @@ def test_the_one_regrade_of_a_filtered_patch_is_its_second_grading_invocation(
 # The ledger itself.
 
 
-def test_a_grading_pass_resolves_only_grading_invocations(tmp_path: Path) -> None:
+def test_a_grading_pass_resolves_only_grading_invocations_whose_cleanup_is_verified(
+    tmp_path: Path,
+) -> None:
     ledger = Ledger.create(
         tmp_path / LEDGER_NAME,
         [{"id": "a", "task_id": "t", "arm": "baseline", "attempt": 1}],
@@ -236,8 +240,11 @@ def test_a_grading_pass_resolves_only_grading_invocations(tmp_path: Path) -> Non
     )
     try:
         coding = ledger.intent(slot=0, stage="coding", attempt_id="a")
-        ledger.intent(slot=0, stage="grading", attempt_id="a")
-        assert ledger.resolve_crashed("grading") == 1
+        grading = ledger.intent(slot=0, stage="grading", attempt_id="a")
+        with pytest.raises(ValueError, match=f"{grading} is not verified"):
+            ledger.resolve_crashed("grading", cleaned=set())
+        assert _states(tmp_path, "grading") == ["intent"]
+        assert ledger.resolve_crashed("grading", cleaned={grading}) == 1
         assert {row["stage"]: row["state"] for row in ledger.invocations()} == {
             "coding": "intent",
             "grading": "unresolved",
@@ -543,6 +550,7 @@ def _review_child() -> None:
     raise SystemExit("the review finished without reaching its judge call")
 
 
+@pytest.mark.usefixtures("host_execution")
 def test_a_judge_call_killed_as_it_starts_still_counts_toward_the_ceiling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

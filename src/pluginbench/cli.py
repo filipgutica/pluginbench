@@ -13,14 +13,14 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
 import yaml
 
-from pluginbench import __version__, run_lock
+from pluginbench import __version__, control_store, run_lock
 from pluginbench.isolation import RuntimeDriftError
 from pluginbench.evaluation import (
     CheckFailed,
@@ -287,21 +287,18 @@ def _work(
     typer.echo(f"Graphable data: {root / 'report/results.json'}")
 
 
-@contextmanager
 def _execution(
     kind: str, target: Path, root: Path | None = None
-) -> Iterator[run_lock.ExecutionLock]:
+) -> AbstractContextManager[run_lock.ExecutionLock]:
     """Own this host's execution lock for `kind` work on `target`, whose evidence is in `root`.
 
     Every command that runs containers or models takes it, before any run lock. It fails at once
-    while another command runs, whatever run that targets.
+    while another command runs, whatever run that targets, or while cleanup is unverified.
     """
     owner = run_lock.ExecutionOwner(
         kind=kind, eval=str(target.resolve()), root=str((root or target).resolve())
     )
-    with run_lock.hold_execution(owner) as lock:
-        lock.publish("active")
-        yield lock
+    return control_store.execute(owner)
 
 
 def _worker_argv(root: Path, *, notify: bool) -> list[str]:
