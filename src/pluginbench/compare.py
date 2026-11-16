@@ -825,6 +825,25 @@ def _arms(evidence: Evidence) -> list[str]:
     return sorted(seen, key=lambda arm: (arm != "vanilla", seen.index(arm)))
 
 
+def _grade_counts(rows: list[Attempt]) -> dict[str, int]:
+    """Attempts by grade. `pending` holds infrastructure errors and attempts not graded yet,
+    which a later run grades; `legacy` holds a legacy run's attempts, which have no grade."""
+    return {
+        "attempts": len(rows),
+        "passes": sum(row.correctness == "pass" for row in rows),
+        "fails": sum(row.correctness == "fail" for row in rows),
+        "pending": sum(row.correctness not in {*GRADED_STATES, "legacy"} for row in rows),
+        "legacy": sum(row.correctness == "legacy" for row in rows),
+    }
+
+
+def _task_passes(counts: dict[str, int]) -> str:
+    """Passes over graded attempts, then the attempts with no grade beside them."""
+    graded = counts["passes"] + counts["fails"]
+    ungraded = [f"{counts[name]} {name}" for name in ("pending", "legacy") if counts[name]]
+    return f"{counts['passes']}/{graded}" + (f" ({', '.join(ungraded)})" if ungraded else "")
+
+
 def _section(evidence: Evidence, gates: Gates, split: str, tasks: list[str]) -> list[str]:
     present = sorted({row.task for row in evidence.attempts} & set(tasks))
     lines = [f"Split {split}: {len(present)} of {len(tasks)} tasks have attempts"]
@@ -835,20 +854,14 @@ def _section(evidence: Evidence, gates: Gates, split: str, tasks: list[str]) -> 
     counts: dict[str, dict[str, int]] = {arm: {} for arm in arms}
     for arm in arms:
         mine = [row for row in evidence.attempts if row.arm == arm and row.task in tasks]
-        counts[arm] = {
-            "attempts": len(mine),
-            "passes": sum(row.correctness == "pass" for row in mine),
-            "fails": sum(row.correctness == "fail" for row in mine),
-            "no grade": sum(row.correctness not in GRADED_STATES for row in mine),
-        }
-    for name in ("attempts", "passes", "fails", "no grade"):
+        counts[arm] = _grade_counts(mine)
+    for name in ("attempts", "passes", "fails", "pending", "legacy"):
         rows.append([name, *(str(counts[arm][name]) for arm in arms)])
-    passes = {arm: _pass_counts(evidence, arm, tasks) for arm in arms}
     for task in tasks:
         cells = []
         for arm in arms:
-            assigned = sum(row.arm == arm and row.task == task for row in evidence.attempts)
-            cells.append(f"{passes[arm][task]}/{assigned}" if assigned else "no attempts")
+            mine = [row for row in evidence.attempts if row.arm == arm and row.task == task]
+            cells.append(_task_passes(_grade_counts(mine)) if mine else "no attempts")
         rows.append([f"passes: {task}", *cells])
     notes: list[str] = []
     shown: set[tuple[object, ...]] = set()

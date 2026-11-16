@@ -18,8 +18,10 @@ import pytest
 
 import resume_support
 from native_support import execution as native_execution
-from pluginbench import claude, codex, grade, harbor_backend, source_only, study, submissions
+from pluginbench import claude, claude_usage, codex, grade, harbor_backend, source_only, study
+from pluginbench import submissions
 from test_codex import _OUTAGE, outage_trace, stream
+from test_provider_stops import PLAIN, _api_error
 
 Invoke = Callable[..., dict[str, Any]]
 HEALTHY: source_only.Requalify = lambda task: None  # noqa: E731
@@ -194,6 +196,44 @@ def test_a_session_that_failed_before_its_first_turn_is_found_for_either_harness
     # A timeout alone proves no turn: the session may have hung before its first one.
     silent = claude.parse_events(stream(started), [])
     assert grade.failed_before_first_turn({**silent, "timed_out": True}, "claude") == (
+        "the session timed out before any model turn"
+    )
+
+
+@pytest.mark.parametrize("after_work", [False, True])
+def test_a_claude_api_error_counts_as_a_turn_only_after_real_model_work(after_work: bool) -> None:
+    # The CLI writes the error as an assistant message from model `<synthetic>`: no model call.
+    init, assistant, error, result = _api_error("invalid_request", 400, "API Error: 400 bad")
+    events = [init, assistant, error, result] if after_work else [init, error, result]
+    if not after_work:
+        result["num_turns"] = 0
+    session = claude.parse_events(stream(*events), [], coding=True)
+    session["timed_out"] = False
+    expected = None if after_work else "API Error: 400 bad"
+    assert grade.failed_before_first_turn(session, "claude") == expected
+
+
+def test_a_claude_timeout_whose_transcript_shows_model_work_is_the_agent_s_attempt(
+    tmp_path: Path,
+) -> None:
+    # The stream was cut after system/init, but the session transcript kept the model's reply,
+    # so usage does not validate and the total is None.
+    init = PLAIN.read_text().splitlines()[0]
+    session = claude.parse_events(init, [], coding=True)
+    session.update(
+        timed_out=True,
+        **claude_usage.coding_usage(
+            init, PLAIN.parent / "sessions", runner_model="claude-opus-5-5", cli_version="2.1.322"
+        ),
+    )
+    assert session["usage"] is None
+    assert session["usage_accounting"]["per_model"]["claude-opus-5-5"][
+        "transcript_output_tokens"
+    ] == 4
+    assert grade.failed_before_first_turn(session, "claude") is None
+    # Without the transcript the same timeout shows no turn.
+    session["usage_accounting"] = {"status": "incomplete", "reasons": ["no transcript"]}
+    assert grade.failed_before_first_turn(session, "claude") == (
         "the session timed out before any model turn"
     )
 

@@ -424,6 +424,8 @@ def prepare(
         output / KEY,
         {
             "schema_version": 1,
+            # The contract each side's correctness follows; a key without it predates grades.
+            "grade_contract": GRADE_CONTRACT,
             "arms": {first_arm: str(first_run.resolve()), second_arm: str(second_run.resolve())},
             "seed": seed,
             "criteria": str(criteria.resolve()),
@@ -857,6 +859,9 @@ def tally(directory: Path, *, require_bound: bool = False) -> dict[str, Any]:
         for task in tasks
     }
     arms = list(key["arms"])
+    # A key prepared before grade contract 1 holds native correctness, no grade: its votes
+    # and bindings stand, but correctness decides none of its pairs.
+    graded_key = key.get("grade_contract") == GRADE_CONTRACT
     wins = dict.fromkeys(arms, 0.0)
     decided = {"correctness": dict.fromkeys(arms, 0.0), "judges": dict.fromkeys(arms, 0.0)}
     side_a = dict.fromkeys(judges, 0)
@@ -875,7 +880,7 @@ def tally(directory: Path, *, require_bound: bool = False) -> dict[str, Any]:
                     comparable[judge] += 1
                     agreed[judge] += vote == others
             passed = {side: sides[side]["correctness"] in PASSING for side in "AB"}
-            graded = all(sides[side]["correctness"] in GRADED for side in "AB")
+            graded = graded_key and all(sides[side]["correctness"] in GRADED for side in "AB")
             if graded and passed["A"] != passed["B"]:
                 by, shares = "correctness", {"A": float(passed["A"]), "B": float(passed["B"])}
             else:

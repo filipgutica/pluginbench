@@ -3709,7 +3709,9 @@ def test_source_only_replays_wait_for_the_frozen_grader_and_a_failed_try_is_clea
     assert f"{len(packages)} attempts have no grade" in output
     assert "Frozen native image is unavailable" in output
     status = run_status.run_status(root)
-    assert status["phase"] != "complete"
+    # No process owns the run, so its phase is the failure it ended with, as for any run
+    # that stopped with work left; `grading` shows only while a run is grading.
+    assert status["phase"] == "failed"
     assert status["resume_command"] == shlex.join(["pluginbench", "run", str(root)])
     (alert,) = [item for item in status["alerts"]["items"] if item["kind"] == "grades_pending"]
     assert alert["severity"] == "error" and alert["attempts"] == len(packages)

@@ -618,3 +618,26 @@ def test_saved_token_gates_require_validation_provenance(
         assert all(row.values["Input tokens"] is None for row in evidence.attempts
                    if row.arm == "candidate")
     assert results.read_bytes() == before
+
+
+def test_a_task_s_passes_are_counted_over_its_graded_attempts_only() -> None:
+    from pluginbench import compare
+
+    def attempt(ident: str, arm: str, correctness: str | None) -> Attempt:
+        return Attempt(ident, "run", "task-a", arm, correctness, {})
+
+    evidence = Evidence(attempts=[
+        attempt("v1", "vanilla", "pass"), attempt("v2", "vanilla", "infra"),
+        attempt("v3", "vanilla", None), attempt("w1", "workflow", "pass"),
+        attempt("w2", "workflow", "legacy"),
+    ])
+    lines = compare._section(evidence, compare.Gates(gates=[]), "all", ["task-a"])
+
+    def cells(label: str) -> list[str]:
+        line = next(line for line in lines if line.startswith(label + "  "))
+        return re.split(r"\s{2,}", line.strip())[1:]
+
+    # An infrastructure error, an attempt not graded yet and a legacy grade are no results:
+    # the pass rate counts graded attempts only, and the others are shown beside it.
+    assert cells("passes: task-a") == ["1/1 (2 pending)", "1/1 (1 legacy)"]
+    assert cells("pending") == ["2", "0"] and cells("legacy") == ["0", "1"]

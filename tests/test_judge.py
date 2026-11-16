@@ -570,6 +570,27 @@ def test_correctness_decides_a_pair_only_when_both_sides_have_a_grade(
     assert result["correctness_decided"]["pairs"] == 0
 
 
+def test_a_key_prepared_before_the_grade_contract_keeps_its_votes_but_not_correctness(
+    tmp_path: Path,
+) -> None:
+    # alpha 1: vanilla passed and the package failed, on the native reward of an older build.
+    run = _two_arms(tmp_path, wa1={"correctness": "fail"})
+    directory = _prepare(tmp_path, run)
+    key_path = directory / "key.json"
+    key = json.loads(key_path.read_text())
+    assert key["grade_contract"] == 1  # New keys record the contract their grades follow.
+    # A key written before grade contract 1 records none, and its correctness is no grade.
+    key.pop("grade_contract")
+    key_path.write_text(json.dumps(key))
+    v, w = "vanilla", "workflow-r9"
+    every = {(task, str(pair)): w for task in ("task-1", "task-2") for pair in (1, 2, 3)}
+    _votes(directory, {"j1": every, "j2": every, "j3": every})
+    result = tally(directory)
+    alpha = {pair["pair"]: pair for pair in result["tasks"][0]["pairs"]}
+    assert alpha[1]["decided_by"] == "judges" and alpha[1]["wins"] == {v: 0.0, w: 1.0}
+    assert result["correctness_decided"]["pairs"] == 0 and result["judged"]["pairs"] == 6
+
+
 def test_agreement_denominator_is_the_other_judges_majority_not_correctness(
     tmp_path: Path,
 ) -> None:

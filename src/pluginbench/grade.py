@@ -89,14 +89,39 @@ def failed_before_first_turn(execution: Mapping[str, Any], harness: object) -> s
     return "the session ended before any model turn"
 
 
+# The model Claude Code names on a message it writes itself, such as an API error: no model call.
+_CLAUDE_SYNTHETIC_MODEL = "<synthetic>"
+
+
 def _claude_turn_observed(execution: Mapping[str, Any]) -> bool:
-    """Whether a parsed Claude session shows a model turn. Claude names no pre-turn failure,
-    unlike Codex's `turn.failed`, and its startup model stands in for an assistant's, so only
-    usage, a tool call or a message counts. This reads the parsed execution only, so it lives
-    here rather than in the hashed Claude launcher."""
+    """Whether a parsed Claude session shows a model turn.
+
+    Claude names no pre-turn failure, unlike Codex's `turn.failed`, so only real model work
+    counts: a validated usage total, transcript tokens (transcripts skip the zero-usage
+    messages the CLI writes itself, and survive a cut stream), a tool call, or a message from
+    a real model. A message from `<synthetic>` alone, such as an initial API error, is none.
+    This reads the parsed execution only, so it lives here rather than in the hashed Claude
+    launcher.
+    """
+    accounting = execution.get("usage_accounting")
+    per_model = accounting.get("per_model") if isinstance(accounting, Mapping) else None
+    transcribed = isinstance(per_model, Mapping) and any(
+        isinstance(counts, Mapping)
+        and any(
+            isinstance(counts.get(key), int) and counts[key] > 0
+            for key in ("transcript_input_tokens", "transcript_output_tokens")
+        )
+        for counts in per_model.values()
+    )
+    models = execution.get("actual_primary_models") or []
+    real_messages = bool(execution.get("agent_messages")) and any(
+        model != _CLAUDE_SYNTHETIC_MODEL for model in models
+    )
     return bool(
         execution.get("usage") is not None
-        or any(execution.get(key) for key in ("command_items", "other_tools", "agent_messages"))
+        or transcribed
+        or real_messages
+        or any(execution.get(key) for key in ("command_items", "other_tools"))
     )
 
 
