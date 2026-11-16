@@ -21,6 +21,7 @@ from typing import Literal
 from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
 
 from pluginbench import codex, study
+from pluginbench.ledger import LEDGER_NAME, CeilingReached, Ledger
 from pluginbench.parallel import run_jobs, validate_jobs
 from pluginbench.assessment import _load_manifest
 from pluginbench.assessment_metrics import inspect_snapshot
@@ -453,6 +454,34 @@ def _captured_execution(artifacts: Path, effort: str, harness: str = "codex") ->
     return execution
 
 
+def _assert_review_room(root: Path, planned: int) -> None:
+    """Refuse a review pass the run's paid-call ceiling has no room for (contract C2).
+
+    Until reviews have invocation rows of their own (P5), the ceiling's room is what coding
+    left, less every judge call earlier review revisions started. A run whose ledger predates
+    ceilings has none to keep.
+    """
+    path = root / LEDGER_NAME
+    if not path.is_file():
+        return
+    ledger = Ledger.read(path)
+    try:
+        room = ledger.paid_room()
+    finally:
+        ledger.close()
+    if room is None:
+        return
+    earlier = sum(
+        int(json.loads(state.read_text())["native_invocations"])
+        for state in sorted((root / "review-revisions").glob("*/review-state.json"))
+    )
+    if earlier + planned > room:
+        raise CeilingReached(
+            f"{planned} review calls would pass the run's paid-call ceiling: coding left room "
+            f"for {room}, and earlier reviews started {earlier}. No review call starts"
+        )
+
+
 def review_study(
     root: Path,
     *,
@@ -496,6 +525,14 @@ def review_study(
     # Read tasks from this run's own frozen copy, even if the run was moved after it stopped.
     tasks = {task.task_id: task for task in study._frozen_study(root).tasks}
     selections = {record.id: record.stages[0] for record in records}
+    # Before the revision exists: a refused pass leaves its name free to run later.
+    _assert_review_room(
+        root,
+        sum(
+            record.before is not None and selections[record.id].snapshot is not None
+            for record in records
+        ),
+    )
     contents = [path.read_text() for path in guidance]
     directory.mkdir(parents=True)
     shutil.copyfile(root / "run.json", directory / "original-run.json")

@@ -16,8 +16,11 @@ from typing import Any
 import pytest
 
 import resume_support
-from native_support import execution as native_execution
-from pluginbench import harbor_backend, processes, provider_stops, source_only, study
+import test_baselines
+import test_study_review
+from native_support import execution as native_execution, runtime_identity, synthetic_contract
+from pluginbench import harbor_backend, processes, provider_stops, source_only, study, study_review
+from pluginbench import submissions, trial_containers
 from pluginbench.ledger import (
     LEDGER_NAME,
     SCHEMA_VERSION,
@@ -253,7 +256,9 @@ def test_a_version_1_ledger_is_read_as_it_is_and_migrated_by_a_writer(tmp_path: 
     observer = Ledger.read(path)
     assert observer.invocations() == [] and len(observer.attempts()) == 2
     observer.close()
-    writer = Ledger.open(path)
+    with pytest.raises(ValueError, match="no invocation history"):
+        Ledger.open(path)
+    writer = Ledger.open(path, history=lambda: [])
     try:
         for call in range(6):
             halted = writer.intent(slot=call % 2, stage="coding", attempt_id="a1")
@@ -293,3 +298,198 @@ def test_run_command_reports_its_child_and_stops_it_when_the_report_fails(
     assert time.monotonic() - started < 10
     with pytest.raises(ProcessLookupError):
         os.killpg(seen[-1], 0)
+
+
+# Review calls share the ceiling (finding 1).
+
+
+def test_a_review_that_would_pass_the_ceiling_is_refused_before_any_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    ledger = Ledger.open(root / LEDGER_NAME)
+    try:
+        # Two coding calls finished; four halts use the rest of the two slots' ceiling of 6.
+        for call in range(4):
+            halted = ledger.intent(slot=call % 2, stage="coding", attempt_id="halted")
+            ledger.end(halted, "halted_provider")
+    finally:
+        ledger.close()
+    calls = test_study_review._judge(monkeypatch, root)
+    with pytest.raises(CeilingReached, match="2 review calls"):
+        study_review.review_study(root)
+    assert calls == [] and not (root / "review-revisions/review").exists()
+
+
+def test_earlier_review_revisions_count_toward_the_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    ledger = Ledger.open(root / LEDGER_NAME)
+    try:
+        halted = ledger.intent(slot=0, stage="coding", attempt_id="halted")
+        ledger.end(halted, "halted_provider")
+    finally:
+        ledger.close()
+    calls = test_study_review._judge(monkeypatch, root)
+    study_review.review_study(root)  # 3 coding rows + 2 reviews of the ceiling of 6.
+    with pytest.raises(CeilingReached):
+        study_review.review_study(root, revision="second")
+    assert len(calls) == 2
+
+
+# Migration keeps the history a version 1 ledger could not hold (finding 2).
+
+
+def _as_version_1(root: Path) -> None:
+    connection = sqlite3.connect(root / LEDGER_NAME)
+    connection.executescript("DROP TABLE invocations; DROP TABLE budget; PRAGMA user_version = 1;")
+    connection.close()
+
+
+def test_a_migrated_ledger_counts_the_calls_its_receipts_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+
+    def undelivered(**kwargs: Any) -> dict[str, Any]:
+        calls.append(str(kwargs["entry"]["id"]))
+        kwargs["on_spawn"](os.getpid())
+        execution = native_execution(
+            kwargs["area"], kwargs["protocol"]["native_task_identity"], reward=1
+        )
+        return {**execution, "treatment_error": f"missing skill {len(calls)}"}
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", undelivered)
+    with pytest.raises(study.CodingInfrastructure):
+        study.run_study(_one_slot(tmp_path), tmp_path / "run")
+    root = tmp_path / "run"
+    for _ in range(2):
+        with pytest.raises(study.CodingInfrastructure):
+            study.resume_study(root)
+    # As a run coded before invocation rows existed left it: three receipts, no rows.
+    _as_version_1(root)
+    with pytest.raises(SlotExhausted, match="used its 3 coding invocations"):
+        study.resume_study(root)
+    assert len(calls) == 3 and _states(root) == ["unresolved"] * 3
+
+
+def test_a_version_1_ledger_whose_receipts_name_no_known_attempt_is_not_migrated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+    with pytest.raises(study.ProviderStopped):
+        monkeypatch.setattr(provider_stops, "saved_stop", lambda artifacts, harness: "a limit")
+        study.run_study(_one_slot(tmp_path), tmp_path / "run")
+    root = tmp_path / "run"
+    _as_version_1(root)
+    stray = root / "invocations/0123456789abcdef/handoff.json"
+    stray.parent.mkdir(parents=True)
+    stray.write_text("{}")
+    with pytest.raises(ValueError, match="cannot tell which slot"):
+        study.resume_study(root)
+    assert len(calls) == 1
+
+
+# Cached vanilla regrades use the grading budget (finding 3).
+
+
+def test_cached_vanilla_regrades_spend_the_slot_s_grading_invocations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(submissions, "reviewed_contract", synthetic_contract)
+    monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: runtime_identity())
+    monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
+    monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
+
+    def invoke(**kwargs: Any) -> dict[str, Any]:
+        kwargs["on_spawn"](os.getpid())
+        area = kwargs["area"]
+        (area / "workspace/answer.py").write_text("answer = 1\n")
+        return native_execution(
+            area,
+            kwargs["protocol"]["native_task_identity"],
+            answer_path="answer.py",
+            timeout=1800,
+            version="0.143.0",
+        )
+
+    regrades: list[str] = []
+
+    def regrade(**kwargs: Any) -> dict[str, object]:
+        if "on_spawn" in kwargs:  # The worker reports itself when the caller asks.
+            kwargs["on_spawn"](os.getpid())
+        regrades.append(str(kwargs["directory"]))
+        raise OSError(f"docker went away {len(regrades)}")
+
+    monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
+    one = test_baselines._study(tmp_path / "one")
+    study.run_study(
+        one, tmp_path / "first", baseline_cache=tmp_path / "cache",
+        baseline_identity=test_baselines._coding(one.tasks),
+    )
+    monkeypatch.setattr(harbor_backend, "regrade_native", regrade)
+    two = test_baselines._study(tmp_path / "two", guidance="another")
+    root = tmp_path / "second"
+    cache: dict[str, Any] = {
+        "baseline_cache": tmp_path / "cache",
+        "baseline_identity": test_baselines._coding(two.tasks),
+    }
+    failures: list[BaseException] = []
+    for attempt in range(8):
+        try:
+            if attempt == 0:
+                study.run_study(two, root, **cache)
+            else:
+                study.resume_study(root, **cache)
+        except (OSError, ValueError) as error:
+            failures.append(error)
+    grading = [row for row in _invocations(root) if row["stage"] == "grading"]
+    # Two cached vanilla slots, three replays each; every replay was recorded before it ran.
+    assert len(regrades) == len(grading) == 6
+    assert {row["state"] for row in grading} == {"failed_transient"}
+    assert isinstance(failures[-1], study.CodingInfrastructure)
+    assert str(failures[-1]).count("used its 3 grading invocations") == 2
+
+
+# A grade's replay finishes only once its grade is saved (finding 4).
+
+
+def test_a_replay_whose_grade_is_not_saved_is_not_finished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unverified(area: Path, execution: dict[str, Any]) -> None:
+        execution["native_verifier_result"] = None
+
+    root, _ = _coded(tmp_path, monkeypatch, unverified)
+    replays: list[str] = []
+    monkeypatch.setattr(
+        harbor_backend, "regrade_native", _regrade(replays, exception=None, reward=1)
+    )
+    monkeypatch.setattr(harbor_backend, "_assert_native_image", lambda image, expected: None)
+    keep = source_only._keep
+    saves: list[Path] = []
+
+    def full_disk(staging: Path | None, target: Path, record: dict[str, Any]) -> None:
+        saves.append(target)
+        if len(saves) <= 2:
+            raise OSError(f"no space left on device ({len(saves)})")
+        keep(staging, target, record)
+
+    monkeypatch.setattr(source_only, "_keep", full_disk)
+    for _ in range(2):
+        with pytest.raises(OSError, match="no space"):
+            source_only.record_source_only_grades(root, requalify=HEALTHY)
+    index = source_only.record_source_only_grades(root, requalify=HEALTHY)
+    assert study._bound_document(root, index)["pending"] == {}
+    by_slot: dict[int, list[str]] = {}
+    for row in _invocations(root):
+        if row["stage"] == "grading":
+            by_slot.setdefault(row["slot"], []).append(row["state"])
+    # Each failed save stopped the pass at the first slot, whose replay never finished.
+    assert sorted(by_slot.values()) == [
+        ["failed_transient", "failed_transient", "finished"],
+        ["finished"],
+    ]

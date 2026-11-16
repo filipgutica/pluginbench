@@ -1287,19 +1287,21 @@ def resume_study(
         admit(treatment, frozen.recipe.harness)
     path = root / LEDGER_NAME
     # Runs from before the ledger kept their states only in run.json.
-    ledger = Ledger.open(path, paid_call_ceiling=paid_call_ceiling) if path.exists() else (
-        Ledger.create(
-            path,
-            _bound_document(root, run["plan"])["entries"],
-            run["attempt_states"],
-            paid_call_ceiling=paid_call_ceiling,
-        )
+    ledger = Ledger.open(
+        path, paid_call_ceiling=paid_call_ceiling, history=partial(invocation_history, root)
+    ) if path.exists() else Ledger.create(
+        path,
+        _bound_document(root, run["plan"])["entries"],
+        run["attempt_states"],
+        paid_call_ceiling=paid_call_ceiling,
+        history=invocation_history(root),
     )
     try:
         plan, manifest, states = _reconcile(root, run, ledger)
         # After `_reconcile`, which accepts the output of any attempt with a record receipt:
-        # a coding invocation still open was cut off by a crash.
-        ledger.resolve_crashed("coding")
+        # an invocation still open, a cached attempt's regrade included, was cut off by a crash.
+        for stage in ("coding", "grading"):
+            ledger.resolve_crashed(stage)
         exhausted = _exhausted(ledger, plan, states)
         if before_coding is not None and any(
             states[entry["id"]] != "complete"
@@ -1327,6 +1329,45 @@ def resume_study(
         guard=guard,
         resumed=True,
     )
+
+
+def invocation_history(root: Path) -> list[invocation_ledger.HistoryRow]:
+    """The invocations a run's evidence shows, for a ledger that predates its invocation rows.
+
+    Every coding call wrote `invocations/<attempt>/<stage>.json` before it started, and every
+    verifier replay without a saved grade left its `.try-*` directory. Each counts toward its
+    slot: finished when its attempt completed, unresolved otherwise. Evidence that names an
+    attempt this run never gave a slot raises, so no slot is granted calls it may have spent.
+    """
+    from pluginbench import source_only  # It imports this module.
+
+    run = json.loads((root / "run.json").read_text())
+    slots = {
+        entry["id"]: slot
+        for slot, entry in enumerate(_bound_document(root, run["plan"])["entries"])
+    }
+    for path in sorted((root / "discarded").glob("*.json")):
+        discarded = json.loads(path.read_text())
+        slots[discarded["id"]] = discarded["slot"]
+    complete = {key for key, state in run["attempt_states"].items() if state == "complete"}
+
+    def row(attempt: str, stage: str, state: str) -> invocation_ledger.HistoryRow:
+        if attempt not in slots:
+            raise ValueError(
+                f"cannot tell which slot attempt {attempt} belongs to, so the calls it made "
+                "cannot be counted and no further call starts; start a new run"
+            )
+        return slots[attempt], stage, attempt, state
+
+    rows = []
+    for receipt in sorted((root / "invocations").glob("*/*.json")):
+        attempt = receipt.parent.name
+        rows.append(row(attempt, "coding", "finished" if attempt in complete else "unresolved"))
+    rows += [
+        row(staging.parent.name, "grading", "unresolved")
+        for staging in sorted((root / source_only.DIRECTORY).glob("filter-*/*/*.try-*"))
+    ]
+    return rows
 
 
 def is_graded_run(plan: dict[str, Any]) -> bool:
@@ -1775,6 +1816,28 @@ def _run_attempts(
                 assert invocation is not None
                 _on_coordinator(emit, partial(ledger.invocation_started, invocation, pid))
 
+            def regrade(**arguments: Any) -> dict[str, object]:
+                """A cached attempt's verifier replay: one grading invocation of this slot,
+                committed before it starts. `commit` finishes it when the attempt completes."""
+                replay = _on_coordinator(
+                    emit,
+                    partial(ledger.intent, slot=index, stage="grading", attempt_id=entry["id"]),
+                )
+                replay_spawned = False
+
+                def replay_spawn(pid: int) -> None:
+                    nonlocal replay_spawned
+                    replay_spawned = True
+                    _on_coordinator(emit, partial(ledger.invocation_started, replay, pid))
+
+                try:
+                    return harbor_backend.regrade_native(**arguments, on_spawn=replay_spawn)
+                except BaseException as failure:
+                    if not isinstance(failure, RunMoved):
+                        ended = invocation_ledger.outcome(failure, spawned=replay_spawned)
+                        emit(partial(ledger.end, replay, *ended))
+                    raise
+
             try:
                 unmoved()
                 attempt_dir = root / "attempts" / entry["id"]
@@ -1791,6 +1854,11 @@ def _run_attempts(
                 )
                 record.update(before=before, before_evidence=before_evidence or None)
                 if imported is not None:
+                    refused = _on_coordinator(emit, partial(ledger.refusal, index, "grading"))
+                    if refused is not None:
+                        # Its replays are spent; it stays unfinished while other slots go on.
+                        error = refused
+                        return
                     for stage in record["stages"]:
                         target = attempt_dir / stage["id"]
                         execution = json.loads((target / "execution.json").read_text())
@@ -1799,7 +1867,7 @@ def _run_attempts(
                         )
                         stage["work"] = _work(execution)
                         if stage["snapshot"] is not None:
-                            regraded = harbor_backend.regrade_native(
+                            regraded = regrade(
                                 artifacts=target / "artifacts",
                                 task_dir=task.native_task,
                                 identity=native_identity(task),

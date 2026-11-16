@@ -10,6 +10,7 @@ import io
 import json
 import hashlib
 import os
+import sqlite3
 import shlex
 import signal
 from types import SimpleNamespace
@@ -2424,6 +2425,19 @@ def _reviewed_run(
     root = tmp_path / "run"
     evaluation.run_evaluation(config, root)
     return root, reviews
+
+
+def test_an_evaluation_ceiling_holds_every_coding_and_review_slot_s_cap(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, reviews = _reviewed_run(config, tmp_path, monkeypatch)
+    connection = sqlite3.connect(root / "evidence/ledger.sqlite")
+    try:
+        [(ceiling,)] = connection.execute("SELECT paid_call_ceiling FROM budget").fetchall()
+    finally:
+        connection.close()
+    # Nine coding slots, each reviewed once.
+    assert len(reviews) == 9 and ceiling == 3 * (9 + 9)
 
 
 def test_review_with_another_reviewer_records_and_reports_that_reviewer(

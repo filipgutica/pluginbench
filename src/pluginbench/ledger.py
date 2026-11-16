@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -108,6 +108,36 @@ class CeilingReached(InvocationRefused):
     """The run reached its paid-call ceiling."""
 
 
+# (slot, stage, attempt ID, state) of an invocation a run's evidence shows, for a ledger built
+# or migrated after the calls it records.
+HistoryRow = tuple[int, str, str, str]
+
+
+def _insert(db: sqlite3.Connection, *, slot: int, stage: str, attempt_id: str, state: str) -> str:
+    """Add the next invocation of `slot` and `stage`; return its ID."""
+    n = db.execute(
+        "SELECT COUNT(*) FROM invocations WHERE slot = ? AND stage = ?", (slot, stage)
+    ).fetchone()[0]
+    # Hex only: valid in a systemd unit name and in a Docker label value.
+    invocation = uuid4().hex
+    db.execute(
+        "INSERT INTO invocations (id, slot, stage, n, attempt_id, state, scope,"
+        " container_label, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            invocation,
+            slot,
+            stage,
+            n + 1,
+            attempt_id,
+            state,
+            f"pb-inv-{invocation}.scope",
+            f"pluginbench.invocation={invocation}",
+            _now(),
+        ),
+    )
+    return invocation
+
+
 def default_ceiling(paid_slots: int) -> int:
     """The paid-call ceiling: every paid slot's cap. Pass coding plus review slots."""
     return SLOT_CAP * paid_slots
@@ -158,12 +188,13 @@ class Ledger:
         states: dict[str, str],
         *,
         paid_call_ceiling: int | None = None,
+        history: Iterable[HistoryRow] = (),
     ) -> Ledger:
         """A new ledger with one row per plan entry, in plan (slot) order.
 
         It is built in a temporary file and renamed into place, so a killed build never leaves
         a ledger that looks valid but lacks attempts. The ceiling defaults to every slot's
-        coding cap.
+        coding cap. `history` holds the invocations a run made before it had this ledger.
         """
         entries = list(entries)
         if path.exists():
@@ -196,25 +227,59 @@ class Ledger:
                     for slot, entry in enumerate(entries)
                 ],
             )
+            for slot, stage, attempt_id, state in history:
+                _insert(connection, slot=slot, stage=stage, attempt_id=attempt_id, state=state)
         connection.close()
         temporary.replace(path)
         return cls.open(path)
 
     @classmethod
-    def open(cls, path: Path, *, paid_call_ceiling: int | None = None) -> Ledger:
-        """Open for writing. A version 1 ledger gains the invocation tables, with
-        `paid_call_ceiling`, or else every slot's coding cap, as its ceiling."""
+    def open(
+        cls,
+        path: Path,
+        *,
+        paid_call_ceiling: int | None = None,
+        history: Callable[[], Iterable[HistoryRow]] | None = None,
+    ) -> Ledger:
+        """Open for writing.
+
+        A version 1 ledger predates invocation rows. It is migrated only with `history`, the
+        invocations its run's evidence shows, so a migration never grants a slot calls it has
+        spent; without it, opening refuses. The ceiling is `paid_call_ceiling`, or else every
+        slot's coding cap.
+        """
         if not path.is_file():
             raise ValueError(f"ledger is missing: {path}")
         connection = sqlite3.connect(path)
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         if version == 1:
-            slots = connection.execute("SELECT COUNT(DISTINCT slot) FROM attempts").fetchone()[0]
-            ceiling = int(paid_call_ceiling or default_ceiling(slots))
-            connection.executescript(
-                f"BEGIN; {_INVOCATION_SCHEMA} INSERT INTO budget VALUES ({ceiling});"
-                f" PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
-            )
+            try:
+                if history is None:
+                    raise ValueError(
+                        "this ledger predates invocation rows and no invocation history was "
+                        "given to migrate it"
+                    )
+                rows = list(history())
+                slots = connection.execute(
+                    "SELECT COUNT(DISTINCT slot) FROM attempts"
+                ).fetchone()[0]
+                with connection:
+                    connection.execute("BEGIN")
+                    for statement in _INVOCATION_SCHEMA.split(";"):
+                        if statement.strip():
+                            connection.execute(statement)
+                    connection.execute(
+                        "INSERT INTO budget VALUES (?)",
+                        (paid_call_ceiling or default_ceiling(slots),),
+                    )
+                    for slot, stage, attempt_id, state in rows:
+                        _insert(
+                            connection, slot=slot, stage=stage, attempt_id=attempt_id, state=state
+                        )
+                    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            except BaseException:
+                connection.close()
+                raise
             version = SCHEMA_VERSION
         if version != SCHEMA_VERSION:
             connection.close()
@@ -269,7 +334,8 @@ class Ledger:
     def complete(self, attempt_id: str, record: dict[str, str], stages: Iterable[str]) -> None:
         """Mark complete; `record` references the attempt's record receipt, already on disk.
 
-        Its open coding invocation finishes in the same transaction: its output is accepted.
+        Its open invocations (its coding call, or a cached attempt's regrade) finish in the
+        same transaction: their output is accepted.
         """
         encoded = json.dumps(record, sort_keys=True)
         with self._db:
@@ -282,7 +348,7 @@ class Ledger:
                 raise ValueError(f"ledger cannot complete attempt {attempt_id}")
             self._db.execute(
                 "UPDATE invocations SET state = 'finished', updated_at = ?"
-                f" WHERE attempt_id = ? AND stage = 'coding' AND state IN {OPEN_STATES}",
+                f" WHERE attempt_id = ? AND state IN {OPEN_STATES}",
                 (_now(), attempt_id),
             )
             for stage in stages:
@@ -372,36 +438,27 @@ class Ledger:
             self._db.execute("BEGIN IMMEDIATE")
             if (reason := self.refusal(slot, stage)) is not None:
                 raise SlotExhausted(reason)
-            if stage in PAID_STAGES:
-                ceiling = self._db.execute("SELECT paid_call_ceiling FROM budget").fetchone()[0]
-                spent = self._db.execute(
-                    f"SELECT COUNT(*) FROM invocations WHERE stage IN {PAID_STAGES}"
-                ).fetchone()[0]
-                if spent >= ceiling:
-                    raise CeilingReached(
-                        f"the run reached its ceiling of {ceiling} paid invocations, so no "
-                        "further model call starts"
-                    )
-            n = self._db.execute(
-                "SELECT COUNT(*) FROM invocations WHERE slot = ? AND stage = ?", (slot, stage)
-            ).fetchone()[0]
-            # Hex only: valid in a systemd unit name and in a Docker label value.
-            invocation = uuid4().hex
-            self._db.execute(
-                "INSERT INTO invocations (id, slot, stage, n, attempt_id, state, scope,"
-                " container_label, updated_at) VALUES (?, ?, ?, ?, ?, 'intent', ?, ?, ?)",
-                (
-                    invocation,
-                    slot,
-                    stage,
-                    n + 1,
-                    attempt_id,
-                    f"pb-inv-{invocation}.scope",
-                    f"pluginbench.invocation={invocation}",
-                    _now(),
-                ),
-            )
-        return invocation
+            if stage in PAID_STAGES and self._paid_room() <= 0:
+                raise CeilingReached(
+                    f"the run reached its ceiling of {self._ceiling()} paid invocations, so no "
+                    "further model call starts"
+                )
+            return _insert(self._db, slot=slot, stage=stage, attempt_id=attempt_id, state="intent")
+
+    def _ceiling(self) -> int:
+        ceiling: int = self._db.execute("SELECT paid_call_ceiling FROM budget").fetchone()[0]
+        return ceiling
+
+    def _paid_room(self) -> int:
+        spent: int = self._db.execute(
+            f"SELECT COUNT(*) FROM invocations WHERE stage IN {PAID_STAGES}"
+        ).fetchone()[0]
+        return self._ceiling() - spent
+
+    def paid_room(self) -> int | None:
+        """Paid invocations the ceiling still allows; None for a version 1 ledger, whose run
+        was coded before ceilings existed."""
+        return None if self._version == 1 else self._paid_room()
 
     def invocation_started(self, invocation: str, pid: int) -> None:
         """Record the spawned child's identity: the invocation is `started`."""
