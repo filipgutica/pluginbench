@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import shutil
 import subprocess
@@ -13,7 +14,7 @@ import pytest
 
 from pluginbench import submissions
 from pluginbench.assessment_metrics import inspect_snapshot
-from pluginbench.harbor_backend import native_task_assets
+from pluginbench.harbor_backend import native_task_assets, native_task_config
 
 
 def _hash(value: object) -> str:
@@ -310,12 +311,30 @@ def test_arbitrary_model_patch_verifier_has_no_production_admission(tmp_path: Pa
         submissions.reviewed_contract(tmp_path)
 
 
+@pytest.mark.filterwarnings("error::UserWarning")
 @pytest.mark.parametrize(
     ("service_line", "admitted"),
     [("", True), ('service = "main"\n', True), ('service = "sidecar"\n', False)],
 )
+@pytest.mark.parametrize(
+    ("artifact_declaration", "task_os", "artifact_admitted"),
+    [
+        ('["/logs/artifacts/model.patch"]', "linux", True),
+        ("[]", "linux", True),
+        ("[]", "windows", False),
+        ('[{source="/logs/artifacts", exclude=["*.patch"]}]', "linux", False),
+        ('[{source="/logs/artifacts", destination="other"}]', "linux", False),
+        ('[{source="/logs/artifacts", service="sidecar"}]', "linux", False),
+    ],
+)
 def test_collection_without_service_runs_in_main(
-    service_line: str, admitted: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    service_line: str,
+    admitted: bool,
+    artifact_declaration: str,
+    task_os: str,
+    artifact_admitted: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     base = "a" * 40
     tests = tmp_path / "tests"
@@ -325,7 +344,7 @@ def test_collection_without_service_runs_in_main(
     (tests / "config.json").write_text(json.dumps({"base_commit": base}))
     # Upstream DeepSWE tasks omit the service; Harbor defaults it to main.
     (tmp_path / "task.toml").write_text(
-        'artifacts = ["/logs/artifacts/model.patch"]\n'
+        f'artifacts = {artifact_declaration}\n[environment]\nos = "{task_os}"\n'
         '[verifier]\nnetwork_mode = "no-network"\nenvironment_mode = "separate"\n'
         "[[verifier.collect]]\n"
         'command = "cd /app && mkdir -p /logs/artifacts && git config --global --add '
@@ -334,8 +353,17 @@ def test_collection_without_service_runs_in_main(
     )
     monkeypatch.setattr(submissions, "_REVIEWED_TESTS", {native_task_assets(tests): base})
     monkeypatch.setattr(submissions, "_GRADER_SHA256", hashlib.sha256(b"grader.py\n").hexdigest())
-    if admitted:
-        assert submissions.reviewed_contract(tmp_path)["base_commit"] == base
+    if admitted and artifact_admitted:
+        contract = submissions.reviewed_contract(tmp_path)
+        assert contract["base_commit"] == base
+        if artifact_declaration != "[]":
+            (tmp_path / "environment").mkdir()
+            (tmp_path / "instruction.md").write_text("Fix the requested behavior.\n")
+            config_type = importlib.import_module("harbor.models.task.config").TaskConfig
+            normalized = config_type.model_validate(native_task_config(tmp_path))
+            assert normalized.artifacts == []
+            (tmp_path / "task.toml").write_text(normalized.model_dump_toml())
+            assert submissions.reviewed_contract(tmp_path) == contract
     else:
         with pytest.raises(ValueError, match="collection or environment changed"):
             submissions.reviewed_contract(tmp_path)
