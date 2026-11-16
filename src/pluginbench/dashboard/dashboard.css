@@ -80,6 +80,10 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 .results td:first-child { min-width: 12rem; }
 .results td:nth-child(5) { min-width: 10rem; }
+/* Eighteen columns: long headers such as "Verification iterations (transcript count)" wrap. */
+.results thead th { white-space: normal; min-width: 4.5rem; }
+.findings { white-space: nowrap; }
+.results td.num .sub { overflow-wrap: normal; }
 .badges { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-top: var(--space-1); }
 .alerts { margin-bottom: var(--space-4); }
 .alerts li { align-items: flex-start; }
