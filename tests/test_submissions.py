@@ -175,8 +175,11 @@ def test_apply_failure_does_not_publish_partial_or_overwrite_existing_source(
 ) -> None:
     working_sources: list[Path] = []
     if failure == "timeout":
+        run = subprocess.run
 
-        def timed_out(command: list[str], *, cwd: Path, **options: object) -> None:
+        def timed_out(command: list[str], *, cwd: Path, **options: Any) -> Any:
+            if "--numstat" in command:  # Reading the patch's paths, before any apply.
+                return run(command, cwd=cwd, **options)
             working_sources.append(cwd)
             (cwd / "code.py").write_text("partially applied\n")
             raise subprocess.TimeoutExpired(
@@ -227,7 +230,14 @@ def test_extended_patch_headers_cannot_redirect_to_unchecked_paths(
         + destination
         + "\n"
     )
-    with pytest.raises(ValueError, match="excluded|inconsistent"):
+    if destination == "hidden-test.py":
+        # Git reads the copy or rename target from its own lines, and that is the path checked:
+        # the hidden tests overwrite it, as for any patch that writes a hidden test path.
+        receipt = submissions.reconstruct(**_write_patch(inputs, patch))
+        overlap = receipt["trusted_test_overlap"]
+        assert isinstance(overlap, list) and "hidden-test.py" in overlap
+        return
+    with pytest.raises(ValueError, match="excluded"):
         submissions.reconstruct(**_write_patch(inputs, patch))
     assert not inputs["destination"].exists()
 
@@ -235,9 +245,11 @@ def test_extended_patch_headers_cannot_redirect_to_unchecked_paths(
 def test_patch_marker_disagreement_cannot_bypass_base_preimage_check(
     inputs: dict[str, Any],
 ) -> None:
+    # Git reads other.py as the preimage, so the patch is checked, and applied, against it.
     patch = _EDIT.replace("--- a/code.py", "--- a/other.py")
-    with pytest.raises(ValueError, match="header and marker"):
+    with pytest.raises(ValueError, match="could not be safely reconstructed: error: other.py"):
         submissions.reconstruct(**_write_patch(inputs, patch))
+    assert not inputs["destination"].exists()
 
 
 @pytest.mark.parametrize("path", ["../escape.py", ".git/config", "node_modules/module.js"])
@@ -250,7 +262,7 @@ def test_unsafe_and_excluded_patch_paths_are_rejected(inputs: dict[str, Any], pa
 
 def test_symlink_patch_modes_and_linked_artifacts_are_rejected(inputs: dict[str, Any]) -> None:
     patch = "diff --git a/link b/link\nnew file mode 120000\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+code.py\n"
-    with pytest.raises(ValueError, match="file mode"):
+    with pytest.raises(submissions.PolicyViolation, match="symlink"):
         submissions.reconstruct(**_write_patch(inputs, patch))
     kwargs = _write_patch(inputs, _EDIT)
     destination = inputs["destination"]

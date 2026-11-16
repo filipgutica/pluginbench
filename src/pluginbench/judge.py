@@ -31,7 +31,6 @@ from pluginbench import codex, study
 from pluginbench.arms import normalize_arm_name
 from pluginbench.assessment import _load_manifest
 from pluginbench.assessment_models import Attempt, InputModel, Snapshot
-from pluginbench.evaluation_report import correctness_state
 from pluginbench.parallel import run_jobs, validate_jobs
 from pluginbench.datasets import TaskCatalog
 from pluginbench.study_review import (
@@ -44,8 +43,8 @@ from pluginbench.study_review import (
 KEY = "key.json"
 PANEL = "panel.json"
 SCHEMA = "response-schema.json"
-# An overlap pass counts as a pass: the verifier graded the production code with its own tests.
-PASSING = {"pass", "overlap_pass"}
+# The report's one grade per attempt; anything else (infra, legacy, ungraded) is no pass.
+PASSING = {"pass"}
 HARNESSES = {"codex", "claude"}
 # Version 2 added judge_cli_version. A binding without a version is version 1.
 BINDING_VERSION = "2"
@@ -118,7 +117,7 @@ class Submission:
     arm: str
     attempt: str
     repeat: int
-    correctness: str
+    correctness: str | None  # The attempt's grade, as the report gives it.
     before_digest: str
     # The review packet, or what stands in for it when the run has none.
     source: Path | Saved
@@ -312,7 +311,7 @@ def load_submissions(
             arm=arm,
             attempt=row["id"],
             repeat=key[1],
-            correctness=correctness_state(row["correctness"], row.get("native_grading")),
+            correctness=row["correctness"],
             before_digest=artifacts["before_digest"],
             source=source,
         )
@@ -901,7 +900,7 @@ def tally(directory: Path, *, require_bound: bool = False) -> dict[str, Any]:
     )
     return {
         "schema_version": 1,
-        "rule": "If exactly one side passed (pass or overlap pass), it wins without a vote. "
+        "rule": "If exactly one side passed, it wins without a vote. "
         "Otherwise the side more than half of the judges prefer wins; anything else is half each.",
         "judges": judges,
         "unbound": len(unbound),

@@ -3,7 +3,7 @@
 Reproduction uses the same pinned inputs and checks results against stated bounds.
 Model sampling varies, so identical inputs do not guarantee identical numbers.
 The seed controls attempt ordering and identities; it does not fix provider sampling.
-Declare the metrics, tolerances, task set, repeats, and overlap-pass policy before comparing results.
+Declare the metrics, tolerances, task set, and repeats before comparing results.
 One task and one repeat demonstrate the workflow; they do not establish statistical reproducibility.
 
 No evaluation result is published yet.
@@ -95,7 +95,6 @@ The version and commit text files are manual provenance notes, not hash-bound ru
 Save this as `gates.yaml` to inspect vanilla correctness counts without asserting a treatment improvement:
 
 ```yaml
-count_overlap_passes: false
 gates: []
 ```
 

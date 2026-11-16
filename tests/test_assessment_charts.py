@@ -13,6 +13,19 @@ import pytest
 from pluginbench.assessment_charts import chart_artifacts_from_data, chart_data
 
 
+def graded(state: str, **attributes: bool) -> dict[str, object]:
+    """A grade contract 1 record: pass or fail with its attributes, or an infrastructure error."""
+    if state == "infra":
+        return {"grade_contract": 1, "status": "infra", "reason": "fixture infrastructure error"}
+    return {
+        "grade_contract": 1,
+        "status": "complete",
+        "passed": state == "pass",
+        "fail_reason": None,
+        "attributes": {"timed_out": False, "agent_error": False, **attributes},
+    }
+
+
 def _report() -> dict[str, object]:
     """Synthetic canonical-shaped observations, used only to exercise chart mapping."""
     provenance = {
@@ -75,6 +88,7 @@ def _report() -> dict[str, object]:
             "elapsed_seconds": 5,
         },
         "correctness": {"status": "pass"},
+        "source_only_grading": graded("pass"),
         "metrics": metrics,
     }
     attempts = [
@@ -97,6 +111,7 @@ def _report() -> dict[str, object]:
     ]
     return {
         "schema_version": 1,
+        "grade_contract": 1,
         "name": "Synthetic chart tests",
         "snapshot_roots": [],
         "attempts": attempts,

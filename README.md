@@ -9,7 +9,7 @@ It then compares correctness, tokens, and the code each attempt added.
 ## What you get
 
 - **Arms.** Vanilla is always included. Each *treatment* is a named set of instruction files, skills, or plugins that you declare in the config. Every treatment is compared with vanilla.
-- **Attempts.** Each task runs once per arm and repeat, in a fresh Docker container, through Harbor 0.24.0. The task's own verifier decides pass or fail.
+- **Attempts.** Each task runs once per arm and repeat, in a fresh Docker container, through Harbor 0.24.0. Each attempt passes or fails: the task's own verifier grades the submitted patch without the agent's own test files. A timeout or agent error is graded with that attribute. An attempt that cannot be graded is an infrastructure error: it counts in no total, and `pluginbench run <run-dir>` codes or grades it again. [Correctness](docs/running-evaluations.md#correctness).
 - **Measures.** You select them in the config:
 
 | Measurement | What it counts | Extra requirement |
@@ -252,7 +252,8 @@ Every setting lives in the config. Flags only control how a command runs.
 
 ## Limits
 
-- A pass means the task's verifier passed. Task checks do not prove that every behavior is preserved.
+- A pass means the task's verifier passed on the submitted source without the agent's tests. Task checks do not prove that every behavior is preserved.
+- The correctness alarm is a gate such as "no fewer passes than vanilla". Runs from before grade contract 1 are labelled legacy and have no grade.
 - Discovery proves that a skill was available, not that the model used it.
 - Smaller numbers alone do not prove better work. Coverage does not prove that assertions are useful.
 - Unknown values are never shown as zero.

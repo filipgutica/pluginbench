@@ -104,7 +104,12 @@ def runtime_identity() -> dict[str, object]:
 
 
 def task_entry(
-    root: Path, name: str, *, answer_path: str = "src/answer.py", version: str = "1.2.3"
+    root: Path,
+    name: str,
+    *,
+    answer_path: str = "src/answer.py",
+    version: str = "1.2.3",
+    solution: str | None = None,
 ) -> dict[str, object]:
     source = root / "fixtures" / name
     answer = source / answer_path
@@ -118,6 +123,10 @@ def task_entry(
     )
     (task / "tests/test.sh").write_text("#!/bin/sh\nexit 0\n")
     (task / "tests/test.patch").write_text("")
+    if solution is not None:
+        # The source-only grade needs the reference solution to tell its files from tests.
+        (task / "solution").mkdir()
+        (task / "solution/solution.patch").write_text(solution)
     image = {
         "image": "sha256:" + "c" * 64,
         "image_id": "sha256:" + "c" * 64,
@@ -212,14 +221,21 @@ def execution(
     }
     image = identity["image_identity"]
     assert isinstance(image, dict)
+    try:
+        exported: dict[str, object] = {
+            "snapshot_digest": inspect_snapshot(area / "workspace")["digest"],
+            "source_metadata_digest": harbor_backend.native_task_assets(area / "workspace"),
+        }
+        export_error = None
+    except ValueError as error:  # As Harbor's export refuses a workspace symlink.
+        exported, export_error = {"snapshot_digest": None, "source_metadata_digest": None}, error
     export = {
         "status": "complete",
         "stopped": True,
         "container_id": "f" * 64,
         "project": "pluginbench-" + "f" * 32 + "__env",
         "state": state,
-        "snapshot_digest": inspect_snapshot(area / "workspace")["digest"],
-        "source_metadata_digest": harbor_backend.native_task_assets(area / "workspace"),
+        **exported,
         "image_id": image["image_id"],
         "workdir": "/app",
         "resources": runtime["resources"],
@@ -300,9 +316,12 @@ expose_spawn_agent_model_overrides = false
     )
     return {
         "native_treatment": treatment,
-        "submission_collected": True,
         "successful_native_completion": True,
-        "submission_export_digest": export["snapshot_digest"],
+        **(
+            {"submission_collected": True, "submission_export_digest": export["snapshot_digest"]}
+            if export_error is None
+            else {"submission_collected": False, "submission_error": str(export_error)}
+        ),
         "private_runtime_removed": True,
         "native_verifier_result": {"rewards": {"reward": reward}},
         "native_artifact_hashes": {

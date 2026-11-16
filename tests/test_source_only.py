@@ -27,8 +27,8 @@ def test_no_pinned_reference_solution_loses_a_file_it_changes() -> None:
     lost = {}
     for solution in solutions:
         _, reference = source_only._task_paths(solution.parents[1])
-        filtered, _ = source_only._without_tests(solution.read_text(), reference)
-        if missing := reference - submissions._patch_paths(filtered):
+        filtered, _ = source_only._without_tests(solution.read_bytes(), reference)
+        if missing := reference - submissions.patch_paths(filtered):
             lost[solution.parents[1].name] = sorted(missing)
 
     # bandit's core/test_set.py, expr's vm/vm_test.go and meriyah's snapshot are among them.
@@ -42,9 +42,9 @@ def test_reference_solution_files_stay_and_every_conftest_leaves() -> None:
         "fixtures/b.css", "examples/c.py",
     ]
     removed = ["benchmarks/x/conftest.py", "conftest.py", "skrub/conftest.py", "vm/run_test.go"]
-    patch = "".join(_section(path) for path in kept + removed)
+    patch = "".join(_section(path) for path in kept + removed).encode()
 
     filtered, left_out = source_only._without_tests(patch, reference)
 
     assert left_out == removed
-    assert filtered == "".join(_section(path) for path in kept)
+    assert filtered == "".join(_section(path) for path in kept).encode()

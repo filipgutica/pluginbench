@@ -347,16 +347,15 @@ for (const option of metricSelect.querySelectorAll("option")) {
 }
 const KEY_METRICS = ["Uncached input tokens", "Output tokens", "Coding time", "Source lines added", "Net cognitive complexity added", "Net cyclomatic complexity added", "Functions added", "Complexity hotspots added", "Introduced dead findings", "Test lines added", "Changed-line coverage %", "Redundant added tests", "Duplicated added test lines", "Total review findings"];
 function taskCheckSummary(attempts) {
-  const executions = attempts.filter(row => ["failed", "timed_out"].includes(row.execution?.status));
-  const completed = attempts.filter(row => !executions.includes(row));
-  const passed = completed.filter(row => row.correctness === "pass").length;
-  const failed = completed.filter(row => row.correctness === "fail" && row.execution?.status === "complete").length;
-  // Overlap passes: the verifier passed every test, but trusted tests overwrote files the agent changed.
-  const overlap = completed.filter(row => row.correctness === "overlap_pass").length;
-  const unknown = attempts.length - passed - failed - overlap - executions.length;
+  // Each attempt passes or fails; an infrastructure error or a legacy grade is no result.
+  const graded = attempts.filter(row => row.correctness === "pass" || row.correctness === "fail");
+  const passed = graded.filter(row => row.correctness === "pass").length;
+  const timedOut = graded.filter(row => row.grade_attributes?.timed_out).length;
+  const agentErrors = graded.filter(row => row.grade_attributes?.agent_error).length;
+  const ungraded = attempts.length - graded.length;
   return {
-    passed: passed + "/" + attempts.length + " attempts passed",
-    remainder: failed + " failed task check" + (failed === 1 ? "" : "s") + (overlap ? " · " + overlap + " overlap pass" + (overlap === 1 ? "" : "es") : "") + " · " + executions.length + " execution failure" + (executions.length === 1 ? "" : "s") + " · " + unknown + " unknown",
+    passed: passed + "/" + graded.length + " graded attempts passed",
+    remainder: (graded.length - passed) + " failed · " + timedOut + " timed out · " + agentErrors + " agent error" + (agentErrors === 1 ? "" : "s") + " · " + ungraded + " not graded",
   };
 }
 // Overview: equal-weight mean of per-task ratios. Task view: this task's ratio, or a difference when the reference is zero.
@@ -539,7 +538,7 @@ function showOutcomes() {
   const target = document.getElementById("outcomes");
   target.replaceChildren();
   create("h2", "Task checks", target);
-  create("p", "Completed task-check failures, native execution failures, and unknown outcomes are counted separately. All attempts remain assigned; these counts do not establish why an execution failed.", target).className = "counts";
+  create("p", "Each attempt passes or fails. A timeout or an agent error is counted beside its grade, never instead of it. An attempt with no grade (an infrastructure error, retried, or a legacy run) is in no pass rate.", target).className = "counts";
   const attempts = (data.attempts || []).filter(row => !taskSelect.value || row.task === taskSelect.value);
   const table = create("table", undefined, target);
   const header = create("tr", undefined, table);
@@ -555,7 +554,7 @@ function showOutcomes() {
   const failures = attempts.filter(row => ["failed", "timed_out"].includes(row.execution?.status));
   if (!failures.length) return;
   create("h3", "Native execution failures", target);
-  create("p", "Execution failures are separate from task checks. Available metrics remain shown; partial token receipts are lower bounds, not final totals.", target).className = "counts";
+  create("p", "These graded attempts timed out or ended with an agent error. Available metrics remain shown; partial token receipts are lower bounds, not final totals.", target).className = "counts";
   const wrap = create("div", undefined, target); wrap.className = "table-wrap";
   const failureTable = create("table", undefined, wrap), head = create("tr", undefined, create("thead", undefined, failureTable));
   for (const label of ["Task", "Guidance", "Run", "Execution reason"]) create("th", label, head).scope = "col";
@@ -677,7 +676,7 @@ function drawEvaluationPlot({ parent, rows, metric }) {
     ? arms.map(arm => ({ type: "bar", name: armLabel(arm), barMaxWidth: 14, barGap: "15%", label, data: categories.map(group => barItem(plotRows.find(row => row.group === group && row.guidance === arm))) }))
     : [{ type: "bar", name: raw ? "Raw values" : "Delta vs vanilla", barMaxWidth: 16, label, data: plotRows.map(barItem) }];
   if (!raw) series[0].markLine = { silent: true, symbol: "none", data: [{ xAxis: 0 }], lineStyle: { color: text }, label: { show: false } };
-  if (raw && !overview && showRuns.checked) series.push({ type: "scatter", symbolSize: 7, data: plotRows.flatMap((row, index) => row.rawRuns.map((observation, repeat) => ({ value: [observation.value, index], observation, symbol: observation.correctness === "fail" ? "rect" : observation.correctness === "unknown" ? "emptyCircle" : "circle", symbolOffset: [0, (repeat % 3 - 1) * 4], itemStyle: { color: color(row) } }))) });
+  if (raw && !overview && showRuns.checked) series.push({ type: "scatter", symbolSize: 7, data: plotRows.flatMap((row, index) => row.rawRuns.map((observation, repeat) => ({ value: [observation.value, index], observation, symbol: observation.correctness === "fail" ? "rect" : observation.correctness !== "pass" ? "emptyCircle" : "circle", symbolOffset: [0, (repeat % 3 - 1) * 4], itemStyle: { color: color(row) } }))) });
   chart.setOption({ animation: false,
     aria: { enabled: true, label: { description: overview && chartBreakdown.value === "tasks" ? "One bar per task and package; select a task to inspect repeated runs." : overview ? "Equal-weight average of each task's median. Each package is compared with vanilla; negative deltas are not automatically better." : "Task-level medians or deltas vs vanilla, with individual runs available in raw mode." } },
     grid: { left: container.clientWidth < 500 ? 120 : 180, right: 100, top: 16, bottom: 48 }, textStyle: { color: text, fontFamily: getComputedStyle(document.body).fontFamily },

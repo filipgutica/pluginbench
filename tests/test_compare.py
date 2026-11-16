@@ -39,9 +39,6 @@ def _gate(name: str) -> Gate:
 def _gates_file(tmp_path: Path, **changes: object) -> Path:
     raw = yaml.safe_load((FIXTURE / "card-gates.yaml").read_text())
     for name, change in changes.items():
-        if name == "count_overlap_passes":
-            raw[name] = change
-            continue
         gate = next(gate for gate in raw["gates"] if gate["name"] == name.replace("_", " "))
         gate.update(change)
     path = tmp_path / "gates.yaml"
@@ -64,7 +61,7 @@ def test_compare_reads_both_report_arm_names(tmp_path: Path, version: int, arm: 
         }],
     }))
     gates = tmp_path / "gates.yaml"
-    gates.write_text("count_overlap_passes: false\ngates: []\n")
+    gates.write_text("gates: []\n")
     before = report.read_bytes()
     result = CliRunner().invoke(cli.app, ["compare", f"{root}=vanilla", "--gates", str(gates)])
     assert result.exit_code == 0, result.output
@@ -296,22 +293,35 @@ def test_a_factor_limit_keeps_its_slack_when_the_comparator_is_negative() -> Non
     assert verdict.limit == pytest.approx(-0.45) and verdict.result == "pass"
 
 
-@pytest.mark.parametrize("counted", [True, False])
-def test_gates_choose_whether_overlap_passes_count(tmp_path: Path, counted: bool) -> None:
-    gates = load_gates(_gates_file(tmp_path, count_overlap_passes=counted))
+def test_a_pass_gate_counts_each_attempt_s_one_grade() -> None:
+    gates = load_gates(FIXTURE / "card-gates.yaml")
     gate = next(gate for gate in gates.gates if gate.name == "passes")
-    # One workflow-main climb attempt is an overlap pass; one vanilla one has reward 0 (a fail).
     verdict = check_gate(load_evidence(PILOT), gates, gate, "workflow-main", CLIMB)
-    assert (verdict.candidate, verdict.comparator) == ((12, 11) if counted else (11, 11))
+    assert (verdict.candidate, verdict.comparator) == (12, 11)
 
 
-def test_gates_file_must_choose_overlap_passes(tmp_path: Path) -> None:
+def test_the_removed_overlap_setting_is_refused_with_its_replacement(tmp_path: Path) -> None:
     raw = yaml.safe_load((FIXTURE / "card-gates.yaml").read_text())
-    del raw["count_overlap_passes"]
     path = tmp_path / "gates.yaml"
-    path.write_text(yaml.safe_dump(raw))
+    path.write_text(yaml.safe_dump({"count_overlap_passes": True, **raw}))
     result = CliRunner().invoke(cli.app, ["compare", *PILOT, "--gates", str(path)])
-    assert result.exit_code == 2 and "count_overlap_passes" in result.stderr
+    assert result.exit_code == 2 and "count_overlap_passes was removed" in result.stderr
+
+
+def test_a_legacy_report_has_no_grade_for_a_pass_gate(tmp_path: Path) -> None:
+    run = tmp_path / "legacy"
+    shutil.copytree(FIXTURE / "pilot-no-coverage", run)
+    results = run / "report/results.json"
+    data = json.loads(results.read_text())
+    del data["grade_contract"]
+    results.write_text(json.dumps(data))
+    evidence = load_evidence([str(run)])
+    assert {row.correctness for row in evidence.attempts} == {"legacy"}
+    gates = load_gates(FIXTURE / "card-gates.yaml")
+    gate = next(gate for gate in gates.gates if gate.name == "passes")
+    tasks = sorted({row.task for row in evidence.attempts})
+    verdict = check_gate(evidence, gates, gate, "workflow-main", tasks)
+    assert verdict.result == "undetermined" and "have no grade" in verdict.detail
 
 
 def test_round_one_takes_the_incumbent_from_the_pilot_only_when_selected() -> None:
@@ -354,6 +364,7 @@ def _write_run(directory: Path, attempts: list[Attempt], references: dict[str, f
     report = directory / "report"
     report.mkdir(parents=True)
     data = {
+        "grade_contract": 1,
         "attempts": [
             {"id": row.id, "task": row.task, "guidance": row.arm, "correctness": row.correctness}
             for row in attempts
@@ -430,36 +441,27 @@ def test_a_pass_count_gate_with_unequal_attempts_per_task_is_undetermined() -> N
 
 
 @pytest.mark.parametrize("name", ["passes", "passes per task"])
-@pytest.mark.parametrize("counted", [True, False])
-def test_unknown_grades_leave_a_pass_count_gate_open_when_they_could_change_it(
-    tmp_path: Path, name: str, counted: bool
-) -> None:
+def test_an_attempt_with_no_grade_leaves_a_pass_count_gate_undetermined(name: str) -> None:
     evidence = Evidence(
         attempts=[
             Attempt(f"{arm}-{n}", "run", "task", arm, state, {})
             for arm, states in (
-                ("candidate", ["pass", "overlap_pass", "unknown"]),
+                ("candidate", ["pass", "pass", "infra"]),
                 ("vanilla", ["pass", "pass", "pass"]),
             )
             for n, state in enumerate(states)
         ]
     )
-    gates = load_gates(_gates_file(tmp_path, count_overlap_passes=counted))
+    gates = load_gates(FIXTURE / "card-gates.yaml")
     gate = next(gate for gate in gates.gates if gate.name == name)
 
     verdict = check_gate(evidence, gates, gate, "candidate", ["task"])
 
-    unknowns = "1 candidate and 0 comparator attempts with unknown correctness"
-    if counted:
-        # 2 or 3 passes against 3 with tolerance 1: the unknown cannot change the result.
-        assert verdict.result == "pass"
-        assert verdict.detail.endswith(f"; {unknowns} cannot change the result")
-    else:
-        # An overlap pass is a known non-pass here: 1 or 2 passes, and the unknown decides.
-        assert (verdict.result, verdict.detail) == (
-            "undetermined",
-            f"{unknowns} could change the result",
-        )
+    # An infrastructure error is retried, never counted as a pass or a fail.
+    assert (verdict.result, verdict.detail) == (
+        "undetermined",
+        "1 candidate and 0 comparator attempts have no grade",
+    )
 
 
 def test_a_metric_gate_with_a_task_on_one_side_only_is_undetermined() -> None:
@@ -595,8 +597,7 @@ def test_saved_token_gates_require_validation_provenance(
     specs = [directory + "=vanilla", directory + "=candidate"]
     evidence = load_evidence(specs)
     gates_path = tmp_path / "gates.yaml"
-    gates_path.write_text(yaml.safe_dump({"count_overlap_passes": True,
-                                        "gates": [_gate("tokens").model_dump(exclude_none=True)]}))
+    gates_path.write_text(yaml.safe_dump({"gates": [_gate("tokens").model_dump(exclude_none=True)]}))
     gates = load_gates(gates_path)
     tasks = [f"task-{index}" for index in range(6)]
     for gate in (

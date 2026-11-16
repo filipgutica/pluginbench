@@ -19,10 +19,9 @@ const PHASES = {
 };
 const OUTCOMES = {
   pass: ["Pass", "success"],
-  overlap_pass: ["Overlap pass", "warning"],
   fail: ["Fail", "danger"],
-  empty: ["Empty patch", "danger"],
-  unknown: ["Unknown", ""],
+  infra: ["Infrastructure error", "warning"],
+  legacy: ["Legacy", ""],
 };
 const STATES = {
   pending: ["Pending", ""],

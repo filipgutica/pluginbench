@@ -15,14 +15,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from pluginbench import run_lock, trial_containers
+from pluginbench import grade, run_lock, trial_containers
 from pluginbench.arms import normalize_arm_name
-from pluginbench.evaluation_report import correctness_state
 from pluginbench.ledger import LEDGER_NAME, Ledger
 
 # Bump on any change that removes or renames a field, or adds a value to an existing enum;
-# adding a field keeps the version. 2: `tokens_status` gained `unvalidated`.
-SCHEMA_VERSION = 2
+# adding a field keeps the version. 2: `tokens_status` gained `unvalidated`. 3: `outcome` is
+# pass, fail, infra or legacy (grade contract 1); overlap_pass, empty and unknown are gone.
+SCHEMA_VERSION = 3
 
 TOKEN_FIELDS = (
     "input_tokens",
@@ -34,12 +34,11 @@ TOKEN_FIELDS = (
 # Native attempts have one stage; its receipts live under attempts/<id>/handoff/.
 _STAGE = "handoff"
 # The `alerts` block's own version, bumped on the same rules as SCHEMA_VERSION; a new `kind`
-# or `severity` is a new enum value. 2: `native_completion_failed` added.
-ALERTS_SCHEMA_VERSION = 2
+# or `severity` is a new enum value. 2: `native_completion_failed` added. 3: it is removed; a
+# failed session is an attribute of a graded attempt, or an infrastructure error.
+ALERTS_SCHEMA_VERSION = 3
 # Worst first; status lists alerts in this order.
 _SEVERITIES = ("error", "warning")
-# sha256 of no bytes: the verifier graded an empty patch.
-_EMPTY_PATCH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
 def _read(path: Path) -> Any:
@@ -97,30 +96,44 @@ def _failure_reason(error: object) -> str | None:
     return str(error) if error else None
 
 
-def _outcome(handoff: Path) -> tuple[str, str | None]:
-    """pass, overlap_pass, fail, empty, or unknown with a saved failure or verifier reason."""
-    checks = ((_read(handoff / "correctness.json") or {}).get("checks") or {})
-    verifier = _read(handoff / "verifier-result.json") or {}
-    # A passing verifier or empty patch cannot rescue a coding session that failed its checks;
-    # the report scores it as a failed receipt, which a withheld overlap result can leave unknown.
-    if checks.get("native_completion") is False:
-        current = handoff / "execution-current.json"
-        execution = _read(current if current.is_file() else handoff / "execution.json") or {}
-        reason = _failure_reason(execution.get("treatment_error") or execution.get("error"))
-        return correctness_state("fail", verifier), reason or "native completion failed"
-    if verifier.get("patch_sha256") == _EMPTY_PATCH:
-        return "empty", None
-    behavior = checks.get("behavior")
-    if behavior is True:
-        return "pass", None
-    if behavior is False:
-        return "fail", None
-    outcome = correctness_state("unknown", verifier)
-    if outcome != "unknown":
-        return outcome, None
-    # An attempt with no graded submission keeps why: a failed call names its error here.
-    failure = _failure_reason((_read(handoff / "unsupported-submission.json") or {}).get("error"))
-    return "unknown", verifier.get("reason") or failure or "no correctness receipt"
+def _grades(evidence: Path, selection: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Each attempt's handoff grade record, or its grade-stage infrastructure error."""
+    reference = selection.get("source_only_grades")
+    index = _read(evidence / reference["path"]) if isinstance(reference, dict) else None
+    if not isinstance(index, dict):
+        return {}
+    grades = {
+        attempt: record
+        for attempt, stages in index.get("records", {}).items()
+        if isinstance(stage := stages.get(_STAGE), dict)
+        and isinstance(record := _read(evidence / stage["path"]), dict)
+    }
+    for attempt, stages in index.get("pending", {}).items():
+        if _STAGE in stages:
+            grades[attempt] = {
+                "grade_contract": index.get("grade_contract"),
+                "status": "infra",
+                "reason": stages[_STAGE],
+            }
+    return grades
+
+
+def _outcome(
+    row: dict[str, Any], handoff: Path, grades: dict[str, dict[str, Any]], graded_run: bool
+) -> tuple[str | None, str | None]:
+    """The attempt's grade (pass, fail, infra, legacy), from its one grade record; else None.
+
+    An attempt whose coding ended in an infrastructure error is `infra` until a resume
+    replaces it. A complete attempt reads None until the grade stage has graded it.
+    """
+    if row["state"] == "interrupted":
+        receipt = _read(handoff / grade.INFRASTRUCTURE_ERROR)
+        return ("infra", receipt.get("reason")) if isinstance(receipt, dict) else (None, None)
+    if row["state"] != "complete":
+        return None, None
+    if not graded_run:
+        return "legacy", f"graded before grade contract {grade.GRADE_CONTRACT}"
+    return grade.outcome(grades.get(row["id"])) or (None, "not graded yet")
 
 
 def _slots(evidence: Path, run: dict[str, Any] | None) -> tuple[list[dict[str, Any]], str]:
@@ -256,30 +269,6 @@ def _alerts(
     items: list[dict[str, Any]] = []
     if error:
         items.append({"kind": "run_failed", "severity": "error", "message": error})
-    groups: dict[str, list[dict[str, Any]]] = {}
-    for attempt in attempts:
-        if attempt["state"] != "complete":
-            continue
-        handoff = evidence / "attempts" / attempt["id"] / _STAGE
-        checks = ((_read(handoff / "correctness.json") or {}).get("checks") or {})
-        if checks.get("native_completion") is False:
-            groups.setdefault(attempt["arm"], []).append(attempt)
-    for arm, rows in sorted(groups.items()):
-        count = len(rows)
-        tasks = sorted({row["task"] for row in rows})
-        reasons = list(dict.fromkeys(row["outcome_reason"] for row in rows))
-        items.append(
-            {
-                "kind": "native_completion_failed",
-                "severity": "error",
-                "message": f"native completion failed for {count} {arm} attempts on "
-                f"{len(tasks)} tasks: {'; '.join(reasons)}",
-                "arm": arm,
-                "attempts": count,
-                "tasks": tasks,
-                "reasons": reasons,
-            }
-        )
     # Only a report built from the selected revision counts: one that names an earlier
     # revision is not rebuilt yet, and its failures may since have been measured.
     collection = (report or {}).get("measurement_collection") or {}
@@ -415,6 +404,8 @@ def run_status(
         "to re-validate token usage"
     )
     decisions = plan.get("baseline_cache") or {}
+    graded_run = plan.get("grade_contract") == grade.GRADE_CONTRACT
+    grades = _grades(evidence, selection)
     origins = (run or {}).get("baseline_origin", {})
     report = _read(root / "report/results.json")
     measured, references = _measures(report)
@@ -447,7 +438,7 @@ def run_status(
             tokens_status = "not_started"
         elif row["state"] in ("running", "interrupted") and tokens_status == "exact":
             tokens_status = "lower_bound"  # Usage saved so far by an unfinished attempt.
-        outcome, reason = _outcome(handoff) if row["state"] == "complete" else (None, None)
+        outcome, reason = _outcome(row, handoff, grades, graded_run)
         elapsed = (execution or {}).get("elapsed_seconds")
         attempts.append(
             {
@@ -579,7 +570,8 @@ def _age(seconds: int) -> str:
     return f"{seconds // 3600}h"
 
 
-_RESULTS = ("pass", "overlap_pass", "fail", "unknown", "empty", "running", "interrupted", "pending")
+# A complete attempt with no grade yet shows its state, `complete`, until the grade stage runs.
+_RESULTS = ("pass", "fail", "infra", "legacy", "complete", "running", "interrupted", "pending")
 
 
 def _shown_state(state: str, active: bool) -> str:

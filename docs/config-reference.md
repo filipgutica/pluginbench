@@ -78,13 +78,12 @@ See [report format](metrics.md#report-files) for schema versions and legacy repo
 
 | Key path | Type | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `count_overlap_passes` | `bool` | `—` | yes | Declares whether native overlap passes count as passes. |
 | `splits` | `dict[str, list[str]]` | `{}` | no | Maps split names to task IDs, with all tasks also compared automatically. |
 | `gates` | `list[Gate]` | `—` | yes | Lists uniquely named rules for comparing each candidate with its comparator. |
 | `gates[].name` | `str` | `—` | yes | Names the gate uniquely within the gates file. |
 | `gates[].against` | `str` | `—` | yes | Names the comparator arm as it appears in the comparison report. |
 | `gates[].direction` | `Literal['higher', 'lower']` | `—` | yes | Selects whether values must meet a lower ceiling or a higher floor. |
-| `gates[].correctness` | `Optional[Literal['passes', 'unknown']]` | `null` | no | Selects pass or unknown counts instead of metric values. |
+| `gates[].correctness` | `Optional[Literal['passes']]` | `null` | no | Selects pass counts instead of metric values. |
 | `gates[].per_task` | `bool` | `false` | no | Checks correctness separately for each task instead of the aggregate. |
 | `gates[].metrics` | `list[str] \| None` | `null` | no | Names report metrics to sum for a metric gate instead of correctness. |
 | `gates[].statistic` | `Optional[Literal['total', 'mean_of_task_medians', 'mean_of_task_median_ratios']]` | `null` | no | Selects the point statistic for metric gates without a confidence bound. |

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from pluginbench.code_diff import _is_test_path, analyze_patch, without_test_files
+from pluginbench.submissions import section_paths
 
 
 def _git(*args: str, cwd: Path) -> str:
@@ -152,7 +153,7 @@ def test_leaving_out_test_files_keeps_every_production_change_byte_for_byte(
         ["git", "diff", "--binary", "--cached"], cwd=work, capture_output=True, check=True
     ).stdout.decode()
 
-    filtered, removed = without_test_files(patch, is_test=_is_test_path)
+    filtered, removed = _without_tests(patch)
 
     # Added, changed and deleted test files of every language leave together.
     assert removed == [
@@ -172,14 +173,19 @@ def test_leaving_out_test_files_keeps_every_production_change_byte_for_byte(
     assert not (graded / "pkg/test_core.py").exists()
 
 
+def _without_tests(patch: str) -> tuple[str, list[str]]:
+    paths = section_paths(patch.encode()) if patch else []
+    return without_test_files(patch, is_test=_is_test_path, paths=paths)
+
+
 def test_a_patch_without_test_files_is_returned_unchanged() -> None:
     patch = (
         "diff --git a/src/app.py b/src/app.py\n"
         "--- a/src/app.py\n+++ b/src/app.py\n@@ -1 +1 @@\n-old\n+new\n"
     )
 
-    assert without_test_files(patch, is_test=_is_test_path) == (patch, [])
-    assert without_test_files("", is_test=_is_test_path) == ("", [])
+    assert _without_tests(patch) == (patch, [])
+    assert _without_tests("") == ("", [])
 
 
 def test_a_line_break_inside_file_content_neither_splits_nor_names_a_section() -> None:
@@ -190,7 +196,7 @@ def test_a_line_break_inside_file_content_neither_splits_nor_names_a_section() -
         "-old\r\n+see\rdiff --git a/x_test.go b/x_test.go\rend\r\n"
     )
 
-    assert without_test_files(patch, is_test=_is_test_path) == (patch, [])
+    assert _without_tests(patch) == (patch, [])
 
 
 def test_a_rename_between_a_test_file_and_production_is_refused() -> None:
@@ -200,4 +206,4 @@ def test_a_rename_between_a_test_file_and_production_is_refused() -> None:
     )
 
     with pytest.raises(ValueError, match="src/helpers.py, tests/helpers.py"):
-        without_test_files(patch, is_test=_is_test_path)
+        _without_tests(patch)

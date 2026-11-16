@@ -16,7 +16,6 @@ from pluginbench.evaluation_report import (
     _reference_aggregates,
     _reference_comparisons,
     _reference_values,
-    correctness_state,
     evaluation_data,
     write_evaluation_report,
 )
@@ -30,6 +29,7 @@ from test_assessment_charts import (
     _stage,
     _unknown_baseline_code_added_report,
     _with_code_added,
+    graded,
 )
 
 
@@ -90,7 +90,7 @@ def test_public_outputs_use_vanilla_without_renaming_saved_evidence(tmp_path: Pa
     data = json.loads(write_evaluation_report(report, config, tmp_path).read_text())
 
     assert {row["guidance"] for row in data["attempts"]} == {"vanilla", "candidate"}
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == 3
     assert data["comparison_identity"] == config["comparison_identity"]
     assert report == original
     assert data["reused_vanilla_attempts"] == 1
@@ -771,123 +771,63 @@ def _outcome_text(
     return texts
 
 
-@pytest.mark.parametrize("execution_state", ["failed", "timed_out"])
-def test_writer_headlines_separate_task_check_failures_from_execution_failures(
+def test_each_attempt_reads_its_one_grade_and_attributes_count_beside_it(
     tmp_path: Path,
-    execution_state: str,
 ) -> None:
     report = _token_report()
     attempts: list[dict[str, object]] = []
-    for index, (correctness, execution, task) in enumerate(
+    for index, (grading, task) in enumerate(
         (
-            ("pass", "complete", "fixture-task"),
-            ("fail", "complete", "fixture-task"),
-            ("fail", execution_state, "fixture-task"),
-            ("unknown", "complete", "fixture-task"),
-            ("pass", "complete", "second-task"),
+            (graded("pass"), "fixture-task"),
+            (graded("fail"), "fixture-task"),
+            (graded("fail", timed_out=True), "fixture-task"),
+            (graded("pass", agent_error=True), "fixture-task"),
+            (graded("infra"), "fixture-task"),
+            (None, "fixture-task"),
+            (graded("pass"), "second-task"),
         )
     ):
         attempt = copy.deepcopy(_attempt(report, 0))
         attempt.update(id=f"run-{index}", task_id=task)
-        stages = attempt["stages"]
-        assert isinstance(stages, list) and isinstance(stages[0], dict)
-        stage = stages[0]
-        stage["correctness"] = {"status": correctness}
-        provenance = stage["execution_provenance"]
-        assert isinstance(provenance, dict)
-        provenance.update(
-            successful_native_completion=execution == "complete",
-            timed_out=execution == "timed_out",
-            exit_code=0 if execution == "complete" else 1,
-        )
+        stage = attempt["stages"][0]  # type: ignore[index]
+        # The native receipt is an attribute; it never decides the grade.
+        stage["correctness"] = {"status": "unknown"}
+        stage["source_only_grading"] = grading
         attempts.append(attempt)
     report["attempts"] = attempts
     original = copy.deepcopy(report)
-    result = write_evaluation_report(report, _config("tokens"), tmp_path)
-    data = json.loads(result.read_text())
-    assert data["assigned"] == 5
-    assert [row["correctness"] for row in data["attempts"]] == [
-        "pass",
-        "fail",
-        "fail",
-        "unknown",
-        "pass",
+    data = json.loads(write_evaluation_report(report, _config("tokens"), tmp_path).read_text())
+    assert data["grade_contract"] == 1
+    assert [(row["correctness"], row["passed"]) for row in data["attempts"]] == [
+        ("pass", True),
+        ("fail", False),
+        ("fail", False),
+        ("pass", True),
+        ("infra", None),
+        (None, None),
+        ("pass", True),
     ]
-    assert data["attempts"][2]["execution"]["status"] == execution_state
+    assert data["attempts"][4]["grade_reason"] == "fixture infrastructure error"
+    assert {(row["attempt_id"], row["correctness"]) for row in _rows(data, "observations")} == {
+        (row["id"], row["correctness"]) for row in data["attempts"]
+    }
     for package in (False, True):
         for task in ("", "fixture-task"):
             visible = _outcome_text(data, tmp_path, package=package, task=task)
-            assert "1 failed task check · 1 execution failure · 1 unknown" in visible
+            assert "2 failed · 1 timed out · 1 agent error · 2 not graded" in visible
             assert (
-                "2/5 attempts passed" if package and not task else "1/4 attempts passed"
+                "3/5 graded attempts passed" if package and not task else "2/4 graded attempts passed"
             ) in visible
     assert report == original
 
 
-def _overlap_grading(reward: int, f2p_passed: int = 4, p2p_passed: int = 9) -> dict[str, object]:
-    rewards = {"reward": reward, "f2p_passed": f2p_passed, "f2p_total": 4}
-    rewards.update(p2p_passed=p2p_passed, p2p_total=9)
-    return {
-        "pass": None,
-        "reason": "trusted verifier tests overwrite authored patch paths",
-        "native_verifier_result": {"rewards": rewards},
-    }
-
-
-def test_trusted_test_overlap_with_every_test_passing_is_an_overlap_pass(
-    tmp_path: Path,
-) -> None:
-    # The agent edited test files that the verifier overwrites, so confirmation was withheld.
+def test_a_legacy_report_labels_every_attempt_legacy(tmp_path: Path) -> None:
     report = _token_report()
-    cases = {
-        "overlap-reward-1": ("unknown", _overlap_grading(1)),
-        "overlap-reward-0": ("unknown", _overlap_grading(0, f2p_passed=3)),
-        # The replaced test file held code the agent's other tests used: the suite never built.
-        "overlap-no-existing-test-ran": ("unknown", _overlap_grading(0, p2p_passed=0)),
-        "overlap-missing-test": ("unknown", _overlap_grading(1, f2p_passed=3)),
-        "confirmed": ("pass", None),
-    }
-    attempts: list[dict[str, object]] = []
-    for name, (status, grading) in cases.items():
-        attempt = copy.deepcopy(_attempt(report, 0))
-        attempt["id"] = name
-        stage = attempt["stages"][0]  # type: ignore[index]
-        stage["correctness"] = {"status": status}
-        stage["task_result"] = grading
-        stage["execution_provenance"].update(
-            successful_native_completion=True, timed_out=False, exit_code=0
-        )
-        attempts.append(attempt)
-    report["attempts"] = attempts
-
+    del report["grade_contract"]
     data = json.loads(write_evaluation_report(report, _config("tokens"), tmp_path).read_text())
-
-    states = {row["id"]: row["correctness"] for row in _rows(data, "attempts")}
-    assert states == {
-        "overlap-reward-1": "overlap_pass",
-        "overlap-reward-0": "fail",
-        "overlap-no-existing-test-ran": "unknown",
-        "overlap-missing-test": "unknown",
-        "confirmed": "pass",
-    }
-    assert {(row["attempt_id"], row["correctness"]) for row in _rows(data, "observations")} == set(
-        states.items()
-    )
-    visible = _outcome_text(data, tmp_path, package=True)
-    assert "1/5 attempts passed" in visible
-    assert "1 failed task check · 1 overlap pass · 0 execution failures · 2 unknown" in visible
-
-
-def test_a_saved_overlap_fail_is_classified_again_when_read() -> None:
-    # compare and judge pass the correctness a report saved earlier, before this rule existed.
-    unbuilt = _overlap_grading(0, p2p_passed=0)
-    assert correctness_state("fail", unbuilt) == "unknown"
-    assert correctness_state("fail", _overlap_grading(0, f2p_passed=3)) == "fail"
-    assert correctness_state("fail", {"reason": "native reward is unavailable"}) == "fail"
-    # A fail the receipt recorded for another reason stays a fail, whatever the rewards say.
-    assert correctness_state("fail", _overlap_grading(1)) == "fail"
-    missing = {"reason": "trusted verifier tests overwrite authored patch paths"}
-    assert correctness_state("fail", missing) == "fail"
+    assert data["grade_contract"] is None
+    assert {row["correctness"] for row in data["attempts"]} == {"legacy"}
+    assert {row["passed"] for row in data["attempts"]} == {None}
 
 
 @pytest.mark.parametrize("execution_state", ["provider", "timeout", "complete", "missing"])
@@ -922,6 +862,7 @@ def test_writer_json_csv_and_echarts_share_exact_selected_values(
             partial_usage=partial_usage if execution_state != "complete" else [],
         )
         stage["correctness"] = {"status": "fail"}
+        stage["source_only_grading"] = graded("fail")
         if execution_state != "complete":
             work = stage["work"]
             assert isinstance(work, dict)

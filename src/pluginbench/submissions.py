@@ -14,7 +14,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from pluginbench.assessment_metrics import EXCLUDED_NAMES, inspect_snapshot
-from pluginbench.code_diff import _file_changes
 
 SOURCE_POLICY = "reviewed-native-patch-source-v2"
 GRADER_STARTUP_POLICY = "reviewed-native-grader-startup-v1"
@@ -211,6 +210,25 @@ def base_tree_manifest(output: str) -> dict[str, dict[str, str]]:
     return entries
 
 
+class PolicyViolation(ValueError):
+    """A hash-verified submission the patch policy refuses; with a healthy task it is a fail.
+
+    Every other `ValueError` and `OSError` while freezing or validating a submission is an
+    evidence or host error: infrastructure, retried, never a result.
+    """
+
+    # symlink: a 120000 mode; file_mode: any mode but 100644 or 100755; unsafe_path: an
+    # absolute, parent, excluded or control-character path; test_rename: a rename or copy
+    # between a test file and another file, which the source-only grade cannot leave out.
+    KINDS = ("symlink", "file_mode", "unsafe_path", "test_rename")
+
+    def __init__(self, kind: str, detail: str) -> None:
+        if kind not in self.KINDS:
+            raise AssertionError(f"unknown policy violation kind: {kind}")
+        super().__init__(f"unsupported submission ({kind}): {detail}")
+        self.kind = kind
+
+
 def _safe_path(value: str, *, included: bool = False) -> None:
     path = PurePosixPath(value)
     if (
@@ -219,55 +237,104 @@ def _safe_path(value: str, *, included: bool = False) -> None:
         or path.as_posix() != value
         or ".." in path.parts
         or "\\" in value
-        or any(ord(char) < 32 for char in value)
+        # A tab is an ordinary path byte that Git quotes; other control characters are refused.
+        or any(ord(char) < 32 and char != "\t" for char in value)
         or (included and any(part in EXCLUDED_NAMES for part in path.parts))
     ):
-        raise ValueError("unsafe or excluded native patch path: " + value)
+        raise PolicyViolation("unsafe_path", "unsafe or excluded native patch path: " + value)
 
 
-def _patch_paths(patch: str) -> set[str]:
-    # The reviewed grader does not reliably parse Git's C-quoted paths.
-    if any(line.startswith("diff --git ") and '"' in line for line in patch.splitlines()):
-        raise ValueError("unsupported quoted native patch path")
-    for line in patch.splitlines():
-        if re.match(r"(?:old mode|new mode|new file mode|deleted file mode) ", line):
-            if line.rsplit(" ", 1)[-1] not in {"100644", "100755"}:
-                raise ValueError("unsupported native patch file mode")
-    changes = _file_changes(patch)
-    paths = {
-        path
-        for change in changes
-        for path in (change.old_path, change.new_path)
-        if path is not None
-    }
-    sections = iter(changes)
-    current = None
-    for line in patch.splitlines():
-        if line.startswith("diff --git "):
-            current = next(sections)
-            header = _file_changes(line)[0]
-            for effective, declared in (
-                (current.old_path, header.old_path),
-                (current.new_path, header.new_path),
-            ):
-                if effective is not None and effective != declared:
-                    raise ValueError("inconsistent native patch header and marker paths")
-        elif current is not None:
-            for prefix, expected in (
-                ("rename from ", current.old_path),
-                ("rename to ", current.new_path),
-                ("copy from ", current.old_path),
-                ("copy to ", current.new_path),
-            ):
-                if line.startswith(prefix):
-                    path = line.removeprefix(prefix)
-                    _safe_path(path, included=True)
-                    if path != expected:
-                        raise ValueError("inconsistent native patch rename or copy paths")
-                    paths.add(path)
+_GIT_ENVIRONMENT = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+_MODE_LINE = re.compile(rb"(?:old mode|new mode|new file mode|deleted file mode) (\S+)$")
+
+
+def _git_paths(patch: bytes, *, reverse: bool) -> list[str]:
+    """Each file section's path as Git reads it: NUL-delimited, never quoted, in patch order.
+
+    `git apply --numstat -z` names one path per section, the postimage one; with `-R` it names
+    the preimage one, with the sections in reverse order.
+    """
+    with tempfile.TemporaryDirectory(prefix="pluginbench-patch-paths-") as temporary:
+        listed = subprocess.run(
+            ["git", "apply", "--numstat", "-z", "--allow-empty", *(["-R"] if reverse else [])],
+            input=patch,
+            cwd=temporary,
+            capture_output=True,
+            check=False,
+            timeout=60,
+            env={
+                "PATH": os.environ["PATH"],
+                "GIT_CEILING_DIRECTORIES": temporary,
+                **_GIT_ENVIRONMENT,
+            },
+        )
+    if listed.returncode:
+        raise ValueError("git cannot read the patch: " + listed.stderr.decode(errors="replace"))
+    records = listed.stdout.split(b"\0")
+    if records[-1] != b"":
+        raise ValueError("git listed the patch paths without a final NUL")
+    paths = []
+    for record in records[:-1]:
+        fields = record.split(b"\t", 2)
+        if len(fields) != 3:
+            raise ValueError("git listed a patch path record it did not delimit")
+        paths.append(fields[2].decode("utf-8", errors="surrogateescape"))
+    return paths[::-1] if reverse else paths
+
+
+def section_paths(patch: bytes) -> list[tuple[str | None, str | None]]:
+    """Each `diff --git` section's old and new path, in order, as Git itself reads them.
+
+    Git C-quotes a path with a quote, tab, backslash or non-ASCII byte in the patch text, so the
+    paths come from Git (`_git_paths`), matched to the sections by order. Only mode lines, which
+    Git never quotes, are read from the text. A path is None where the section creates or
+    deletes its file.
+    """
+    if patch and not patch.startswith(b"diff --git "):
+        # Git would read such text as no patch at all, and grade it as an empty submission.
+        raise ValueError("the patch does not start with a diff --git header")
+    headers: list[list[bytes]] = []
+    in_header = False
+    for line in patch.split(b"\n"):
+        if line.startswith(b"diff --git "):
+            headers.append([])
+            in_header = True
+        elif line.startswith((b"@@", b"GIT binary patch", b"Binary files ")):
+            in_header = False  # File content follows, never read here.
+        elif in_header:
+            headers[-1].append(line)
+    after = _git_paths(patch, reverse=False)
+    before = _git_paths(patch, reverse=True)
+    if not len(headers) == len(after) == len(before):
+        raise ValueError(f"the patch has {len(headers)} file sections but Git reads {len(after)}")
+    result: list[tuple[str | None, str | None]] = []
+    for header, old, new in zip(headers, before, after, strict=True):
+        for line in header:
+            if (mode := _MODE_LINE.match(line)) is not None:
+                if mode[1] == b"120000":
+                    raise PolicyViolation("symlink", "the patch adds or changes a symlink")
+                if mode[1] not in {b"100644", b"100755"}:
+                    raise PolicyViolation("file_mode", "unsupported file mode " + mode[1].decode())
+        created = any(line.startswith(b"new file mode ") for line in header)
+        deleted = any(line.startswith(b"deleted file mode ") for line in header)
+        result.append((None if created else old, None if deleted else new))
+    return result
+
+
+def patch_paths(patch: bytes) -> set[str]:
+    """Every path a submitted patch touches; a policy violation raises `PolicyViolation`."""
+    paths = {path for pair in section_paths(patch) for path in pair if path is not None}
     for path in paths:
         _safe_path(path, included=True)
     return paths
+
+
+def task_patch_paths(path: Path) -> set[str]:
+    """Every path a task's own patch touches. The task is fixed, so a violation is no fail."""
+    try:
+        return patch_paths(path.read_bytes())
+    except PolicyViolation as error:
+        raise ValueError(f"task patch {path.name}: {error}") from None
 
 
 def _proof(*, before: Path, task_dir: Path, identity: dict[str, object]) -> dict[str, Any]:
@@ -360,8 +427,7 @@ def reconstruct(
     digest = hashlib.sha256(patch_bytes).hexdigest()
     if digest != hashes[PATCH_ARTIFACT]:
         raise ValueError("native graded patch changed")
-    text = patch_bytes.decode("utf-8", errors="strict")
-    paths = _patch_paths(text)
+    paths = patch_paths(patch_bytes)
     tree = proof["base_tree"]
     for path in paths:
         preimage = before / path
@@ -383,7 +449,7 @@ def reconstruct(
         mode = "100755" if preimage.stat().st_mode & 0o111 else "100644"
         if blob != entry.get("blob") or mode != entry["mode"]:
             raise ValueError("native patch preimage differs from verifier base: " + path)
-    hidden = _patch_paths((task_dir / "tests/test.patch").read_text())
+    hidden = task_patch_paths(task_dir / "tests/test.patch")
     with tempfile.TemporaryDirectory(prefix="pluginbench-canonical-patch-") as temporary:
         source = Path(temporary) / "source"
         shutil.copytree(before, source)
@@ -404,9 +470,8 @@ def reconstruct(
                 timeout=60,
                 env={
                     "PATH": os.environ["PATH"],
-                    "GIT_CONFIG_GLOBAL": os.devnull,
-                    "GIT_CONFIG_NOSYSTEM": "1",
                     "GIT_CEILING_DIRECTORIES": temporary,
+                    **_GIT_ENVIRONMENT,
                 },
             )
         except subprocess.TimeoutExpired as error:

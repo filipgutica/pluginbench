@@ -495,27 +495,12 @@ def _votes(directory: Path, judges: dict[str, dict[tuple[str, str], str]]) -> No
 
 
 def test_tally_applies_correctness_first_then_a_strict_majority(tmp_path: Path) -> None:
-    overlap: dict[str, object] = {
-        "correctness": "unknown",
-        "native_grading": {
-            "reason": "trusted verifier tests overwrite authored patch paths",
-            "native_verifier_result": {
-                "rewards": {
-                    "reward": 1,
-                    "f2p_passed": 2,
-                    "f2p_total": 2,
-                    "p2p_passed": 5,
-                    "p2p_total": 5,
-                }
-            },
-        },
-    }
     run = _two_arms(
         tmp_path,
         # alpha 1: only vanilla passes, so it wins although every judge prefers the other side.
         wa1={"correctness": "fail"},
-        # alpha 2: vanilla's overlap pass is a pass; both pass, so judges decide.
-        ba2=overlap,
+        # alpha 2: both pass, so judges decide.
+        ba2={"correctness": "pass"},
         # alpha 3: both fail; judges decide.
         ba3={"correctness": "fail"},
         wa3={"correctness": "fail"},
