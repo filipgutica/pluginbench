@@ -36,6 +36,9 @@ from test_grade import HEALTHY, _coded
 from test_resume import _PATH, _killed_resume, _killed_run
 from test_provider_stops import codex_rollout
 
+# Every resume here recovers what a killed run left, which needs the host execution lock.
+pytestmark = pytest.mark.usefixtures("host_execution")
+
 
 def _invocations(root: Path) -> list[dict[str, Any]]:
     ledger = Ledger.read(root / LEDGER_NAME)
@@ -58,7 +61,6 @@ def _one_slot(tmp_path: Path) -> study.ResolvedStudy:
 # Crash boundaries.
 
 
-@pytest.mark.usefixtures("host_execution")
 @pytest.mark.parametrize("boundary", ["during-call", "after-identity", "after-execution"])
 def test_a_slot_killed_three_times_after_its_intent_never_gets_a_fourth_invocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
@@ -80,7 +82,6 @@ def test_a_slot_killed_three_times_after_its_intent_never_gets_a_fourth_invocati
     assert all((row["identity"] is not None) is started for row in rows)
 
 
-@pytest.mark.usefixtures("host_execution")
 def test_a_kill_before_acceptance_keeps_the_saved_output_as_the_finished_invocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -550,7 +551,6 @@ def _review_child() -> None:
     raise SystemExit("the review finished without reaching its judge call")
 
 
-@pytest.mark.usefixtures("host_execution")
 def test_a_judge_call_killed_as_it_starts_still_counts_toward_the_ceiling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

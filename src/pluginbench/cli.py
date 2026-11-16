@@ -598,6 +598,45 @@ def stop(
         )
 
 
+@app.command("repair")
+def repair(
+    run: Path = typer.Argument(..., help="The run whose crashed calls blocked this host."),
+    confirm_stopped: bool = typer.Option(
+        False,
+        "--confirm-stopped",
+        help="Confirm you checked that nothing the run's crashed calls started still runs.",
+    ),
+) -> None:
+    """Lift the host block that a run's unverifiable cleanup left, on your confirmation.
+
+    Use it only after checking that no process or container of that run's crashed calls still
+    runs. The confirmation and its time are recorded.
+    """
+    try:
+        if not confirm_stopped:
+            raise ValueError(
+                "repair changes nothing without --confirm-stopped; check that nothing the run's "
+                "crashed calls started still runs, then confirm"
+            )
+        target = str(run.resolve())
+        owner = run_lock.ExecutionOwner(kind="recovery", eval=target, root=target)
+        with run_lock.hold_execution(owner) as lock:
+            confirmed, lifted = control_store.confirm_stopped(lock, run)
+    except (OSError, ValueError) as exc:
+        _error(exc)
+        return
+    for item in confirmed:
+        what = item["detail"].get("stage", "trial containers")
+        typer.echo(f"Confirmed stopped: {what} {item['id']} of {item['run']}")
+    if not confirmed:
+        typer.echo(f"Nothing of {run.resolve()} was waiting for cleanup.")
+    typer.echo(
+        "The host is unblocked."
+        if lifted
+        else "Another run's cleanup is still unverified, so the host stays blocked."
+    )
+
+
 @app.command("compare")
 def compare(
     runs: list[str] = typer.Argument(

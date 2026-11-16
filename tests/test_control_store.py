@@ -7,6 +7,9 @@ Cleanup checks are fakes here; nothing starts a container, a systemd unit or a m
 from __future__ import annotations
 
 import os
+import re
+import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -19,10 +22,11 @@ from typer.testing import CliRunner
 
 import pluginbench
 import resume_support
-from pluginbench import cli, control_store, judge, run_lock, study
+from pluginbench import cli, control_store, harbor_backend, judge, run_lock, study
+from pluginbench import trial_containers
 from pluginbench.control_store import CleanupBlocked, ControlStore, OwnerWatch
-from pluginbench.ledger import LEDGER_NAME, Ledger
-from test_resume import _killed_run
+from pluginbench.ledger import LEDGER_NAME, Ledger, child_identity
+from test_resume import _REAL_RUNNING, _Docker, _container, _killed_run
 
 _SOURCE = str(Path(pluginbench.__file__).parents[1])
 
@@ -32,8 +36,8 @@ def _host(state: Path) -> control_store.HostState:
         return store.host()
 
 
-def _still_running(operation: Mapping[str, Any]) -> dict[str, Any]:
-    raise CleanupBlocked(f"process 7 of {operation['stage']} invocation still runs")
+def _still_running(item: Mapping[str, Any]) -> dict[str, Any]:
+    raise CleanupBlocked(f"process 7 of {item['detail']['stage']} invocation still runs")
 
 
 def _crashed(tmp_path: Path) -> Path:
@@ -68,15 +72,15 @@ def test_unverified_cleanup_keeps_crashed_rows_open_and_blocks_the_host(
     assert calls == [] and _rows(root) == [crashed]
     assert _host(isolated_host_state).barrier == control_store.HOST_CLEANUP
     with ControlStore.open(isolated_host_state) as store:
-        assert [row["invocation_id"] for row in store.unclean()] == [crashed["id"]]
+        assert [row["id"] for row in store.items(unclean=True)] == [crashed["id"]]
 
     # Once cleanup verifies, it does so before saved output is reconciled, and only then is the
     # crashed row marked unresolved.
     trace: list[str] = []
 
-    def verified(operation: Mapping[str, Any]) -> dict[str, Any]:
+    def verified(item: Mapping[str, Any]) -> dict[str, Any]:
         trace.append("verify")
-        return {"invocation_id": operation["invocation_id"]}
+        return {"id": item["id"]}
 
     reconcile = study._reconcile
 
@@ -113,42 +117,62 @@ def test_sweeping_crashed_rows_needs_the_host_execution_lock(
     assert [row["state"] for row in _rows(root)] == ["intent"]
 
 
-def test_the_recorded_process_is_cleaned_up_only_once_it_is_gone() -> None:
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-    operation = {
-        "invocation_id": "a1",
-        "stage": "review",
-        "identity": {
-            "pid": child.pid,
-            "start_time": run_lock.process_start(child.pid),
-            "process_group": child.pid,
-        },
-    }
+# Leads a new session, starts a child in its own process group, reports that child's PID and
+# exits: the leader is gone while its group still runs.
+_LEADER = """
+import subprocess, sys
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+print(child.pid, flush=True)
+"""
+
+
+def test_a_recorded_process_group_is_clean_only_once_every_member_is_gone(
+    tmp_path: Path,
+) -> None:
+    leader = subprocess.Popen(
+        [sys.executable, "-c", _LEADER], stdout=subprocess.PIPE, text=True, start_new_session=True
+    )
+    assert leader.stdout is not None
+    member = int(leader.stdout.readline())
+    identity = child_identity(leader.pid)
+    leader.wait(timeout=10)
+    item = {"id": "a1", "run": str(tmp_path), "kind": "invocation", "detail": {
+        "stage": "review", "identity": identity,
+    }}
     try:
-        with pytest.raises(CleanupBlocked, match=f"kill -TERM -- -{child.pid}"):
-            control_store.verify_invocation(operation)
+        with pytest.raises(CleanupBlocked, match=rf"group {leader.pid} .* still has processes {member}"):
+            control_store.verify_invocation(item)
     finally:
-        child.kill()
-        child.wait(timeout=5)
-    assert control_store.verify_invocation(operation)["invocation_id"] == "a1"
-    # Killed before its child was recorded: nothing of it can still be found by identity.
-    assert control_store.verify_invocation({**operation, "identity": None})
+        os.kill(member, signal.SIGKILL)
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            assert control_store.verify_invocation(item)["checked"] == "process group"
+            break
+        except CleanupBlocked:
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+    # What cannot be checked blocks: no record, or a PID from another namespace.
+    for unknown in (None, {**identity, "pid_namespace": "pid:[1]"}):
+        with pytest.raises(CleanupBlocked, match="repair --confirm-stopped"):
+            control_store.verify_invocation({**item, "detail": {"stage": "review", "identity": unknown}})
+    # A process recorded before a reboot ended with it.
+    rebooted = {**identity, "boot_id": "an-earlier-boot"}
+    assert control_store.verify_invocation({**item, "detail": {"stage": "review", "identity": rebooted}})
 
 
 def _seed_barrier(state: Path, run: Path) -> None:
     with ControlStore.open(state) as store:
-        store.block(
-            "process 7 of coding invocation a1 still runs",
+        store.fence(
             [
                 {
-                    "invocation_id": "a1",
-                    "ledger": str(run / LEDGER_NAME),
-                    "stage": "coding",
-                    "scope": "pb-inv-a1.scope",
-                    "label": "pluginbench.invocation=a1",
-                    "identity": {"pid": 7, "start_time": "1", "process_group": 7},
+                    "id": "a1",
+                    "run": str(run),
+                    "kind": "invocation",
+                    "detail": {"stage": "coding", "identity": None},
                 }
             ],
+            "process 7 of coding invocation a1 still runs",
         )
 
 
@@ -200,7 +224,7 @@ def test_a_cleanup_barrier_blocks_every_execution_command_whatever_run_it_target
     argv = _entry_points(tmp_path, monkeypatch, work)[command]
     result = CliRunner().invoke(cli.app, argv)
     assert result.exit_code == 2, result.output
-    assert "cleanup of 1 crashed invocation is not verified" in result.stderr
+    assert "cleanup of 1 crashed call is not verified" in result.stderr
     assert work == []
     assert _host(isolated_host_state).barrier == control_store.HOST_CLEANUP
     assert not run_lock.execution_owner(isolated_host_state).held
@@ -210,9 +234,7 @@ def test_a_barrier_lifts_once_its_cleanup_verifies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
 ) -> None:
     _seed_barrier(isolated_host_state, tmp_path / "crashed-run")
-    monkeypatch.setattr(
-        control_store, "verify_invocation", lambda operation: {"invocation_id": "a1"}
-    )
+    monkeypatch.setattr(control_store, "verify_invocation", lambda item: {"id": "a1"})
     judged: list[Path] = []
 
     def judged_once(directory: Path, **kwargs: Any) -> int:
@@ -226,7 +248,7 @@ def test_a_barrier_lifts_once_its_cleanup_verifies(
     assert judged == [tmp_path]
     assert _host(isolated_host_state).barrier is None
     with ControlStore.open(isolated_host_state) as store:
-        assert store.unclean() == []
+        assert store.items(unclean=True) == []
 
 
 # Takes the execution lock's flock and never publishes an owner record, as a process paused or
@@ -269,3 +291,159 @@ def test_an_unverified_holder_turns_reconciling_after_30_seconds_and_is_never_to
         holder.kill()
         holder.wait(timeout=5)
     assert watch.poll() == "free" and _host(state).reconciling is None
+
+
+def _live_call(tmp_path: Path) -> tuple[Path, subprocess.Popen[bytes]]:
+    """A run whose open review call recorded a child that still runs."""
+    run = tmp_path / "crashed"
+    run.mkdir()
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    ledger = Ledger.create(
+        run / LEDGER_NAME,
+        [{"id": "a", "task_id": "t", "arm": "vanilla", "attempt": 1}],
+        {"a": "running"},
+    )
+    try:
+        ledger.invocation_started(ledger.intent(slot=0, stage="review", attempt_id="a"), child.pid)
+    finally:
+        ledger.close()
+    return run, child
+
+
+def _judged(monkeypatch: pytest.MonkeyPatch) -> tuple[list[str], list[Path]]:
+    """`judge run` aimed at a run with nothing to do with the crash; returns argv and calls."""
+    judged: list[Path] = []
+
+    def judged_once(directory: Path, **kwargs: Any) -> int:
+        judged.append(directory)
+        return 0
+
+    monkeypatch.setattr(judge, "run", judged_once)
+    return ["judge", "run", "unrelated-run", "--judge", "codex:m:high"], judged
+
+
+def _sweep(run: Path) -> None:
+    ledger = Ledger.open(run / LEDGER_NAME)
+    try:
+        control_store.verify_crashed(ledger, run / LEDGER_NAME, ("review",))
+    finally:
+        ledger.close()
+
+
+def _failing_fence(self: ControlStore, items: Any, detail: str) -> None:
+    raise sqlite3.OperationalError("disk I/O error")
+
+
+def test_a_failed_barrier_write_still_keeps_an_unrelated_run_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
+) -> None:
+    run, child = _live_call(tmp_path)
+    argv, judged = _judged(monkeypatch)
+    try:
+        with monkeypatch.context() as broken:
+            broken.setattr(ControlStore, "fence", _failing_fence)
+            with control_store.execute(_owner(run)), pytest.raises(sqlite3.OperationalError):
+                _sweep(run)
+        # The marker written before the barrier fences the host for every later command.
+        result = CliRunner().invoke(cli.app, argv)
+        assert result.exit_code == 2, result.output
+        assert f"still has processes {child.pid}" in result.stderr and judged == []
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+    result = CliRunner().invoke(cli.app, argv)
+    assert result.exit_code == 0, result.output
+    assert len(judged) == 1 and _host(isolated_host_state).barrier is None
+    assert not (isolated_host_state / control_store.MARKER_NAME).exists()
+
+
+def test_when_no_fence_can_be_written_the_host_stays_locked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
+) -> None:
+    run, child = _live_call(tmp_path)
+
+    def unwritable(state: Path, items: Any) -> None:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(control_store, "_write_marker", unwritable)
+    monkeypatch.setattr(ControlStore, "fence", _failing_fence)
+    try:
+        with control_store.execute(_owner(run)):
+            with pytest.raises(CleanupBlocked, match=r"process \d+ keeps the host") as caught:
+                _sweep(run)
+        found = re.search(r"process (\d+) keeps", str(caught.value))
+        assert found is not None
+        sleeper = int(found.group(1))
+        try:
+            snapshot = run_lock.execution_owner(isolated_host_state)
+            assert snapshot.held and not snapshot.verified
+            with pytest.raises(run_lock.ExecutionBusy):
+                with run_lock.hold_execution(_owner(tmp_path / "unrelated")):
+                    pass
+        finally:
+            os.kill(sleeper, signal.SIGKILL)
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+
+
+def test_a_failed_container_stop_blocks_the_host_before_any_crashed_row_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
+) -> None:
+    root = _killed_run(tmp_path, boundary="after-identity", at=1, tasks=1, treatments=0, repeats=1)
+    [crashed] = _rows(root)
+    here = str((root / "frozen/suite/0/task").resolve()) + "/environment"
+    docker = _Docker([_container("main", "pluginbench-" + "a" * 32 + "__env", here)])
+
+    def stuck(*arguments: str, **kwargs: Any) -> str:
+        if arguments[0] == "stop":
+            raise ValueError("docker stop failed: permission denied")
+        return docker(*arguments, **kwargs)
+
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+    monkeypatch.setattr(trial_containers, "running", _REAL_RUNNING)
+    monkeypatch.setattr(harbor_backend, "_docker", stuck)
+    with control_store.execute(_owner(root)):
+        with pytest.raises(CleanupBlocked, match="could not be stopped: docker stop failed"):
+            study.resume_study(root)
+    assert calls == [] and _rows(root) == [crashed]
+    assert _host(isolated_host_state).barrier == control_store.HOST_CLEANUP
+    argv, judged = _judged(monkeypatch)
+    result = CliRunner().invoke(cli.app, argv)
+    assert result.exit_code == 2 and "could not be stopped" in result.stderr and judged == []
+    # Once Docker can stop it, the next command does, lifts the barrier and runs.
+    monkeypatch.setattr(harbor_backend, "_docker", docker)
+    result = CliRunner().invoke(cli.app, argv)
+    assert result.exit_code == 0, result.output
+    assert docker.stopped == [["main"]] and len(judged) == 1
+    assert _host(isolated_host_state).barrier is None
+
+
+def test_an_unverifiable_call_blocks_until_the_operator_confirms_it_stopped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
+) -> None:
+    root = _crashed(tmp_path)  # Killed before its child was recorded.
+    [crashed] = _rows(root)
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+    with control_store.execute(_owner(root)):
+        with pytest.raises(CleanupBlocked, match=f"repair --confirm-stopped {root}"):
+            study.resume_study(root)
+    runner = CliRunner()
+    refused = runner.invoke(cli.app, ["repair", str(root)])
+    assert refused.exit_code == 2
+    assert _host(isolated_host_state).barrier == control_store.HOST_CLEANUP
+    result = runner.invoke(cli.app, ["repair", str(root), "--confirm-stopped"])
+    assert result.exit_code == 0, result.output
+    assert f"Confirmed stopped: coding {crashed['id']} of {root}" in result.stdout
+    assert "The host is unblocked." in result.stdout
+    with ControlStore.open(isolated_host_state) as store:
+        [item] = store.items(unclean=False)
+    assert item["proof"]["confirmed_by"] == "operator" and item["proof"]["at"]
+    # The confirmation stands: the resume closes the crashed row and codes the slot again.
+    with control_store.execute(_owner(root)):
+        study.resume_study(root)
+    assert _rows(root)[0]["state"] == "unresolved" and len(calls) == 1

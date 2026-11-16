@@ -294,6 +294,15 @@ def boot_id() -> str:
         return ""
 
 
+def pid_namespace() -> str:
+    """This process's PID namespace. A PID recorded in another namespace names another process
+    here, or none."""
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return ""
+
+
 @cache
 def execution_version() -> str:
     """The package version and a hash of its code. A changed checkout keeps the version number,

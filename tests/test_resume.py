@@ -24,12 +24,15 @@ import native_support
 import resume_support
 from legacy_support import current_runtime, legacy_json
 from native_support import execution as native_execution
-from pluginbench import control_store, grade, harbor_backend, ledger, parallel, run_status, study
+from pluginbench import grade, harbor_backend, ledger, parallel, run_status, study
 from pluginbench import trial_containers
 from pluginbench.ledger import Ledger
 from pluginbench import codex
 from test_codex import _OUTAGE, outage_trace, stream
 from test_provider_stops import CODEX_LIMITED_STDOUT, codex_rollout
+
+# Every resume here recovers what a killed run left, which needs the host execution lock.
+pytestmark = pytest.mark.usefixtures("host_execution")
 
 _REAL_RUNNING = trial_containers.running
 _PATH = os.pathsep.join([str(Path(pluginbench.__file__).parents[1]), str(Path(__file__).parent)])
@@ -74,7 +77,6 @@ def _json(path: Path) -> Any:
     return json.loads(path.read_text())
 
 
-@pytest.mark.usefixtures("host_execution")
 @pytest.mark.parametrize(
     ("boundary", "kept", "discarded"),
     [
@@ -179,7 +181,6 @@ def _container(
     }
 
 
-@pytest.mark.usefixtures("host_execution")
 def test_resume_stops_only_the_containers_its_killed_attempt_left_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -478,7 +479,6 @@ def test_a_codex_usage_limit_mid_session_stops_the_run_unscored_and_uncached(
     assert len(list(cache.glob("*/*/manifest.json"))) == 6
 
 
-@pytest.mark.usefixtures("host_execution")
 def test_resume_reads_a_moved_copy_from_its_own_frozen_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -504,7 +504,6 @@ def test_resume_reads_a_moved_copy_from_its_own_frozen_files(
     assert paths and all(path.startswith(str(moved.resolve())) for path in paths)
 
 
-@pytest.mark.usefixtures("host_execution")
 def test_vanilla_attempts_finished_before_a_kill_are_already_cached(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -552,7 +551,6 @@ def _as_legacy_run(root: Path) -> None:
     (root / "run.json").write_text(json.dumps(run))
 
 
-@pytest.mark.usefixtures("host_execution")
 def test_resume_killed_while_it_rewrites_the_plan_can_resume_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -588,7 +586,6 @@ def test_resume_killed_while_it_builds_a_legacy_ledger_recovers_every_attempt(
     assert len(calls) == 10 and not set(calls) & set(finished)
 
 
-@pytest.mark.usefixtures("host_execution")
 def test_moving_the_run_during_a_call_never_writes_to_the_old_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -617,10 +614,6 @@ def test_moving_the_run_during_a_call_never_writes_to_the_old_path(
     assert (moved / "evidence/invocations" / calls[0] / "handoff.json").is_file()
     (moved / "run.lock").unlink()
     resume_support.install(monkeypatch, calls)
-    # The fake call recorded this test's own process as its child, and that still runs.
-    monkeypatch.setattr(
-        control_store, "verify_invocation", lambda operation: dict(operation, checked="fake")
-    )
     study.resume_study(moved / "evidence")
     assert set(_json(moved / "evidence/run.json")["discarded_attempts"]) == {calls[0]}
 
@@ -757,7 +750,6 @@ def test_vanilla_attempt_killed_before_it_was_cached_is_cached_on_resume(
     assert len(list(cache.glob("*/*/manifest.json"))) == 6
 
 
-@pytest.mark.usefixtures("host_execution")
 def test_a_942f12c_vanilla_run_resumes_after_docker_memory_moved_by_28_kib(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

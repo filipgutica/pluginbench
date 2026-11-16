@@ -1393,6 +1393,7 @@ def test_a_fresh_claude_attempt_with_other_built_ins_stops_a_run_that_reuses_van
                for reason in revalidated["usage_validation"]["reasons"])
 
 
+@pytest.mark.usefixtures("host_execution")
 def test_a_claude_rate_limit_mid_session_stops_the_run_and_its_vanilla_is_coded_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1497,6 +1498,7 @@ def test_a_fully_fresh_claude_run_with_other_built_ins_still_scores_and_says_why
                for line in skipped)
 
 
+@pytest.mark.usefixtures("host_execution")
 def test_a_resumed_claude_run_with_attempts_under_other_built_ins_reuses_no_cached_vanilla(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1528,6 +1530,7 @@ def test_a_resumed_claude_run_with_attempts_under_other_built_ins_reuses_no_cach
     assert any(line.startswith("Cached vanilla attempts are not reused") for line in progress)
 
 
+@pytest.mark.usefixtures("host_execution")
 def test_a_resumed_claude_run_whose_own_vanilla_is_cached_keeps_caching_its_vanilla(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1551,6 +1554,7 @@ def test_a_resumed_claude_run_whose_own_vanilla_is_cached_keeps_caching_its_vani
     assert len(list(cache.glob("*/*/manifest.json"))) == 2
 
 
+@pytest.mark.usefixtures("host_execution")
 def test_a_claude_run_prepared_before_the_claude_identity_resumes_into_the_claude_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

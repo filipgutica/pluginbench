@@ -550,7 +550,11 @@ On interruption or fatal failure, new jobs stop. Active jobs finish or time out;
 
 Only one PluginBench command executes on a host at a time. `run`, `check`, `review`, `measure`, and `judge run` share one execution lock for your user account, whatever run they target. While one runs, another fails at once and names the run and process that hold the host.
 
-A resume marks a call cut off by a crash as unresolved only after it confirms that the recorded process of that call has stopped. If that process still runs, the resume refuses to start. Every execution command refuses too, whatever run it targets. The error names the process and the command that stops it. Run your command again after that process stops.
+After a crash, a resume first checks that the crashed calls left nothing running. It checks every process in each call's recorded process group, then stops the trial containers that the run left running. Only then does it accept saved output or mark a call unresolved.
+
+If something still runs, or a stop fails, the resume refuses to start. Every execution command refuses too, whatever run it targets. The error names what still runs and how to stop it. Run your command again once it has stopped.
+
+Sometimes PluginBench cannot check a call: the call was killed before its process was recorded, or the run was moved. Check by hand that nothing of that run still runs. Then confirm with `pluginbench repair --confirm-stopped RUN_DIR`. This command records your confirmation and its time, and lifts the block.
 
 A Codex session that fails before its first model turn is a fatal failure, not an outcome. This is a `turn.failed` event with no usage, commands, or agent messages, as when a network or backend outage cuts the container off from Codex. The run stops after the first one with an error that names the attempt and Codex's message. The attempt stays `interrupted` and never enters the vanilla cache. Resume once Codex is reachable: the attempt is discarded and its slot is coded again. Timeouts, and failures after the agent has used tokens, run a command, or sent a message, stay scored.
 

@@ -225,7 +225,10 @@ def child() -> None:
 def child_resume() -> None:
     """argv: run, boundary. Resumes a study and kills itself at `boundary`."""
     root, boundary = sys.argv[1:3]
-    install(pytest.MonkeyPatch(), [], boundary=boundary, at=1)
+    patch = pytest.MonkeyPatch()
+    install(patch, [], boundary=boundary, at=1)
+    # The killed calls left no process; test_control_store covers the check itself.
+    patch.setattr(control_store, "verify_invocation", lambda item: {"id": item["id"]})
     # As the CLI does: recovering what the last crash left needs the host execution lock.
     owner = ExecutionOwner(kind="run", eval=root, root=root)
     with control_store.execute(owner, state=Path(root).parent / "host-state"):

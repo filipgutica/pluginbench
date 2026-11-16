@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from pluginbench.run_lock import process_start
+from pluginbench.run_lock import boot_id, pid_namespace, process_start
 
 # Version 2 adds `invocations` and `budget`; a writable open migrates version 1 in place.
 SCHEMA_VERSION = 2
@@ -156,7 +156,8 @@ def default_ceiling(paid_slots: int) -> int:
 
 
 def child_identity(pid: int) -> dict[str, object]:
-    """A spawned child's PID, kernel start time and the process group it leads.
+    """A spawned child's PID, kernel start time and the process group it leads, with the boot
+    and PID namespace they are valid in, so recovery can find what is left of it.
 
     `processes.run_command` starts each child in a new session, so its group ID is its PID.
     A child that already exited has no start time left to read.
@@ -165,7 +166,13 @@ def child_identity(pid: int) -> dict[str, object]:
         start: str | None = process_start(pid)
     except ProcessLookupError:
         start = None
-    return {"pid": pid, "start_time": start, "process_group": pid}
+    return {
+        "pid": pid,
+        "start_time": start,
+        "process_group": pid,
+        "boot_id": boot_id(),
+        "pid_namespace": pid_namespace(),
+    }
 
 
 def outcome(error: BaseException, *, spawned: bool) -> tuple[str, str | None]:
