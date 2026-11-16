@@ -8,6 +8,7 @@ import pytest
 
 from pluginbench import codex, remeasure, study, study_review
 from pluginbench.collectors import Collector
+from pluginbench.ledger import LEDGER_NAME
 from test_study_review import _existing_study
 
 
@@ -92,7 +93,10 @@ def test_fixed_review_projection_preserves_completed_measurements(
     assert native_path.parent == root / "review-revisions/fixed/report-native/original"
     assert path.read_bytes() == preserved_projection
     after = study._inventory(root)
-    assert all(after[name] == digest for name, digest in protected.items())
+    # The ledger records the judge calls; every other protected file is unchanged.
+    assert all(
+        after[name] == digest for name, digest in protected.items() if name != LEDGER_NAME
+    )
     remeasure.validate_remeasurement(root, root / "observer-revisions" / measurement_name)
     projected = json.loads(path.read_text())
     assert projected["measurement_revision"] == original["measurement_revision"]
