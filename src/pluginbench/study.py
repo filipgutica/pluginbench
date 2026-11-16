@@ -1911,7 +1911,7 @@ def _run_attempts(
         if exhausted:
             raise invocation_ledger.SlotExhausted(
                 f"{len(exhausted)} attempts have no coding invocation left, so the run cannot "
-                "finish and they are not coded again: "
+                "finish and they are not coded again; start a new run to code them: "
                 + "; ".join(
                     f"{plan['entries'][slot]['task_id']} · "
                     f"{normalize_arm_name(plan['entries'][slot]['arm'])} · "
