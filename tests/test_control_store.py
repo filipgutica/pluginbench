@@ -292,8 +292,9 @@ def test_containers_are_checked_only_after_the_processes_and_on_every_retry(
     assert len(inventories) == 3 and _record(isolated_host_state)["pending"] == []
 
 
-def test_an_unreachable_daemon_during_a_resume_fences_the_host(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
+@pytest.mark.parametrize("unknown", ["daemon unreachable", "runtime unreadable"])
+def test_containers_that_cannot_be_checked_during_a_resume_fence_the_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path, unknown: str
 ) -> None:
     root = _crashed(tmp_path, "after-identity")
     [crashed] = _rows(root)
@@ -303,14 +304,22 @@ def test_an_unreachable_daemon_during_a_resume_fences_the_host(
     def unreachable(runtime: Any) -> None:
         raise ValueError("Cannot connect to the Docker daemon")
 
-    monkeypatch.setattr(harbor_backend, "_assert_daemon", unreachable)
-    with pytest.raises(CleanupBlocked, match="Docker could not be checked"):
-        with control_store.execute(_owner(root)):
-            study.resume_study(root)
-    assert calls == [] and _rows(root) == [crashed]
-    # Its process is gone, but the run's containers are unknown: an unrelated run stays out.
-    assert not _admitted(isolated_host_state, tmp_path)
-    monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime: None)
+    def unreadable(frozen: Any) -> dict[str, object]:
+        raise ValueError("no isolation recorded")
+
+    with monkeypatch.context() as broken:
+        if unknown == "daemon unreachable":
+            broken.setattr(harbor_backend, "_assert_daemon", unreachable)
+            reason = "Docker could not be checked"
+        else:
+            broken.setattr(study, "prepared_runtime", unreadable)
+            reason = "the Docker runtime could not be found"
+        with pytest.raises(CleanupBlocked, match=reason):
+            with control_store.execute(_owner(root)):
+                study.resume_study(root)
+        assert calls == [] and _rows(root) == [crashed]
+        # Its process is gone, but the run's containers are unknown: an unrelated run stays out.
+        assert not _admitted(isolated_host_state, tmp_path)
     assert _admitted(isolated_host_state, tmp_path)
 
 
@@ -369,6 +378,32 @@ def test_an_error_before_any_recorded_work_releases_the_host(
             raise ValueError("unsupported measurements: bogus")
     assert _record(isolated_host_state)["state"] == "released"
     assert _admitted(isolated_host_state, tmp_path)
+
+
+def test_a_run_root_without_a_ledger_is_unknown(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    # Killed while preparing a new run: nothing records what preparation started.
+    destination = tmp_path / "preparing"
+    destination.mkdir()
+    _crashed_owner(isolated_host_state, kind="run", root=destination, runtimes=[])
+    with pytest.raises(CleanupBlocked, match=f"repair --confirm-stopped {destination}"):
+        with control_store.execute(_owner(tmp_path / "unrelated")):
+            pass
+
+
+def test_confirming_an_unreadable_record_never_covers_a_later_one(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    owner_record = isolated_host_state / run_lock.EXECUTION_OWNER
+    owner_record.write_text("{not json")
+    assert not _admitted(isolated_host_state, tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["repair", str(isolated_host_state), "--confirm-stopped"])
+    assert result.exit_code == 0 and "The host is unblocked." in result.stdout
+    assert _admitted(isolated_host_state, tmp_path)
+    owner_record.write_text("{not json either")
+    assert not _admitted(isolated_host_state, tmp_path)
 
 
 def _stuck_run(tmp_path: Path) -> tuple[Path, dict[str, Any]]:

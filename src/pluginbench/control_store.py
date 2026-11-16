@@ -310,26 +310,21 @@ def _obligation_checks(obligation: dict[str, Any]) -> list[Check]:
     """Everything to verify before a dead owner's root is known to have nothing running."""
     root = str(obligation["root"])
     name = f"{obligation.get('pid')}-{obligation.get('acquired_at')}"
-    if obligation.get("kind") in UNRECORDED_KINDS:
+    path = _ledger(Path(root))
+    if obligation.get("kind") in UNRECORDED_KINDS or path is None:
         reason = (
-            f"`{obligation.get('kind')}` for {root} ended without a clean release, and no "
+            f"{root}, whose owner ended without a clean release, was moved or deleted"
+            if not Path(root).is_dir()
+            else f"`{obligation.get('kind')}` for {root} ended without a clean release, and no "
             "ledger records its processes"
         )
-    elif not Path(root).is_dir():
-        reason = f"{root}, whose owner ended without a clean release, was moved or deleted"
-    else:
-        reason = ""
-    if reason:
         return [{"id": f"{name}:unrecorded", "root": root, "kind": "unrecorded", "reason": reason}]
-    checks: list[Check] = []
-    path = _ledger(Path(root))
-    if path is not None:
-        ledger = Ledger.read(path)
-        try:
-            checks += _invocations(_open(ledger), root)
-        finally:
-            ledger.close()
-    evidence = path.parent if path else Path(root) / "evidence"
+    ledger = Ledger.read(path)
+    try:
+        checks = _invocations(_open(ledger), root)
+    finally:
+        ledger.close()
+    evidence = path.parent
     if obligation.get("kind") != "run" or not (evidence / "frozen" / "suite").is_dir():
         return checks  # No trial of this owner can have started a container.
     runtimes: list[dict[str, Any] | None] = list(obligation.get("runtimes") or [])

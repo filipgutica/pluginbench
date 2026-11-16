@@ -522,7 +522,9 @@ def _carried(state: Path) -> list[dict[str, Any]]:
         return []
     previous = _read_record(path)
     if previous is None:
-        return [{"kind": "unknown", "root": str(state), "pid": None, "acquired_at": None}]
+        # Named by when it was found, so confirming it never covers a later unreadable record.
+        found = datetime.now(UTC).isoformat()
+        return [{"kind": "unknown", "root": str(state), "pid": None, "acquired_at": found}]
     carried = previous.get("pending")
     pending = [item for item in carried if isinstance(item, dict)] if isinstance(carried, list) else []
     if previous.get("state") != "released":
