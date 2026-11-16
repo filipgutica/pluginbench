@@ -127,7 +127,9 @@ def metrics_reference() -> str:
         "Token provenance retains original figures and recording time in `usage_validation`.",
         "Compare treats tokens without validated provenance as unknown in every report schema.",
         "Higher coverage or lower cost alone does not establish a better solution.",
-        "Correctness gates use `correctness: passes` or `correctness: unknown` instead of metric names.",
+        "Correctness gates use `correctness: passes` instead of metric names. Each attempt passes or "
+        "fails (grade contract 1); an infrastructure error or a legacy grade is no result, so a pass "
+        "gate on it is undetermined.",
         "See [running evaluations](running-evaluations.md#compare-runs) for gate statistics and bounds.",
         "",
         "| Metric | What it measures | Unit | Gates-file name | Direction |",
@@ -143,8 +145,13 @@ def metrics_reference() -> str:
         "",
         "`report/results.json`, `report/results.csv`, and `report/report.html` name the no-guidance arm `vanilla`.",
         "CSV column names are unchanged; the `arm` column now contains `vanilla` instead of `baseline`.",
-        "The JSON format is `schema_version: 2`. Version 1 called this arm `baseline`.",
-        "`compare`, `status`, and `judge prepare` accept both report versions without rewriting them.",
+        "The JSON format is `schema_version: 3`. Version 1 called this arm `baseline`.",
+        "Version 3 adds `grade_contract` (1, or null for a legacy run) and, per attempt, `passed`, "
+        "`grade_reason` and `grade_attributes`. `correctness` is `pass`, `fail`, `infra` (an "
+        "infrastructure error, retried, never a result), `legacy`, or null before grading; "
+        "`overlap_pass`, `empty` and `unknown` are gone.",
+        "`compare`, `status`, and `judge prepare` read every report version without rewriting it; "
+        "a report without `grade_contract` has no grade for a pass gate.",
         "",
         "| Version 1 | Version 2 | Location |",
         "| --- | --- | --- |",
@@ -161,7 +168,11 @@ def metrics_reference() -> str:
         "HTML uses the same public data, labels, and vanilla-first ordering.",
         "Opaque attempt IDs, evidence paths, provenance, and comparison identities keep their stored values.",
         "Evidence files, `inputs/study.json`, run identities, and cache keys still use `baseline` internally.",
-        "Existing runs and vanilla caches can resume and reuse without migration.",
+        "The rename needs no migration: vanilla caches from earlier builds are still reused,",
+        "unless an entry holds an infrastructure error or a session that never reached the model.",
+        "A run coded before grade contract 1 is legacy: `status` and `report` read it, but",
+        "`pluginbench run` refuses to code more of it. Start a new run instead; see",
+        "[Correctness](running-evaluations.md#correctness).",
     ]
     return "\n".join(lines) + "\n"
 

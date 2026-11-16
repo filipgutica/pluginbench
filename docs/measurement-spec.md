@@ -31,9 +31,9 @@ For every attempt, report measures of correctness, the code it added, the tests 
 
 ## Requirements
 
-### R1. Correctness (unchanged)
+### R1. Correctness
 
-Report confirmed pass, fail, unknown, and execution failure per attempt, as today. All other measures are reported for all attempts and, separately labelled, for passing attempts.
+Report one grade per attempt, pass or fail (grade contract 1; see [Correctness](running-evaluations.md#correctness)). An attempt that cannot be graded is an infrastructure error: it is retried and counts in no total. All other measures are reported for all attempts and, separately labelled, for passing attempts.
 
 ### R2. Code added (source only)
 

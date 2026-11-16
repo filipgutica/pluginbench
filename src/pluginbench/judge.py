@@ -28,10 +28,10 @@ import yaml
 from pydantic import StrictInt, StrictStr
 
 from pluginbench import codex, study
+from pluginbench.grade import GRADE_CONTRACT
 from pluginbench.arms import normalize_arm_name
 from pluginbench.assessment import _load_manifest
 from pluginbench.assessment_models import Attempt, InputModel, Snapshot
-from pluginbench.evaluation_report import correctness_state
 from pluginbench.parallel import run_jobs, validate_jobs
 from pluginbench.datasets import TaskCatalog
 from pluginbench.study_review import (
@@ -44,8 +44,11 @@ from pluginbench.study_review import (
 KEY = "key.json"
 PANEL = "panel.json"
 SCHEMA = "response-schema.json"
-# An overlap pass counts as a pass: the verifier graded the production code with its own tests.
-PASSING = {"pass", "overlap_pass"}
+# The report's one grade per attempt; anything else (infra, legacy, ungraded) is no pass.
+PASSING = {"pass"}
+# Each attempt's one grade (grade contract 1). Anything else, an infrastructure error, a legacy
+# run's correctness or none yet, is no grade, so correctness cannot decide its pair.
+GRADED = {"pass", "fail"}
 HARNESSES = {"codex", "claude"}
 # Version 2 added judge_cli_version. A binding without a version is version 1.
 BINDING_VERSION = "2"
@@ -118,7 +121,7 @@ class Submission:
     arm: str
     attempt: str
     repeat: int
-    correctness: str
+    correctness: str | None  # The attempt's grade, as the report gives it.
     before_digest: str
     # The review packet, or what stands in for it when the run has none.
     source: Path | Saved
@@ -275,6 +278,7 @@ def load_submissions(
     )
     submissions: dict[tuple[str, int], Submission] = {}
     unavailable: list[tuple[str, int]] = []
+    graded = data.get("grade_contract") == GRADE_CONTRACT
     for row in rows:
         key = (row["task"], int(row["repeat"]))
         where = f"{run} {arm} {row['task']} repeat {key[1]}"
@@ -312,7 +316,8 @@ def load_submissions(
             arm=arm,
             attempt=row["id"],
             repeat=key[1],
-            correctness=correctness_state(row["correctness"], row.get("native_grading")),
+            # A report from before grade contract 1 holds no grade, as compare reads it.
+            correctness=row["correctness"] if graded else "legacy",
             before_digest=artifacts["before_digest"],
             source=source,
         )
@@ -419,6 +424,8 @@ def prepare(
         output / KEY,
         {
             "schema_version": 1,
+            # The contract each side's correctness follows; a key without it predates grades.
+            "grade_contract": GRADE_CONTRACT,
             "arms": {first_arm: str(first_run.resolve()), second_arm: str(second_run.resolve())},
             "seed": seed,
             "criteria": str(criteria.resolve()),
@@ -852,6 +859,9 @@ def tally(directory: Path, *, require_bound: bool = False) -> dict[str, Any]:
         for task in tasks
     }
     arms = list(key["arms"])
+    # A key prepared before grade contract 1 holds native correctness, no grade: its votes
+    # and bindings stand, but correctness decides none of its pairs.
+    graded_key = key.get("grade_contract") == GRADE_CONTRACT
     wins = dict.fromkeys(arms, 0.0)
     decided = {"correctness": dict.fromkeys(arms, 0.0), "judges": dict.fromkeys(arms, 0.0)}
     side_a = dict.fromkeys(judges, 0)
@@ -870,7 +880,8 @@ def tally(directory: Path, *, require_bound: bool = False) -> dict[str, Any]:
                     comparable[judge] += 1
                     agreed[judge] += vote == others
             passed = {side: sides[side]["correctness"] in PASSING for side in "AB"}
-            if passed["A"] != passed["B"]:
+            graded = graded_key and all(sides[side]["correctness"] in GRADED for side in "AB")
+            if graded and passed["A"] != passed["B"]:
                 by, shares = "correctness", {"A": float(passed["A"]), "B": float(passed["B"])}
             else:
                 majority = _majority(list(pair_votes.values()))
@@ -901,7 +912,7 @@ def tally(directory: Path, *, require_bound: bool = False) -> dict[str, Any]:
     )
     return {
         "schema_version": 1,
-        "rule": "If exactly one side passed (pass or overlap pass), it wins without a vote. "
+        "rule": "If both sides have a grade and exactly one passed, it wins without a vote. "
         "Otherwise the side more than half of the judges prefer wins; anything else is half each.",
         "judges": judges,
         "unbound": len(unbound),

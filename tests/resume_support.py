@@ -42,11 +42,18 @@ BOUNDARIES = {
 
 
 def recipe(
-    directory: Path, *, tasks: int, treatments: int, repeats: int, jobs: int, seed: int = 42
+    directory: Path,
+    *,
+    tasks: int,
+    treatments: int,
+    repeats: int,
+    jobs: int,
+    seed: int = 42,
+    solution: str | None = None,
 ) -> Path:
     suite = directory / "suite"
     suite.mkdir(parents=True)
-    entries = [task_entry(suite, f"task-{index}") for index in range(tasks)]
+    entries = [task_entry(suite, f"task-{index}", solution=solution) for index in range(tasks)]
     (suite / "tasks.yaml").write_text(yaml.safe_dump({"schema_version": 1, "tasks": entries}))
     guidance = {}
     for index in range(treatments):

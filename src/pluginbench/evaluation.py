@@ -11,9 +11,11 @@ import shutil
 import tempfile
 from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Literal
 from collections.abc import Callable
+from uuid import uuid4
 
 import yaml
 from pydantic import (
@@ -58,7 +60,14 @@ from pluginbench.measurement_profiles import (
     selected_measurements,
 )
 from pluginbench.assessment_metrics import scoped_code_size, scoped_test_size
-from pluginbench.datasets import TaskCatalog, TaskEntry, load_tasks, portable_native_identity
+from pluginbench.datasets import (
+    TaskCatalog,
+    TaskEntry,
+    TaskSpec,
+    load_tasks,
+    native_identity,
+    portable_native_identity,
+)
 from pluginbench.collectors import Collector
 from pluginbench.assessment_charts import chart_data
 from pluginbench.evaluation_report import write_evaluation_report
@@ -581,6 +590,24 @@ def _reference_agents(
         _write(temporary, passed)
         temporary.replace(entry)
     return rows
+
+
+def _requalify(evidence: Path, task: TaskSpec) -> str | None:
+    """Run a task's nop and oracle again, never from the cache; why they fail, or None.
+
+    A grade may only stand as a fail when the task is healthy now, so an admission pass is
+    not enough.
+    """
+    destination = evidence / source_only.DIRECTORY / "requalify" / task.task_id / uuid4().hex
+    rows = _reference_agent_rows(
+        harbor_backend.run_reference_agents(native_identity(task), destination)
+    )
+    broken = [
+        f"{agent} {row['state']}: {row['reason']}"
+        for agent, row in rows.items()
+        if row["state"] != "ready"
+    ]
+    return "; ".join(broken) or None
 
 
 class CheckFailed(ValueError):
@@ -1166,11 +1193,15 @@ def _finish_evaluation(
             evidence, str(selection["review_revision"])
         )
     if source_only.needs_grading(evidence, selection.get("source_only_grades")):
-        # Also backfills a run finished before this grade or its current filter existed, and
-        # retries stages the frozen runtime could not replay last time.
-        selection["source_only_grades"] = record_source_only_grades(evidence, progress=progress)
+        # Also grades a run finished before the current filter existed, and grades again the
+        # stages that hit an infrastructure error last time.
+        selection["source_only_grades"] = record_source_only_grades(
+            evidence, requalify=partial(_requalify, evidence), progress=progress
+        )
     _save_selection(root, selection)
     regenerate_report(root)
+    if selection.get("source_only_grades") is not None:
+        source_only.raise_if_pending(evidence, selection["source_only_grades"], root)
     return root
 
 

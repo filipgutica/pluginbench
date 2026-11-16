@@ -21,7 +21,14 @@ from typing import Any
 
 import pytest
 
-from pluginbench import claude, claude_launch, claude_treatments, evaluation, saved_usage
+from pluginbench import (
+    claude,
+    claude_launch,
+    claude_treatments,
+    evaluation,
+    grade,
+    saved_usage,
+)
 from pluginbench import harbor_backend as harbor
 from pluginbench.native_treatments import REMOTE_ROOT, NativeCapabilities, admit
 from pluginbench.processes import run_command
@@ -73,6 +80,8 @@ class Container:
     # Changes to the captured hook entries the CLI writes at the head of the root transcript.
     edit_transcript: Callable[[list[dict[str, Any]]], None] = lambda entries: None
     agent_root: Path | None = None
+    # What Harbor's trial reports as its exception, such as an agent timeout.
+    exception_info: dict[str, Any] | None = None
 
     @property
     def remote(self) -> Path:
@@ -230,7 +239,10 @@ class Container:
                 )
                 await self.agent.run("Fix the bug.", self.agent_environment, context())
                 return SimpleNamespace(
-                    model_dump=lambda mode: {"exception_info": None, "verifier_result": None}
+                    model_dump=lambda mode: {
+                        "exception_info": container.exception_info,
+                        "verifier_result": None,
+                    }
                 )
 
         monkeypatch.setattr(importlib.import_module("harbor.trial.trial"), "Trial", Trial)
@@ -490,6 +502,29 @@ def test_a_fresh_attempt_whose_hooks_are_all_audited_keeps_complete_usage(
         assert saved["usage_accounting"]["reason"] == reason
         assert revalidated["usage"] is None
         assert revalidated["usage_validation"]["reasons"] == [reason]
+
+
+def test_a_timeout_after_model_work_under_unaudited_hooks_is_the_agent_s_attempt(
+    attempt: Callable[..., Attempt], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The agent timed out with its stream cut after system/init; the transcript kept the
+    # model's reply. Unaudited hooks then move native accounting under `native_sessions`.
+    made = attempt(treated=True)
+    stream = shlex.quote(str(made.container.root / "stream.jsonl"))
+    made.container.after_sessions = (
+        f"awk '{{print}} /\"subtype\": \"init\"/{{exit}}' {stream} > {stream}.cut "
+        f"&& mv {stream}.cut {stream}"
+    )
+    made.container.exception_info = {
+        "exception_type": "AgentTimeoutError",
+        "exception_message": "Agent execution timed out after 1800 seconds",
+    }
+    made.invoke(monkeypatch)
+    saved = json.loads((made.area / "artifacts/execution.json").read_text())
+    assert saved["timed_out"] is True and saved["usage"] is None
+    native = saved["usage_accounting"]["native_sessions"]
+    assert native["per_model"][MODEL]["transcript_output_tokens"] == 4
+    assert grade.failed_before_first_turn(saved, "claude") is None
 
 
 def test_a_token_in_a_saved_artifact_refuses_the_attempt(

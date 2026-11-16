@@ -11,7 +11,7 @@ import math
 import random
 import shlex
 import statistics
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -19,11 +19,12 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from pluginbench.arms import normalize_arm_name
-from pluginbench.evaluation_report import MEASUREMENT_METRICS, correctness_state
+from pluginbench.evaluation_report import MEASUREMENT_METRICS
+from pluginbench.grade import GRADE_CONTRACT
 
-PASS_STATES = {"pass"}
-# Any other correctness, such as unknown, could be a pass or a fail.
-GRADED_STATES = {"pass", "fail", "overlap_pass"}
+# Each attempt's one grade. Any other correctness (an infrastructure error, a legacy run's grade,
+# or none yet) is no result: a pass gate on such an attempt is undetermined.
+GRADED_STATES = {"pass", "fail"}
 TOKEN_METRICS = ["Input tokens", "Output tokens"]
 BOOTSTRAP_DRAWS = 10_000
 BOOTSTRAP_SEED = 0
@@ -65,8 +66,8 @@ class Gate(BaseModel):
     direction: Literal["higher", "lower"] = Field(
         description="Selects whether values must meet a lower ceiling or a higher floor."
     )
-    correctness: Literal["passes", "unknown"] | None = Field(
-        default=None, description="Selects pass or unknown counts instead of metric values."
+    correctness: Literal["passes"] | None = Field(
+        default=None, description="Selects pass counts instead of metric values."
     )
     per_task: bool = Field(
         default=False,
@@ -153,10 +154,6 @@ class Gate(BaseModel):
 class Gates(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    # Required: whether an overlap pass counts as a pass is the study's choice, never a default.
-    count_overlap_passes: bool = Field(
-        description="Declares whether native overlap passes count as passes."
-    )
     splits: dict[str, list[str]] = Field(
         default_factory=dict,
         description="Maps split names to task IDs, with all tasks also compared automatically.",
@@ -164,6 +161,16 @@ class Gates(BaseModel):
     gates: list[Gate] = Field(
         description="Lists uniquely named rules for comparing each candidate with its comparator."
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def no_overlap_passes(cls, data: object) -> object:
+        if isinstance(data, dict) and "count_overlap_passes" in data:
+            raise ValueError(
+                "count_overlap_passes was removed: each attempt now has one grade, pass or "
+                "fail, so delete the setting"
+            )
+        return data
 
     @model_validator(mode="after")
     def unique_names(self) -> Gates:
@@ -179,7 +186,8 @@ class Attempt:
     run: str
     task: str
     arm: str
-    correctness: str
+    # `pass` or `fail`; `infra`, `legacy`, or None (not graded yet) is no grade.
+    correctness: str | None
     values: dict[str, float | None]
     # Why a metric has no value, from the report's observation.
     reasons: dict[str, str] = field(default_factory=dict)
@@ -261,7 +269,6 @@ def paired_comparison(
     ratios: dict[str, float] = {}
     missing_passes: dict[str, str] = {}
     missing_tokens: dict[str, str] = {}
-    states = PASS_STATES | ({"overlap_pass"} if gates.count_overlap_passes else set())
     for task in sorted(set(tasks)):
         sides = [
             [row for row in evidence.attempts if row.arm == arm and row.task == task]
@@ -274,9 +281,9 @@ def paired_comparison(
             missing_passes[task] = missing_tokens[task] = why
             continue
         if any(row.correctness not in GRADED_STATES for rows in sides for row in rows):
-            missing_passes[task] = "unknown correctness on at least one attempt"
+            missing_passes[task] = "no grade on at least one attempt"
         else:
-            rates = [sum(row.correctness in states for row in rows) / len(rows) for rows in sides]
+            rates = [sum(row.correctness == "pass" for row in rows) / len(rows) for rows in sides]
             differences[task] = rates[0] - rates[1]
         totals = [[_sum(row.values, TOKEN_METRICS) for row in rows] for rows in sides]
         if any(
@@ -319,6 +326,8 @@ def load_evidence(specs: list[str]) -> Evidence:
         if not results.is_file():
             raise ValueError(f"{directory} has no report/results.json; run `pluginbench report`")
         data = json.loads(results.read_text())
+        # A report without the grade contract is a legacy run's: its attempts read `legacy`.
+        graded = data.get("grade_contract") == GRADE_CONTRACT
         evidence.identities[directory] = data.get("comparison_identity")
         values: dict[str, dict[str, float | None]] = {}
         reasons: dict[str, dict[str, str]] = {}
@@ -368,7 +377,7 @@ def load_evidence(specs: list[str]) -> Evidence:
                     run=directory,
                     task=row["task"],
                     arm=arm,
-                    correctness=correctness_state(row["correctness"], row.get("native_grading")),
+                    correctness=row["correctness"] if graded else "legacy",
                     values=values.get(row["id"], {}),
                     reasons=reasons.get(row["id"], {}),
                 )
@@ -562,16 +571,11 @@ def _within(gate: Gate, value: float, limit: float) -> bool:
     return value <= limit if gate.direction == "lower" else value >= limit
 
 
-def _correctness_counts(
-    evidence: Evidence, gates: Gates, arm: str, tasks: list[str], kind: str
-) -> dict[str, int | None]:
-    states = PASS_STATES | ({"overlap_pass"} if gates.count_overlap_passes else set())
-    if kind == "unknown":
-        states = {"unknown"}
+def _pass_counts(evidence: Evidence, arm: str, tasks: list[str]) -> dict[str, int | None]:
     counts: dict[str, int | None] = {}
     for task in tasks:
         rows = [row for row in evidence.attempts if row.arm == arm and row.task == task]
-        counts[task] = sum(row.correctness in states for row in rows) if rows else None
+        counts[task] = sum(row.correctness == "pass" for row in rows) if rows else None
     return counts
 
 
@@ -647,46 +651,25 @@ def check_gate(
             return Verdict(
                 None, None, None, "undetermined", "attempts per task differ: " + ", ".join(unequal)
             )
-        # Every task has attempts on both sides now, so no count is None.
-        mine, theirs = (
-            {
-                task: count or 0
-                for task, count in _correctness_counts(
-                    evidence, gates, arm, tasks, gate.correctness
-                ).items()
-            }
-            for arm in arms
-        )
-        verdict = _count_verdict(gate, mine, theirs, tasks)
-        unknown = [
+        ungraded = [
             [row for row in attempts[arm] if row.correctness not in GRADED_STATES] for arm in arms
         ]
-        if gate.correctness != "passes" or not any(unknown):
-            return verdict
-        # Each unknown could be a pass or a fail. Pass counts only grow with more passes, so
-        # counting each side's unknowns all as passes or all as fails gives the extreme results.
-        mine_high, theirs_high = (
-            {task: counts[task] + sum(row.task == task for row in rows) for task in counts}
-            for counts, rows in zip((mine, theirs), unknown, strict=True)
-        )
-        results = {
-            _count_verdict(gate, side, other, tasks).result
-            for side in (mine, mine_high)
-            for other in (theirs, theirs_high)
-        }
-        unknowns = (
-            f"{len(unknown[0])} candidate and {len(unknown[1])} comparator attempts "
-            "with unknown correctness"
-        )
-        if len(results) > 1:
+        if any(ungraded):
+            # An infrastructure error is retried, never a result, so the gate waits for it.
             return Verdict(
-                verdict.candidate,
-                verdict.comparator,
+                None,
+                None,
                 None,
                 "undetermined",
-                f"{unknowns} could change the result",
+                f"{len(ungraded[0])} candidate and {len(ungraded[1])} comparator attempts "
+                "have no grade",
             )
-        return replace(verdict, detail=f"{verdict.detail}; {unknowns} cannot change the result")
+        # Every task has attempts on both sides now, so no count is None.
+        mine, theirs = (
+            {task: count or 0 for task, count in _pass_counts(evidence, arm, tasks).items()}
+            for arm in arms
+        )
+        return _count_verdict(gate, mine, theirs, tasks)
     mine_measure = measure(evidence, gate, candidate, tasks)
     theirs_measure = measure(evidence, gate, gate.against, tasks)
     # Any assigned attempt without a value leaves the gate open: deciding on the attempts that
@@ -842,6 +825,25 @@ def _arms(evidence: Evidence) -> list[str]:
     return sorted(seen, key=lambda arm: (arm != "vanilla", seen.index(arm)))
 
 
+def _grade_counts(rows: list[Attempt]) -> dict[str, int]:
+    """Attempts by grade. `pending` holds infrastructure errors and attempts not graded yet,
+    which a later run grades; `legacy` holds a legacy run's attempts, which have no grade."""
+    return {
+        "attempts": len(rows),
+        "passes": sum(row.correctness == "pass" for row in rows),
+        "fails": sum(row.correctness == "fail" for row in rows),
+        "pending": sum(row.correctness not in {*GRADED_STATES, "legacy"} for row in rows),
+        "legacy": sum(row.correctness == "legacy" for row in rows),
+    }
+
+
+def _task_passes(counts: dict[str, int]) -> str:
+    """Passes over graded attempts, then the attempts with no grade beside them."""
+    graded = counts["passes"] + counts["fails"]
+    ungraded = [f"{counts[name]} {name}" for name in ("pending", "legacy") if counts[name]]
+    return f"{counts['passes']}/{graded}" + (f" ({', '.join(ungraded)})" if ungraded else "")
+
+
 def _section(evidence: Evidence, gates: Gates, split: str, tasks: list[str]) -> list[str]:
     present = sorted({row.task for row in evidence.attempts} & set(tasks))
     lines = [f"Split {split}: {len(present)} of {len(tasks)} tasks have attempts"]
@@ -852,23 +854,14 @@ def _section(evidence: Evidence, gates: Gates, split: str, tasks: list[str]) -> 
     counts: dict[str, dict[str, int]] = {arm: {} for arm in arms}
     for arm in arms:
         mine = [row for row in evidence.attempts if row.arm == arm and row.task in tasks]
-        counts[arm] = {
-            "attempts": len(mine),
-            "confirmed passes": sum(row.correctness == "pass" for row in mine),
-            "overlap passes": sum(row.correctness == "overlap_pass" for row in mine),
-            "unknown": sum(row.correctness == "unknown" for row in mine),
-        }
-        counts[arm]["passes"] = counts[arm]["confirmed passes"] + (
-            counts[arm]["overlap passes"] if gates.count_overlap_passes else 0
-        )
-    for name in ("attempts", "confirmed passes", "overlap passes", "passes", "unknown"):
+        counts[arm] = _grade_counts(mine)
+    for name in ("attempts", "passes", "fails", "pending", "legacy"):
         rows.append([name, *(str(counts[arm][name]) for arm in arms)])
-    passes = {arm: _correctness_counts(evidence, gates, arm, tasks, "passes") for arm in arms}
     for task in tasks:
         cells = []
         for arm in arms:
-            assigned = sum(row.arm == arm and row.task == task for row in evidence.attempts)
-            cells.append(f"{passes[arm][task]}/{assigned}" if assigned else "no attempts")
+            mine = [row for row in evidence.attempts if row.arm == arm and row.task == task]
+            cells.append(_task_passes(_grade_counts(mine)) if mine else "no attempts")
         rows.append([f"passes: {task}", *cells])
     notes: list[str] = []
     shown: set[tuple[object, ...]] = set()
@@ -941,9 +934,7 @@ def compare(specs: list[str], gates_path: Path) -> str:
     all_tasks = sorted({row.task for row in evidence.attempts})
     notes = _check_comparable(evidence, gates)
     lines = [
-        "Overlap passes count as passes."
-        if gates.count_overlap_passes
-        else "Overlap passes do not count as passes.",
+        "Each attempt passes or fails; an attempt with no grade is not counted.",
         *(f"Run identity: {note}" for note in notes),
         *(
             f"{run}: rebuild with `{shlex.join(['pluginbench', 'report', run])}` "

@@ -1,4 +1,4 @@
-{"attempts": [
+{"grade_contract": 1, "attempts": [
 {"id": "5debd63ebdabf02f", "task": "happy-dom-abort-pending-body-reads", "guidance": "superpowers", "correctness": "pass", "native_grading": {"reason": null, "native_verifier_result": {"rewards": {"reward": 1, "f2p_passed": 14, "f2p_total": 14, "p2p_passed": 165, "p2p_total": 165}}}},
 {"id": "ac4a6e3043bcc4b9", "task": "happy-dom-abort-pending-body-reads", "guidance": "baseline", "correctness": "pass", "native_grading": {"reason": null, "native_verifier_result": {"rewards": {"reward": 1, "f2p_passed": 14, "f2p_total": 14, "p2p_passed": 165, "p2p_total": 165}}}},
 {"id": "48758317a30cd277", "task": "testem-per-launcher-reports", "guidance": "superpowers", "correctness": "pass", "native_grading": {"reason": null, "native_verifier_result": {"rewards": {"reward": 1, "f2p_passed": 65, "f2p_total": 65, "p2p_passed": 469, "p2p_total": 469}}}},

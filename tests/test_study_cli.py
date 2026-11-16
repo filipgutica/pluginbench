@@ -5,10 +5,12 @@ from __future__ import annotations
 import fcntl
 import inspect
 import csv
+import dataclasses
 import io
 import json
 import hashlib
 import os
+import shlex
 import signal
 from types import SimpleNamespace
 import shutil
@@ -81,6 +83,8 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> evaluation.Evalua
     (task / "instruction.md").write_text("Implement the task.\n")
     (task / "tests/test.sh").write_text("#!/bin/sh\nexit 0\n")
     (task / "tests/test.patch").write_text("")
+    # The source-only grade, the only grade, needs the reference solution's files.
+    (task / "solution/solution.patch").write_text("")
     (tmp_path / "a.md").write_text("Use existing helpers.\n")
     (tmp_path / "b.md").write_text("Keep state minimal.\n")
     monkeypatch.setattr(
@@ -945,9 +949,10 @@ def test_integrated_evaluation_and_report_regeneration(
     assert json.loads((review / "protocol.json").read_text())["jobs"] == config.jobs
     assert len(calls) == data["assigned"] == 9
     assert {row["guidance"] for row in data["attempts"]} == {"vanilla", "workflow", "superpowers"}
-    assert sum(row["correctness"] == "fail" for row in data["attempts"]) == (
-        0 if unavailable else 1
-    )
+    # The first attempt fails: on its reward, or as a symlink the patch policy refuses.
+    assert [row.get("grade_reason") for row in data["attempts"] if row["correctness"] == "fail"] == [
+        "unsupported_submission:symlink" if unavailable else None
+    ]
     assert {row["family"] for row in data["observations"]} == {
         "tokens",
         "lines",
@@ -1665,7 +1670,7 @@ def test_a_gate_on_a_listed_pair_reads_the_report_as_undetermined(
         direction="higher",
         tolerance=10,
     )
-    gates = Gates(count_overlap_passes=True, gates=[gate])
+    gates = Gates(gates=[gate])
 
     split = check_gate(
         evidence, gates, gate, candidate, ["arbitrary-native-task", "covered-native-task"]
@@ -3648,10 +3653,12 @@ def test_a_finished_run_grades_each_submission_again_without_its_test_files(
 
     assert result.exit_code == 0, result.stderr + result.stdout
     after = _rows(root)
-    # The native grade, its evidence and the correctness it gives are unchanged.
-    assert {key: (row["correctness"], row["native_grading"]) for key, row in before.items()} == {
-        key: (row["correctness"], row["native_grading"]) for key, row in after.items()
+    # The native grade and its evidence are unchanged; the source-only grade is the correctness.
+    assert {key: row["native_grading"] for key, row in before.items()} == {
+        key: row["native_grading"] for key, row in after.items()
     }
+    assert {row["correctness"] for row in before.values()} == {None}
+    assert {row["correctness"] for row in after.values()} == {"pass"}
     assert {key: digest for key, digest in _tree(root / "evidence").items() if key in native} == native
     packages = [row for row in after.values() if row["guidance"] != "vanilla"]
     vanilla = [row for row in after.values() if row["guidance"] == "vanilla"]
@@ -3694,17 +3701,27 @@ def test_source_only_replays_wait_for_the_frozen_grader_and_a_failed_try_is_clea
     monkeypatch.setattr(harbor_backend, "_assert_native_image", gone)
     result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
 
-    # The run and its report finish; the grades that need the grader say why they wait.
-    assert result.exit_code == 0, result.stderr + result.stdout
+    # The partial report is written, but the run is not finished: it exits non-zero, and
+    # status names the grading left, its reasons and the command that grades it.
+    assert result.exit_code != 0, result.stderr + result.stdout
     assert graded == []
-    waiting = [line for line in result.stdout.splitlines() if "source-only" in line]
-    assert len(waiting) == 1 and str(len(packages)) in waiting[0]
-    assert "Frozen native image is unavailable" in waiting[0]
+    output = result.stderr + result.stdout
+    assert f"{len(packages)} attempts have no grade" in output
+    assert "Frozen native image is unavailable" in output
+    status = run_status.run_status(root)
+    # No process owns the run, so its phase is the failure it ended with, as for any run
+    # that stopped with work left; `grading` shows only while a run is grading.
+    assert status["phase"] == "failed"
+    assert status["resume_command"] == shlex.join(["pluginbench", "run", str(root)])
+    (alert,) = [item for item in status["alerts"]["items"] if item["kind"] == "grades_pending"]
+    assert alert["severity"] == "error" and alert["attempts"] == len(packages)
+    assert "Frozen native image is unavailable" in alert["message"]
     for key, row in _rows(root).items():
         grading = row["source_only_grading"]
         if key in packages:
-            # Pending, unlike a permanent `unavailable`: a later run grades it.
-            assert grading["status"] == "pending" and row["source_only_reward"] is None
+            # An infrastructure error, never a result: a later run grades it.
+            assert grading["status"] == "infra" and row["source_only_reward"] is None
+            assert row["correctness"] == "infra"
             assert grading["reason"].startswith("Frozen native image is unavailable")
         else:
             assert grading["status"] == "complete" and row["source_only_reward"] == 1
@@ -3718,17 +3735,24 @@ def test_source_only_replays_wait_for_the_frozen_grader_and_a_failed_try_is_clea
         raise ValueError("verifier container crashed")
 
     monkeypatch.setattr(harbor_backend, "regrade_native", crash)
-    failed = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
-    assert failed.exit_code != 0
+    crashed = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+    # A crashed replay is an infrastructure error too: the run is not finished, and its failed
+    # try stays until the next run grades the attempt.
+    assert crashed.exit_code != 0, crashed.stderr + crashed.stdout
     directory = root / "evidence/source-only" / f"filter-{source_only.FILTER_REVISION}"
     assert len(list(directory.glob("*/*.try-*"))) == 1
+    assert [_rows(root)[key]["correctness"] for key in packages].count("infra") == 1
 
     result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
 
     assert result.exit_code == 0, result.stderr + result.stdout
     assert list(directory.glob("*/*.try-*")) == []
     assert {_rows(root)[key]["source_only_reward"] for key in packages} == {1}
+    assert {_rows(root)[key]["correctness"] for key in packages} == {"pass"}
     assert evaluation.plan_resume(root)["verifier_replays"] == 0
+    status = run_status.run_status(root)
+    assert status["phase"] == "complete" and status["resume_command"] is None
+    assert not [item for item in status["alerts"]["items"] if item["kind"] == "grades_pending"]
 
 
 def test_a_new_filter_revision_grades_again_beside_the_earlier_one(
@@ -3760,43 +3784,71 @@ def test_a_new_filter_revision_grades_again_beside_the_earlier_one(
     assert len(graded) == 2 * replays
 
 
-@pytest.mark.parametrize(
-    ("solution", "reason"),
-    [
-        (
-            _SOLUTION.replace("src/test_set.py", '"src/t\\303\\251st_set.py"'),
-            "unsupported quoted native patch path",
-        ),
-        (
-            _SOLUTION.replace("new file mode 100644", "new file mode 120000"),
-            "unsupported native patch file mode",
-        ),
-    ],
-    ids=["quoted-path", "symlink-mode"],
-)
-def test_a_reference_solution_the_parser_refuses_leaves_the_grade_unavailable(
-    config: evaluation.Evaluation,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    solution: str,
-    reason: str,
+def test_a_reference_solution_path_git_quotes_is_read_like_any_other(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Git quotes the whole a/ or b/ name of a path with a non-ASCII byte.
+    quoted = '"{}/src/t\\303\\251st_set.py"'
+    solution = (
+        f"diff --git {quoted.format('a')} {quoted.format('b')}\nnew file mode 100644\n"
+        f"--- /dev/null\n+++ {quoted.format('b')}\n@@ -0,0 +1 @@\n+flag = True\n"
+    )
     root, graded = _finished_without_source_only_grades(config, tmp_path, monkeypatch, solution)
-    runner = CliRunner()
-    dry = runner.invoke(cli.app, ["run", str(root), "--dry-run"])
-    assert dry.exit_code == 0, dry.stderr + dry.stdout
-    assert "Verifier replays: 0" in dry.stdout
+    packages = [key for key, row in _rows(root).items() if row["guidance"] != "vanilla"]
 
-    result = runner.invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+    result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
 
-    # The run finishes; no stage can tell its files from tests, so none is replayed.
+    # Git reads the quoted path, so every stage is graded. The agents' src/test_set.py is not
+    # the reference's file, so it leaves with their tests, and their answer fails without it.
     assert result.exit_code == 0, result.stderr + result.stdout
+    assert len(graded) == len(packages)
+    for key, row in _rows(root).items():
+        assert row["source_only_grading"]["status"] == "complete"
+        assert row["correctness"] == ("fail" if key in packages else "pass")
+
+
+def test_status_report_and_compare_read_the_same_grade_for_every_attempt(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = _finished_without_source_only_grades(config, tmp_path, monkeypatch)
+
+    def agree() -> dict[str, str | None]:
+        report = {key: row["correctness"] for key, row in _rows(root).items()}
+        status = {row["id"]: row["outcome"] for row in run_status.run_status(root)["attempts"]}
+        compared = {attempt.id: attempt.correctness for attempt in load_evidence([str(root)]).attempts}
+        assert status == report == compared
+        return report
+
+    assert set(agree().values()) == {None}  # Coded, not graded yet.
+    monkeypatch.setattr(harbor_backend, "_assert_native_image", _grader_gone)
+    assert CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"]).exit_code != 0
+    assert set(agree().values()) == {"infra", "pass"}
+    monkeypatch.setattr(harbor_backend, "_assert_native_image", lambda image, expected: None)
+    assert CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"]).exit_code == 0
+    assert set(agree().values()) == {"pass"}
+
+
+def _grader_gone(image: object, expected: object) -> None:
+    raise ValueError("Frozen native image is unavailable or its reference was rebound")
+
+
+def test_a_reference_solution_the_patch_policy_refuses_is_an_infrastructure_error(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    solution = _SOLUTION.replace("new file mode 100644", "new file mode 120000")
+    root, graded = _finished_without_source_only_grades(config, tmp_path, monkeypatch, solution)
+
+    result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+
+    # The task, not the attempt, is broken: never a fail, no stage is replayed, and the run
+    # is not finished while its attempts have no grade.
+    assert result.exit_code != 0, result.stderr + result.stdout
+    assert "attempts have no grade" in result.stderr + result.stdout
     assert graded == []
     for row in _rows(root).values():
         grading = row["source_only_grading"]
-        assert grading["status"] == "unavailable" and row["source_only_reward"] is None
-        assert grading["reason"] == reason
-    assert evaluation.plan_resume(root)["verifier_replays"] == 0
+        assert grading["status"] == "infra" and row["correctness"] == "infra"
+        assert "solution.patch" in grading["reason"] and "symlink" in grading["reason"]
 
 
 class _Killed(BaseException):
@@ -4408,7 +4460,7 @@ def test_an_earlier_build_reports_the_same_measurements_with_legacy_arm_names(
     ours = {name: (root / "report" / name).read_bytes() for name in names}
     evidence = load_evidence([str(root)])
     csv_rows = list(csv.DictReader(io.StringIO(ours["results.csv"].decode())))
-    assert json.loads(ours["results.json"])["schema_version"] == 2
+    assert json.loads(ours["results.json"])["schema_version"] == 3
 
     assert _old_report(export, root, tmp_path).startswith("exit: 0")
 
@@ -4417,9 +4469,15 @@ def test_an_earlier_build_reports_the_same_measurements_with_legacy_arm_names(
     assert {row["guidance"] for row in legacy["attempts"]} == {
         "baseline", "workflow", "superpowers"
     }
-    # The old writer still reads the same saved run. Only public naming and the
-    # versioned JSON/HTML format changed; its comparison inputs and CSV measures agree.
-    assert load_evidence([str(root)]) == evidence
+    # The old writer still reads the same saved run. Only public naming, the versioned
+    # JSON/HTML format and the grade changed: it stamps no grade contract, so compare reads
+    # its attempts as legacy, with no grade. Other comparison inputs and CSV measures agree.
+    assert load_evidence([str(root)]) == dataclasses.replace(
+        evidence,
+        attempts=[
+            dataclasses.replace(attempt, correctness="legacy") for attempt in evidence.attempts
+        ],
+    )
     old_csv = list(csv.DictReader(io.StringIO((root / "report/results.csv").read_text())))
     for row in old_csv:
         if row["arm"] == "baseline":
@@ -4442,8 +4500,9 @@ def test_report_on_a_run_stopped_during_coding_covers_the_finished_attempts_and_
     data = json.loads((root / "report/results.json").read_text())
     assert data["unfinished_run"] == {"complete": 2, "assigned": 9}
     assert data["limitations"][0].startswith("This run is not finished: 2 of 9 attempts")
-    graded = [row for row in data["attempts"] if row["correctness"] != "unknown"]
-    assert len(data["attempts"]) == 9 and len(graded) == 2
+    # The grade stage runs once coding finishes, so no attempt has a grade yet.
+    assert len(data["attempts"]) == 9
+    assert {row["correctness"] for row in data["attempts"]} == {None}
 
 
 def test_judge_prepare_reads_saved_snapshots_when_a_run_has_no_review_packets(

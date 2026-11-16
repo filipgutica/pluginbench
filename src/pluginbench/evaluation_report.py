@@ -7,6 +7,8 @@ import statistics
 from pathlib import Path
 
 from pluginbench.arms import normalize_arm_name
+from pluginbench.grade import GRADE_CONTRACT
+from pluginbench.grade import outcome as grade_outcome
 from pluginbench.measurement_profiles import REMOVED_TEST_OVERLAP, readiness_state
 from pluginbench.assessment_charts import (
     DIAGNOSTIC_PANELS,
@@ -146,41 +148,6 @@ PROVENANCE_FIELDS = (
     "execution_status",
     "execution_reason",
 )
-
-TRUSTED_TEST_OVERLAP = "trusted verifier tests overwrite authored patch paths"
-
-
-def correctness_state(status: object, grading: object) -> str:
-    """Correctness of one attempt, separating overlap passes from unknowns.
-
-    PluginBench withholds confirmation when trusted verifier tests overwrite paths the agent
-    changed. The verifier still grades the agent's production code against its own tests, so
-    reward 1 with every fail-to-pass and pass-to-pass test passing is an overlap pass, and
-    reward 0 is a fail. One exception stays unknown: reward 0 with no pass-to-pass test passing.
-    A replaced test file can remove code the agent's other test files use, so the existing suite
-    may fail to build before any test runs. Any other withheld result stays unknown.
-    """
-    grading = _map(grading)
-    if status not in {"unknown", "fail"} or grading.get("reason") != TRUSTED_TEST_OVERLAP:
-        return str(status)
-    rewards = _map(_map(grading.get("native_verifier_result")).get("rewards"))
-    if status == "fail" and rewards.get("reward") != 0:
-        # A fail the receipt recorded itself, such as a run that did not complete.
-        return "fail"
-    if rewards.get("reward") == 0:
-        # Also a saved report's earlier verdict, which compare and judge read back.
-        p2p_total = rewards.get("p2p_total")
-        no_existing_test_ran = (
-            isinstance(p2p_total, int) and p2p_total > 0 and rewards.get("p2p_passed") == 0
-        )
-        return "unknown" if no_existing_test_ran else "fail"
-    every_test_passed = all(
-        isinstance(rewards.get(f"{kind}_total"), int)
-        and rewards.get(f"{kind}_passed") == rewards.get(f"{kind}_total")
-        for kind in ("f2p", "p2p")
-    )
-    return "overlap_pass" if rewards.get("reward") == 1 and every_test_passed else "unknown"
-
 
 COMPLETENESS_COUNTS = {
     "iterations": "Verification transcript counts",
@@ -807,12 +774,15 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
         )
         for attempt in _rows(report.get("attempts"))
     }
-    states = {
-        attempt_id: correctness_state(
-            _map(stage.get("correctness")).get("status", "unknown"), stage.get("task_result")
-        )
+    graded = report.get("grade_contract") == GRADE_CONTRACT
+    # The attempt's one grade, read only from its grade record; None until it is graded.
+    outcomes = {
+        attempt_id: grade_outcome(_map(stage.get("source_only_grading")) or None)
+        if graded
+        else ("legacy", f"graded before grade contract {GRADE_CONTRACT}")
         for attempt_id, stage in handoffs.items()
     }
+    states = {key: value[0] if value else None for key, value in outcomes.items()}
     # Pairs the check recorded as not measured. One collector serves several measures, so a
     # marked pair's collector can still run; its values are hidden, not reported.
     skipped = {
@@ -878,6 +848,11 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
                 if str(attempt.get("id")) in origins
                 else None,
                 "correctness": states[attempt.get("id")],
+                "passed": {"pass": True, "fail": False}.get(str(states[attempt.get("id")])),
+                "grade_reason": (outcomes[attempt.get("id")] or (None, None))[1],
+                "grade_attributes": _map(stage.get("source_only_grading")).get("attributes")
+                if graded
+                else None,
                 "native_grading": stage.get("task_result"),
                 # The native verifier over the submission without its test files; see
                 # source_only.py. Null when the run has no such grade.
@@ -971,8 +946,10 @@ def evaluation_data(report: dict[str, object], config: dict[str, object]) -> dic
             "This report selects a separate review revision. Judge charts show that revision's usage; bound prior review receipts retain earlier calls, failures, and usage."
         )
     data = {
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "evaluation",
+        # None for a legacy run, whose attempts read `legacy` instead of a grade.
+        "grade_contract": GRADE_CONTRACT if graded else None,
         "name": report.get("name"),
         "comparison_identity": config.get("comparison_identity"),
         "guidance_packages": config.get("guidance_packages", {}),

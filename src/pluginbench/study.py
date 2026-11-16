@@ -30,10 +30,10 @@ from pydantic import (
     model_validator,
 )
 
-from pluginbench import baselines, claude, codex, harbor_backend, provider_stops, submissions
+from pluginbench import baselines, claude, codex, grade, harbor_backend, provider_stops
+from pluginbench import submissions
 from pluginbench import trial_containers
 from pluginbench.arms import normalize_arm_name
-from pluginbench.codex_events import failed_before_first_turn
 from pluginbench.saved_usage import AuditedHook, revalidate_usage
 from pluginbench.harbor_backend import binary_native_reward as _binary_native_reward
 from pluginbench.treatments import (
@@ -46,9 +46,8 @@ from pluginbench.baselines import BaselineCache
 from pluginbench.ledger import LEDGER_NAME, Ledger
 from pluginbench.run_lock import RunMoved
 from pluginbench.parallel import run_jobs, validate_jobs
-from pluginbench.assessment import _correctness, build_assessment, write_assessment
+from pluginbench.assessment import build_assessment, write_assessment
 from pluginbench.assessment_metrics import EXCLUDED_NAMES, inspect_snapshot
-from pluginbench.evaluation_report import TRUSTED_TEST_OVERLAP
 from pluginbench.assessment_models import (
     ArtifactRef,
     AssessmentInput,
@@ -260,6 +259,8 @@ def plan_study(study: ResolvedStudy) -> dict[str, Any]:
         "host": recipe.harness,
         "backend": recipe.backend,
         "source_policy": submissions.SOURCE_POLICY,
+        # What passes, fails or is infrastructure; a plan without it is a legacy run.
+        "grade_contract": grade.GRADE_CONTRACT,
         "model": recipe.model,
         "requested_reasoning_effort": recipe.reasoning,
         "delivery": delivery_policy(recipe.harness),
@@ -447,7 +448,8 @@ def _model_identity(executions: list[dict[str, Any]]) -> str | None:
     """The one model an attempt ran on, or None when it is not a single-model attempt.
 
     Codex cannot lock a subagent's model or effort, so a descendant on another model or
-    reasoning effort than the root makes the attempt ineligible, as a mixed Claude stream does.
+    reasoning effort than the root leaves the attempt without one model, as a mixed Claude
+    stream does. It is still graded, with the `mixed_model` attribute (`grade.attributes`).
     """
     model = _consistent_observation(executions, "actual_primary_models")
     effort = _consistent_observation(executions, "runtime_effort_evidence")
@@ -476,6 +478,10 @@ def _observed_harness_version(executions: list[dict[str, Any]]) -> str | None:
     return versions[0] if versions and versions[0] and len(set(versions)) == 1 else None
 
 
+# The native receipt's reason when the hidden tests overwrite paths the agent changed.
+TRUSTED_TEST_OVERLAP = "trusted verifier tests overwrite authored patch paths"
+
+
 class BackendUnavailable(ValueError):
     """A coding session failed before its first model turn, or stopped at its provider or
     account (a limit, an authentication failure, or an unrecovered server error); the run stops
@@ -484,6 +490,13 @@ class BackendUnavailable(ValueError):
 
 class BuiltinsDiffer(ValueError):
     """A fresh Claude attempt's built-ins differ from the reused vanilla's; the run stops."""
+
+
+class CodingInfrastructure(ValueError):
+    """A coding attempt that ended without gradable evidence: an infrastructure error.
+
+    It is never complete, graded or cached; its slot is coded again by the next resume.
+    """
 
 
 def _call_error(error: BaseException) -> str:
@@ -495,24 +508,8 @@ def _call_error(error: BaseException) -> str:
     return f"{process} exceeded its budget of {error.timeout:g} seconds"
 
 
-# Attempts that may finish in a row with a failed call and no submission before the run stops.
+# Attempts that may end in a row with an infrastructure error before the run stops.
 CONSECUTIVE_FAILURE_LIMIT = 3
-
-
-def _failed_call(root: Path, record: dict[str, Any]) -> str | None:
-    """`task · arm · repeat: error` for an attempt whose call failed with no submission."""
-    for stage in record["stages"]:
-        path = root / "attempts" / record["id"] / stage["id"] / "execution.json"
-        execution = json.loads(path.read_text()) if path.is_file() else {}
-        error = execution.get("error")
-        if error and execution.get("submission_collected") is not True:
-            if isinstance(error, dict):  # Harbor's exception_info for the agent.
-                error = f"{error.get('exception_type')}: {error.get('exception_message')}"
-            return (
-                f"{record['task_id']} · {normalize_arm_name(record['arm'])} · "
-                f"repeat {record['attempt']}: {error}"
-            )
-    return None
 
 
 def _execute_stage(
@@ -543,6 +540,7 @@ def _execute_stage(
     """
     _assert_frozen(root)
     interrupted: KeyboardInterrupt | None = None
+    worker_error: str | None = None
     try:
         codex.reject_guidance(area / "workspace", include_ancestors=True, reject_git=False)
         on_native_start()
@@ -571,7 +569,8 @@ def _execute_stage(
             prompt=prompt,
             timeout=study.recipe.timeout_seconds,
         )
-    # A worker process that overruns its budget is a failed call like any other.
+    # A worker that raises, or overruns its budget, is infrastructure: Harbor records an agent
+    # timeout or an agent error in the result it returns, so neither reaches this handler.
     except (OSError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
         artifacts = area / "artifacts"
         execution = codex.parse_events(
@@ -598,12 +597,10 @@ def _execute_stage(
             if runtime_receipt.is_file():
                 execution.update(json.loads(runtime_receipt.read_text()))
         execution.update(successful_native_completion=False, error=_call_error(exc))
-        if isinstance(exc, subprocess.TimeoutExpired):
-            # The worker never returned a verifier result, so a patch it collected cannot be
-            # graded. Left as collected, the attempt would be scored as a fail.
-            execution["submission_collected"] = False
         if isinstance(exc, KeyboardInterrupt):
             interrupted = exc
+        else:
+            worker_error = _call_error(exc)
     mixed = None
     if reused_vanilla:
         receipt = _discovery_receipt(execution, area / "artifacts")
@@ -663,10 +660,28 @@ def _execute_stage(
             + " out of the PluginBench cache root and start a new run, which codes its own "
             "vanilla"
         )
-    backend_error = failed_before_first_turn(execution)
+    if provider_stop is not None:
+        # Checked first: its message names the limit. Never recorded as complete, so the
+        # attempt stays interrupted, a resume discards it and codes its slot again, and it never
+        # reaches the vanilla cache.
+        _record_infrastructure(target, f"{study.recipe.harness} stopped on {provider_stop}")
+        raise BackendUnavailable(
+            f"{study.recipe.harness} stopped on {provider_stop} in attempt {entry['id']} "
+            f"({entry['task_id']} · {normalize_arm_name(entry['arm'])} · "
+            f"repeat {entry['attempt']}). The attempt is not scored and the run stops. Resume "
+            "the run once the limit resets or the provider recovers; this attempt is coded again"
+        )
+    # A worker that raised or artifacts that could not be copied leave no session to read.
+    backend_error = (
+        None
+        if worker_error or artifact_error
+        else grade.failed_before_first_turn(execution, study.recipe.harness)
+    )
     if backend_error is not None:
-        # Never recorded as complete: the attempt stays interrupted, so a resume discards it
-        # and codes its slot again, and it never reaches the vanilla cache.
+        # As above: never complete, never graded, never cached; a resume codes it again.
+        _record_infrastructure(
+            target, f"{study.recipe.harness} failed before its first model turn: {backend_error}"
+        )
         raise BackendUnavailable(
             f"{study.recipe.harness} failed before its first model turn in attempt {entry['id']} "
             f"({entry['task_id']} · {normalize_arm_name(entry['arm'])} · "
@@ -674,15 +689,34 @@ def _execute_stage(
             "The attempt is not scored and the run stops. Resume the run once the backend is "
             "reachable; this attempt is coded again"
         )
-    if provider_stop is not None:
-        # As above: never complete, never graded, never cached; a resume codes it again.
-        raise BackendUnavailable(
-            f"{study.recipe.harness} stopped on {provider_stop} in attempt {entry['id']} "
-            f"({entry['task_id']} · {normalize_arm_name(entry['arm'])} · "
-            f"repeat {entry['attempt']}). The attempt is not scored and the run stops. Resume "
-            "the run once the limit resets or the provider recovers; this attempt is coded again"
+    infrastructure = worker_error or artifact_error or grade.coding_infrastructure(execution)
+    if infrastructure is None and execution.get("submission_collected") is not True:
+        # An export refuses a symlink, but the hash-bound patch still holds the submission.
+        violation = _patch_violation(task, target, execution)
+        if violation is not None:
+            _write(
+                target / "unsupported-submission.json",
+                {
+                    "source_policy": submissions.SOURCE_POLICY,
+                    "error": str(violation),
+                    "policy_violation": violation.kind,
+                    "export_error": execution.get("submission_error"),
+                },
+            )
+            return (
+                {
+                    "id": stage_id,
+                    "snapshot": None,
+                    "correctness": None,
+                    "evidence": None,
+                    "work": _work(execution),
+                },
+                execution,
+            )
+        infrastructure = str(
+            execution.get("submission_error") or "Harbor did not freeze a complete submission"
         )
-    if artifact_error or execution.get("submission_collected") is not True:
+    if infrastructure is not None:
         exported_digest = execution.get("submission_export_digest")
         if not artifact_error and isinstance(exported_digest, str):
             try:
@@ -698,27 +732,14 @@ def _execute_stage(
                 _write(
                     target / "ungraded-submission.json",
                     {
-                        "status": "stopped export; cleanup proof incomplete; not graded",
+                        "status": "stopped export of an infrastructure error; not graded",
                         "digest": exported_digest,
                     },
                 )
             except ValueError as error:
                 execution["error"] = str(error)
                 _write(target / "execution.json", execution)
-        _write(
-            target / "unsupported-submission.json",
-            {"error": execution.get("error", "Harbor did not freeze a complete submission")},
-        )
-        return (
-            {
-                "id": stage_id,
-                "snapshot": None,
-                "correctness": None,
-                "evidence": None,
-                "work": _work(execution),
-            },
-            execution,
-        )
+        raise _infrastructure(target, entry, infrastructure)
     try:
         exported = inspect_snapshot(area / "workspace")
         if exported["digest"] != execution.get("submission_export_digest"):
@@ -733,16 +754,7 @@ def _execute_stage(
                 if path.is_symlink():
                     links[path.relative_to(raw).as_posix()] = os.readlink(path)
         _write(target / "unsupported-submission.json", {"error": str(exc), "symlinks": links})
-        return (
-            {
-                "id": stage_id,
-                "snapshot": None,
-                "correctness": None,
-                "evidence": None,
-                "work": _work(execution),
-            },
-            execution,
-        )
+        raise _infrastructure(target, entry, str(exc)) from None
     diagnostic = target / "diagnostic-source"
     shutil.copytree(
         area / "workspace",
@@ -769,6 +781,13 @@ def _execute_stage(
             {
                 "source_policy": submissions.SOURCE_POLICY,
                 "error": str(error),
+                # Only a policy violation on intact evidence can be graded (a fail), and only
+                # once the grade stage finds the task healthy; anything else is infrastructure.
+                **(
+                    {"policy_violation": error.kind}
+                    if isinstance(error, submissions.PolicyViolation)
+                    else {}
+                ),
                 "diagnostic_source_path": diagnostic.name,
                 "diagnostic_source_digest": inspect_snapshot(diagnostic)["digest"],
                 "diagnostic_source_metadata_digest": harbor_backend.native_task_assets(diagnostic),
@@ -777,6 +796,8 @@ def _execute_stage(
                 ),
             },
         )
+        if not isinstance(error, submissions.PolicyViolation):
+            raise _infrastructure(target, entry, str(error)) from None
         return (
             {
                 "id": stage_id,
@@ -800,6 +821,44 @@ def _execute_stage(
     return stage, execution
 
 
+def _patch_violation(
+    task: TaskSpec, target: Path, execution: dict[str, Any]
+) -> submissions.PolicyViolation | None:
+    """The policy violation of an unexported submission's hash-bound patch, if it is one."""
+    with tempfile.TemporaryDirectory(prefix="pluginbench-unexported-") as temporary:
+        try:
+            submissions.reconstruct(
+                before=task.fixture,
+                task_dir=task.native_task,
+                identity=native_identity(task),
+                artifacts=target / "artifacts",
+                execution=execution,
+                destination=Path(temporary).resolve() / "source",
+            )
+        except submissions.PolicyViolation as violation:
+            return violation
+        except (OSError, ValueError):
+            return None  # No intact patch to grade: infrastructure.
+    return None
+
+
+def _record_infrastructure(target: Path, reason: str) -> None:
+    """Record why an attempt has no gradable evidence, so status reads it as `infra`."""
+    _write(
+        target / grade.INFRASTRUCTURE_ERROR,
+        {"grade_contract": grade.GRADE_CONTRACT, "stage": "coding", "reason": reason},
+    )
+
+
+def _infrastructure(target: Path, entry: dict[str, Any], reason: str) -> CodingInfrastructure:
+    """Record an infrastructure error; the error it returns is not a result."""
+    _record_infrastructure(target, reason)
+    return CodingInfrastructure(
+        f"{entry['task_id']} · {normalize_arm_name(entry['arm'])} · repeat {entry['attempt']}: "
+        f"{reason}"
+    )
+
+
 def _verify_snapshot(
     *,
     root: Path,
@@ -816,11 +875,8 @@ def _verify_snapshot(
         snapshot=snapshot, task=task, artifacts=target / "artifacts", execution=execution
     )
     _write(target / "verifier-result.json", result)
-    checks: dict[str, bool | None] = {
-        "behavior": result["pass"],
-        "verifier": result["pass"],
-        "native_completion": execution.get("successful_native_completion") is True,
-    }
+    # The native verifier's reward, an attribute: the source-only grade is the attempt's grade.
+    checks: dict[str, bool | None] = {"behavior": result["pass"], "verifier": result["pass"]}
     receipt = CorrectnessReceipt(
         schema_version=1,
         snapshot_digest=snapshot_ref["sha256"],
@@ -1185,6 +1241,12 @@ def resume_study(
     run = json.loads((root / "run.json").read_text())
     if run["status"] == "complete":
         return root
+    if not is_graded_run(_bound_document(root, run["plan"])):
+        raise ValueError(
+            f"this run was coded before grade contract {grade.GRADE_CONTRACT}, so new attempts "
+            "could not be compared with its saved ones; its saved results stay readable. Start "
+            "a new run to code more"
+        )
     frozen = _frozen_study(root)
     validate_jobs(frozen.recipe.jobs)
     for treatment in frozen.treatments.values():
@@ -1218,6 +1280,11 @@ def resume_study(
         guard=guard,
         resumed=True,
     )
+
+
+def is_graded_run(plan: dict[str, Any]) -> bool:
+    """Whether a run's plan was coded under the current grade contract, not a legacy one."""
+    return plan.get("grade_contract") == grade.GRADE_CONTRACT
 
 
 def _assert_task_runtimes(frozen: ResolvedStudy, current: dict[str, object]) -> None:
@@ -1513,12 +1580,15 @@ def _run_attempts(
             status="running",
         )
 
-        # Attempts that made a call in this invocation, and the latest of them, in the order
-        # they finished, that each ended with an error and no submission.
+        # Attempts that made a call in this invocation; the latest of them, in the order they
+        # finished, that each ended in an infrastructure error; and every such error.
         called: set[str] = set()
         failed_in_a_row: list[str] = []
+        infrastructure: list[str] = []
 
-        def commit(index: int, record: dict[str, Any], status: str) -> None:
+        def commit(
+            index: int, record: dict[str, Any], status: str, error: str | None = None
+        ) -> None:
             if guard:
                 guard()
             records[index] = record
@@ -1538,8 +1608,9 @@ def _run_attempts(
             if cache is not None and status == "complete":
                 # Cached as it finishes, so a run that stops later still keeps it for reuse.
                 uncached(record, cache.publish(record))
-            if status == "complete" and record["id"] in called:
-                error = _failed_call(root, record)
+            if error is not None:
+                infrastructure.append(error)
+            if record["id"] in called and (error is not None or status == "complete"):
                 if error is None:
                     failed_in_a_row.clear()
                 else:
@@ -1547,11 +1618,11 @@ def _run_attempts(
                 if len(failed_in_a_row) == CONSECUTIVE_FAILURE_LIMIT:
                     # A setup that fails every call must not spend the whole budget.
                     raise ValueError(
-                        f"the last {CONSECUTIVE_FAILURE_LIMIT} attempts to finish each failed "
-                        "without a submission, so no new attempt starts: "
+                        f"the last {CONSECUTIVE_FAILURE_LIMIT} attempts to finish each ended in "
+                        "an infrastructure error, so no new attempt starts: "
                         + "; ".join(failed_in_a_row)
-                        + ". They stay recorded. `pluginbench run <run-dir>` codes the pending "
-                        "slots"
+                        + ". They are not graded. `pluginbench run <run-dir>` codes their slots "
+                        "again"
                     )
 
         def invoked(index: int, record: dict[str, Any], stage_id: str) -> None:
@@ -1584,6 +1655,7 @@ def _run_attempts(
             record = copy.deepcopy(records[index])
             stage_id = "handoff"
             completed = False
+            error: str | None = None
 
             def unmoved() -> None:
                 # Workers check too: evidence they write must never recreate a moved run's path.
@@ -1663,24 +1735,29 @@ def _run_attempts(
                 with tempfile.TemporaryDirectory(prefix="pluginbench-study-") as temporary:
                     area = Path(temporary) / "handoff"
                     shutil.copytree(task.fixture, area / "workspace")
-                    stage, execution = _execute_stage(
-                        root=root,
-                        area=area,
-                        entry=entry,
-                        task=task,
-                        study=frozen,
-                        stage_id="handoff",
-                        prompt="",
-                        on_native_start=started,
-                        expected_runtime=expected_runtime,
-                        guard=unmoved,
-                        reused_vanilla=_reused_vanilla(plan)
-                        if frozen.recipe.harness == "claude"
-                        else None,
-                        reused_cohorts=_reused_cohorts(plan),
-                        pinned_builtins=pinned_builtins,
-                        claude_version=claude_version,
-                    )
+                    try:
+                        stage, execution = _execute_stage(
+                            root=root,
+                            area=area,
+                            entry=entry,
+                            task=task,
+                            study=frozen,
+                            stage_id="handoff",
+                            prompt="",
+                            on_native_start=started,
+                            expected_runtime=expected_runtime,
+                            guard=unmoved,
+                            reused_vanilla=_reused_vanilla(plan)
+                            if frozen.recipe.harness == "claude"
+                            else None,
+                            reused_cohorts=_reused_cohorts(plan),
+                            pinned_builtins=pinned_builtins,
+                            claude_version=claude_version,
+                        )
+                    except CodingInfrastructure as infra:
+                        # Never complete: committed as interrupted, so a resume codes it again.
+                        error = str(infra)
+                        return
                     record.update(
                         stages=[stage],
                         model=_model_identity([execution]),
@@ -1702,6 +1779,7 @@ def _run_attempts(
                         copy.deepcopy(record),
                         # Work that finished while a stop drained it is kept, not discarded.
                         "complete" if completed else "interrupted",
+                        error,
                     )
                 )
 
@@ -1715,6 +1793,11 @@ def _run_attempts(
             operation=attempt,
             on_submit=submitted,
         )
+        if infrastructure:
+            raise CodingInfrastructure(
+                f"{len(infrastructure)} attempts ended in an infrastructure error and are not "
+                "graded; `pluginbench run <run-dir>` codes them again: " + "; ".join(infrastructure)
+            )
         _checkpoint(root, frozen, manifest, states, status="complete")
     except RunMoved:
         raise  # Writing anything now would recreate the old path.
@@ -1852,6 +1935,7 @@ def report_study(
         if output.resolve() != output:
             raise ValueError("review projection output cannot follow symlinks")
     report = build_assessment(manifest_path)
+    report["grade_contract"] = plan.get("grade_contract")
     if measurement_state is not None:
         report["measurement_revision"] = measurement_state
         if measurement_state.get("references") is not None:
@@ -2032,37 +2116,6 @@ def report_study(
                 original_result = _bound_document(root, verifier_result)
                 if "task_result" not in stage:
                     stage["task_result"] = original_result
-                reward = _binary_native_reward(original_result.get("native_verifier_result"))
-                if (
-                    reward is not None
-                    and original_result.get("pass") is None
-                    and stage["snapshot_digest"] is not None
-                    and original_result.get("binding") == "model.patch reconstructs measured source"
-                    and original_result.get("graded_source_digest")
-                    == original_result.get("measured_source_digest")
-                    == stage["snapshot_digest"]
-                ):
-                    stage["task_result"] = {**original_result, "pass": reward}
-                    stage["task_result"].pop("reason", None)
-                    receipt = CorrectnessReceipt.model_validate(
-                        {
-                            "schema_version": 1,
-                            **{
-                                key: stage["correctness"][key]
-                                for key in ("snapshot_digest", "command", "tool", "tool_version")
-                            },
-                            "checks": {
-                                **stage["correctness"]["checks"],
-                                "behavior": reward,
-                                "verifier": reward,
-                            },
-                        }
-                    )
-                    stage["correctness"] = _correctness(receipt, ["behavior"])
-                    stage["correctness"]["projection"] = {
-                        "method": "source-bound binary reward",
-                        "original_verifier_result": verifier_result,
-                    }
             stage["execution_provenance"] = {
                 "artifact": run["executions"][attempt["id"]][stage["id"]],
                 "observed_harness_version": codex.observed_cli_version(

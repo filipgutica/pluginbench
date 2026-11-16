@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from pluginbench import codex, codex_events, processes, isolation
+from pluginbench import codex, grade, processes, isolation
 
 
 def test_codex_final_message_excludes_earlier_progress_for_structured_review() -> None:
@@ -1293,7 +1293,7 @@ def test_outage_without_positive_model_evidence_stays_retryable(
     parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
     assert parsed["usage"] is None
     assert parsed["observed_token_usage"] is False
-    assert codex_events.failed_before_first_turn(parsed) == "workspace routing discovery failed"
+    assert grade.failed_before_first_turn(parsed, "codex") == "workspace routing discovery failed"
 
 
 @pytest.mark.parametrize(
@@ -1314,7 +1314,7 @@ def test_one_model_output_record_blocks_pre_model_retry(item_type: str) -> None:
     trace = outage_trace("header") + "\n" + stream({"type": "response_item", "payload": item})
     parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
     assert parsed["observed_token_usage"] is True
-    assert codex_events.failed_before_first_turn(parsed) is None
+    assert grade.failed_before_first_turn(parsed, "codex") is None
 
 
 @pytest.mark.parametrize("version", ["0.162.1", "0.167.0", "0.167.1"])
@@ -1337,7 +1337,7 @@ def test_failed_completion_retains_partial_stream_evidence(
     parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
     assert parsed["usage"] is None
     assert parsed["observed_token_usage"] is model_ran
-    assert codex_events.failed_before_first_turn(parsed) == (
+    assert grade.failed_before_first_turn(parsed, "codex") == (
         None if model_ran else "workspace routing discovery failed"
     )
 
@@ -1360,7 +1360,7 @@ def test_stream_output_event_blocks_pre_model_retry(version: str, kind: str) -> 
     })
     parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
     assert parsed["observed_token_usage"] is True
-    assert codex_events.failed_before_first_turn(parsed) is None
+    assert grade.failed_before_first_turn(parsed, "codex") is None
 
 
 @pytest.mark.parametrize("version", ["0.162.1", "0.167.0", "0.167.1"])
@@ -1379,7 +1379,7 @@ def test_completed_model_output_item_blocks_pre_model_retry(version: str, item_t
     })
     parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
     assert parsed["observed_token_usage"] is True
-    assert codex_events.failed_before_first_turn(parsed) is None
+    assert grade.failed_before_first_turn(parsed, "codex") is None
 
 
 @pytest.mark.parametrize(
@@ -1405,7 +1405,7 @@ def test_completed_item_requires_positive_output_evidence(
     })
     parsed = codex.parse_events(stream(*_OUTAGE), [trace], "codex")
     assert parsed["observed_token_usage"] is model_ran
-    assert codex_events.failed_before_first_turn(parsed) == (
+    assert grade.failed_before_first_turn(parsed, "codex") == (
         None if model_ran else "workspace routing discovery failed"
     )
 
@@ -1419,13 +1419,13 @@ def test_one_stdout_output_item_blocks_pre_model_retry(item_type: str) -> None:
     stdout = stream(*_OUTAGE, {"type": "item.completed", "item": {"type": item_type}})
     parsed = codex.parse_events(stdout, [], "codex")
     assert parsed["observed_token_usage"] is True
-    assert codex_events.failed_before_first_turn(parsed) is None
+    assert grade.failed_before_first_turn(parsed, "codex") is None
 
 
 def test_session_that_failed_before_its_first_model_turn_is_a_backend_failure() -> None:
     execution = codex.parse_events(stream(*_OUTAGE), [], "codex")
     execution["timed_out"] = False
-    assert codex_events.failed_before_first_turn(execution) == "workspace routing discovery failed"
+    assert grade.failed_before_first_turn(execution, "codex") == "workspace routing discovery failed"
 
 
 @pytest.mark.parametrize(
@@ -1445,7 +1445,7 @@ def test_model_call_evidence_does_not_require_valid_accounting(evidence: str) ->
         stdout += "\n" + stream({"type": "turn.completed", "usage": counts})
     parsed = codex.parse_events(stdout, [trace] if trace else [], "codex")
     assert parsed["usage"] is None
-    assert codex_events.failed_before_first_turn(parsed) is None
+    assert grade.failed_before_first_turn(parsed, "codex") is None
     assert parsed["observed_token_usage"] is True
 
 
@@ -1455,7 +1455,7 @@ def test_model_call_evidence_does_not_require_valid_accounting(evidence: str) ->
 ])
 def test_malformed_or_unknown_stdout_does_not_block_pre_model_retry(record: str) -> None:
     parsed = codex.parse_events(stream(*_OUTAGE) + "\n" + record, [], "codex")
-    assert codex_events.failed_before_first_turn(parsed) == "workspace routing discovery failed"
+    assert grade.failed_before_first_turn(parsed, "codex") == "workspace routing discovery failed"
 
 
 @pytest.mark.parametrize(
@@ -1486,7 +1486,7 @@ def test_non_model_records_do_not_block_pre_model_retry(
     }}
     records = [event] if event["type"] == "session_meta" else [header, event]
     parsed = codex.parse_events(stream(*_OUTAGE), [stream(*records)], "codex")
-    assert codex_events.failed_before_first_turn(parsed) == "workspace routing discovery failed"
+    assert grade.failed_before_first_turn(parsed, "codex") == "workspace routing discovery failed"
 
 
 @pytest.mark.parametrize(
@@ -1504,8 +1504,6 @@ def test_non_model_records_do_not_block_pre_model_retry(
             [],
             False,
         ),
-        # Timed out while waiting for the network: a scored timeout.
-        (_OUTAGE[:4], [], True),
         # Failed after the model had already used tokens.
         (_OUTAGE, [_USAGE_TRACE], False),
         # Failed after the agent ran a command.
@@ -1520,9 +1518,18 @@ def test_non_model_records_do_not_block_pre_model_retry(
         ),
     ],
 )
-def test_sessions_where_the_agent_worked_or_timed_out_are_not_backend_failures(
+def test_sessions_where_the_agent_worked_are_not_backend_failures(
     events: list[dict[str, object]], traces: list[str], timed_out: bool
 ) -> None:
     execution = codex.parse_events(stream(*events), traces, "codex")
     execution["timed_out"] = timed_out
-    assert codex_events.failed_before_first_turn(execution) is None
+    assert grade.failed_before_first_turn(execution, "codex") is None
+
+
+def test_a_timeout_while_waiting_for_the_network_failed_before_its_first_turn() -> None:
+    # No usage, command or message: the timeout proves no turn, so it is no scored attempt.
+    execution = codex.parse_events(stream(*_OUTAGE[:4]), [], "codex")
+    execution["timed_out"] = True
+    assert grade.failed_before_first_turn(execution, "codex") == (
+        "the session timed out before any model turn"
+    )

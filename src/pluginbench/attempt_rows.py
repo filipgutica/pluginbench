@@ -62,7 +62,7 @@ FIELDS = (
 
 
 def attempt_rows(report: dict[str, Any], runner: dict[str, Any]) -> list[dict[str, Any]]:
-    """Rows for every attempt in a schema 1 or 2 report, in the report's order."""
+    """Rows for every attempt in a schema 1, 2 or 3 report, in the report's order."""
     observed: dict[tuple[str, str], dict[str, Any]] = {
         (row["attempt_id"], row["metric"]): row for row in report.get("observations", [])
     }

@@ -40,7 +40,7 @@ TOKEN_GATE = Gate(
     bound="upper",
     factor=1.3,
 )
-GATES = Gates(count_overlap_passes=True, gates=[PASS_GATE, TOKEN_GATE])
+GATES = Gates(gates=[PASS_GATE, TOKEN_GATE])
 
 
 def _evidence() -> Evidence:
@@ -149,7 +149,8 @@ def test_exclusions_are_visible_and_cannot_pass_a_bound_gate() -> None:
     original = evidence.attempts[0]
     # Six good pairs remain; missing evidence must still block a gate.
     evidence.attempts += [
-        replace(original, id="unknown", task="unknown", correctness="unknown"),
+        # An infrastructure error is no grade, so its task has no pass-rate pair.
+        replace(original, id="unknown", task="unknown", correctness="infra"),
         replace(original, id="unknown-baseline", task="unknown", arm="vanilla"),
         replace(original, id="missing-tokens", task="missing-tokens", values={}),
         replace(original, id="missing-baseline", task="missing-tokens", arm="vanilla"),
@@ -178,24 +179,6 @@ def test_incomplete_or_invalid_tokens_are_excluded(bad_total: float | None) -> N
     result = paired_comparison(evidence, GATES, "candidate", "vanilla", TASKS)
     assert TASKS[0] in result.tokens.missing
     assert len(result.passes.tasks) == 6
-
-
-def test_overlap_policy_applies_to_paired_pass_rates() -> None:
-    evidence = _evidence()
-    evidence.attempts = [
-        replace(row, correctness="overlap_pass") if row.arm == "candidate" else row
-        for row in evidence.attempts
-    ]
-    counted = paired_comparison(evidence, GATES, "candidate", "vanilla", TASKS)
-    excluded = paired_comparison(
-        evidence,
-        GATES.model_copy(update={"count_overlap_passes": False}),
-        "candidate",
-        "vanilla",
-        TASKS,
-    )
-    assert counted.passes.value == 0.5
-    assert excluded.passes.value == -0.5
 
 
 @pytest.mark.parametrize(
@@ -232,6 +215,7 @@ def test_cli_cross_run_pairs_match_a_single_run(tmp_path: Path) -> None:
                 {
                     # Identical saved identities: the runs are comparable.
                     "comparison_identity": {"runner": {"model": "model-a"}},
+                    "grade_contract": 1,
                     "attempts": [
                         {
                             "id": row.id,

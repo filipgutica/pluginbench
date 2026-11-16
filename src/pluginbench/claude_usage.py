@@ -305,7 +305,9 @@ def _read_transcript(
             continue
         events.append(event)
         if "sessionId" in event and event["sessionId"] != session:
+            # Its messages are another session's work: never this session's usage.
             reasons.append(f"transcript {path.name} belongs to another session")
+            continue
         message = event.get("message")
         if event.get("type") != "assistant" or not isinstance(message, dict):
             continue

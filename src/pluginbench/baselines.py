@@ -16,8 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from pluginbench import claude, claude_treatments, components, harbor_backend, provider_stops
-from pluginbench import submissions
-from pluginbench.codex_events import failed_before_first_turn
+from pluginbench import grade, saved_usage, submissions
 from pluginbench.native_treatments import DELIVERY_POLICY, NativeCapabilities
 from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.assessment_models import AttemptInput
@@ -375,35 +374,36 @@ def _matches_native_stage(
                     execution=execution,
                     destination=Path(temporary).resolve() / "source",
                 )
-            except ValueError:
-                pass
+            except submissions.PolicyViolation:
+                pass  # The only submission frozen without a snapshot that is graded: a fail.
+            except (OSError, ValueError):
+                return False
             else:
                 return False
     return _native_cleanup_matches(receipt.get("cleanup"))
 
 
-def _never_reached_model(execution: dict[str, Any], harness: object) -> bool:
-    """Whether a session never got a model turn, so its empty outcome is no baseline.
+def _not_a_baseline(attempt: Path, record: dict[str, Any], harness: object) -> str | None:
+    """Why a vanilla attempt's saved stages make it no baseline, else None.
 
-    Codex names that failure (`failed_before_first_turn`). Claude does not, and its startup
-    model stands in for an assistant's, so any Claude session without a timeout, usage, tool
-    call or message counts as one. A timeout is the agent's attempt, as for Codex.
+    Builds before grade contract 1 recorded each of these as complete: a session that never
+    reached the model, a provider stop, and an infrastructure error, now coded again.
     """
-    if harness != "claude":
-        return failed_before_first_turn(execution) is not None
-    return not (
-        execution.get("timed_out") is True
-        or execution.get("usage") is not None
-        or any(execution.get(key) for key in ("command_items", "other_tools", "agent_messages"))
-    )
-
-
-def _provider_stop(attempt: Path, record: dict[str, Any], harness: object) -> str | None:
-    """The provider stop a vanilla attempt's saved stages record, which makes it no baseline."""
     for stage in record["stages"]:
-        stop = provider_stops.saved_stop(attempt / stage["id"] / "artifacts", harness)
+        target = attempt / stage["id"]
+        execution = json.loads((target / "execution.json").read_text())
+        # Transcript tokens show a turn only as this build reads the saved transcripts: an
+        # earlier one counted another session's messages. The recorded usage total already
+        # required the session's identity.
+        current = saved_usage.revalidate_usage(execution, target / "execution.json")
+        evidence = {**execution, "usage_accounting": current["usage_accounting"]}
+        if grade.failed_before_first_turn(evidence, harness) is not None:
+            return "its session never reached the model"
+        stop = provider_stops.saved_stop(target / "artifacts", harness)
         if stop is not None:
-            return stop
+            return f"its session stopped on {stop}"
+        if (reason := grade.coding_infrastructure(execution)) is not None:
+            return f"it ended in an infrastructure error: {reason}"
     return None
 
 
@@ -762,14 +762,15 @@ class BaselineCache:
             raise ValueError(
                 "baseline cache cohort lacks complete isolated native baseline evidence"
             )
-        # Entries cached before provider stops were detected may hold one.
+        # Entries cached by earlier builds may hold a provider stop or an infrastructure error.
         harness = manifest["context"]["coding"]["study"]["harness"]
         for record in records:
-            stop = _provider_stop(cached / "attempts" / record["id"], record, harness)
-            if stop is not None:
+            reason = _not_a_baseline(cached / "attempts" / record["id"], record, harness)
+            if reason is not None:
                 raise ValueError(
-                    f"baseline cache entry {cached.parent.name}/{cached.name} stopped on {stop}. "
-                    "Move it out of the PluginBench cache root; its repeat is then coded again"
+                    f"baseline cache entry {cached.parent.name}/{cached.name} is no baseline: "
+                    f"{reason}. Move it out of the PluginBench cache root; its repeat is then "
+                    "coded again"
                 )
         return manifest
 
@@ -881,19 +882,9 @@ class BaselineCache:
             )
         if not _eligible(attempt=attempt, record=record, coding=coding, task=self.tasks[task_id]):
             return "its saved evidence does not match the vanilla cache identity"
-        # A session that never reached the model is no baseline. Runs from before the coding
-        # pass stopped on such a session recorded it as complete.
-        harness = coding["study"]["harness"]
-        if any(
-            _never_reached_model(
-                json.loads((attempt / stage["id"] / "execution.json").read_text()), harness
-            )
-            for stage in record["stages"]
-        ):
-            return "its session never reached the model"
-        stop = _provider_stop(attempt, record, harness)
-        if stop is not None:
-            return f"its session stopped on {stop}"
+        reason = _not_a_baseline(attempt, record, coding["study"]["harness"])
+        if reason is not None:
+            return reason
         cohort = self.path / key
         cohort.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=f".{record['attempt']}-", dir=cohort) as temporary:

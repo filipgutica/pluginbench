@@ -9,7 +9,7 @@ It then compares correctness, tokens, and the code each attempt added.
 ## What you get
 
 - **Arms.** Vanilla is always included. Each *treatment* is a named set of instruction files, skills, or plugins that you declare in the config. Every treatment is compared with vanilla.
-- **Attempts.** Each task runs once per arm and repeat, in a fresh Docker container, through Harbor 0.24.0. The task's own verifier decides pass or fail.
+- **Attempts.** Each task runs once per arm and repeat, in a fresh Docker container, through Harbor 0.24.0. Each attempt passes or fails: the task's own verifier grades the submitted patch without the agent's own test files. A timeout or agent error is graded with that attribute. An attempt that cannot be graded is an infrastructure error: it counts in no total, and `pluginbench run <run-dir>` codes or grades it again. [Correctness](docs/running-evaluations.md#correctness).
 - **Measures.** You select them in the config:
 
 | Measurement | What it counts | Extra requirement |
@@ -241,7 +241,8 @@ Every setting lives in the config. Flags only control how a command runs.
 
 - `pluginbench stop runs/<run>` stops new attempts. Attempts already coding finish and are kept, including with `jobs: 1`. Resume never codes complete attempts again.
 - `pluginbench run runs/<run>` resumes. A run that was killed, for example by a host shutdown, shows `interrupted`, and `status` prints this command. Complete attempts are kept and never coded again. An attempt cut off mid-call is recorded as `discarded-interrupted` and a new attempt takes its slot. Containers the killed attempt left running are stopped before coding resumes, and `status` names them until then. Resume cannot repair a failing solution.
-- If Codex fails before its first model turn, for example during a network outage, the run stops instead of scoring the attempt. Resume when Codex is reachable.
+- If Codex or Claude Code fails before its first model turn, for example during a network outage, a CLI startup error, or a timeout with no model turn, the run stops instead of scoring the attempt. Resume when the CLI can reach its model.
+- A run coded before grade contract 1 is legacy: `status` and `report` read it, but `pluginbench run` refuses to code more of it. Start a new run; its vanilla cache entries are still reused.
 - If a Claude Code or Codex session stops at a usage or rate limit, an authentication failure, or a provider error that retries did not recover, the run also stops instead of scoring the attempt. Resume after the limit resets. [Concurrency and resume](docs/running-evaluations.md#concurrency-and-resume).
 - Vanilla attempts are cached in `$XDG_CACHE_HOME/pluginbench` (default `~/.cache/pluginbench`) and reused by any later run with the same task, model, and settings. Grading and measures run again. Reports mark reused attempts. Claude Code attempts are cached under their own key, for Claude Code 2.1.322 only. [Baselines and reports](docs/running-evaluations.md#baselines-and-reports).
 
@@ -252,7 +253,8 @@ Every setting lives in the config. Flags only control how a command runs.
 
 ## Limits
 
-- A pass means the task's verifier passed. Task checks do not prove that every behavior is preserved.
+- A pass means the task's verifier passed on the submitted source without the agent's tests. Task checks do not prove that every behavior is preserved.
+- The correctness alarm is a gate such as "no fewer passes than vanilla". Runs from before grade contract 1 are labelled legacy and have no grade.
 - Discovery proves that a skill was available, not that the model used it.
 - Smaller numbers alone do not prove better work. Coverage does not prove that assertions are useful.
 - Unknown values are never shown as zero.

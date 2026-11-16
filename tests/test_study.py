@@ -177,20 +177,25 @@ def test_harbor_submissions_use_trusted_grading_and_keep_missing_values(
         return execution
 
     monkeypatch.setattr(harbor_backend, "invoke_native", invoke)
-    root = study.run_study(study.load_study(path), tmp_path / "results")
-    report = json.loads((root / "report/assessment-report.json").read_text())
-    stages = [attempt["stages"][0] for attempt in report["attempts"]]
-    assert len(calls) == len(stages) == 6
-    assert stages[0]["snapshot_digest"] is None
-    assert stages[0]["correctness"]["status"] == "unknown"
-    assert stages[1]["correctness"]["status"] == "fail"
-    assert stages[2]["snapshot_digest"] is None
-    assert stages[2]["correctness"]["status"] == "unknown"
+    root = tmp_path / "results"
+    # Call 1 froze no submission and call 3's worker failed: both are infrastructure errors,
+    # never graded. The others are graded on Harbor's reward, whatever their native exit.
+    with pytest.raises(study.CodingInfrastructure, match="2 attempts ended in an infra"):
+        study.run_study(study.load_study(path), root)
+    run = json.loads((root / "run.json").read_text())
+    assert len(calls) == run["actual_calls"] == 6
+    assert sorted(run["attempt_states"].values()) == ["complete"] * 4 + ["interrupted"] * 2
     ungraded = list(root.glob("attempts/*/handoff/ungraded-submission/src/answer.py"))
     assert len(ungraded) == 1 and ungraded[0].read_text() == "answer = 1\n"
-    assert all(stage["correctness"]["status"] == "pass" for stage in stages[3:])
+    study.report_study(root)
+    report = json.loads((root / "report/assessment-report.json").read_text())
+    stages = [
+        attempt["stages"][0]
+        for attempt in report["attempts"]
+        if run["attempt_states"][attempt["id"]] == "complete"
+    ]
+    assert [stage["correctness"]["status"] for stage in stages] == ["pass"] * 4
     assert all(stage["work"]["tokens"] is None for stage in stages)
-    assert json.loads((root / "run.json").read_text())["actual_calls"] == 6
 
 
 def test_runtime_drift_stops_new_calls_and_preserves_completed_submission(
@@ -319,7 +324,7 @@ def test_frozen_guidance_tampering_is_rejected_on_report(
 
 
 @pytest.mark.parametrize("cause", ["timeout", "provider"])
-def test_native_failure_is_retained_even_if_workspace_checks_pass(
+def test_a_timeout_is_graded_and_a_provider_error_is_infrastructure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cause: str,
@@ -362,13 +367,21 @@ def test_native_failure_is_retained_even_if_workspace_checks_pass(
         return execution
 
     monkeypatch.setattr(harbor_backend, "invoke_native", incomplete)
-    root = study.run_study(recipe, tmp_path / "results")
+    root = tmp_path / "results"
+    if cause == "provider":
+        # A Harbor trial error other than the agent's own is infrastructure: never graded.
+        with pytest.raises(study.CodingInfrastructure, match="ApiOverloadedError"):
+            study.run_study(recipe, root)
+        state = json.loads((root / "run.json").read_text())["attempt_states"]
+        assert sorted(state.values()).count("interrupted") == 1
+        return
+    study.run_study(recipe, root)
     report = json.loads((root / "report/assessment-report.json").read_text())
     assert len(report["attempts"]) == 12
+    # A timeout after the first turn is graded on its submission; the timeout is an attribute.
     failed = report["attempts"][0]["stages"][0]
-    assert failed["correctness"]["checks"]["behavior"] is True
-    assert failed["correctness"]["checks"]["native_completion"] is False
-    assert failed["correctness"]["status"] == "fail"
+    assert failed["correctness"]["checks"] == {"behavior": True, "verifier": True}
+    assert failed["correctness"]["status"] == "pass"
     assert failed["work"]["tokens"] is None
     execution = failed["execution_provenance"]
     assert execution["stream_errors"] == stream_errors
@@ -603,8 +616,14 @@ def test_native_source_binding_keeps_unsupported_grade_unknown(tmp_path: Path, f
     assert bound["native_verifier_result"] == result["native_verifier_result"]
 
 
-@pytest.mark.parametrize("failure", ["symlink", "patch", "export"])
-def test_unsupported_submission_is_retained_and_remaining_attempts_run(
+_SYMLINK_SECTION = (
+    "diff --git a/src/link.py b/src/link.py\nnew file mode 120000\n--- /dev/null\n"
+    "+++ b/src/link.py\n@@ -0,0 +1 @@\n+answer.py\n\\ No newline at end of file\n"
+)
+
+
+@pytest.mark.parametrize("failure", ["symlink", "patch", "export", "policy"])
+def test_an_unsupported_submission_keeps_its_evidence_and_remaining_attempts_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
@@ -619,11 +638,12 @@ def test_unsupported_submission_is_retained_and_remaining_attempts_run(
         execution = invoke(**kwargs)
         if len(calls) == 1:
             artifacts = kwargs["area"] / "artifacts"
+            patch = artifacts / "harbor/trial/artifacts/logs/artifacts/model.patch"
             if failure == "symlink":
                 (kwargs["area"] / "workspace/src/link.py").symlink_to(outside)
-            elif failure == "patch":
-                patch = artifacts / "harbor/trial/artifacts/logs/artifacts/model.patch"
-                patch.write_text("invalid patch\n")
+            elif failure in {"patch", "policy"}:
+                text = "invalid patch\n" if failure == "patch" else patch.read_text()
+                patch.write_text(text + (_SYMLINK_SECTION if failure == "policy" else ""))
                 execution["native_artifact_hashes"] = harbor_backend._native_artifact_hashes(
                     artifacts / "harbor/trial/artifacts"
                 )
@@ -635,18 +655,32 @@ def test_unsupported_submission_is_retained_and_remaining_attempts_run(
         return execution
 
     monkeypatch.setattr(harbor_backend, "invoke_native", unsupported)
-    root = study.run_study(recipe, tmp_path / "results")
+    root = tmp_path / "results"
+    if failure != "policy":
+        # Evidence that cannot be exported or read is infrastructure: kept, never graded.
+        with pytest.raises(study.CodingInfrastructure, match="1 attempts ended in an infra"):
+            study.run_study(recipe, root)
+        assert len(calls) == 12
+        states = json.loads((root / "run.json").read_text())["attempt_states"]
+        (failed,) = [attempt for attempt, state in states.items() if state == "interrupted"]
+        target = root / "attempts" / failed / "handoff"
+        receipt = json.loads((target / "unsupported-submission.json").read_text())
+        if failure == "symlink":
+            assert receipt["symlinks"] == {"src/link.py": str(outside)}
+            assert (target / "unsupported-submission/src/link.py").is_symlink()
+            assert "outside.txt" not in receipt["error"]
+        return
+    # A policy violation on intact evidence is graded; its diagnostics are bound to the report.
+    study.run_study(recipe, root)
     assert len(calls) == 12
     report = json.loads((root / "report/assessment-report.json").read_text())
     assert len(report["attempts"]) == 12
     stage = report["attempts"][0]["stages"][0]
     assert stage["snapshot_digest"] is None
     target = root / "attempts" / report["attempts"][0]["id"] / "handoff"
-    if failure == "symlink":
-        assert stage["submission_error"]["symlinks"] == {"src/link.py": str(outside)}
-        assert (target / "unsupported-submission/src/link.py").is_symlink()
-        assert "outside.txt" not in stage["submission_error"]["error"]
-        return
+    assert json.loads((target / "unsupported-submission.json").read_text())[
+        "policy_violation"
+    ] == "symlink"
     source = target / "diagnostic-source/src/answer.py"
     patch = target / "artifacts/harbor/trial/artifacts/logs/artifacts/model.patch"
     for artifact in (source, patch):
@@ -885,7 +919,9 @@ def test_parallel_coding_overlaps_keeps_seeded_order_and_bound_native_counts(
         harbor_backend, "preflight", lambda **kwargs: {"harness_version": "offline fixture"}
     )
 
-    def invoke(*, area: Path, entry: dict[str, object], **kwargs: object) -> dict[str, object]:
+    def invoke(
+        *, area: Path, entry: dict[str, object], protocol: dict[str, Any], **kwargs: object
+    ) -> dict[str, object]:
         nonlocal active, maximum
         attempt_id = entry["id"]
         assert isinstance(attempt_id, str)
@@ -902,6 +938,7 @@ def test_parallel_coding_overlaps_keeps_seeded_order_and_bound_native_counts(
         if index:
             released[index - 1].set()
         return {
+            **native_execution(area, protocol["native_task_identity"]),
             "submission_collected": True,
             "successful_native_completion": True,
             "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},

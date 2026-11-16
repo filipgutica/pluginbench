@@ -14,7 +14,9 @@ from pluginbench import (
     claude,
     claude_launch,
     claude_treatments,
+    claude_usage,
     evaluation,
+    grade,
     harbor_backend,
     native_treatments,
     saved_usage,
@@ -192,6 +194,25 @@ def test_native_cache_reuses_failed_attempts_and_unknown_usage_without_observers
     execution = second.root / "attempts/baseline-1/handoff/execution.json"
     assert json.loads(execution.read_text())["successful_native_completion"] is False
     assert list(second.root.glob("baseline-evidence/*/origin.json"))
+
+
+def test_an_earlier_build_s_cached_infrastructure_error_is_no_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before grade contract 1, an attempt with an infrastructure error was cached complete."""
+    path = tmp_path / "cache"
+    first, _, records = _cohort(tmp_path / "first", path)
+    target = first.root / "attempts/baseline-1/handoff/execution.json"
+    execution = json.loads(target.read_text())
+    target.write_text(json.dumps({**execution, "error": {"exception_type": "ApiOverloadedError"}}))
+    with monkeypatch.context() as earlier:
+        earlier.setattr(baselines, "_not_a_baseline", lambda *args: None)
+        assert _publish(first, records) == [None, None]
+
+    second, _, _ = _cohort(tmp_path / "second", path)
+    # Graded now, it would be a vanilla fail; its repeat must be coded again instead.
+    with pytest.raises(ValueError, match="is no baseline: it ended in an infrastructure error"):
+        _statuses(second)
 
 
 @pytest.mark.parametrize(
@@ -485,6 +506,7 @@ def test_session_that_never_reached_the_model_is_not_published(tmp_path: Path) -
     execution = json.loads(receipt.read_text())
     execution.update(
         usage=None,
+        observed_token_usage=False,
         timed_out=False,
         stream_errors=[{"type": "turn.failed", "error": {"message": "backend unreachable"}}],
     )
@@ -520,6 +542,7 @@ def test_cohort_lock_and_each_published_repeat_is_its_own_hit(tmp_path: Path) ->
 def test_reuse_regrades_without_replaying_models_and_retains_failures(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsupported_patch: bool
 ) -> None:
+    """A cached attempt keeps its native failure, and a policy violation stays reusable."""
     calls = []
     regrades = []
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: runtime_identity())
@@ -550,7 +573,12 @@ def test_reuse_regrades_without_replaying_models_and_retains_failures(
             and kwargs["entry"]["attempt"] == 2
         ):
             artifacts = area / "artifacts/harbor/trial/artifacts"
-            (artifacts / submissions.PATCH_ARTIFACT).write_text("invalid patch\n")
+            patch = artifacts / submissions.PATCH_ARTIFACT
+            patch.write_text(
+                patch.read_text() + "diff --git a/link.py b/link.py\nnew file mode 120000\n"
+                "--- /dev/null\n+++ b/link.py\n@@ -0,0 +1 @@\n+answer.py\n"
+                "\\ No newline at end of file\n"
+            )
             result["native_artifact_hashes"] = harbor_backend._native_artifact_hashes(artifacts)
         return result
 
@@ -598,8 +626,8 @@ def test_reuse_regrades_without_replaying_models_and_retains_failures(
     )["usage_validation"]
     assert validation["recorded_usage"] == {"input_tokens": 13}
     assert validation["status"] == "unavailable"
-    correctness = second / baseline[0]["stages"][0]["correctness"]["path"]
-    assert json.loads(correctness.read_text())["checks"]["native_completion"] is False
+    execution = second / "attempts" / baseline[0]["id"] / "handoff/execution.json"
+    assert json.loads(execution.read_text())["successful_native_completion"] is False
     # Origins name their cohort relative to the cache root, never the origin run's path.
     assert all(
         item["origin_cohort"] == f"cache/{item['cache_key']}/{item['original_record']['attempt']}"
@@ -1103,8 +1131,9 @@ def test_claude_evidence_that_differs_from_its_identity_cannot_seed_the_cache(
         receipt = json.loads((artifacts / "native-treatment.json").read_text())
         invocation = json.loads((artifacts / "invocation.json").read_text())
         if fault == "timeout-unknown-usage":
-            # A timeout leaves no result event: usage is unknown, and the attempt is scored.
-            execution.update(usage=None, timed_out=True)
+            # A timeout leaves no result event: usage is unknown. The agent's message proves a
+            # turn, so the attempt is scored.
+            execution.update(usage=None, timed_out=True, agent_messages=["Working on it."])
         elif fault == "never-reached-model":
             execution.update(usage=None, timed_out=False)
         elif fault == "builtins":
@@ -1161,6 +1190,50 @@ def test_claude_evidence_that_differs_from_its_identity_cannot_seed_the_cache(
         if fault == "never-reached-model"
         else "its saved evidence does not match the vanilla cache identity"
     ] * 2
+
+
+def _stale_foreign_transcripts(cache: baselines.BaselineCache) -> None:
+    """Each saved Claude attempt as an earlier build recorded it: a stream cut after
+    system/init, transcript rows from another session, and their tokens in `per_model`."""
+    plain = CLAUDE_FIXTURES / "coding/plain"
+    init = (plain / "stream.jsonl").read_text().splitlines()[0]
+    # The earlier parser added the rows' tokens whatever their session.
+    counted = claude_usage.coding_usage(
+        init, plain / "sessions", runner_model=CLAUDE_RUNNER["model"],
+        cli_version=CLAUDE_RUNNER["harness_version"],
+    )["usage_accounting"]
+    for target in cache.root.glob("attempts/*/handoff"):
+        artifacts = target / "artifacts"
+        (artifacts / "stdout.jsonl").write_text(init + "\n")
+        sessions = artifacts / "harbor/trial/agent/sessions"
+        shutil.copytree(plain / "sessions", sessions)
+        (transcript,) = sessions.rglob("*.jsonl")
+        rows = [json.loads(line) for line in transcript.read_text().splitlines()]
+        transcript.write_text(
+            "".join(json.dumps({**row, "sessionId": "earlier-session"}) + "\n" for row in rows)
+        )
+        execution = json.loads((target / "execution.json").read_text())
+        execution.update(usage=None, timed_out=True, usage_accounting={
+            **counted, "reasons": [f"transcript {transcript.name} belongs to another session"],
+        })
+        (target / "execution.json").write_text(json.dumps(execution))
+
+
+def test_a_cached_claude_attempt_whose_only_turn_is_another_session_s_is_no_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "cache"
+    first, _, records = _claude_cohort(tmp_path / "first", path)
+    _stale_foreign_transcripts(first)
+    # This build refuses to cache it.
+    assert _publish(first, records) == ["its session never reached the model"] * 2
+    # An earlier build cached it; reuse must not import it, so it never reaches grading.
+    with monkeypatch.context() as earlier:
+        earlier.setattr(baselines, "_not_a_baseline", lambda *args: None)
+        assert _publish(first, records) == [None, None]
+    second, _, _ = _claude_cohort(tmp_path / "second", path)
+    with pytest.raises(ValueError, match="is no baseline: its session never reached the model"):
+        _statuses(second)
 
 
 def test_the_claude_vanilla_identity_binds_subagents_to_the_runner_model() -> None:
@@ -1343,6 +1416,11 @@ def test_a_claude_rate_limit_mid_session_stops_the_run_and_its_vanilla_is_coded_
     assert "You've hit your limit" in run["error"]
     assert not any((root / "attempts" / attempt / "handoff/correctness.json").exists()
                    for attempt in stopped)
+    # An infrastructure error, as status reads it: never a result.
+    receipts = [json.loads((root / "attempts" / attempt / "handoff" / grade.INFRASTRUCTURE_ERROR)
+                           .read_text()) for attempt in stopped]
+    assert all(receipt["reason"].startswith("claude stopped on a usage or rate limit")
+               for receipt in receipts)
     assert not list(cache.glob("*/*/manifest.json"))
 
     _claude_backend(monkeypatch)
@@ -1391,7 +1469,8 @@ def test_a_cached_claude_vanilla_that_stopped_at_its_limit_is_not_reused(
 
     two = _study(tmp_path / "two", guidance="another", runner=CLAUDE_RUNNER)
     with pytest.raises(ValueError, match=(
-        f"baseline cache entry {entry.parent.name}/1 stopped on a usage or rate limit"
+        f"baseline cache entry {entry.parent.name}/1 is no baseline: its session stopped on a usage "
+        "or rate limit"
     )):
         study.run_study(two, tmp_path / "second", baseline_cache=cache,
                         baseline_identity=_claude_identity(two.tasks))
@@ -1409,7 +1488,7 @@ def test_a_fully_fresh_claude_run_with_other_built_ins_still_scores_and_says_why
                            baseline_identity=_claude_identity(one.tasks))
     report = json.loads((root / "report/assessment-report.json").read_text())
     for row in report["attempts"]:
-        assert _attempt_json(root, row["id"], "correctness.json")["checks"]["native_completion"]
+        assert _attempt_json(root, row["id"], "correctness.json")["checks"]["verifier"]
         assert row["stages"][0]["work"]["usage_validation"]["status"] == "validated"
     assert not list(cache.glob("*/*/manifest.json"))
     skipped = [line for line in progress if " was not cached in " in line]

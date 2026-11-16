@@ -1,5 +1,4 @@
 # The engineering guidance climb card's gates 1-3 (gate 4 runs validators outside PluginBench).
-count_overlap_passes: true  # card Amendment 1
 splits:
   climb:
     - true-myth-iterable-collection-combinators
@@ -20,11 +19,6 @@ gates:
     per_task: true
     against: vanilla
     direction: higher
-    tolerance: 1
-  - name: unknown correctness
-    correctness: unknown
-    against: vanilla
-    direction: lower
     tolerance: 1
   - name: tokens
     metrics: [Input tokens, Output tokens]

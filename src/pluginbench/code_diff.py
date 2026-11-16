@@ -163,12 +163,20 @@ def _is_test_path(path: str) -> bool:
     )
 
 
-def without_test_files(patch: str, *, is_test: Callable[[str], bool]) -> tuple[str, list[str]]:
+class TestRename(ValueError):
+    """A rename or copy between a test file and another file, which cannot be left out."""
+
+
+def without_test_files(
+    patch: str, *, is_test: Callable[[str], bool], paths: list[tuple[str | None, str | None]]
+) -> tuple[str, list[str]]:
     """Drop every file section of a Git patch whose path `is_test`; keep the rest verbatim.
 
-    Returns the remaining patch and the sorted test paths it dropped. Sections are cut at `diff --git` headers,
-    so each kept section keeps its exact text. A rename or copy between a test path and another
-    path is refused: dropping it would change the other file too.
+    `paths` holds each section's old and new path in order, as Git reads them
+    (`submissions.section_paths`), so a quoted path is never parsed here. Returns the remaining
+    patch and the sorted test paths it dropped. Sections are cut at `diff --git` headers, so
+    each kept section keeps its exact text. A rename or copy between a test path and another
+    path raises `TestRename`: dropping it would change the other file too.
     """
     sections: list[str] = []
     # Only "\n" ends a line in a Git patch; file content may hold "\r" or "\f" mid-line.
@@ -177,33 +185,26 @@ def without_test_files(patch: str, *, is_test: Callable[[str], bool]) -> tuple[s
             sections.append(line)
         else:
             sections[-1] += line
+    headed = [section for section in sections if section.startswith("diff --git ")]
+    if len(headed) != len(paths):
+        raise ValueError(f"the patch has {len(headed)} file sections but {len(paths)} path pairs")
+    pairs = iter(paths)
     kept: list[str] = []
     removed: set[str] = set()
     for section in sections:
-        header = _section_header(section) if section.startswith("diff --git ") else ""
-        changes = _file_changes(header) if header else ()
-        paths = {path for change in changes for path in (change.old_path, change.new_path) if path}
-        tests = {path for path in paths if is_test(path)}
-        if tests and tests != paths:
-            raise ValueError(
+        pair = next(pairs) if section.startswith("diff --git ") else (None, None)
+        named = {path for path in pair if path}
+        tests = {path for path in named if is_test(path)}
+        if tests and tests != named:
+            raise TestRename(
                 "a rename or copy between a test file and another file cannot be left out "
-                "without changing the other file: " + ", ".join(sorted(paths))
+                "without changing the other file: " + ", ".join(sorted(named))
             )
         if tests:
             removed |= tests
         else:
             kept.append(section)
     return "".join(kept), sorted(removed)
-
-
-def _section_header(section: str) -> str:
-    """A file section's lines before its first hunk or binary data: its paths, no file content."""
-    lines: list[str] = []
-    for line in section.split("\n"):
-        if line.startswith(("@@", "GIT binary patch", "Binary files ")):
-            break
-        lines.append(line)
-    return "\n".join(lines)
 
 
 def _is_source_path(path: str) -> bool:
