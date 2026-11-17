@@ -828,11 +828,11 @@ def test_parallel_remeasurement_deduplicates_fixed_inputs_with_serial_repeats(
         root,
         profiles=_profile(tmp_path),
         revision="parallel",
-        jobs=3,
+        jobs=2,
     )
     state = json.loads(revision.read_text())
     assert maximum == 2 and not active and finished == [1, 0]
-    assert state["jobs"] == 3 and state["unique_inputs"] == 2
+    assert state["jobs"] == 2 and state["unique_inputs"] == 2
     assert sorted(calls) == [(index, repeat) for index in range(2) for repeat in range(2)]
     assert all([repeat for i, repeat in calls if i == index] == [0, 1] for index in range(2))
     proposed = json.loads(remeasure.validate_remeasurement(root, revision.parent).read_text())
@@ -880,7 +880,7 @@ def test_parallel_partial_collection_finishes_other_inputs_without_promoting_fai
         root,
         profiles=profiles,
         revision="partial-parallel",
-        jobs=3,
+        jobs=2,
     )
     state = json.loads(revision.read_text())
     assert state["status"] == "complete" and state["unique_inputs"] == 2
@@ -902,6 +902,21 @@ def test_remeasurement_invalid_jobs_has_no_filesystem_effects(tmp_path: Path, jo
             tmp_path / "missing", profiles={}, revision="invalid", jobs=jobs
         )
     assert list(tmp_path.iterdir()) == []
+
+
+def test_a_revision_saved_with_more_jobs_than_a_host_runs_does_not_resume(tmp_path: Path) -> None:
+    directory = tmp_path / "observer-revisions" / "wide"
+    directory.mkdir(parents=True)
+    state = {
+        "status": "failed", "frozen_profiles": {}, "profile_inventory": {}, "jobs": 3,
+        "implementation": remeasure._implementation(),
+    }
+    (directory / "revision.json").write_text(json.dumps(state))
+    with pytest.raises(ValueError, match="jobs=3 is more than the 2 task jobs"):
+        remeasure.resume_remeasurement(tmp_path, revision="wide")
+    with pytest.raises(ValueError, match="jobs=3 is more than the 2 task jobs"):
+        remeasure.propose_remeasurement(tmp_path / "missing", profiles={}, revision="new", jobs=3)
+    assert list(directory.iterdir()) == [directory / "revision.json"]
 
 
 def test_parallel_observer_fatal_failure_drains_active_receipts_without_new_repeats(

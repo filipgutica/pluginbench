@@ -235,7 +235,7 @@ Every setting lives in the config. Flags only control how a command runs.
 
 **Measurements.** Before any paid call, PluginBench runs each selected collector twice on the starting code. A measure with no collector for a task is `not_configured`, and one whose collector fails its probe is `broken`. That task is then not measured for it, and the run continues, as long as another task can measure it. A measure that is ready on no task stops the run. With `measurement_settings.max_not_ready_share: "1/3"`, a measure that is not ready on more than a third of the tasks stops the run too. With `measurement_settings.require_ready: true`, any such task stops the run. Selecting `review` requires a `reviewer` block. [Measurements](docs/running-evaluations.md#measurements).
 
-**Concurrency.** `jobs` defaults to 2 and accepts 1 to 4. A value above Docker capacity fails the check; PluginBench does not lower it. [Concurrency and resume](docs/running-evaluations.md#concurrency-and-resume).
+**Concurrency.** `jobs` defaults to 2 and accepts 1 or 2, the task jobs one host runs at once. A value above that, or above Docker capacity, fails the check; PluginBench does not lower it. [Concurrency and resume](docs/running-evaluations.md#concurrency-and-resume).
 
 ## Stop, resume, and reuse
 

@@ -905,13 +905,15 @@ def test_parallel_coding_overlaps_keeps_seeded_order_and_bound_native_counts(
 
     recipe_path = _recipe(tmp_path)
     document = yaml.safe_load(recipe_path.read_text())
-    document.update(repeats=1, jobs=4)
+    document.update(repeats=1, jobs=2)
     recipe_path.write_text(yaml.safe_dump(document))
     resolved = study.load_study(recipe_path)
     plan = study.plan_study(resolved)
     order = {entry["id"]: index for index, entry in enumerate(plan["entries"])}
-    gate, lock = Barrier(4), Lock()
+    # Two at a time: each pair overlaps, and the second of each finishes first.
+    gate, lock = Barrier(2), Lock()
     released = [Event() for _ in range(4)]
+    released[1].set()
     released[3].set()
     completed: list[int] = []
     active = maximum = 0
@@ -935,7 +937,7 @@ def test_parallel_coding_overlaps_keeps_seeded_order_and_bound_native_counts(
         with lock:
             completed.append(index)
             active -= 1
-        if index:
+        if index % 2:
             released[index - 1].set()
         return {
             **native_execution(area, protocol["native_task_identity"]),
@@ -950,9 +952,9 @@ def test_parallel_coding_overlaps_keeps_seeded_order_and_bound_native_counts(
     root = study.run_study(resolved, tmp_path / "parallel-results")
     run = json.loads((root / "run.json").read_text())
     records = json.loads((root / "assessment-input.json").read_text())["records"]
-    assert maximum == 4 and completed == [3, 2, 1, 0]
+    assert maximum == 2 and completed == [1, 0, 3, 2]
     assert [record["id"] for record in records] == list(order)
-    assert run["jobs"] == run["actual_calls"] == run["completed_attempts"] == 4
+    assert run["jobs"] == 2 and run["actual_calls"] == run["completed_attempts"] == 4
     assert set(run["invocation_starts"]) == set(order)
     for attempt_id, starts in run["invocation_starts"].items():
         assert set(starts) == {"handoff"}
@@ -970,6 +972,19 @@ def test_parallel_coding_overlaps_keeps_seeded_order_and_bound_native_counts(
     assert [row["stages"][0]["work"]["tokens"] for row in serial_records] == [
         row["stages"][0]["work"]["tokens"] for row in records
     ]
+
+
+def test_a_study_with_more_than_two_jobs_starts_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recipe_path = _recipe(tmp_path)
+    document = yaml.safe_load(recipe_path.read_text())
+    document.update(jobs=3)
+    recipe_path.write_text(yaml.safe_dump(document))
+    calls = _fake_runtime(monkeypatch)
+    with pytest.raises(ValueError, match="jobs=3 is more than the 2 task jobs"):
+        study.run_study(study.load_study(recipe_path), tmp_path / "results")
+    assert calls == [] and not (tmp_path / "results").exists()
 
 
 def test_parallel_preparation_failure_has_no_native_invocation(

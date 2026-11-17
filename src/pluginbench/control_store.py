@@ -5,13 +5,19 @@ work, and records `released` only when it leaves cleanly: its block returned and
 on the way succeeded. The next owner carries every unreleased record forward as an obligation,
 in that same write (`run_lock.hold_execution`).
 
-Until P4b labels every container and scopes every process, PluginBench cannot list everything a
-command starts: measurement and regrade containers, for one, fall outside any inventory. So an
-obligation never clears by itself. Each is one unknown check that only `pluginbench repair
---confirm-stopped ROOT` clears, after checking again (`confirm_stopped`). Every crash needs that
-repair. The other checks are diagnostics for the operator and for repair:
+An owner whose record has schema 3 (`run_lock.CONTAINED_SCHEMA`) ran every coding, grading,
+review, collect and preflight call inside an operation it recorded first, and started every
+container, build and trial only inside one, labelled with its invocation. Its checks below then
+cover all those may have left, so its obligation clears by itself once they pass. The owner's
+own host commands (image pulls, git) run unscoped and start no container, so no check covers
+them. An owner record from an earlier build, or one that cannot be read, is one more unknown
+check that only `pluginbench repair --confirm-stopped ROOT` clears, after checking again
+(`confirm_stopped`). The checks:
 - processes: each invocation R's ledger still has open, and each the owner ended. A live process
   in the group the ledger recorded for it blocks, with a hint to stop it (`verify_invocation`).
+  For a contained owner, a call with no process record is covered by its operation: one still
+  recorded is checked below, one whose cleanup was proven left `cleanup.json`, and one with no
+  runtime directory never started, since the directory comes before anything spawns.
 - containers: for each Docker runtime the owner recorded, once the processes are confirmed. The
   trial containers R left running are stopped, and two inventories at least a second apart must
   find none (`verify_containers`). One pass has RECOVERY_SECONDS, and every Docker command in it
@@ -21,12 +27,14 @@ repair. The other checks are diagnostics for the operator and for repair:
   stopped and proven gone with the processes in it, then the containers carrying its label are
   removed and proven gone (`invocation_runtime.verify_scope`, `verify_labelled`).
 
-Repair never confirms a check that finds something running. A resume repeats the process and
-container checks for its own crashed calls before it accepts saved output or marks a call
-unresolved (`verify_crashed`).
+Once a contained owner's checks pass, each call and operation they covered gets a `cleanup.json`
+in its runtime directory, the proof a resume's own checks read. Repair never confirms a check
+that finds something running. A resume repeats the process and container checks for its own
+crashed calls before it accepts saved output or marks a call unresolved (`verify_crashed`).
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 import time
@@ -188,8 +196,9 @@ def _repair(root: str) -> str:
 def verify_invocation(check: Check) -> dict[str, Any]:
     """Prove that nothing in the invocation's recorded process group still runs.
 
-    A live member blocks, even after the leader exits. A missing record, a record without its
-    boot, or one from another PID namespace is unknown. A record from an earlier boot is gone
+    A live member blocks, even after the leader exits. A missing record is unknown unless the
+    check says what covers it (`_coverage`). A record without its boot, or one from another PID
+    namespace, is unknown. A record from an earlier boot is gone
     with that boot. Children that left the group with `setsid` are not seen; systemd scopes
     will cover them.
     """
@@ -197,6 +206,8 @@ def verify_invocation(check: Check) -> dict[str, Any]:
     pid, group = identity.get("pid"), identity.get("process_group")
     name = f"{check['stage']} invocation {check['id']}"
     if type(pid) is not int or type(group) is not int or "boot_id" not in identity:
+        if covered := check.get("covered"):
+            return {"id": check["id"], "checked": covered, "at": _now()}
         raise CleanupUnknown(f"{name} has no verifiable process record. {_repair(check['root'])}")
     proof = {"id": check["id"], "checked": "process group", "at": _now()}
     if identity["boot_id"] != run_lock.boot_id():
@@ -401,13 +412,39 @@ def _invocations(rows: Sequence[dict[str, Any]], root: str) -> list[Check]:
     ]
 
 
-def _obligation_checks(obligation: dict[str, Any]) -> list[Check]:
+def contained(obligation: dict[str, Any]) -> bool:
+    """Whether a dead owner ran everything it started as recorded operations: its record has
+    schema 3 and was read whole."""
+    return obligation.get("schema") == run_lock.CONTAINED_SCHEMA and "problem" not in obligation
+
+
+def _coverage(
+    invocation: str, state: Path, operations: Collection[str], *, contained: bool
+) -> str | None:
+    """What proves that a call with no process record left nothing running, or None.
+
+    Every call of a contained owner runs as its operation, whose runtime directory exists
+    before anything of it spawns. A recorded operation is checked first in the same pass; a
+    `cleanup.json` is a proof already written. Without the directory, only a call `contained`
+    says a contained owner made is known never to have started.
+    """
+    directory = state / "invocations" / invocation
+    if (directory / "cleanup.json").is_file():
+        return "its operation's cleanup was proven"
+    if not contained:
+        return None
+    if invocation in operations:
+        return "its operation's scope and labelled containers are checked first"
+    return None if directory.exists() else "its operation never started"
+
+
+def _obligation_checks(obligation: dict[str, Any], state: Path) -> list[Check]:
     """What a dead owner may have left running, as checks.
 
-    Until P4b labels every container and scopes every process, no check can list all a command
-    starts, so the owner itself is always one unknown check: only `repair --confirm-stopped`
-    clears it. The other checks are diagnostics. They name processes and containers known to
-    still run, which repair never confirms, and each cleanup the owner recorded as failed.
+    For a contained owner they cover everything (see `contained`). Any other owner is one more
+    unknown check that only `repair --confirm-stopped` clears; its other checks name processes
+    and containers known to still run, which repair never confirms. Each cleanup the owner
+    recorded as failed is an unknown check either way.
     """
     root = str(obligation["root"])
     name = f"{obligation.get('pid')}-{obligation.get('acquired_at')}"
@@ -443,10 +480,13 @@ def _obligation_checks(obligation: dict[str, Any]) -> list[Check]:
         for kind in ("scope", "labelled")
         for item in obligation.get("operations") or []
     ]
-    return [unreleased, *failed, *operations, *_work_checks(obligation)]
+    owned = [*failed, *operations, *_work_checks(obligation, state)]
+    if not contained(obligation):
+        return [unreleased, *owned]
+    return [{**check, "contained": True} for check in owned]
 
 
-def _work_checks(obligation: dict[str, Any]) -> list[Check]:
+def _work_checks(obligation: dict[str, Any], state: Path) -> list[Check]:
     root = str(obligation["root"])
     name = f"{obligation.get('pid')}-{obligation.get('acquired_at')}"
     path = _ledger(Path(root))
@@ -459,6 +499,11 @@ def _work_checks(obligation: dict[str, Any]) -> list[Check]:
     finally:
         ledger.close()
     checks = _invocations(rows, root)
+    recorded = {item["id"] for item in obligation.get("operations") or []}
+    for check, row in zip(checks, rows, strict=True):
+        # Only a call this owner touched is its own; an older one needs its own proof.
+        own = contained(obligation) and since is not None and _touched(row, since)
+        check["covered"] = _coverage(check["id"], state, recorded, contained=own)
     evidence = path.parent
     # A recorded runtime stays an obligation whatever its directory now holds.
     runtimes: list[dict[str, Any] | None] = list(obligation.get("runtimes") or [])
@@ -491,17 +536,19 @@ def execute(owner: ExecutionOwner, *, state: Path | None = None) -> Iterator[Exe
     """Take the host execution lock, verify every obligation it carries, then run the block.
 
     Every execution entry point enters here, before any run lock. While an obligation fails,
-    nothing runs, whatever this command targets. Until P4b every obligation holds a check
-    that only `repair --confirm-stopped` passes, so the one write that clears them happens only
-    when a repair confirmed it but could not clear it itself.
+    nothing runs, whatever this command targets. A contained owner's obligation clears once its
+    checks pass; any other only once a repair confirmed it.
     """
     with run_lock.hold_execution(owner, state=state) as lock:
         with ControlStore.open(lock.state) as store:
             if pending := lock.record["pending"]:
-                checks = [check for item in pending for check in _obligation_checks(item)]
+                checks = [
+                    check for item in pending for check in _obligation_checks(item, lock.state)
+                ]
                 blocked, unknown = _verify(checks, store.confirmed(), None, _deadline())
                 if blocked or unknown:
                     raise _refusal([*blocked, *(reason for _, reason in unknown)])
+                _prove(lock.state, checks, store.confirmed())
                 lock.settle([])
             # Holding the lock proves any holder an observer could not verify is gone.
             store.set_reconciling(None)
@@ -510,6 +557,36 @@ def execute(owner: ExecutionOwner, *, state: Path | None = None) -> Iterator[Exe
         # Returning is a clean exit. Left by an exception after it recorded work (see
         # ExecutionLock.dirty), the owner stays unreleased, so the next one verifies this root.
         lock.dirty = False
+
+
+def _prove(state: Path, checks: Sequence[Check], confirmed: Collection[tuple[str, str]]) -> None:
+    """Save a `cleanup.json` for each operation and each covered call of a contained owner that
+    these passed checks proved clean, so a resume's own checks of those calls read it
+    (`_coverage`). What an operator confirmed was never proven, so it gets none."""
+
+    def proven(check: Check) -> bool:
+        ids = [check["id"]]
+        if check["kind"] == "scope":
+            ids.append(check["id"].replace(":scope:", ":labelled:"))
+        return bool(check.get("contained")) and all(
+            (item, check["root"]) not in confirmed for item in ids
+        )
+
+    proofs = {
+        str(check["operation"]["id"] if check["kind"] == "scope" else check["id"]): str(
+            check.get("covered") or "its scope and labelled containers were proven gone"
+        )
+        for check in checks
+        if proven(check)
+        and (check["kind"] == "scope" or (check["kind"] == "invocation" and check.get("covered")))
+    }
+    for invocation, proof in proofs.items():
+        directory = state / "invocations" / invocation
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not (directory / "cleanup.json").exists():
+            (directory / "cleanup.json").write_text(
+                json.dumps({"id": invocation, "recovered": proof, "at": _now()}, indent=2) + "\n"
+            )
 
 
 def _held() -> ExecutionLock:
@@ -543,6 +620,8 @@ def verify_crashed(
     lock.dirty = True  # Until the check passes and the block returns, this root stays fenced.
     root = str(lock.record["root"])
     checks = _invocations(rows, root)
+    for check in checks:
+        check["covered"] = _coverage(check["id"], lock.state, (), contained=False)
     if runtime is not None:
         try:
             known: dict[str, object] | None = runtime()
@@ -584,7 +663,7 @@ def confirm_stopped(
         raise ValueError(
             f"no open obligation names {target}; repair takes one of: {', '.join(roots)}"
         )
-    checks = [check for item in matching for check in _obligation_checks(item)]
+    checks = [check for item in matching for check in _obligation_checks(item, lock.state)]
     deadline = _deadline()  # Shared by both passes.
     with ControlStore.open(lock.state) as store:
         confirmed = store.confirmed()

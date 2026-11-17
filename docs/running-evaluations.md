@@ -544,7 +544,7 @@ Unknown values are never zero. A complete scan of a submission that changed no f
 
 ## Concurrency and resume
 
-Coding attempts, measurement inputs, and reviews run concurrently within their phases. `jobs` defaults to 2 on every machine and accepts 1 to 4. Docker capacity is bounded by Docker CPU capacity and an 80% Docker memory budget. A `jobs` value above that capacity fails before preparation instead of being lowered, because jobs is part of the comparison identity. Preparation and each snapshot's two measurement repeats stay sequential. Jobs affect scheduling and comparison identity, not the number of coding attempts. Subagents can make additional model requests.
+Coding attempts, measurement inputs, and reviews run concurrently within their phases. `jobs` defaults to 2 on every machine and accepts 1 or 2: one host runs at most two task jobs at once, coding or measuring, and a saved run or measurement revision with more is refused on resume rather than lowered. Docker capacity is bounded by Docker CPU capacity and an 80% Docker memory budget. A `jobs` value above that capacity fails before preparation instead of being lowered, because jobs is part of the comparison identity. Preparation and each snapshot's two measurement repeats stay sequential. Jobs affect scheduling and comparison identity, not the number of coding attempts. Subagents can make additional model requests.
 
 On interruption or fatal failure, new jobs stop. Active jobs finish or time out; their receipts remain, and an attempt that finishes while the run drains is kept as complete.
 
@@ -552,14 +552,15 @@ Only one PluginBench command executes on a host at a time. `run`, `check`, `revi
 
 A command that does not finish cleanly fences the host. A crash or a kill always does. Ctrl-C or an error does once the command has started building or probing tasks, recorded a model call, or recorded the Docker runtime its containers use. So does a failed cleanup of a call's processes or containers, even if the command then finishes.
 
-Until PluginBench runs each command in its own systemd scope and labels every container it starts, it cannot prove that everything a fenced command started has stopped: a process may have left its call's process group, and measurement and regrade containers carry no label a check can find. So no check clears a fence on its own. The next execution command, whatever run it targets, refuses to start with "... ended without a clean release ...", and names `pluginbench repair --confirm-stopped ROOT`. Check by hand that nothing the command started still runs, then run that command with the root exactly as the error names it.
+Every call, measurement, regrade, review, collection and preflight runs as an operation in its own systemd user scope, and every container it starts carries that operation's label. The command records each operation before anything of it starts. So the next execution command, whatever run it targets, checks what the fenced command left and clears the fence by itself once the checks pass: each operation's scope is stopped and gone, no container carries its label, and no process or trial container of its run still runs. It saves that proof as `cleanup.json` in the operation's directory under the PluginBench state directory.
+
+A fence left by an earlier PluginBench build, which ran some of these outside a scope or without a label, cannot be proven that way. The next execution command refuses to start with "... ended without a clean release ...", and names `pluginbench repair --confirm-stopped ROOT`. Check by hand that nothing the command started still runs, then run that command with the root exactly as the error names it.
 
 If the host's owner record itself is unreadable or invalid, its release cannot be trusted. The error then names the PluginBench state directory as the root: check that no PluginBench command, process or container still runs, and repair that directory. Any obligation in the record that is still valid stays, with its own root and checks, and needs its own repair.
 
-One case the interim rule cannot see: a process that a call started, which left its process group with `setsid`, can outlive a command that finished normally and released the host. Nothing finds it until PluginBench runs each command in its own systemd scope.
+Each check tells you what it can see:
 
-The checks still run, as a diagnosis. Each tells you what it can see:
-
+- each recorded operation's scope, which is stopped, so every process in it ends however it left its group, and every container labelled with that operation, which is removed;
 - every process in the process group of each call that was still open, or that the command ended itself, since a call can end while its cleanup failed;
 - the run's trial containers, for each Docker daemon the command recorded, each checked on its own. Any it finds are stopped, and two later checks at least a second apart must find none. If the run's frozen suite is gone, its containers cannot be found, so they count as unknown;
 - the reason any cleanup failed, when it could be saved.

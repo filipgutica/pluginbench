@@ -70,7 +70,7 @@ See [report format](metrics.md#report-files) for schema versions and legacy repo
 | `repeats` | `int` | `3` | no | Sets the number of attempts for each task and arm. |
 | `seed` | `int` | `42` | no | Seeds attempt ordering and identities without guaranteeing deterministic model sampling. |
 | `timeout_seconds` | `int` | `1800` | no | Sets the coding agent timeout in seconds, including child work. |
-| `jobs` | `int` | `2` | no | Sets concurrent jobs from one to four, subject to Docker capacity. |
+| `jobs` | `int` | `2` | no | Sets concurrent jobs from one to two, subject to Docker capacity. |
 | `container_cpus` | `int \| None` | `null` | no | Sets a common CPU limit covering all selected task requirements, or uses their common declaration. |
 | `container_memory_mb` | `int \| None` | `null` | no | Sets a common memory limit in MB covering all selected task requirements, or uses their common declaration. |
 

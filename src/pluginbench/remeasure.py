@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pluginbench
 from pluginbench import components, harbor_backend, study
-from pluginbench.parallel import run_jobs, validate_jobs
+from pluginbench.parallel import require_host_jobs, run_jobs, validate_jobs
 from pluginbench.assessment import _load_manifest, build_assessment
 from pluginbench.assessment_metrics import (
     compare_evidence,
@@ -716,6 +716,7 @@ def propose_remeasurement(
     proposal binds them exactly as if it had collected them.
     """
     validate_jobs(jobs)
+    require_host_jobs(jobs)
     root = root.resolve()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", revision):
         raise ValueError("revision must be a single named directory")
@@ -831,6 +832,7 @@ def resume_remeasurement(
             "started, so a resume would mix two implementations; choose a new --revision name"
         )
     validate_jobs(state["jobs"])
+    require_host_jobs(int(str(state["jobs"])))
     run, manifest, original = _native_state(root)
     protected = _preserved_inventory(root, manifest, original.parent)
     if (
