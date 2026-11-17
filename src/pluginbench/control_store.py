@@ -7,12 +7,16 @@ work, `execute` checks every obligation and clears them with one write, only onc
 passes. Whatever a check cannot prove is unknown: the obligation stays, and nothing runs.
 
 The checks for an obligation at root R:
-- processes: each invocation R's ledger still has open. No live process may remain in the process
+- processes: each invocation R's ledger still has open, and each the owner ended, since a call
+  can end while its process-group cleanup failed. No live process may remain in the process
   group the ledger recorded for it (`verify_invocation`).
-- containers: for each Docker runtime the owner recorded before starting containers, and only
-  once every process is proven gone. The daemon at the runtime's endpoint must still be the one
-  it recorded, the trial containers R left running are stopped, and two inventories at least a
-  second apart find none (`verify_containers`).
+- containers: for each Docker runtime the owner recorded before starting containers, each on its
+  own, and only once every process is proven gone. The daemon at the runtime's endpoint must
+  still be the one it recorded, the trial containers R left running are stopped, and two
+  inventories at least a second apart find none (`verify_containers`). Without R's frozen suite
+  they cannot be found, so they are unknown.
+
+One recovery pass has RECOVERY_SECONDS; every Docker command in it is capped by what is left.
 - unrecorded work: `check`, `measure` and `judge run` start processes no ledger records, so until
   per-invocation systemd scopes exist their obligations are unknown.
 
@@ -44,6 +48,8 @@ SCHEMA_VERSION = 1
 UNKNOWN_OWNER_GRACE = 30.0
 # Seconds between the two container inventories that must both find nothing.
 INVENTORY_INTERVAL = 1.0
+# One recovery pass's whole budget; every Docker command in it is capped by what is left.
+RECOVERY_SECONDS = 120.0
 # Kinds whose external processes no ledger records.
 UNRECORDED_KINDS = ("preflight", "measure", "judge", "unknown")
 
@@ -200,25 +206,42 @@ def verify_invocation(check: Check) -> dict[str, Any]:
     return proof
 
 
+def _deadline() -> float:
+    return time.monotonic() + RECOVERY_SECONDS
+
+
 def verify_containers(
-    check: Check, progress: Callable[[str], None] | None = None
+    check: Check, progress: Callable[[str], None] | None = None, *, deadline: float | None = None
 ) -> dict[str, Any]:
     """Stop the trial containers the run left running, and prove none still runs.
 
     Each inventory first proves the daemon is the one the runtime recorded. After the stop, two
     inventories at least INVENTORY_INTERVAL apart must both be empty, which catches a container
-    created late, such as a sidecar.
+    created late, such as a sidecar. Every Docker command is capped by what is left before
+    `deadline`, a `time.monotonic()` value; once it passes, the containers are unknown.
     """
+    deadline = _deadline() if deadline is None else deadline
     runtime, evidence = check["runtime"], Path(check["evidence"])
     where = f"the trial containers of {evidence}"
     if runtime is None:
         missing = check.get("missing", "no Docker runtime is known")
         raise CleanupUnknown(f"{missing} for {where}. {_repair(check['root'])}")
+    if not (evidence / "frozen" / "suite").is_dir():
+        # The inventory finds trial containers by their frozen suite, so without it it would
+        # find none, whatever runs.
+        raise CleanupUnknown(
+            f"the frozen suite that names {where} is missing. {_repair(check['root'])}"
+        )
 
     def inventory() -> list[dict[str, str]]:
+        if time.monotonic() >= deadline:
+            raise CleanupUnknown(
+                f"recovery used up its {RECOVERY_SECONDS:.0f} seconds before {where} were "
+                f"checked. {_repair(check['root'])}"
+            )
         try:
-            harbor_backend._assert_daemon(runtime)
-            return trial_containers.running(evidence, expected_runtime=runtime)
+            harbor_backend._assert_daemon(runtime, timeout=trial_containers.timeout(deadline))
+            return trial_containers.running(evidence, expected_runtime=runtime, deadline=deadline)
         except (
             OSError, ValueError, subprocess.SubprocessError, isolation.RuntimeDriftError
         ) as exc:
@@ -229,7 +252,7 @@ def verify_containers(
     if inventory():
         try:
             trial_containers.stop_left_running(
-                evidence, expected_runtime=runtime, progress=progress
+                evidence, expected_runtime=runtime, progress=progress, deadline=deadline
             )
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             raise CleanupBlocked(f"{where} could not be stopped: {exc}") from exc
@@ -242,30 +265,44 @@ def verify_containers(
 
 
 def _verify(
-    checks: Sequence[Check], confirmed: Collection[str], progress: Callable[[str], None] | None
+    checks: Sequence[Check],
+    confirmed: Collection[str],
+    progress: Callable[[str], None] | None,
+    deadline: float,
 ) -> tuple[list[str], list[tuple[Check, str]]]:
     """Run every check; return the blocking failures and the unknown checks with their reasons.
 
-    Containers are checked only after every process is proven gone or confirmed: until then a
-    create may still be in flight.
+    Processes come first. Containers are checked only once every process is proven gone or
+    confirmed, since until then a create may still be in flight; then each runtime is checked
+    on its own, so one that cannot be checked never hides another.
     """
     blocked: list[str] = []
     unknown: list[tuple[Check, str]] = []
-    for check in checks:
+    producers = [check for check in checks if check["kind"] != "containers"]
+    containers = [check for check in checks if check["kind"] == "containers"]
+    for check in producers:
         if check["id"] in confirmed:
             continue
         try:
             if check["kind"] == "invocation":
                 verify_invocation(check)
-            elif check["kind"] == "unrecorded":
+            else:
                 raise CleanupUnknown(f"{check['reason']}. {_repair(check['root'])}")
-            elif blocked or unknown:
+        except CleanupUnknown as exc:
+            unknown.append((check, str(exc)))
+        except CleanupBlocked as exc:
+            blocked.append(str(exc))
+    producers_gone = not blocked and not unknown
+    for check in containers:
+        if check["id"] in confirmed:
+            continue
+        try:
+            if not producers_gone:
                 raise CleanupUnknown(
                     f"processes of {check['evidence']} are not proven gone, so a container may "
                     f"still be created. {_repair(check['root'])}"
                 )
-            else:
-                verify_containers(check, progress)
+            verify_containers(check, progress, deadline=deadline)
         except CleanupUnknown as exc:
             unknown.append((check, str(exc)))
         except CleanupBlocked as exc:
@@ -290,6 +327,31 @@ def _open(ledger: Ledger, stages: Collection[str] | None = None) -> list[dict[st
         row
         for row in ledger.invocations()
         if row["state"] in OPEN_STATES and (stages is None or row["stage"] in stages)
+    ]
+
+
+# Ended states that never started a process, or whose cleanup a recovery already verified.
+_NOTHING_LEFT = ("aborted_prespawn", "unresolved")
+
+
+def _owned(ledger: Ledger, since: object) -> list[dict[str, Any]]:
+    """Every invocation a dead owner may have left running: each open one, and each it ended
+    with a recorded process, since that process may live on if its cleanup failed. An ended
+    call without one started nothing: the runner stops a child whose record fails. `since` is
+    when the owner took the lock; without a readable one, every ended call counts."""
+    try:
+        start = datetime.fromisoformat(str(since))
+    except ValueError:
+        start = None
+    return [
+        row
+        for row in ledger.invocations()
+        if row["state"] in OPEN_STATES
+        or (
+            row["state"] not in _NOTHING_LEFT
+            and row["identity"] is not None
+            and (start is None or datetime.fromisoformat(row["updated_at"]) >= start)
+        )
     ]
 
 
@@ -321,15 +383,16 @@ def _obligation_checks(obligation: dict[str, Any]) -> list[Check]:
         return [{"id": f"{name}:unrecorded", "root": root, "kind": "unrecorded", "reason": reason}]
     ledger = Ledger.read(path)
     try:
-        checks = _invocations(_open(ledger), root)
+        checks = _invocations(_owned(ledger, obligation.get("acquired_at")), root)
     finally:
         ledger.close()
     evidence = path.parent
-    if obligation.get("kind") != "run" or not (evidence / "frozen" / "suite").is_dir():
-        return checks  # No trial of this owner can have started a container.
+    # A recorded runtime stays an obligation whatever its directory now holds.
     runtimes: list[dict[str, Any] | None] = list(obligation.get("runtimes") or [])
     missing = "no Docker runtime is known"
     if not runtimes:
+        if obligation.get("kind") != "run" or not (evidence / "frozen" / "suite").is_dir():
+            return checks  # It recorded no runtime and froze no trial, so started no container.
         # The owner died before it recorded the runtime its trials use: the run's own.
         from pluginbench import study
 
@@ -362,7 +425,7 @@ def execute(owner: ExecutionOwner, *, state: Path | None = None) -> Iterator[Exe
         with ControlStore.open(lock.state) as store:
             if pending := lock.record["pending"]:
                 checks = [check for item in pending for check in _obligation_checks(item)]
-                blocked, unknown = _verify(checks, store.confirmed(), None)
+                blocked, unknown = _verify(checks, store.confirmed(), None, _deadline())
                 if blocked or unknown:
                     raise _refusal([*blocked, *(reason for _, reason in unknown)])
                 lock.settle([])
@@ -424,7 +487,7 @@ def verify_crashed(
         )
     with ControlStore.open(lock.state) as store:
         confirmed = store.confirmed()
-    blocked, unknown = _verify(checks, confirmed, progress)
+    blocked, unknown = _verify(checks, confirmed, progress, _deadline())
     if blocked or unknown:
         raise _refusal([*blocked, *(reason for _, reason in unknown)])
     return frozenset(check["id"] for check in checks if check["kind"] == "invocation")
@@ -448,15 +511,16 @@ def confirm_stopped(
             f"no open obligation names {target}; repair takes one of: {', '.join(roots)}"
         )
     checks = [check for item in matching for check in _obligation_checks(item)]
+    deadline = _deadline()  # Shared by both passes.
     with ControlStore.open(lock.state) as store:
         confirmed = store.confirmed()
-        blocked, unknown = _verify(checks, confirmed, None)
+        blocked, unknown = _verify(checks, confirmed, None, deadline)
         # Containers were unknown only because a process was; with the operator's word for the
         # processes, check the containers for real before confirming anything.
         processes = [(check, reason) for check, reason in unknown if check["kind"] != "containers"]
-        if not blocked and len(processes) < len(unknown):
+        if not blocked and processes and len(processes) < len(unknown):
             vouched = {*confirmed, *(check["id"] for check, _ in processes)}
-            blocked, containers = _verify(checks, vouched, None)
+            blocked, containers = _verify(checks, vouched, None, deadline)
             unknown = [*processes, *containers]
         if blocked:
             raise CleanupBlocked(

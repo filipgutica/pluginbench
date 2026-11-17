@@ -550,10 +550,12 @@ On interruption or fatal failure, new jobs stop. Active jobs finish or time out;
 
 Only one PluginBench command executes on a host at a time. `run`, `check`, `review`, `measure`, and `judge run` share one execution lock for your user account, whatever run they target. While one runs, another fails at once and names the run and process that hold the host.
 
-A command that does not finish cleanly fences the host. A crash or a kill always does. Ctrl-C or an error does once the command has recorded a model call or the Docker runtime its containers use. The next execution command, whatever run it targets, first checks that the fenced command left nothing running:
+A command that does not finish cleanly fences the host. A crash or a kill always does. Ctrl-C or an error does once the command has started building or probing tasks, recorded a model call, or recorded the Docker runtime its containers use. The next execution command, whatever run it targets, first checks that the fenced command left nothing running:
 
-- every process in each recorded call's process group;
-- the run's trial containers, against the Docker daemon the run recorded. Any it finds are stopped, and two later checks at least a second apart must find none.
+- every process in the process group of each call that was still open, or that the command ended itself, since a call can end while its cleanup failed;
+- the run's trial containers, for each Docker daemon the command recorded, each checked on its own. Any it finds are stopped, and two later checks at least a second apart must find none. If the run's frozen suite is gone, its containers cannot be found, so they count as unknown.
+
+The whole check has 120 seconds, and each Docker command gets only what is left of that time.
 
 Containers are checked only once every process is known to be gone, because a live process could still start one. A resume runs the same checks on its own run before it accepts saved output or marks a call unresolved.
 

@@ -545,7 +545,10 @@ class Ledger:
         """Every invocation by slot, stage and order; none in a version 1 ledger."""
         if self._version == 1:
             return []
-        keys = ("id", "slot", "stage", "n", "attempt_id", "state", "scope", "container_label")
+        keys = (
+            "id", "slot", "stage", "n", "attempt_id", "state", "scope", "container_label",
+            "updated_at",
+        )
         rows = self._db.execute(
             f"SELECT {', '.join(keys)}, identity, error FROM invocations ORDER BY slot, stage, n"
         ).fetchall()

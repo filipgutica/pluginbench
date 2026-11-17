@@ -159,10 +159,14 @@ def _docker(
     return result.stdout
 
 
-def _assert_daemon(expected_runtime: dict[str, object]) -> None:
+def _assert_daemon(expected_runtime: dict[str, object], *, timeout: int = _DOCKER_TIMEOUT) -> None:
     engine = _object(expected_runtime.get("docker_engine"), "frozen Docker engine")
     actual = _object(
-        json.loads(_docker("info", "--format", "{{json .}}", expected_runtime=expected_runtime)),
+        json.loads(
+            _docker(
+                "info", "--format", "{{json .}}", expected_runtime=expected_runtime, timeout=timeout
+            )
+        ),
         "Docker daemon",
     )
     if not engine.get("id") or actual.get("ID") != engine["id"]:

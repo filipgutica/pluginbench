@@ -506,6 +506,20 @@ def note_work() -> None:
         _execution.dirty = True
 
 
+@contextmanager
+def external_work() -> Iterator[None]:
+    """Hold the owner unclean while the block starts external work, such as image builds and
+    probe containers. A block left by an exception may leave that work behind; one that returns
+    has finished it, so the owner is then as clean as before."""
+    lock = _execution
+    if lock is None:
+        yield
+        return
+    before, lock.dirty = lock.dirty, True
+    yield
+    lock.dirty = before
+
+
 def note_runtime(runtime: dict[str, object]) -> None:
     """Record the Docker runtime containers are about to start under; without the host lock
     there is no owner record, and nothing to record."""

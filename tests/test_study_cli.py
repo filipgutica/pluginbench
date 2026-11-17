@@ -111,7 +111,7 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> evaluation.Evalua
     monkeypatch.setattr(harbor_backend, "probe_coding_environment", passing_git_probe)
     monkeypatch.setattr(harbor_backend, "run_reference_agents", passing_reference_agents)
     monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
-    monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime: None)
+    monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime, **kwargs: None)
     monkeypatch.setattr(
         isolation, "codex_code_mode_host", lambda: Path("/fixture/codex-code-mode-host")
     )
@@ -4778,3 +4778,29 @@ def test_fresh_iterations_only_evaluation_binds_saved_trace_counts(
     trace.write_text(trace.read_text().replace("pytest", "pytest -q"))
     with pytest.raises(ValueError, match="verification iteration evidence changed"):
         evaluation.regenerate_report(root)
+
+
+@pytest.mark.parametrize("failure", ["validation", "image build", "blocking finding"])
+def test_preparation_fences_the_host_only_while_its_external_work_runs(
+    checkable: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    output: Path = checkable["output"]
+    if failure == "validation":
+        output.mkdir()  # Refused before anything external starts.
+    elif failure == "image build":
+
+        def failed_build(**kwargs: Any) -> dict[str, object]:
+            raise ValueError("image build failed")
+
+        monkeypatch.setattr(harbor_backend, "prepare_native_task", failed_build)
+    else:
+        monkeypatch.setattr(evaluation, "blocking_findings", lambda *args, **kwargs: ["blocked"])
+    config = evaluation.load_evaluation(checkable["path"])
+    state = tmp_path / "host-state"
+    owner = run_lock.ExecutionOwner(kind="run", eval="config", root=str(output))
+    with pytest.raises(ValueError):
+        with control_store.execute(owner, state=state):
+            evaluation.prepare_evaluation(config, output)
+    record = json.loads((state / run_lock.EXECUTION_OWNER).read_text())
+    # A build cut off by its error may leave containers; a finished check leaves nothing.
+    assert (record["state"] == "released") is (failure != "image build")

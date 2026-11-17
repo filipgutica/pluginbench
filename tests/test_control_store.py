@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -38,10 +39,12 @@ def _record(state: Path) -> dict[str, Any]:
     return value
 
 
-def _crashed_owner(state: Path, *, kind: str, root: Path, runtimes: list[Any]) -> None:
+def _crashed_owner(
+    state: Path, *, kind: str, root: Path, runtimes: list[Any], acquired_at: str = "earlier"
+) -> None:
     """The record an owner leaves when it dies before releasing."""
     record = {
-        "schema": 2, "pid": 7, "acquired_at": "earlier", "kind": kind, "root": str(root),
+        "schema": 2, "pid": 7, "acquired_at": acquired_at, "kind": kind, "root": str(root),
         "state": "active", "runtimes": runtimes, "pending": [],
     }
     (state / run_lock.EXECUTION_OWNER).write_text(json.dumps(record))
@@ -276,7 +279,7 @@ def test_containers_are_checked_only_after_the_processes_and_on_every_retry(
         return []
 
     monkeypatch.setattr(trial_containers, "running", inventory)
-    monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime: None)
+    monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime, **kwargs: None)
     try:
         # A live producer could still create a container, so the containers are unknown too.
         with pytest.raises(CleanupBlocked, match="a container may still be created"):
@@ -301,7 +304,7 @@ def test_containers_that_cannot_be_checked_during_a_resume_fence_the_host(
     calls: list[str] = []
     resume_support.install(monkeypatch, calls)
 
-    def unreachable(runtime: Any) -> None:
+    def unreachable(runtime: Any, **kwargs: Any) -> None:
         raise ValueError("Cannot connect to the Docker daemon")
 
     def unreadable(frozen: Any) -> dict[str, object]:
@@ -406,6 +409,109 @@ def test_confirming_an_unreadable_record_never_covers_a_later_one(
     assert not _admitted(isolated_host_state, tmp_path)
 
 
+def test_a_call_that_ended_while_its_process_lived_is_checked_after_its_owner_dies(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    # Its process-group cleanup failed, so the call ended failed_transient with its child alive,
+    # and then the owner was killed.
+    run, child = _live_call(tmp_path)
+    acquired_at = datetime.now(UTC).isoformat()
+    ledger = Ledger.open(run / LEDGER_NAME)
+    [call] = ledger.invocations()
+    ledger.end(call["id"], "failed_transient", "OSError: process-group cleanup failed")
+    ledger.close()
+    _crashed_owner(
+        isolated_host_state, kind="review", root=run, runtimes=[], acquired_at=acquired_at
+    )
+    try:
+        assert not _admitted(isolated_host_state, tmp_path)
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+    assert _admitted(isolated_host_state, tmp_path)
+
+
+def test_calls_that_ended_before_the_dead_owner_started_are_not_its_obligation(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    run, child = _live_call(tmp_path)  # The live child stands in for a reused process group.
+    ledger = Ledger.open(run / LEDGER_NAME)
+    [call] = ledger.invocations()
+    ledger.end(call["id"], "finished")
+    ledger.close()
+    later = datetime.now(UTC).isoformat()
+    _crashed_owner(isolated_host_state, kind="review", root=run, runtimes=[], acquired_at=later)
+    try:
+        assert _admitted(isolated_host_state, tmp_path)
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+
+
+def test_each_recorded_runtime_is_checked_even_when_another_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
+) -> None:
+    run = tmp_path / "two-runtimes"
+    (run / "frozen/suite").mkdir(parents=True)
+    Ledger.create(run / LEDGER_NAME, [], {}).close()
+    runtimes = [{"docker_engine": {"id": "offline"}}, {"docker_engine": {"id": "live"}}]
+    _crashed_owner(isolated_host_state, kind="run", root=run, runtimes=runtimes)
+    daemons: list[str] = []
+
+    def daemon(runtime: dict[str, Any], **kwargs: Any) -> None:
+        daemons.append(runtime["docker_engine"]["id"])
+        if runtime["docker_engine"]["id"] == "offline":
+            raise ValueError("Cannot connect to the Docker daemon")
+
+    survivor = [{"name": "survivor", "id": "s", "project": "p"}]
+    monkeypatch.setattr(harbor_backend, "_assert_daemon", daemon)
+    monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: survivor)
+    monkeypatch.setattr(trial_containers, "stop_left_running", lambda evidence, **kwargs: None)
+    result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+    # The live daemon still runs a container, so nothing is confirmed, not even the offline one.
+    assert result.exit_code == 2 and "survivor" in result.stderr, result.output
+    assert "live" in daemons
+    with ControlStore.open(isolated_host_state) as store:
+        assert store.confirmations() == []
+    assert not _admitted(isolated_host_state, tmp_path)
+
+
+def test_a_recorded_runtime_is_checked_even_when_the_frozen_suite_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
+) -> None:
+    run = tmp_path / "unfrozen"
+    run.mkdir()
+    Ledger.create(run / LEDGER_NAME, [], {}).close()
+    _crashed_owner(
+        isolated_host_state, kind="run", root=run, runtimes=[{"docker_engine": {"id": "d"}}]
+    )
+    monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime, **kwargs: None)
+    monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
+    with pytest.raises(CleanupBlocked, match="frozen suite .* is missing"):
+        with control_store.execute(_owner(tmp_path / "unrelated")):
+            pass
+
+
+def test_recovery_shares_one_deadline_that_caps_every_docker_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run, container = _stuck_run(tmp_path)
+    timeouts: list[int] = []
+    docker = _Docker([])
+
+    def timed(*arguments: str, timeout: int = 60, **kwargs: Any) -> str:
+        timeouts.append(timeout)
+        return docker(*arguments, **kwargs)
+
+    monkeypatch.setattr(trial_containers, "running", _REAL_RUNNING)
+    monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime, **kwargs: None)
+    monkeypatch.setattr(harbor_backend, "_docker", timed)
+    control_store.verify_containers(_containers(run), deadline=time.monotonic() + 5)
+    assert timeouts and max(timeouts) <= 5
+    with pytest.raises(CleanupUnknown, match="120 seconds"):
+        control_store.verify_containers(_containers(run), deadline=time.monotonic() - 1)
+
+
 def _stuck_run(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
     run = tmp_path / "stuck"
     (run / "frozen/suite/0/task").mkdir(parents=True)
@@ -426,7 +532,7 @@ def test_a_container_still_running_after_its_stop_or_created_late_blocks(
     run, container = _stuck_run(tmp_path)
     docker = _Docker([container])
     monkeypatch.setattr(trial_containers, "running", _REAL_RUNNING)
-    monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime: None)
+    monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime, **kwargs: None)
 
     def ignored_stop(*arguments: str, **kwargs: Any) -> str:
         return "main" if arguments[0] == "stop" else docker(*arguments, **kwargs)
@@ -464,7 +570,7 @@ def test_a_replaced_docker_daemon_or_client_is_unknown(
 ) -> None:
     run, _ = _stuck_run(tmp_path)
 
-    def replaced(runtime: Any) -> None:
+    def replaced(runtime: Any, **kwargs: Any) -> None:
         raise error
 
     monkeypatch.setattr(harbor_backend, "_assert_daemon", replaced)

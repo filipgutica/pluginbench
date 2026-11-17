@@ -31,7 +31,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # payload bytes and bindings; coding launch behavior stays v1.
             # The optional spawn callback only reports the worker's PID to the invocation
             # ledger; what is launched, and how, is unchanged, so this stays v1.
-            "harbor_backend.py": "541feaf8625fbe434099aef3e08637498969a6115345f09f06611e4a64307da4",
+            # The daemon check takes an optional timeout, which only cleanup after a crash
+            # passes; launches are unchanged.
+            "harbor_backend.py": "d562847ec6016a2b506b658044f9e4c12713a1bd5f2366b8b9764a8b95eab1a2",
             # The same spawn callback; launches are unchanged.
             "processes.py": "eb63b5afabfa461b6a5b394388c21999f8f6dfb96b34b86db9d32318a738fc58",
             # Claude admission dispatch, and the Codex config's V2 spawn-override hide. The
