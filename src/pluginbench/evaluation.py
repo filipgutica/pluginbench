@@ -1791,6 +1791,8 @@ def plan_measure(
     """Check that a finished run can gain `measurements` as measurement revision `revision`."""
     root = root.expanduser().resolve()
     selection = _load_selection(root)
+    # Refused here, before `measure` asks to start, as `measure_evaluation` refuses it.
+    require_host_jobs(_saved_evaluation(selection).jobs)
     _, resumed = _measure_inputs(root, selection, measurements, revision, coverage_profiles, tasks)
     collected, carried = (
         _measure_split(selection, measurements)

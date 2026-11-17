@@ -919,7 +919,7 @@ def test_a_revision_saved_with_more_jobs_than_a_host_runs_does_not_resume(tmp_pa
     assert list(directory.iterdir()) == [directory / "revision.json"]
 
 
-def test_measuring_a_run_saved_with_more_jobs_than_a_host_runs_prepares_nothing(
+def test_measuring_a_run_saved_with_more_jobs_than_a_host_runs_is_refused_before_it_asks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from types import SimpleNamespace
@@ -936,6 +936,9 @@ def test_measuring_a_run_saved_with_more_jobs_than_a_host_runs_prepares_nothing(
     )
     with pytest.raises(ValueError, match="jobs=3 is more than the 2 task jobs"):
         evaluation.measure_evaluation(tmp_path, ["coverage"], "wide")
+    # Planning refuses it too, so `measure` never asks to start it.
+    with pytest.raises(ValueError, match="jobs=3 is more than the 2 task jobs"):
+        evaluation.plan_measure(tmp_path, ["coverage"], "wide")
 
 
 def test_parallel_observer_fatal_failure_drains_active_receipts_without_new_repeats(
