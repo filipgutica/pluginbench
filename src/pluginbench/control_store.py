@@ -17,6 +17,9 @@ repair. The other checks are diagnostics for the operator and for repair:
   find none (`verify_containers`). One pass has RECOVERY_SECONDS, and every Docker command in it
   is capped by what is left.
 - each cleanup the owner recorded as failed (`run_lock.note_leftover`), with its reason.
+- each operation the owner recorded (`invocation_runtime.run_operation`): its systemd scope is
+  stopped and proven gone with the processes in it, then the containers carrying its label are
+  removed and proven gone (`invocation_runtime.verify_scope`, `verify_labelled`).
 
 Repair never confirms a check that finds something running. A resume repeats the process and
 container checks for its own crashed calls before it accepts saved output or marks a call
@@ -65,8 +68,11 @@ CREATE TABLE IF NOT EXISTS confirmations (
 );
 """
 
-# One thing to verify: {"id", "root", "kind": "invocation" | "containers" | "unrecorded", ...}.
+# One thing to verify: {"id", "root", "kind", ...}. Kinds: "invocation" (a ledger call's process
+# group), "scope" (an operation's systemd scope), "unrecorded" (unknown until confirmed); and the
+# container kinds, "containers" (a run's trial containers) and "labelled" (an operation's).
 Check = dict[str, Any]
+CONTAINER_KINDS = ("containers", "labelled")
 
 
 class CleanupBlocked(ValueError):
@@ -285,16 +291,20 @@ def _verify(
     confirmed, since until then a create may still be in flight; then each runtime is checked
     on its own, so one that cannot be checked never hides another.
     """
+    from pluginbench import invocation_runtime
+
     blocked: list[str] = []
     unknown: list[tuple[Check, str]] = []
-    producers = [check for check in checks if check["kind"] != "containers"]
-    containers = [check for check in checks if check["kind"] == "containers"]
+    producers = [check for check in checks if check["kind"] not in CONTAINER_KINDS]
+    containers = [check for check in checks if check["kind"] in CONTAINER_KINDS]
     for check in producers:
         if (check["id"], check["root"]) in confirmed:
             continue
         try:
             if check["kind"] == "invocation":
                 verify_invocation(check)
+            elif check["kind"] == "scope":
+                invocation_runtime.verify_scope(check["operation"], deadline=deadline)
             else:
                 raise CleanupUnknown(f"{check['reason']}. {_repair(check['root'])}")
         except CleanupUnknown as exc:
@@ -308,10 +318,14 @@ def _verify(
         try:
             if not producers_gone:
                 raise CleanupUnknown(
-                    f"processes of {check['evidence']} are not proven gone, so a container may "
+                    f"processes of {check.get('evidence', check['root'])} are not proven gone, "
+                    "so a container may "
                     f"still be created. {_repair(check['root'])}"
                 )
-            verify_containers(check, progress, deadline=deadline)
+            if check["kind"] == "labelled":
+                invocation_runtime.verify_labelled(check["operation"], deadline=deadline)
+            else:
+                verify_containers(check, progress, deadline=deadline)
         except CleanupUnknown as exc:
             unknown.append((check, str(exc)))
         except CleanupBlocked as exc:
@@ -416,7 +430,13 @@ def _obligation_checks(obligation: dict[str, Any]) -> list[Check]:
         }
         for index, item in enumerate(obligation.get("leftovers") or [])
     ]
-    return [unreleased, *failed, *_work_checks(obligation)]
+    # Each operation it recorded: its scope first, then the containers carrying its label.
+    operations: list[Check] = [
+        {"id": f"{name}:{kind}:{item['id']}", "root": root, "kind": kind, "operation": item}
+        for kind in ("scope", "labelled")
+        for item in obligation.get("operations") or []
+    ]
+    return [unreleased, *failed, *operations, *_work_checks(obligation)]
 
 
 def _work_checks(obligation: dict[str, Any]) -> list[Check]:
@@ -564,7 +584,9 @@ def confirm_stopped(
         blocked, unknown = _verify(checks, confirmed, None, deadline)
         # Containers were unknown only because a process was; with the operator's word for the
         # processes, check the containers for real before confirming anything.
-        processes = [(check, reason) for check, reason in unknown if check["kind"] != "containers"]
+        processes = [
+            (check, reason) for check, reason in unknown if check["kind"] not in CONTAINER_KINDS
+        ]
         if not blocked and processes and len(processes) < len(unknown):
             vouched = {*confirmed, *((check["id"], check["root"]) for check, _ in processes)}
             blocked, containers = _verify(checks, vouched, None, deadline)

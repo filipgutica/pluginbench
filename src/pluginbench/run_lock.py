@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import pwd
+import re
 import signal
 import subprocess
 import threading
@@ -449,6 +450,7 @@ def _obligation_problem(value: object) -> str | None:
         ("acquired_at", str, True),
         ("runtimes", list, False),
         ("leftovers", list, False),
+        ("operations", list, False),
     ):
         item = value.get(key)
         if item is None and not required:
@@ -462,6 +464,44 @@ def _obligation_problem(value: object) -> str | None:
         for item in value.get("leftovers") or []
     ):
         return "has a failed cleanup without a reason"
+    for item in value.get("operations") or []:
+        if problem := _operation_problem(item):
+            return f"has an operation that {problem}"
+    return None
+
+
+def is_invocation_id(value: object) -> bool:
+    """Whether `value` is an invocation ID: 32 lowercase hex digits, valid in a systemd unit name
+    and a Docker label value."""
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value) is not None
+
+
+def _operation_problem(value: object) -> str | None:
+    """Why `value` is not an operation `invocation_runtime` recorded, whose scope and labelled
+    containers recovery can stop; None when it is."""
+    if not isinstance(value, dict):
+        return "is not an object"
+    invocation = value.get("id")
+    if not is_invocation_id(invocation):
+        return f"has id {invocation!r}, not 32 hex digits"
+    if value.get("scope") != f"pb-inv-{invocation}.scope":
+        return f"names scope {value.get('scope')!r}, not its own"
+    if value.get("label") != f"pluginbench.invocation={invocation}":
+        return f"names label {value.get('label')!r}, not its own"
+    if not isinstance(value.get("docker"), dict | None) or not isinstance(value.get("dir"), str):
+        return "has no valid Docker runtime or directory"
+    for key in ("bootstrap", "payload"):
+        identity = value.get(key)
+        if identity is None:
+            continue
+        if not (
+            isinstance(identity, dict)
+            and type(identity.get("pid")) is int
+            and isinstance(identity.get("start_time"), str | None)
+            and isinstance(identity.get("boot_id"), str)
+            and isinstance(identity.get("pid_namespace"), str)
+        ):
+            return f"has an invalid {key} identity"
     return None
 
 
@@ -595,6 +635,41 @@ class ExecutionLock:
         except OSError:
             pass  # The in-memory flag alone keeps the release unrecorded.
 
+    def note_operation(self, operation: dict[str, Any]) -> None:
+        """Record an operation's scope, label and runtime before anything of it spawns. While it
+        stays recorded, this owner's release stays unrecorded. If the record cannot be written,
+        this raises and nothing may spawn."""
+        if problem := _operation_problem(operation):
+            raise ValueError(f"operation {problem}")
+        self._update(
+            lambda record: {**record, "operations": [*record.get("operations", []), operation]}
+        )
+
+    def record_operation(self, invocation: str) -> dict[str, Any]:
+        """The recorded operation `invocation`, as last written."""
+        return next(item for item in self.record["operations"] if item["id"] == invocation)
+
+    def update_operation(self, invocation: str, **fields: object) -> None:
+        """Add what is known of a recorded operation, such as a process identity."""
+        self._update(
+            lambda record: {
+                **record,
+                "operations": [
+                    {**item, **fields} if item["id"] == invocation else item
+                    for item in record["operations"]
+                ],
+            }
+        )
+
+    def drop_operation(self, invocation: str) -> None:
+        """Forget an operation once its cleanup is verified."""
+        self._update(
+            lambda record: {
+                **record,
+                "operations": [item for item in record["operations"] if item["id"] != invocation],
+            }
+        )
+
     def _update(self, change: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
         # Adopt the record only once it is on disk, so a failed write never reaches it later.
         with self._updating:
@@ -711,6 +786,7 @@ def hold_execution(owner: ExecutionOwner, *, state: Path | None = None) -> Itera
                 "acquired_at": datetime.now(UTC).isoformat(),
                 "runtimes": [],
                 "leftovers": [],
+                "operations": [],
                 "pending": _carried(state),
             },
         )
@@ -720,7 +796,9 @@ def hold_execution(owner: ExecutionOwner, *, state: Path | None = None) -> Itera
             yield lock
         finally:
             _execution = None
-            if not lock.dirty and not lock.leftover:
+            # An operation still recorded was never proven cleaned up, whatever the caller did
+            # with the error that said so.
+            if not lock.dirty and not lock.leftover and not lock.record["operations"]:
                 try:
                     lock.publish("released")
                 except OSError:
