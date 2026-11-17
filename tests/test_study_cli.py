@@ -43,6 +43,7 @@ from pluginbench import (
     language_analysis,
     mutation,
     parallel,
+    processes,
     remeasure,
     run_lock,
     run_status,
@@ -3656,10 +3657,11 @@ def _finished_without_source_only_grades(
         # Correct only with the production test_set.py and without the agent's test files.
         reward = int("+flag = True" in patch and "tests/" not in patch and "conftest" not in patch)
         if (spawned := kwargs.get("on_spawn")) is not None:
-            # As the real regrade reports its worker, which has exited once the grade returns.
-            worker = subprocess.Popen([sys.executable, "-c", ""])
-            worker.wait(timeout=10)
-            spawned(worker.pid)
+            # As the real regrade runs its worker: reported, then stopped and drained.
+            processes.run_command(
+                [sys.executable, "-c", ""], cwd=tmp_path, env=os.environ, timeout=30,
+                on_spawn=spawned,
+            )
         return {
             "verifier_result": {"rewards": {"reward": reward}},
             "exception_info": None,
