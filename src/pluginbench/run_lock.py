@@ -376,16 +376,23 @@ def _read_record(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     """The owner record at `path`, or None and why it cannot be trusted. A missing record has
     no reason; an unreadable or invalid one is unknown, never an empty record."""
     value, problem = _load_record(path)
-    problem = problem or (None if value is None else _record_problem(value))
+    if value is _MISSING:
+        return None, None
+    problem = problem or _record_problem(value)
     return (None, problem) if problem else (value, None)
 
 
+# What _load_record returns for a record that does not exist. JSON `null` is a parsed value,
+# which validation refuses like any other record that is not an object.
+_MISSING = object()
+
+
 def _load_record(path: Path) -> tuple[Any, str | None]:
-    """The parsed JSON at `path`, or None and why it cannot be read; (None, None) if missing."""
+    """The parsed JSON at `path`, or None and why it cannot be read; _MISSING if absent."""
     try:
         return json.loads(path.read_text()), None
     except FileNotFoundError:
-        return None, None
+        return _MISSING, None
     except (OSError, ValueError) as exc:
         return None, f"it cannot be read: {exc}"
 
@@ -656,7 +663,7 @@ def _carried(state: Path) -> list[dict[str, Any]]:
     obligation that validates on its own is kept with its own root and checks, so repairing
     the fence never clears them."""
     value, problem = _load_record(state / EXECUTION_OWNER)
-    if value is None and problem is None:
+    if value is _MISSING:
         return []
     kept, problems = ([], [problem]) if problem else _obligations(value)
     if problems:

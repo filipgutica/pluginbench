@@ -1005,6 +1005,19 @@ def test_a_corrupt_owner_record_is_unknown_until_repair(
     assert _admitted(isolated_host_state, tmp_path)
 
 
+@pytest.mark.parametrize("record", ["null", "[]", '"x"', "0"])
+def test_an_owner_record_that_is_not_an_object_is_unknown_until_repair(
+    tmp_path: Path, isolated_host_state: Path, record: str
+) -> None:
+    (isolated_host_state / run_lock.EXECUTION_OWNER).write_text(record)
+    with pytest.raises(CleanupBlocked, match="it is not a JSON object"):
+        with control_store.execute(_owner(tmp_path / "unrelated")):
+            pass
+    result = CliRunner().invoke(cli.app, ["repair", str(isolated_host_state), "--confirm-stopped"])
+    assert result.exit_code == 0 and "The host is unblocked." in result.stdout, result.output
+    assert _admitted(isolated_host_state, tmp_path)
+
+
 def test_a_confirmation_covers_only_its_own_root_and_identity(
     tmp_path: Path, isolated_host_state: Path
 ) -> None:
