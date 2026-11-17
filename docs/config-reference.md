@@ -51,7 +51,7 @@ See [report format](metrics.md#report-files) for schema versions and legacy repo
 | `measurement_settings.coverage.provisioned_tool.name` | `str` | `—` | yes | Selects the vendored coverage.py or c8 tool. |
 | `measurement_settings.coverage.provisioned_tool.version` | `str` | `—` | yes | Pins an exact release supplied by PluginBench. |
 | `measurement_settings.coverage.provisioned_tool.sha256` | `str` | `""` | no | Records the verified artifact SHA-256; filled when omitted. |
-| `measurement_settings.coverage.provisioned_tool.provisioner_version` | `int` | `6` | no | Pins the PluginBench measurement_tools component that provisions the tool. |
+| `measurement_settings.coverage.provisioned_tool.provisioner_version` | `int` | `7` | no | Pins the PluginBench measurement_tools component that provisions the tool. |
 | `measurement_settings.coverage.format` | `Literal['lcov', 'coverage-py-json', 'go-coverprofile']` | `"lcov"` | no | Selects the parser for the coverage report. |
 | `measurement_settings.coverage.timeout_seconds` | `int` | `600` | no | Sets the coverage command timeout in seconds from one to 7200. |
 | `measurement_settings.coverage.source_scope` | `list[str] \| None` | `null` | no | Selects repository-relative source patterns for this coverage profile. |
@@ -63,7 +63,7 @@ See [report format](metrics.md#report-files) for schema versions and legacy repo
 | `measurement_settings.coverage_profiles.<name>.provisioned_tool.name` | `str` | `—` | yes | Selects the vendored coverage.py or c8 tool. |
 | `measurement_settings.coverage_profiles.<name>.provisioned_tool.version` | `str` | `—` | yes | Pins an exact release supplied by PluginBench. |
 | `measurement_settings.coverage_profiles.<name>.provisioned_tool.sha256` | `str` | `""` | no | Records the verified artifact SHA-256; filled when omitted. |
-| `measurement_settings.coverage_profiles.<name>.provisioned_tool.provisioner_version` | `int` | `6` | no | Pins the PluginBench measurement_tools component that provisions the tool. |
+| `measurement_settings.coverage_profiles.<name>.provisioned_tool.provisioner_version` | `int` | `7` | no | Pins the PluginBench measurement_tools component that provisions the tool. |
 | `measurement_settings.coverage_profiles.<name>.format` | `Literal['lcov', 'coverage-py-json', 'go-coverprofile']` | `"lcov"` | no | Selects the parser for the coverage report. |
 | `measurement_settings.coverage_profiles.<name>.timeout_seconds` | `int` | `600` | no | Sets the coverage command timeout in seconds from one to 7200. |
 | `measurement_settings.coverage_profiles.<name>.source_scope` | `list[str] \| None` | `null` | no | Selects repository-relative source patterns for this coverage profile. |

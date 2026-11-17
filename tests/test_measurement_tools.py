@@ -92,8 +92,8 @@ def test_tool_version_hash_and_provisioner_bind_profile_identity(
 @pytest.mark.parametrize(("name", "version", "mode"), [
     (name, version, mode)
     for name, version in [("coverage.py", "7.6.12"), ("c8", "10.1.3")]
-    for mode in ["tamper", "failed-tests", "signal", "docker-signal", "mutation", "path", "image-interpreter"]
-] + [("c8", "10.1.3", mode) for mode in ["sigpipe", "sigpipe-mutation"]])
+    for mode in ["tamper", "failed-tests", "signal", "docker-signal", "mutation", "path", "image-interpreter", "population"]
+] + [("c8", "10.1.3", mode) for mode in ["sigpipe", "sigpipe-mutation", "sigusr1"]])
 def test_native_coverage_uses_vendored_tool_outside_task_tree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, version: str, mode: str,
 ) -> None:
@@ -154,6 +154,9 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
                                 "\nexec " + shlex.quote(interpreter) + ' "$@"\n')
                 shim.chmod(0o755)
     (source / f"unloaded.{suffix}").write_text("value = 2\n" if suffix == "py" else "const value = 2\n")
+    injected = "test_injected.py" if suffix == "py" else "gen.py"
+    if mode == "population":
+        shutil.copyfile(source / f"main.{suffix}", source / injected)
     (source / ".git").mkdir()
     (source / ".git/HEAD").write_text("original git state\n")
     container = tmp_path / "container"
@@ -256,6 +259,14 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
             command[0] = sys.executable
         result = subprocess.run(command, cwd=app, env=container_env(argv),
                                 capture_output=True, text=True, timeout=30)
+        if mode == "population" and command[-1] in {"json", "report"}:
+            if suffix == "py":
+                output = json.loads((app / "coverage.json").read_text())
+                output["files"] = {injected: output["files"]["main.py"]}
+                (app / "coverage.json").write_text(json.dumps(output))
+            else:
+                output_path = app / "coverage/lcov.info"
+                output_path.write_text(output_path.read_text().replace("SF:main.js", "SF:" + injected))
         assert not preload_marker.exists(), "task NODE_OPTIONS executed before c8 startup"
         if mode == "docker-signal" and result.returncode < 0:
             # Docker CLI represents a killed exec as 128 + signal, rather than -signal.
@@ -280,18 +291,22 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
         # A shell normalizes SIGKILL to 137; observe the direct subprocess's -9 receipt.
         command = [sys.executable, "-I", "-S", "/opt/pluginbench-tools/coverage.py/launch-coverage.py",
                    "run", "runner.py"]
-    if mode.startswith("sigpipe"):
+    if mode in {"sigpipe", "sigpipe-mutation", "sigusr1"}:
         command = ["node", "/opt/pluginbench-tools/c8/launch-c8.cjs", "--all", "--",
-                   "sh", "-c", "node main.js; kill -PIPE $$"]
+                   "sh", "-c", "node main.js; kill -" + ("USR1" if mode == "sigusr1" else "PIPE") + " $$"]
     frozen = tmp_path / "profile.json"
     coverage = profile(name, version).model_copy(update={"command": command, "report_path": report_path})
     frozen.write_text(json.dumps({"native_task_identity": identity, "test_scope": ["test_*"],
                                  "coverage": coverage.model_dump(mode="json")}))
     collector = collectors.Collector.model_validate({
-        "kind": "coverage", "config": frozen, "scope": [f"*.{suffix}"], "command": command,
+        "kind": "coverage", "config": frozen, "scope": ["*"] if mode == "population" else [f"*.{suffix}"], "command": command,
         "tool_version": version, "report_format": report_format, "report_path": report_path,
     })
     before = inspect_snapshot(source)["digest"]
+    if mode == "population":
+        with pytest.raises(ValueError, match="expected tool source population"):
+            collectors._native_coverage(source, collector, tmp_path / "out")
+        return
     if mode == "image-interpreter":
         with pytest.raises(ValueError, match="interpreter.*outside"):
             harbor.run_native_command(
@@ -301,7 +316,7 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
         assert len(created) == 1
         assert "/app/" not in copies
         return
-    if mode in {"signal", "docker-signal", "mutation", "sigpipe", "sigpipe-mutation"}:
+    if mode in {"signal", "docker-signal", "mutation", "sigpipe", "sigpipe-mutation", "sigusr1"}:
         tool = coverage.provisioned_tool
         assert tool is not None
         destination = tmp_path / "out"
@@ -315,7 +330,8 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
                 snapshot=source, task_identity=identity, destination=destination,
                 command=command, report_path=report_path, timeout=30, provisioned_tool=tool,
             )
-            assert execution["exit_code"] == ({"docker-signal": 137, "sigpipe": 141}.get(mode, -9))
+            assert execution["exit_code"] == ({"docker-signal": 137, "sigpipe": 141, "sigusr1": 138}.get(mode, -9 if suffix == "py" else 137))
+            assert "Debugger listening" not in str(execution["stderr"])
             assert not execution["report_collected"]
         assert len(created) == 1
         assert stopped == created

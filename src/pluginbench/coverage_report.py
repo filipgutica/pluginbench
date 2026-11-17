@@ -978,6 +978,7 @@ def parse_coverage(
     source_scope: list[str],
     test_scope: list[str],
     workdir: str,
+    expected_sources: set[str] | None = None,
 ) -> dict[str, object]:
     parsers = {
         "lcov": parse_lcov,
@@ -986,6 +987,11 @@ def parse_coverage(
     }
     if format not in parsers:
         raise ValueError(f"Unsupported coverage format: {format}")
-    return parsers[format](
+    result = parsers[format](
         report, snapshot=snapshot, source_scope=source_scope, test_scope=test_scope, workdir=workdir
     )
+    measured = result["files_measured"]
+    assert isinstance(measured, list)
+    if expected_sources is not None and not set(measured) <= expected_sources:
+        raise ValueError("Coverage record is outside the expected tool source population")
+    return result

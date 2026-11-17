@@ -335,9 +335,9 @@ def test_c8_source_population_has_no_filename_or_extension_exclusions(tmp_path: 
     from pluginbench.coverage_report import parse_lcov
 
     names = ["src/rollup.config.js", "src/logic-test.js", "src/upper.JS", *[
-        f"src/impl{suffix}" for suffix in [".cjs", ".mjs", ".jsx", ".ts", ".cts", ".mts", ".tsx"]
+        f"src/impl{suffix}" for suffix in [".cjs", ".mjs"]
     ]]
-    excluded = ["src/types.d.ts", "src/types.d.mts", "src/types.d.cts", "src/tool.py", "src/x.vue",
+    excluded = [f"src/transformed{suffix}" for suffix in [".ts", ".tsx", ".jsx", ".cts", ".mts"]] + ["src/types.d.ts", "src/types.d.mts", "src/types.d.cts", "src/tool.py", "src/x.vue",
                 "src/core.test.js", "src/view.test.tsx", "src/__tests__/a.ts"]
     (tmp_path / "src").mkdir()
     for name in [*names, *excluded]:
@@ -354,6 +354,33 @@ def test_c8_source_population_has_no_filename_or_extension_exclusions(tmp_path: 
     assert isinstance(lines, dict)
     assert set(lines["total"]) == {f"{name}:1" for name in names}
     assert lines["covered"] == []
+    from pluginbench.assessment_metrics import _coverage, inspect_snapshot
+    inventory = inspect_snapshot(tmp_path)["files"]
+    assert isinstance(inventory, dict)
+    assessed = _coverage(report, set(inventory), ["src/**"])
+    unmeasured = assessed["unmeasured_source_files"]
+    assert isinstance(unmeasured, list) and set(unmeasured) >= set(excluded[:5] + ["src/tool.py"])
+
+
+@pytest.mark.parametrize("char", ["\n", "\x0c", "\x7f", "\x85", "\u2028", "\u2029"])
+def test_population_refuses_control_and_separator_names(char: str) -> None:
+    with pytest.raises(ValueError, match="controls or line separators"):
+        with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3"), source_files=[f"src/a{char}DA:1,1.js"]):
+            pytest.fail("unsafe population entered staging")
+
+
+def test_c8_never_opens_map_comment_targets(tmp_path: Path) -> None:
+    marker, forbidden = tmp_path / "read", tmp_path / "forbidden.map"
+    guard = tmp_path / "guard.cjs"
+    guard.write_text("const fs=require('fs'),read=fs.readFileSync;fs.readFileSync=function(p,...a){"
+                     f"if(String(p)==={json.dumps(str(forbidden))}){{fs.writeFileSync({json.dumps(str(marker))},'read');throw Error('forbidden map read')}}"
+                     "return read.call(this,p,...a)};delete require.cache[__filename]")
+    (tmp_path / "u.js").write_text(f"void 0;\n//# sourceMappingURL={forbidden}\n")
+    with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3"), source_files=["u.js"]) as stage:
+        result = subprocess.run(c8_command(stage / "c8", "--all", "--", "node", "-e", "1"), cwd=tmp_path,
+                                env={**os.environ, "NODE_OPTIONS": "--require=" + str(guard)}, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists(), "c8 opened the task-supplied map target"
 
 
 def test_c8_refuses_scope_containing_only_tests(tmp_path: Path) -> None:

@@ -219,11 +219,12 @@ The c8 launcher calls the pinned report implementation with the staged
 `c8-config.json`, built-in `lcovonly`, and fixed output paths. It never invokes
 c8's option parser or discovers `.c8rc*`, `.nycrc*`, or task `package.json` config.
 It passes `exclude: []` and explicit extensions derived from the frozen profile's
-JS/TS source files: `.js`, `.cjs`, `.mjs`, `.jsx`, `.ts`, `.cts`, `.mts`, and `.tsx`.
+plain JavaScript source files: `.js`, `.cjs`, and `.mjs` (case-insensitive).
 PluginBench's source classifier excludes test paths, and `coverage_sources` excludes
 declarations (`.d.ts`, `.d.mts`, `.d.cts`). Other languages are not c8 populations.
-Config-like names, `*-test.js`, and `.mts` are not silently dropped. An empty source
-population refuses explicitly. Python selects literal database filenames rather
+Config-like names and `*-test.js` are not silently dropped. An empty source
+population or a name containing a control or Unicode line/paragraph separator refuses explicitly.
+Native parsers reject records outside the exact staged population. Python selects literal database filenames rather
 than treating the staged source list as glob patterns.
 The pinned Python INI sets `include_namespace_packages = True`, so never-imported
 files beneath directories without `__init__.py` also stay in the population.
@@ -246,13 +247,15 @@ v8, and `node:coverage` hints, including block and line forms.
 Limitations:
 
 - Code inside the measured process can forge raw collection data.
-- coverage.py omits unloaded files whose names are not importable (for example,
-  `dotted.v2.py` and `plus+one.py`); downstream checks flag these as unmeasured.
+- coverage.py omits unloaded files whose base name contains `. # ~ ! $ @ % ^ & * ( ) + = ,`
+  (before the `.py` suffix); downstream checks flag these as unmeasured.
+- TS and JSX (`.ts`, `.tsx`, `.jsx`, `.cts`, `.mts`) are unmeasured: transformed offsets
+  need trusted maps. Kysely loses provisioned coverage; cattrs, returns and direct-source Yjs remain supported. Existing sql-formatter LCOV profiles are unchanged.
 - Exit codes 129–255 are treated as signals, even if the program explicitly chose one.
 
 Provisioning records resolved module, dependency, configuration, and staged
 source-file-list origins in `execution.json` under
-`provisioned_tool.runtime_origin`. Provisioner version 6 refuses older saved
+`provisioned_tool.runtime_origin`. Provisioner version 7 refuses older saved
 profiles. Prepare a new measurement revision with these launcher commands.
 Resume fingerprints bind only the distributions selected by the profile.
 

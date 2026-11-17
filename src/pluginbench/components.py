@@ -20,8 +20,8 @@ VERSIONS: dict[str, int] = {
     # Version 2 adds Go line populations, so a profile version 1 froze reads differently.
     "coverage_observer": 2,
     "mutation_observer": 1,
-    # Version 6 disables map discovery, narrows c8 populations, and preserves ignored signals.
-    "measurement_tools": 6,
+    # Version 7 binds plain-JS populations, parser membership and safe names/map reads/signals.
+    "measurement_tools": 7,
     # Version 3 resolves Codex launches and grants its selected release and helper binaries.
     "local_sandbox": 3,
 }

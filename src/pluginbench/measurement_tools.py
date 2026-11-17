@@ -11,6 +11,7 @@ from pathlib import Path
 import tarfile
 import tempfile
 import zipfile
+import unicodedata
 from typing import TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -24,7 +25,7 @@ SUPPORT_FILES = {
     "coverage.py": ("launch-coverage.py", "coverage-config.ini"),
     "c8": ("launch-c8.cjs", "c8-config.json"),
 }
-_JS_TS_SUFFIXES = {".js", ".cjs", ".mjs", ".jsx", ".ts", ".cts", ".mts", ".tsx"}
+_TOOL_SUFFIXES = {"c8": {".js", ".cjs", ".mjs"}, "coverage.py": {".py"}}
 # c8 includes its complete production dependency tree, not just the npm package tarball.
 CATALOG = {
     ("coverage.py", "7.6.12"): (
@@ -108,11 +109,20 @@ def collection_files(directory: Path, tool: ProvisionedTool) -> list[Path]:
     return files
 
 
+def source_population(name: str, filenames: list[str]) -> set[str]:
+    if any(unicodedata.category(char) in {"Cc", "Zl", "Zp"} for file in filenames for char in file):
+        raise ValueError("coverage population paths must not contain controls or line separators")
+    return {file for file in coverage_sources(set(filenames), ["*"])
+            if Path(file).suffix.lower() in _TOOL_SUFFIXES[name]}
+
+
 @contextmanager
 def staged_tool(
     tool: ProvisionedTool, *, source_files: list[str] | None = None, data: Path | None = None
 ) -> Iterator[Path]:
     content = artifact_bytes(tool)
+    if source_files is not None:
+        source_files = sorted(source_population(tool.name, source_files))
     with tempfile.TemporaryDirectory(prefix="pluginbench-tool-") as directory:
         root = Path(directory)
         target = root / tool.name
@@ -126,10 +136,7 @@ def staged_tool(
         for name in SUPPORT_FILES[tool.name]:
             (target / name).write_bytes((ARTIFACTS / name).read_bytes())
         if tool.name == "c8":
-            source_files = sorted(
-                name for name in coverage_sources(set(source_files or []), ["*"])
-                if Path(name).suffix.lower() in _JS_TS_SUFFIXES
-            )
+            source_files = source_files or []
             extensions = {Path(name).suffix for name in source_files}
             (target / "source-extensions.json").write_text(json.dumps(sorted(extensions)))
         (target / "source-files.json").write_text(json.dumps(source_files))

@@ -98,6 +98,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
     "coverage_observer": (
         2,
         {
+            # Optional provisioned-population validation is versioned by measurement_tools v7.
             # Optional Go `go list` and `go tool cover` sidecars narrow completeness to
             # compiled files with blocks, and a zero-width Go block with no statements parses
             # instead of aborting. An optional LCOV instrumented-counts sidecar likewise lets
@@ -112,7 +113,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # lines and any file a line directive is in or names. A profile v1 froze would now
             # report Go line coverage and compare executed lines across readiness repeats.
             "coverage_report.py": (
-                "7915e6742224d11a7994c3bac44042581085b44928a96ea0d95a937429796bf0"
+                "1710d88f7bfe136525c4c7fd652957596f2ab81e152c609c58f39fb8ffdf0826"
             ),
         },
     ),
@@ -131,12 +132,12 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         },
     ),
     "measurement_tools": (
-        6,
+        7,
         {
-            # v6 disables map discovery, filters c8 sources, and preserves ignored signals.
-            "measurement_tools.py": "eb12353ca5548ac56258a1d42f04dfef77e23d2364d36b2d7dad3ac93b45dc99",
+            # v7 binds plain-JS populations and safe names, map reads, signals, and parsing.
+            "measurement_tools.py": "7cecbb10a1bd90e74f62b74c91c197b22f8c1e79cfb73ead4bb0057f5024ce32",
             "coverage_tools/launch-coverage.py": "afc80136c0f8f1e436935063615a2bd6bfe9857dbaec00f6f1f0ab3469faf06f",
-            "coverage_tools/launch-c8.cjs": "f631d28528f16f00be8d088a454a56589d00cbf8e30264167f67308ee2e3c60f",
+            "coverage_tools/launch-c8.cjs": "aac95a3301ee2e51e29ecd491ff25cf2efcdfa937609dcf8a3fcb363ec965950",
             "coverage_tools/c8-config.json": "2ee2372e0af85263890e3e052453e08a091d47225ffa7678ca8a6c963fcbb177",
             "coverage_tools/coverage-config.ini": "cbc139caa43cfefc8464c88db4af9c053a87a2c60cee43799b40c62c36c564dc",
         },

@@ -21,6 +21,11 @@ function checkedOrigin (filename) {
 // The backend clears startup injection before Node starts; do not pass it to the child.
 for (const name of ['NODE_OPTIONS', 'NODE_PATH', 'EXPERIMENTAL_MONOCART']) delete process.env[name]
 
+// c8 has its own map-file reader in addition to convert-source-map. Disable it BEFORE
+// report.js captures the export; no task comment may cause a file or device read.
+const mapReader = require.resolve('./node_modules/c8/lib/source-map-from-file')
+require(mapReader)
+require.cache[mapReader].exports = () => null
 const createReport = require('./node_modules/c8/lib/report')
 const convertSourceMap = require('./node_modules/convert-source-map')
 // c8 and v8-to-istanbul share this pinned copy. Never discover task-provided maps.
@@ -58,8 +63,7 @@ async function main () {
     })
     if (child.error) throw child.error
     if (child.signal) {
-      process.kill(process.pid, child.signal)
-      // Node ignores some signals (including SIGPIPE); retain the child's failure anyway.
+      // Never re-raise: SIGUSR1 starts Node's inspector instead of terminating it.
       process.exitCode = 128 + constants.signals[child.signal]
       return
     }
