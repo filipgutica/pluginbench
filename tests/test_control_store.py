@@ -8,6 +8,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -954,6 +955,46 @@ def test_confirming_an_unreadable_record_never_covers_a_later_one(
     assert _admitted(isolated_host_state, tmp_path)
     owner_record.write_text("{not json either")
     assert not _admitted(isolated_host_state, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    ["pending null", "only released", "pending entry not an object", "pending pid a string", "truncated"],
+)
+def test_a_corrupt_owner_record_is_unknown_until_repair(
+    tmp_path: Path, isolated_host_state: Path, corrupt: str
+) -> None:
+    earlier = tmp_path / "earlier"
+    earlier.mkdir()
+    # A released owner that carries an earlier owner which never released.
+    obligation = {
+        "schema": 2, "pid": 7, "kind": "run", "root": str(earlier), "state": "active",
+        "acquired_at": "earlier", "runtimes": [], "leftovers": [],
+    }
+    record: dict[str, Any] = {**obligation, "pid": 8, "state": "released", "pending": [obligation]}
+    if corrupt == "pending null":
+        record["pending"] = None
+    elif corrupt == "only released":
+        record = {"state": "released"}
+    elif corrupt == "pending entry not an object":
+        record["pending"] = [str(earlier)]
+    elif corrupt == "pending pid a string":
+        record["pending"] = [{**obligation, "pid": "7"}]
+    text = json.dumps(record)
+    (isolated_host_state / run_lock.EXECUTION_OWNER).write_text(
+        text[: len(text) // 2] if corrupt == "truncated" else text
+    )
+    # Nothing in it is trusted, not even its release: the state directory is the root to repair.
+    state = re.escape(str(isolated_host_state))
+    with pytest.raises(
+        CleanupBlocked,
+        match=rf"owner record in {state} is unreadable or invalid .*repair --confirm-stopped {state}`",
+    ):
+        with control_store.execute(_owner(tmp_path / "unrelated")):
+            pass
+    result = CliRunner().invoke(cli.app, ["repair", str(isolated_host_state), "--confirm-stopped"])
+    assert result.exit_code == 0 and "The host is unblocked." in result.stdout, result.output
+    assert _admitted(isolated_host_state, tmp_path)
 
 
 def test_a_call_that_ended_while_its_process_lived_is_checked_after_its_owner_dies(

@@ -372,13 +372,65 @@ class LockSnapshot:
         )
 
 
-def _read_record(path: Path) -> dict[str, object] | None:
-    """The owner record at `path`; None when it is missing or malformed, which is unknown."""
+def _read_record(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    """The owner record at `path`, or None and why it cannot be trusted. A missing record has
+    no reason; an unreadable or invalid one is unknown, never an empty record."""
     try:
         value = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return None
-    return value if isinstance(value, dict) else None
+    except FileNotFoundError:
+        return None, None
+    except (OSError, ValueError) as exc:
+        return None, f"it cannot be read: {exc}"
+    problem = _record_problem(value)
+    return (None, problem) if problem else (value, None)
+
+
+def _record_problem(value: object) -> str | None:
+    """Why `value` is not an owner record whose release and obligations can be trusted; None
+    when it is. A record from before releases were recorded (schema 1) only has to name its
+    owner, since it always counts as unreleased."""
+    if not isinstance(value, dict):
+        return "it is not a JSON object"
+    schema = value.get("schema")
+    if type(schema) is not int or schema not in (1, 2):
+        return f"its schema {schema!r} is not 1 or 2"
+    if schema == 2:
+        if value.get("state") not in OWNER_STATES:
+            return f"its state {value.get('state')!r} is not one of {', '.join(OWNER_STATES)}"
+        pending = value.get("pending")
+        if not isinstance(pending, list):
+            return f"its pending obligations are {type(pending).__name__}, not a list"
+        for index, item in enumerate(pending):
+            if problem := _obligation_problem(item):
+                return f"pending obligation {index} {problem}"
+    return _obligation_problem(value)
+
+
+def _obligation_problem(value: object) -> str | None:
+    """Why `value` cannot be checked as an owner that may have left work running."""
+    if not isinstance(value, dict):
+        return "is not an object"
+    for key, kind, required in (
+        ("root", str, True),
+        ("kind", str, True),
+        ("pid", int, False),
+        ("acquired_at", str, False),
+        ("runtimes", list, False),
+        ("leftovers", list, False),
+    ):
+        item = value.get(key)
+        if item is None and not required:
+            continue
+        if type(item) is not kind or (kind is str and not item):
+            return f"has {key} {item!r}, not a{'n' if kind is int else ''} {kind.__name__}"
+    if not all(isinstance(item, dict) for item in value.get("runtimes") or []):
+        return "has a runtime that is not an object"
+    if not all(
+        isinstance(item, dict) and isinstance(item.get("reason"), str)
+        for item in value.get("leftovers") or []
+    ):
+        return "has a failed cleanup without a reason"
+    return None
 
 
 def _holds(record: dict[str, object], lock: os.stat_result) -> bool:
@@ -407,7 +459,7 @@ def execution_owner(state: Path | None = None) -> LockSnapshot:
     """Observe the host execution lock without taking it."""
     state = state or state_root()
     path = state / EXECUTION_LOCK
-    record = _read_record(state / EXECUTION_OWNER)
+    record, _ = _read_record(state / EXECUTION_OWNER)
     try:
         fd = os.open(path, os.O_RDONLY)
     except FileNotFoundError:
@@ -475,7 +527,7 @@ class ExecutionLock:
             current = None
         if current is None or (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
             raise ExecutionLost(f"the host execution lock in {self.state} was replaced")
-        if _read_record(self.state / EXECUTION_OWNER) != self.record:
+        if _read_record(self.state / EXECUTION_OWNER)[0] != self.record:
             raise ExecutionLost(f"another owner record replaced this process's in {self.state}")
 
     def publish(self, state: str) -> None:
@@ -574,19 +626,21 @@ def note_runtime(runtime: dict[str, object]) -> None:
 
 def _carried(state: Path) -> list[dict[str, Any]]:
     """The obligations the last owner left: those it carried, and itself unless it recorded a
-    clean release. A record from before releases were recorded counts as unreleased, and an
-    unreadable one is an obligation whose root is the state directory."""
-    path = state / EXECUTION_OWNER
-    if not path.exists():
-        return []
-    previous = _read_record(path)
-    if previous is None:
+    clean release. A record from before releases were recorded counts as unreleased. An
+    unreadable or invalid one is a single obligation whose root is the state directory, since
+    nothing in it can be trusted, not even its release."""
+    previous, problem = _read_record(state / EXECUTION_OWNER)
+    if problem is not None:
         # Named by when it was found, so confirming it never covers a later unreadable record.
         found = datetime.now(UTC).isoformat()
-        return [{"kind": "unknown", "root": str(state), "pid": None, "acquired_at": found}]
-    carried = previous.get("pending")
-    pending = [item for item in carried if isinstance(item, dict)] if isinstance(carried, list) else []
-    if previous.get("state") != "released":
+        return [
+            {"kind": "unknown", "root": str(state), "pid": None, "acquired_at": found,
+             "problem": problem}
+        ]
+    if previous is None:
+        return []
+    pending: list[dict[str, Any]] = list(previous.get("pending", []))
+    if previous.get("schema") == 1 or previous["state"] != "released":
         pending.append({key: value for key, value in previous.items() if key != "pending"})
     return pending
 

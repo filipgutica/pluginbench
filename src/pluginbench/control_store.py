@@ -393,23 +393,26 @@ def _obligation_checks(obligation: dict[str, Any]) -> list[Check]:
         "root": root,
         "kind": "unrecorded",
         "reason": (
-            f"`{obligation.get('kind')}` for {root} ended without a clean release, and until "
+            f"the host's owner record in {root} is unreadable or invalid "
+            f"({obligation['problem']}), so nothing it says can be trusted and what earlier "
+            "commands left is unknown. Check that no PluginBench command, process or container "
+            "still runs; repair takes this directory as the root"
+            if "problem" in obligation
+            else f"`{obligation.get('kind')}` for {root} ended without a clean release, and until "
             "P4b PluginBench cannot prove that everything a command starts has stopped"
             if Path(root).is_dir()
             else f"{root}, whose owner ended without a clean release, was moved or deleted"
         ),
     }
-    leftovers = obligation.get("leftovers")
+    # The owner record was validated when it was read (run_lock._record_problem).
     failed: list[Check] = [
         {
             "id": f"{name}:leftover:{index}",
             "root": root,
             "kind": "unrecorded",
-            "reason": str(item.get("reason") if isinstance(item, dict) else item),
+            "reason": item["reason"],
         }
-        for index, item in enumerate(
-            leftovers if isinstance(leftovers, list) else [] if leftovers is None else [leftovers]
-        )
+        for index, item in enumerate(obligation.get("leftovers") or [])
     ]
     return [unreleased, *failed, *_work_checks(obligation)]
 
