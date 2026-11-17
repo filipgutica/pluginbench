@@ -59,10 +59,17 @@ def test_coverage_dependency_symlink_refuses_before_task_code_executes(tmp_path:
 
 
 def c8_command(root: Path, *arguments: str) -> list[str]:
-    launcher = root / "launch-c8.cjs"
-    if launcher.exists():
-        return ["node", str(launcher), *arguments]
-    return ["node", str(root / "node_modules/c8/bin/c8.js"), *arguments]
+    # Launcher checks exercise both operations; native integration owns the fresh-container proof.
+    runner = root / "test-report.cjs"
+    runner.write_text(
+        "const {spawnSync}=require('node:child_process'),fs=require('node:fs');"
+        "const first=spawnSync(process.execPath,[process.argv[2],...process.argv.slice(3)],{stdio:'inherit'});"
+        "if(first.status!==0)process.exit(first.status||1);"
+        "if(fs.existsSync('coverage/lcov.info'))process.exit(0);"
+        "const report=spawnSync(process.execPath,[process.argv[2],'report'],{stdio:'inherit'});"
+        "process.exit(report.status||0);"
+    )
+    return ["node", str(runner), str(root / "launch-c8.cjs"), *arguments]
 
 
 @pytest.mark.parametrize("config", [".c8rc.json", ".nycrc.json", "package.json"])
@@ -260,7 +267,7 @@ def test_reporting_does_not_run_image_pth_or_task_sitecustomize(tmp_path: Path) 
     assert report == [2]
 
 
-@pytest.mark.parametrize("mode", ["matching", "forged", "outside"])
+@pytest.mark.parametrize("mode", ["matching", "forged", "outside", "empty", "empty-no-content", "unmapped-source", "missing-line"])
 @pytest.mark.parametrize("mapping", ["external", "inline"])
 def test_c8_map_content_must_match_frozen_source(tmp_path: Path, mode: str, mapping: str) -> None:
     import base64
@@ -276,13 +283,25 @@ def test_c8_map_content_must_match_frozen_source(tmp_path: Path, mode: str, mapp
     source_map = json.dumps({"version": 3, "file": "subject.js", "names": [],
                              "sources": [str(outside) if mode == "outside" else "../src/subject.js"],
                              "sourcesContent": [content], "mappings": "AAAA;AACA;AACA;AACA"})
+    parsed_map = json.loads(source_map)
+    if mode.startswith("empty"):
+        parsed_map["mappings"] = ""
+    if mode == "empty-no-content":
+        del parsed_map["sourcesContent"]
+    if mode == "missing-line":
+        parsed_map["mappings"] = "AAAA;;;AAGA"
+    if mode == "unmapped-source":
+        (app / "src/other.js").write_text(source)
+        parsed_map["sources"].append("../src/other.js")
+        parsed_map["sourcesContent"].append(source)
+    source_map = json.dumps(parsed_map)
     if mapping == "external":
         (app / "dist/subject.js.map").write_text(source_map)
         url = "subject.js.map"
     else:
         url = "data:application/json;base64," + base64.b64encode(source_map.encode()).decode()
     (app / "dist/subject.js").write_text(source + "//# sourceMappingURL=" + url + "\n")
-    with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3")) as stage:
+    with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3").model_copy(update={"source_maps": True})) as stage:
         result = subprocess.run(c8_command(stage / "c8", "--all", "--", "node", "dist/subject.js"),
                                 cwd=app, capture_output=True, text=True, timeout=30)
     if mode == "matching":
@@ -299,21 +318,53 @@ def test_c8_map_content_must_match_frozen_source(tmp_path: Path, mode: str, mapp
         assert not (app / "coverage/lcov.info").exists()
 
 
-@pytest.mark.parametrize("tamper", ["additional", "changed"])
-def test_python_reporting_refuses_data_not_written_by_this_run(tmp_path: Path, tamper: str) -> None:
-    app = tmp_path / "app"
-    python_fixture(app)
+@pytest.mark.parametrize("damage", ["additional", "symlink", "missing"])
+def test_raw_transfer_refuses_non_data_files(tmp_path: Path, damage: str) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / ".coverage").write_bytes(b"opaque collection data")
+    if damage == "additional":
+        (data / ".coverage.stale").write_bytes(b"stale database")
+    elif damage == "symlink":
+        (data / ".coverage").unlink()
+        (data / ".coverage").symlink_to(tmp_path / "outside")
+    else:
+        (data / ".coverage").unlink()
+    with pytest.raises(ValueError, match="raw data"):
+        with tools.staged_tool(tools.ProvisionedTool(name="coverage.py", version="7.6.12"), data=data):
+            pytest.fail("untrusted non-data crossed the reporting boundary")
+
+
+def test_python_exclusion_hints_do_not_remove_unexecuted_lines(tmp_path: Path) -> None:
+    python_fixture(tmp_path)
+    (tmp_path / "src/subject.py").write_text("def unused():\n    return 42  # pragma: no cover\n\nvalue = 1\n")
     with tools.staged_tool(tools.ProvisionedTool(name="coverage.py", version="7.6.12")) as stage:
-        root = stage / "coverage.py"
-        command, env = python_command(root, "run", "runner.py")
-        subprocess.run(command, cwd=app, env=env, check=True, capture_output=True, text=True)
-        if tamper == "additional":
-            (root / "data/.coverage.stale").write_bytes((root / "data/.coverage").read_bytes())
-        else:
-            with (root / "data/.coverage").open("ab") as stream:
-                stream.write(b"tampered database")
-        command, env = python_command(root, "json")
-        result = subprocess.run(command, cwd=app, env=env, capture_output=True, text=True, timeout=30)
-    assert result.returncode != 0
-    assert "PluginBench coverage" in result.stderr
-    assert not (app / "coverage.json").exists()
+        assert python_measure(stage / "coverage.py", tmp_path) == [2]
+
+
+@pytest.mark.parametrize("hint", ["c8 ignore next", "v8 ignore next", "node:coverage ignore next"])
+def test_c8_exclusion_hints_do_not_cover_unexecuted_lines(tmp_path: Path, hint: str) -> None:
+    (tmp_path / "main.js").write_text(
+        f"function unused() {{\n  /* {hint} */ return 42;\n}}\nconsole.log(1);\n"
+    )
+    with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3")) as stage:
+        result = subprocess.run(c8_command(stage / "c8", "--all", "--", "node", "main.js"),
+                                cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert "DA:2,0" in (tmp_path / "coverage/lcov.info").read_text()
+
+
+def test_c8_remapping_is_off_unless_profile_enables_it(tmp_path: Path) -> None:
+    (tmp_path / "main.js").write_text(
+        "function unused() {\n return 42;\n}\nconsole.log(1);\n//# sourceMappingURL=main.js.map\n"
+    )
+    (tmp_path / "main.js.map").write_text(json.dumps({
+        "version": 3, "sources": ["outside.js"], "sourcesContent": ["forged"], "names": [], "mappings": "",
+    }))
+    with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3")) as stage:
+        result = subprocess.run(c8_command(stage / "c8", "--all", "--", "node", "main.js"),
+                                cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    report = (tmp_path / "coverage/lcov.info").read_text()
+    assert "SF:main.js" in report and "DA:2,0" in report
+    assert "outside.js" not in report

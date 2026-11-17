@@ -24,6 +24,10 @@ for (const name of ['NODE_OPTIONS', 'NODE_PATH', 'EXPERIMENTAL_MONOCART']) delet
 const createReport = require('./node_modules/c8/lib/report')
 const convertSourceMap = require('./node_modules/convert-source-map')
 const v8ToIstanbul = require('./node_modules/v8-to-istanbul')
+const { TraceMap, decodedMappings } = require('./node_modules/@jridgewell/trace-mapping')
+// The pinned converter has no public ignore-hint switch. Disable its single hint parser.
+require('./node_modules/v8-to-istanbul/lib/source').prototype._parseIgnore = () => undefined
+const remap = JSON.parse(fs.readFileSync(path.join(root, 'source-maps.json'), 'utf8'))
 const settings = JSON.parse(fs.readFileSync(config, 'utf8'))
 if (JSON.stringify(settings) !== '{"reporter":["lcovonly"],"all":true}') refuse('unexpected pinned config')
 const origin = {
@@ -37,6 +41,13 @@ const origin = {
 function verifiedMap (map, script) {
   if (!Array.isArray(map.sources) || !map.sources.length || map.sections) refuse('unsupported source map')
   if (map.sourcesContent && map.sourcesContent.length !== map.sources.length) refuse('invalid sourcesContent')
+  if (typeof map.mappings !== 'string' || !map.mappings.trim()) refuse('empty mappings')
+  const segments = decodedMappings(new TraceMap(map))
+  const mappedSources = new Set(segments.flat().filter(segment => segment.length >= 4).map(segment => segment[1]))
+  if (map.sources.some((_, index) => !mappedSources.has(index))) refuse('source has zero mapped segments')
+  const generated = fs.readFileSync(script, 'utf8').trimEnd().split(/\r?\n/)
+  if (generated.some((line, index) => line.trim() && !line.trim().startsWith('//') &&
+    !(segments[index] || []).some(segment => segment.length >= 4))) refuse('unmapped generated line')
   // Reuse the pinned converter's resolver, including sourceRoot and file/webpack URLs.
   const converter = v8ToIstanbul(script)
   const contents = map.sources.map((source, index) => {
@@ -58,15 +69,20 @@ async function main () {
     console.log(JSON.stringify(origin))
     return
   }
-  // This is the entire launcher interface. Task arguments never reach c8's option parser.
-  if (input[0] !== '--all' || input[1] !== '--' || input.length < 3 || input[2].startsWith('-')) {
-    refuse('use --all -- command [arguments]')
+  const tempDirectory = path.join(root, 'data')
+  if (input.length !== 1 || input[0] !== 'report') {
+    // Task arguments never reach a tool option parser. Collection never reports.
+    if (input[0] !== '--all' || input[1] !== '--' || input.length < 3 || input[2].startsWith('-')) {
+      refuse('use --all -- command [arguments]')
+    }
+    fs.mkdirSync(tempDirectory)
+    const child = spawnSync(input[2], input.slice(3), {
+      cwd, stdio: 'inherit', env: { ...process.env, NODE_V8_COVERAGE: tempDirectory }
+    })
+    if (child.error) throw child.error
+    process.exitCode = child.status === null ? 1 : child.status
+    return
   }
-  const tempDirectory = fs.mkdtempSync(path.join(root, 'data-'))
-  const child = spawnSync(input[2], input.slice(3), {
-    cwd, stdio: 'inherit', env: { ...process.env, NODE_V8_COVERAGE: tempDirectory }
-  })
-  if (child.error) throw child.error
   const report = createReport({
     ...settings, reportsDirectory: path.join(cwd, 'coverage'), tempDirectory,
     src: [cwd], resolve: cwd, omitRelative: true, excludeNodeModules: true
@@ -74,6 +90,7 @@ async function main () {
   const merge = report._getMergedProcessCov.bind(report)
   report._getMergedProcessCov = () => {
     const merged = merge()
+    if (!remap) return merged
     // Validate before c8's conversion loop, which catches and drops converter errors.
     // Cover V8's cache, disk maps, inline maps, and the --all unloaded-file path.
     for (const script of merged.result) {
@@ -87,6 +104,12 @@ async function main () {
     }
     return merged
   }
+  if (!remap) report._getSourceMap = script => ({
+    // Blank map comments without shifting offsets. The converter cannot discover a map.
+    source: fs.readFileSync(script.url, 'utf8')
+      .replace(convertSourceMap.commentRegex, value => value.replace(/[^\r\n]/g, ' '))
+      .replace(convertSourceMap.mapFileCommentRegex, value => value.replace(/[^\r\n]/g, ' '))
+  })
   const sourceFiles = JSON.parse(fs.readFileSync(path.join(root, 'source-files.json'), 'utf8'))
   if (sourceFiles) {
     const allowed = new Set(sourceFiles)
@@ -98,7 +121,6 @@ async function main () {
     }
   }
   await report.run()
-  process.exitCode = child.status === null ? 1 : child.status
 }
 
 main().catch(error => {

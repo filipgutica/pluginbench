@@ -10,7 +10,6 @@ if not sys.flags.isolated or not sys.flags.no_site:
 import importlib
 from importlib.abc import MetaPathFinder
 from importlib.machinery import ModuleSpec, PathFinder
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -21,7 +20,6 @@ from collections.abc import Sequence
 ROOT = Path(__file__).resolve().parent
 CONFIG = ROOT / "coverage-config.ini"
 DATA = ROOT / "data/.coverage"
-RECEIPT = ROOT / "coverage-data.json"
 # tomli is coverage's only optional third-party dependency (on Python before 3.11).
 TOOL_PACKAGES = {"coverage", "tomli"}
 
@@ -79,9 +77,6 @@ def main() -> int:
     if reporting:
         if set(DATA.parent.iterdir()) != {DATA}:
             raise SystemExit("PluginBench coverage: unexpected data files; combining is forbidden")
-        expected = {"sha256": hashlib.sha256(DATA.read_bytes()).hexdigest(), "cwd": os.getcwd()}
-        if json.loads(RECEIPT.read_text()) != expected:
-            raise SystemExit("PluginBench coverage: data differs from this run's receipt")
         # config_file is the API equivalent of the pinned --rcfile used for run.
         # The CLI's reporting path inserts cwd on sys.path, so use the reporting API.
         measured = coverage.Coverage(config_file=str(CONFIG), data_file=str(DATA))
@@ -107,9 +102,6 @@ def main() -> int:
     ])
     if not isinstance(result, int):
         raise RuntimeError("coverage CLI did not return an exit code")
-    RECEIPT.write_text(json.dumps({
-        "sha256": hashlib.sha256(DATA.read_bytes()).hexdigest(), "cwd": os.getcwd(),
-    }))
     return result
 
 

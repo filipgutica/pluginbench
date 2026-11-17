@@ -42,6 +42,9 @@ class ProvisionedTool(BaseModel):
     name: str = Field(description="Selects the vendored coverage.py or c8 tool.")
     version: str = Field(description="Pins an exact release supplied by PluginBench.")
     # Operators declare name/version. Preparation fills these pins and saved profiles retain them.
+    source_maps: bool = Field(
+        default=False, description="Enables validated c8 remapping; leave off except for profiles needing it."
+    )
     sha256: str = Field(
         default="", description="Records the verified artifact SHA-256; filled when omitted."
     )
@@ -54,6 +57,8 @@ class ProvisionedTool(BaseModel):
     def pinned_artifact(self) -> ProvisionedTool:
         if (self.name, self.version) not in CATALOG:
             raise ValueError(f"unsupported provisioned tool: {self.name} {self.version}")
+        if self.source_maps and self.name != "c8":
+            raise ValueError("source_maps is supported only for c8")
         _, expected = CATALOG[(self.name, self.version)]
         if self.sha256 and self.sha256 != expected:
             raise ValueError("provisioned tool SHA-256 differs from the pinned artifact")
@@ -93,8 +98,23 @@ def read_tool(value: object) -> ProvisionedTool | None:
     )
 
 
+def collection_files(directory: Path, tool: ProvisionedTool) -> list[Path]:
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("coverage collection requires a regular raw data directory")
+    files = sorted(directory.iterdir())
+    if not files or any(
+        file.is_symlink() or not file.is_file()
+        or (file.name != ".coverage" if tool.name == "coverage.py" else file.suffix != ".json")
+        for file in files
+    ):
+        raise ValueError("coverage collection requires only regular raw data files")
+    return files
+
+
 @contextmanager
-def staged_tool(tool: ProvisionedTool, *, source_files: list[str] | None = None) -> Iterator[Path]:
+def staged_tool(
+    tool: ProvisionedTool, *, source_files: list[str] | None = None, data: Path | None = None
+) -> Iterator[Path]:
     content = artifact_bytes(tool)
     with tempfile.TemporaryDirectory(prefix="pluginbench-tool-") as directory:
         root = Path(directory)
@@ -109,4 +129,9 @@ def staged_tool(tool: ProvisionedTool, *, source_files: list[str] | None = None)
         for name in SUPPORT_FILES[tool.name]:
             (target / name).write_bytes((ARTIFACTS / name).read_bytes())
         (target / "source-files.json").write_text(json.dumps(source_files))
+        (target / "source-maps.json").write_text(json.dumps(tool.source_maps))
+        if data is not None:
+            (target / "data").mkdir()
+            for file in collection_files(data, tool):
+                (target / "data" / file.name).write_bytes(file.read_bytes())
         yield root

@@ -44,7 +44,7 @@ from pluginbench.code_diff import _is_source_path, _is_test_path
 from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.assessment_metrics import EXCLUDED_NAMES
 from pluginbench.processes import run_command
-from pluginbench.measurement_tools import CONTAINER_ROOT, ProvisionedTool, read_tool, staged_tool
+from pluginbench.measurement_tools import CONTAINER_ROOT, ProvisionedTool, collection_files, read_tool, staged_tool
 
 HARBOR_VERSION = "0.24.0"
 PROTOCOL = "harbor-docker-v1"
@@ -2913,6 +2913,7 @@ def run_native_command(
     timeout: int,
     provisioned_tool: ProvisionedTool | None = None,
     provisioned_scope: list[str] | None = None,
+    reporting_data: Path | None = None,
 ) -> dict[str, object]:
     """Run explicitly configured measurement commands in a fresh frozen image."""
     relative = Path(report_path)
@@ -2996,13 +2997,14 @@ def run_native_command(
             "-c",
             "sleep infinity",
         ).strip()
+        receipt["container_id"] = container_id
         docker("start", container_id)
         if provisioned_tool is not None:
             # The tool never enters the task snapshot, its Git tree, or its dependency paths.
             with staged_tool(provisioned_tool, source_files=[
                 filename for filename in original_inventory
                 if any(fnmatch.fnmatchcase(filename, pattern) for pattern in (provisioned_scope or ["*"]))
-            ]) as staged:
+            ], data=reporting_data) as staged:
                 docker(
                     "exec", "--user", "0", container_id, "bash", "-c",
                     "set -eu; test ! -L /opt; mkdir -p /opt; "
@@ -3105,7 +3107,16 @@ def run_native_command(
             report_path=report_path,
         )
         receipt["source_integrity"] = "verified"
-        if not receipt["timed_out"]:
+        if provisioned_tool is not None and reporting_data is None and not receipt["timed_out"]:
+            # Stop before copying raw data. Nothing executable from this container is reused.
+            raw = destination / "collection-data"
+            raw.mkdir()
+            docker("cp", container_id + ":" + tool_root + "/data/.", str(raw), limit=300)
+            receipt["raw_data_sha256"] = {
+                file.name: hashlib.sha256(file.read_bytes()).hexdigest()
+                for file in collection_files(raw, provisioned_tool)
+            }
+        elif not receipt["timed_out"]:
             report = destination / "after" / relative
             # Included-source export rejects all symlinks before reaching this read.
             if report.is_file():
@@ -3135,6 +3146,30 @@ def run_native_command(
         codex.write_json(destination / "execution.json", receipt)
     if failure is not None:
         raise failure
+    if provisioned_tool is not None and reporting_data is None and not receipt["timed_out"]:
+        # Re-enter the same labelled create/copy/exec/cleanup path with the pinned image,
+        # frozen host source, and a NEW artifact extraction. Transfer only opaque raw data.
+        report_command = (
+            ["python", "-I", "-S", tool_root + "/launch-coverage.py", "json"]
+            if provisioned_tool.name == "coverage.py" else ["node", tool_root + "/launch-c8.cjs", "report"]
+        )
+        try:
+            reporting = run_native_command(
+                snapshot=snapshot, task_identity=task_identity, destination=destination / "reporting",
+                command=report_command, report_path=report_path, timeout=timeout,
+                provisioned_tool=provisioned_tool, provisioned_scope=provisioned_scope,
+                reporting_data=destination / "collection-data",
+            )
+            receipt["reporting"] = reporting
+            receipt["provisioned_tool"] = reporting["provisioned_tool"]
+            if reporting["report_collected"]:
+                shutil.copyfile(destination / "reporting/report.raw", destination / "report.raw")
+                receipt.update(report_collected=True, report_sha256=reporting["report_sha256"])
+        except BaseException as error:
+            receipt["reporting_error"] = str(error)
+            raise
+        finally:
+            codex.write_json(destination / "execution.json", receipt)
     return receipt
 
 

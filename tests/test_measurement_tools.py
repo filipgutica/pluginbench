@@ -98,7 +98,38 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
     source = tmp_path / "source"
     source.mkdir()
     suffix = "py" if name == "coverage.py" else "js"
-    (source / f"main.{suffix}").write_text("print(1)\n" if suffix == "py" else "console.log(1)\n")
+    (source / f"main.{suffix}").write_text(
+        "def unused():\n    return 42\n\nvalue = 1\n" if suffix == "py" else
+        "function unused() {\n  return 42;\n}\nconsole.log(1);\n"
+    )
+    if suffix == "py":
+        payload = ("\n_original = JsonReporter.report\ndef forge(self, morfs, outfile):\n"
+                   "    import io, json\n    buf = io.StringIO()\n"
+                   "    _original(self, morfs, buf)\n    data = json.loads(buf.getvalue())\n"
+                   "    def rewrite(x):\n        if isinstance(x, dict):\n"
+                   "            if 'executed_lines' in x:\n"
+                   "                x['executed_lines'] += x['missing_lines']; x['missing_lines'] = []\n"
+                   "            if 'num_statements' in x:\n"
+                   "                x.update(covered_lines=x['num_statements'], missing_lines=0)\n"
+                   "            for v in x.values(): rewrite(v)\n"
+                   "        elif isinstance(x, list):\n            for v in x: rewrite(v)\n"
+                   "    rewrite(data)\n    json.dump(data, outfile)\n    return 100\nJsonReporter.report = forge\n")
+        (source / "runner.py").write_text(
+            "import main\nimport coverage.jsonreport\nfrom pathlib import Path\n"
+            "p = Path(coverage.jsonreport.__file__)\n"
+            f"p.write_text(p.read_text() + {payload!r})\n"
+        )
+    else:
+        payload = ("\nconst original = module.exports.prototype.onDetail;\n"
+                   "module.exports.prototype.onDetail = function(n) {\n"
+                   " const fc = n.getFileCoverage(); for (const k of Object.keys(fc.s)) fc.s[k] = 1;\n"
+                   " return original.call(this, n); };\n")
+        (source / "runner.cjs").write_text(
+            "require('./main.js'); const fs = require('node:fs'), path = require('node:path');\n"
+            "const root = path.dirname(process.env.NODE_V8_COVERAGE);\n"
+            "fs.appendFileSync(path.join(root, 'node_modules/istanbul-reports/lib/lcovonly/index.js'),"
+            + json.dumps(payload) + ");\n"
+        )
     (source / f"unloaded.{suffix}").write_text("value = 2\n" if suffix == "py" else "const value = 2\n")
     (source / ".git").mkdir()
     (source / ".git/HEAD").write_text("original git state\n")
@@ -113,6 +144,9 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
     monkeypatch.setattr(harbor, "assert_runtime", lambda expected, **kwargs: expected)
     monkeypatch.setattr(harbor, "_frozen_executable", lambda *a: {"resolved_path": "docker"})
     copies: list[str] = []
+    created: list[str] = []
+    stopped: list[str] = []
+    container_id = "container"
     preload_marker = tmp_path / "node-preload-ran"
     if suffix == "js":
         (source / "preload.cjs").write_text(
@@ -132,11 +166,22 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
         return env
 
     def docker(*args: str, **kwargs: object) -> str:
+        nonlocal container, app, container_id
+        harbor._admit_operation_command(args)
         if args[0] == "create":
             assert args[args.index("--network") + 1] == "none"
-            return "container"
+            assert args[-3] == "sha256:frozen"
+            assert "--label" in args
+            if created:
+                assert created[-1] in stopped, "reporter started before collection stopped"
+            container_id = f"container-{len(created)}"
+            created.append(container_id)
+            container = tmp_path / container_id
+            app = container / "app"
+            shutil.copytree(source, app)
+            return container_id
         if "--pluginbench-verify" in args:
-            command = list(args[args.index("container") + 1:])
+            command = list(args[args.index(container_id) + 1:])
             command = [arg.replace("/opt/pluginbench-tools", str(container / "opt/pluginbench-tools"))
                        for arg in command]
             if command[0] == "python":
@@ -146,10 +191,19 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
             assert not preload_marker.exists(), "task NODE_OPTIONS executed before c8 startup"
             assert result.returncode == 0, result.stderr
             return result.stdout
+        if args[0] == "stop":
+            stopped.append(args[-1])
         if args[0] == "cp":
-            target = args[2].split(":", 1)[1]
-            copies.append(target)
-            shutil.copytree(args[1].removesuffix("/."), container / target.lstrip("/"), dirs_exist_ok=True)
+            if ":" in args[1]:
+                raw = container / args[1].split(":", 1)[1].lstrip("/").removesuffix("/.")
+                shutil.copytree(raw, args[2], dirs_exist_ok=True)
+            else:
+                target = args[2].split(":", 1)[1]
+                copies.append(target)
+                shutil.copytree(args[1].removesuffix("/."), container / target.lstrip("/"), dirs_exist_ok=True)
+                # Both real containers see /app; translate that namespace in the filesystem fake.
+                for raw in (container / "opt/pluginbench-tools/c8/data").glob("*.json"):
+                    raw.write_text(raw.read_text().replace(str(tmp_path / "container-0/app"), str(app)))
         return ""
 
     monkeypatch.setattr(harbor, "_docker", docker)
@@ -163,9 +217,11 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
     monkeypatch.setattr(harbor, "export_native_source", export)
 
     def execute(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        command = argv[argv.index("container") + 1:]
+        command = argv[argv.index(container_id) + 1:]
         command = [arg.replace("/opt/pluginbench-tools", str(container / "opt/pluginbench-tools"))
                    for arg in command]
+        if command[0] == "python":
+            command[0] = sys.executable
         result = subprocess.run(command, cwd=app, env=container_env(argv),
                                 capture_output=True, text=True, timeout=30)
         assert not preload_marker.exists(), "task NODE_OPTIONS executed before c8 startup"
@@ -176,13 +232,13 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
     if suffix == "py":
         (source / ".coveragerc").write_text("[run]\nrelative_files = True\nsource = .\n")
         shutil.copyfile(source / ".coveragerc", app / ".coveragerc")
-        command = ["bash", "-c", f"{sys.executable} -I -S /opt/pluginbench-tools/coverage.py/launch-coverage.py run main.py && "
+        command = ["bash", "-c", f"{sys.executable} -I -S /opt/pluginbench-tools/coverage.py/launch-coverage.py run runner.py && "
                    f"{sys.executable} -I -S /opt/pluginbench-tools/coverage.py/launch-coverage.py json"]
         report_path = "coverage.json"
         report_format = "coverage-py-json"
     else:
         command = ["node", "/opt/pluginbench-tools/c8/launch-c8.cjs", "--all",
-                   "--", "node", "main.js"]
+                   "--", "node", "runner.cjs"]
         report_path = "coverage/lcov.info"
         report_format = "lcov"
     frozen = tmp_path / "profile.json"
@@ -199,7 +255,14 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
     assert report and (tmp_path / "out/report.raw").is_file()
     lines = report["lines"]
     assert isinstance(lines, dict)
-    assert f"main.{suffix}:1" in lines["covered"]
+    assert f"main.{suffix}:4" in lines["covered"]
+    assert f"main.{suffix}:2" not in lines["covered"], "collection patched the staged reporter"
+    assert len(created) == 2
+    assert stopped == created
+    altered = tmp_path / "container-0/opt/pluginbench-tools" / name / (
+        "coverage/jsonreport.py" if suffix == "py" else "node_modules/istanbul-reports/lib/lcovonly/index.js"
+    )
+    assert payload in altered.read_text(), "the measured process did not exercise the attack"
     assert f"unloaded.{suffix}:1" in lines["total"]
     assert f"unloaded.{suffix}:1" not in lines["covered"]
     receipt = json.loads((tmp_path / "out/execution.json").read_text())

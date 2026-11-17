@@ -148,20 +148,14 @@ measurement_settings:
     tool_version: 7.6.12
     format: coverage-py-json
     report_path: coverage.json
-    command:
-      - bash
-      - -c
-      - |
-        python -I -S /opt/pluginbench-tools/coverage.py/launch-coverage.py run-module pytest
-        status=$?
-        python -I -S /opt/pluginbench-tools/coverage.py/launch-coverage.py json || exit $?
-        exit "$status"
+    command: [python, -I, -S, /opt/pluginbench-tools/coverage.py/launch-coverage.py, run-module, pytest]
 ```
 
 Use the task image's Python executable. The portable wheel requires Python 3.9+
 and uses the Python tracer. Use `run <script> [arguments]` or
-`run-module <module> [arguments]`, followed by a separate `json` invocation.
-Reporting writes `coverage.json`. Other coverage.py options and operations refuse.
+`run-module <module> [arguments]`. The profile runs collection only; PluginBench
+runs `json` in a fresh reporting container and writes `coverage.json`.
+Other coverage.py options and operations refuse.
 PluginBench stages the profile's exact source-file list outside the task tree;
 reports include only those files, including unloaded files.
 
@@ -170,9 +164,11 @@ For c8, use `provisioned_tool: {name: c8, version: 10.1.3}` and
 `env -u NODE_OPTIONS -u NODE_PATH -u EXPERIMENTAL_MONOCART node
 /opt/pluginbench-tools/c8/launch-c8.cjs --all -- <test command>`.
 The backend also clears these environment variables before starting Node.
-The launcher accepts exactly that shape and writes `coverage/lcov.info`. It collects
-unloaded files and filters remapped output to the staged source-file list. Build
-output still needs source maps for TypeScript coverage.
+The launcher accepts exactly that collection shape. PluginBench runs `report` in a
+fresh reporting container and writes `coverage/lcov.info`, including unloaded
+files and filtering output to the staged source-file list. Remapping is off by
+default. For the kysely TypeScript profile, set `source_maps: true` inside
+`provisioned_tool`; leave it off for cattrs, returns, and yjs.
 
 PluginBench verifies the vendored artifact before runtime checks. Unknown names,
 unsupported versions, missing files, changed hashes, and incompatible provisioner
@@ -199,8 +195,16 @@ Collection passes the staged `coverage-config.ini` with `--rcfile`; reporting
 passes that same absolute file through coverage.py's `config_file` API. Neither
 operation discovers task coverage configuration. The pinned config loads no
 plugins, disables parallel mode, and selects one absolute data file outside `/app`.
-Reporting refuses extra data files or a database changed since collection's
-SHA-256 receipt. There is no append or combine operation.
+Reporting reads only the single transferred database. Extra files and links
+refuse at the host transfer boundary. There is no append or combine operation.
+
+The measurement container stops before raw output is copied. PluginBench then
+creates another container from the same pinned image through the same labelled
+Docker path. It stages a new extraction from the verified artifact and copies in
+only raw collection data and frozen host source. It reuses no tool directory,
+interpreter, dependencies, or filesystem layer the measured process touched.
+Reports produced by the measurement container are discarded. Both container
+receipts and the transferred data hashes are recorded in `execution.json`.
 
 Collection enables image site packages and task imports because it executes the
 measured program. JSON reporting runs in its own `-I -S` process, clears the
@@ -214,22 +218,23 @@ The c8 launcher calls the pinned report implementation with the staged
 `c8-config.json`, built-in `lcovonly`, and fixed output paths. It never invokes
 c8's option parser or discovers `.c8rc*`, `.nycrc*`, or task `package.json` config.
 Before conversion, it validates cached, external, and inline source maps against
-the frozen source files. Every mapped source must resolve inside the task tree;
+the frozen source files. Empty mappings, a listed source with zero mapped segments, and unmapped nonblank
+generated lines other than line comments refuse. Every mapped source must resolve
+inside the task tree;
 any embedded `sourcesContent` must match its source file byte for byte. A mismatch
 refuses the measurement before LCOV is written.
 
-The profile schema has no separate ignore-hint exclusion policy. These launchers
-retain the tools' default treatment of ignore hints present in frozen source
-files. Source-map text cannot introduce different hints.
+Both tools use the same exclusion policy: source hints cannot exclude lines or
+credit unexecuted lines. The pinned INI clears `exclude_lines` and
+`partial_branches`. The pinned c8 converter has no public hint switch, so the
+reporting launcher disables its single `_parseIgnore` method. This disables c8,
+v8, and `node:coverage` hints, including block and line forms.
 
-This isolates reporting from task configuration and startup hooks. It does not
-protect collection from task code executing inside the measured process. Such
-code can alter tracing or collected data; the data receipt is a consistency check,
-not an authenticity guarantee against that process.
+Residual risk: code inside the measured process can forge the raw collection data.
 
 Provisioning records resolved module, dependency, configuration, and staged
 source-file-list origins in `execution.json` under
-`provisioned_tool.runtime_origin`. Provisioner version 3 refuses older saved
+`provisioned_tool.runtime_origin`. Provisioner version 4 refuses older saved
 profiles. Prepare a new measurement revision with these launcher commands.
 Resume fingerprints bind only the distributions selected by the profile.
 

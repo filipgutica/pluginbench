@@ -45,7 +45,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # Containers, builds and trials now start only inside an operation, on the daemon
             # it recorded; a launch inside one is unchanged, so this stays v1.
             # Optional measurement provisioning leaves coding launches unchanged (v1).
-            "harbor_backend.py": "10315f8025c806c7af9786331cf9add58af96f88e6dd83a59de2d2bfddf38c56",
+            "harbor_backend.py": "69e113f4ce3e91a98a782352684fc9e24e8f614304eb17159950cce215fc7330",
             # The same spawn callback; launches are unchanged. A failed process-group cleanup
             # or output drain now also tells the host lock owner, which records it for the next
             # owner to check. Launches are unchanged.
@@ -131,14 +131,14 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         },
     ),
     "measurement_tools": (
-        3,
+        4,
         {
-            # v3 isolates Python reporting/configuration/data and validates c8 map sources.
-            "measurement_tools.py": "00bd8484ecd59d723aba79f3b3c67f90fbeacc36281c56ae4c3a4120f1365ecc",
-            "coverage_tools/launch-coverage.py": "7b174ddaf8e0d2cc9cfde3627a43f78a9843ae8a7d254dba406556a1925150de",
-            "coverage_tools/launch-c8.cjs": "de7cf978eabfabeb9001ce38da4c91f013f59055d9450b479352208ba9e9e9c0",
+            # v4 reports in fresh containers, validates maps, and disables exclusion hints.
+            "measurement_tools.py": "57d5bffdd4badcbbe9d37f44a149679e5de02ae321eb429ca5d73665bccc16bf",
+            "coverage_tools/launch-coverage.py": "297461d2032e34f917392c9eba9b45c9b08769c496565fb37ad989ba86a39cfa",
+            "coverage_tools/launch-c8.cjs": "4f2507a5afc9d92685c166856612f5c47ffa81f188b14d7f0283188424d88b2f",
             "coverage_tools/c8-config.json": "2ee2372e0af85263890e3e052453e08a091d47225ffa7678ca8a6c963fcbb177",
-            "coverage_tools/coverage-config.ini": "613e235e58afd7710f96d6d7baa21eb7c6379b428003c084f8b8782a0f8da587",
+            "coverage_tools/coverage-config.ini": "1ff3036ad9b40af6c1b0c195c4cb5b87ab2f308a9ac4287c58778639f13ba2a4",
         },
     ),
     "local_sandbox": (
