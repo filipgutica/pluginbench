@@ -82,6 +82,9 @@ class CleanupBlocked(Exception):
     infrastructure error and start more work. The CLI reports it as the command's error.
     """
 
+    # Whether the call it ended had launched its scope, so the call is spent (`ledger.outcome`).
+    launched = False
+
 
 class CleanupUnknown(CleanupBlocked):
     """PluginBench cannot tell whether something still runs; only the operator can confirm."""

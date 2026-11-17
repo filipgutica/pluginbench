@@ -178,18 +178,19 @@ def child_identity(pid: int) -> dict[str, object]:
 def outcome(error: BaseException, *, spawned: bool) -> tuple[str, str | None]:
     """The state and error signature that end an invocation which raised `error`.
 
-    A call whose cleanup was not verified (`control_store.CleanupBlocked`) is `unresolved`: it
-    is spent, its usage is unknown, and the host stays fenced until recovery verifies it.
     Nothing external started unless the spawn reported its child, or the error says the call's
-    scope was launched (`launched`, as on OperationFailed), so that is the one refund besides an
-    operator interrupt. The signature is what the short-circuit compares: the error's stable
+    scope was launched (`launched`, set by `invocation_runtime.run_operation`), so that is the
+    one refund besides an operator interrupt. A spent call whose cleanup was not verified
+    (`control_store.CleanupBlocked`) is `unresolved`: its usage is unknown, and the host stays
+    fenced until recovery verifies it. The signature is what the short-circuit compares: the error's stable
     `reason` when it has one, which holds no attempt ID or temporary path.
     """
     from pluginbench.control_store import CleanupBlocked
 
+    spent = spawned or getattr(error, "launched", False)
     if isinstance(error, CleanupBlocked):
-        return "unresolved", None
-    if not spawned and not getattr(error, "launched", False):
+        return ("unresolved", None) if spent else ("aborted_prespawn", None)
+    if not spent:
         return "aborted_prespawn", None
     if isinstance(error, KeyboardInterrupt):
         return "interrupted_operator", None

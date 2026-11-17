@@ -337,10 +337,20 @@ def run_operation(
     run; if it raises, nothing runs. `progress` gets each line the handler reports (`report`).
     The handler's own exception becomes OperationFailed; a handler past its deadline is killed
     and raises OperationDeadlineExceeded. Before anything spawns this raises only
-    HostUnavailable or ValueError. A cleanup that cannot be verified raises
-    control_store.CleanupBlocked whatever the operation did, and keeps the owner unreleased.
+    HostUnavailable, ValueError, or CleanupBlocked once an earlier cleanup of this owner was not
+    verified. A cleanup that cannot be verified raises control_store.CleanupBlocked whatever the
+    operation did, and keeps the owner unreleased. Any error raised once the scope's bootstrap
+    started carries `launched`: the call is spent (`ledger.outcome`).
     """
     lock = _lock()
+    if lock.leftover:
+        from pluginbench.control_store import CleanupBlocked
+
+        # A failed cleanup halts new admission for the whole owner, whichever slot hit it.
+        raise CleanupBlocked(
+            "an earlier operation's cleanup was not verified, so this command starts no more "
+            "operations; the next command checks what it left first"
+        )
     launcher = require_user_manager()
     spec = request.spec
     directory = lock.state / "invocations" / spec.id
@@ -355,10 +365,14 @@ def run_operation(
         {"id": spec.id, "scope": spec.scope, "label": spec.label, "docker": spec.docker,
          "dir": str(directory), "bootstrap": None, "payload": None}
     )
+    launched = True  # Unless it fails before its bootstrap starts; `_launch` marks the rest.
     try:
         return _launch(
             lock, request, _scope_command(launcher, request, path), directory, started, progress
         )
+    except BaseException as exc:
+        launched = getattr(exc, "launched", False)
+        raise
     finally:
         try:
             verify_cleanup(lock.record_operation(spec.id), lock=lock)
@@ -368,11 +382,15 @@ def run_operation(
             lock.note_leftover(f"cleanup of invocation {spec.id} was not verified: {exc}")
             # It replaces the operation's own outcome (chained as its context): while anything
             # of it may run, its slot stays taken and no more work starts.
-            if isinstance(exc, CleanupBlocked):
+            blocked = (
+                exc
+                if isinstance(exc, CleanupBlocked)
+                else CleanupBlocked(f"cleanup of invocation {spec.id} was not verified: {exc}")
+            )
+            blocked.launched = launched
+            if blocked is exc:
                 raise
-            raise CleanupBlocked(
-                f"cleanup of invocation {spec.id} was not verified: {exc}"
-            ) from exc
+            raise blocked from exc
 
 
 def _launch(
@@ -411,25 +429,31 @@ def _launch(
             os.close(read_end)
         try:
             try:
-                lock.update_operation(spec.id, bootstrap=_identity(proc.pid))
-                os.write(write_end, b"1")
+                try:
+                    lock.update_operation(spec.id, bootstrap=_identity(proc.pid))
+                    os.write(write_end, b"1")
+                finally:
+                    os.close(write_end)
+                with _admit(listener, lock, spec, started) as connection:
+                    outcome = _wait(connection, spec, request.timeout, progress)
             finally:
-                os.close(write_end)
-            with _admit(listener, lock, spec, started) as connection:
-                outcome = _wait(connection, spec, request.timeout, progress)
-        finally:
-            # The bootstrap, or the entry point it became, is this process's unreaped child, so
-            # its PID cannot have been reused.
-            try:
-                proc.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-    if outcome == "deadline":
-        raise OperationDeadlineExceeded(
-            f"operation {request.operation} did not return within {request.timeout:g} seconds"
-        )
-    return _result(directory, request.operation, proc.returncode)
+                # The bootstrap, or the entry point it became, is this process's unreaped
+                # child, so its PID cannot have been reused.
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            if outcome == "deadline":
+                raise OperationDeadlineExceeded(
+                    f"operation {request.operation} did not return within "
+                    f"{request.timeout:g} seconds"
+                )
+            return _result(directory, request.operation, proc.returncode)
+        except BaseException as exc:
+            # Its bootstrap started, so whatever ended it, the call is spent.
+            setattr(exc, "launched", True)
+            raise
 
 
 def rebuild(result: dict[str, Any]) -> Exception:

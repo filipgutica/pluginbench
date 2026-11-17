@@ -35,6 +35,12 @@ REFERENCE_AGENTS = 2
 # A task's measurement preparation: observer installs and profile setup, which apply no timeout
 # of their own.
 MEASUREMENT_PREPARATION = 1800
+# The images a task's preparation resolves: its base, its grader, and the grader with its tests
+# bundled in. Each is pulled or built, within the timeouts `harbor_backend` gives a pull
+# (`_inspect_image`) and a build (`_build_native_image`).
+PREPARED_IMAGES = 3
+IMAGE_PULL = 600
+IMAGE_BUILD = 1800
 
 
 def _absolute(path: Path) -> Path:
@@ -222,8 +228,8 @@ def readiness_budget(task_dir: Path, config: Evaluation) -> int:
 
 def preflight_budget(config: Evaluation) -> int:
     """A check or preparation's whole budget, summed over its tasks and never divided by
-    parallelism: each task's image build and agent installation, its measurement preparation
-    and readiness, then its nop and oracle, each with its export and cleanup."""
+    parallelism: each task's image pulls and builds, its agent installation, its measurement
+    preparation and readiness, then its nop and oracle, each with its export and cleanup."""
     from pluginbench import harbor_backend
 
     source = config.tasks.resolve()
@@ -231,6 +237,7 @@ def preflight_budget(config: Evaluation) -> int:
     total = 0
     for task in config.tasks.task_ids:
         task_dir = suite / "tasks" / task
+        total += PREPARED_IMAGES * (IMAGE_PULL + IMAGE_BUILD)
         total += harbor_backend._native_worker_budget(task_dir=task_dir, prepare=True)
         total += readiness_budget(task_dir, config)
         total += requalify_budget(task_dir) + AFTER_WORKER

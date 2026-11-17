@@ -13,6 +13,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -809,3 +810,92 @@ def test_an_unverified_review_cleanup_ends_the_pass(
 
     assert len(calls) == 1
     assert _states(root, "review") == ["unresolved"]
+
+
+def _in_scope(lock: Any, request: Any, command: Any, directory: Any, started: Any, progress: Any) -> Any:
+    return operation_support.run_in_place(request, started=started, progress=progress)
+
+
+def test_two_jobs_share_one_owner_through_the_real_run_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both slots record, admit and drop operations on one owner record at once. Run several
+    studies, since one slot's check races the other's write."""
+    _through_run_operation(
+        monkeypatch,
+        launch=_in_scope,
+        cleanup=lambda operation, *, lock: lock.drop_operation(operation["id"]),
+    )
+    for run in range(4):
+        calls: list[str] = []
+        resume_support.install(monkeypatch, calls)
+        monkeypatch.setattr(invocation_runtime, "run_operation", _RUN_OPERATION)
+        resolved = study.load_study(
+            resume_support.recipe(tmp_path / f"config-{run}", tasks=6, treatments=0, repeats=1, jobs=2)
+        )
+        study.run_study(resolved, tmp_path / f"run-{run}")
+        assert len(calls) == 6
+
+
+def _halting(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Run operations through the real `run_operation`, two at once: the first call's cleanup
+    fails, and the second reaches its `run_operation` only after that. Return what launched."""
+    failed = threading.Event()
+    first: list[str] = []
+    launched: list[str] = []
+    guard = threading.Lock()
+
+    def run_operation(request: Any, **kwargs: Any) -> Any:
+        with guard:
+            mine = not first
+            if mine:
+                first.append(request.spec.id)
+        if not mine:
+            assert failed.wait(10)  # In flight, about to make its call, as the first fails.
+        return _RUN_OPERATION(request, **kwargs)
+
+    def launch(lock: Any, request: Any, command: Any, directory: Any, started: Any, progress: Any) -> Any:
+        launched.append(request.spec.id)
+        return _in_scope(lock, request, command, directory, started, progress)
+
+    def cleanup(operation: dict[str, Any], *, lock: Any) -> None:
+        if operation["id"] in first:
+            failed.set()
+            raise CleanupBlocked("a container of it survived its removal")
+        lock.drop_operation(operation["id"])
+
+    _through_run_operation(monkeypatch, launch=launch, cleanup=cleanup)
+    monkeypatch.setattr(invocation_runtime, "run_operation", run_operation)
+    return launched
+
+
+def test_after_one_slots_cleanup_fails_the_other_slot_launches_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+    launched = _halting(monkeypatch)
+    resolved = study.load_study(
+        resume_support.recipe(tmp_path / "config", tasks=4, treatments=0, repeats=1, jobs=2)
+    )
+
+    with pytest.raises(CleanupBlocked):
+        study.run_study(resolved, tmp_path / "run")
+
+    assert len(launched) == len(calls) == 1
+    # The other slot's call never launched, so it is given back to its slot.
+    assert sorted(_states(tmp_path / "run")) == ["aborted_prespawn", "unresolved"]
+
+
+def test_after_one_review_cleanup_fails_an_in_flight_review_makes_no_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    calls = test_study_review._judge(monkeypatch, root, behavior="clean")
+    launched = _halting(monkeypatch)
+
+    with pytest.raises(CleanupBlocked):
+        study_review.review_study(root, jobs=2)
+
+    assert len(launched) == len(calls) == 1
+    assert sorted(_states(root, "review")) == ["aborted_prespawn", "unresolved"]

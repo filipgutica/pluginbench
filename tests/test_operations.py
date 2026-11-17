@@ -274,4 +274,5 @@ def test_each_operation_budget_outlasts_its_implementations_own_timeouts(
     # given where two 7,200 s coverage runs alone need 14,400 s).
     one = worker(task_dir=task, prepare=True) + operations.requalify_budget(task)
     readiness = 2 * (7200 + 7200)
-    assert operations.preflight_budget(cast(Any, config)) > 2 * (one + readiness)
+    images = 3 * (600 + 1800)  # Base, grader and bundled grader, each pulled or built.
+    assert operations.preflight_budget(cast(Any, config)) > 2 * (one + readiness + images)
