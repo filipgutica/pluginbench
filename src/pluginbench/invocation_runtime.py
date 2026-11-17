@@ -69,8 +69,10 @@ MINIMUM_SYSTEMD = 255
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 LABEL_KEY = "pluginbench.invocation"
 
-# The invocation whose handler this process runs; set once by the entry point, in the scope.
+# The invocation whose handler this process runs, and the Docker runtime it recorded (None for
+# an operation that starts no container); set once by the entry point, in the scope.
 _current: str | None = None
+_runtime: dict[str, object] | None = None
 # The entry point's connection to its owner, for `report`, and the lock its senders share.
 _channel: tuple[socket.socket, threading.Lock] | None = None
 _CREATES = (("run",), ("create",), ("container", "run"), ("container", "create"))
@@ -175,9 +177,14 @@ class CleanupProof:
     at: str
 
 
+def _state() -> tuple[str | None, dict[str, object] | None]:
+    """The invocation this process runs as and the Docker runtime it recorded."""
+    return _current, _runtime
+
+
 def current() -> str | None:
     """The invocation ID of the operation this process runs as, or None outside one."""
-    return _current
+    return _state()[0]
 
 
 def report(text: str) -> None:
@@ -194,6 +201,39 @@ def report(text: str) -> None:
             connection.sendall(message)
         except OSError:
             pass
+
+
+def creates(arguments: tuple[str, ...]) -> bool:
+    """Whether Docker `arguments` create a container, or build an image: a builder other than
+    the engine's own starts BuildKit in a container."""
+    return arguments[:1] == ("build",) or any(
+        arguments[: len(create)] == create for create in _CREATES
+    )
+
+
+def container_invocation(runtime: dict[str, object] | None) -> str:
+    """The invocation whose label a container about to start under `runtime` carries.
+
+    Containers start only inside an operation that recorded the same Docker daemon, so
+    recovery knows where to find them by that label. Anything else is refused.
+    """
+    invocation, recorded = _state()
+    if invocation is None:
+        raise ValueError(
+            "PluginBench creates a container or builds an image only inside an operation, "
+            "whose label lets recovery find it"
+        )
+    ours, theirs = (recorded or {}).get("docker_engine"), (runtime or {}).get("docker_engine")
+    if not (
+        isinstance(ours, dict)
+        and isinstance(theirs, dict)
+        and (theirs.get("id"), theirs.get("endpoint")) == (ours.get("id"), ours.get("endpoint"))
+    ):
+        raise ValueError(
+            f"operation {invocation} recorded no Docker daemon, or another one, so it starts no "
+            "container on this one"
+        )
+    return invocation
 
 
 def with_label(arguments: tuple[str, ...], invocation: str) -> tuple[str, ...]:
@@ -359,7 +399,8 @@ def run_operation(
     path = directory / "request.json"
     _write_private(
         path,
-        {"id": spec.id, "operation": request.operation, "arguments": request.arguments},
+        {"id": spec.id, "operation": request.operation, "arguments": request.arguments,
+         "docker": spec.docker},
     )
     lock.note_operation(
         {"id": spec.id, "scope": spec.scope, "label": spec.label, "docker": spec.docker,
@@ -814,8 +855,8 @@ def _execute(path: Path) -> int:
         if _receive(connection) != {"permit": request["id"]}:
             return 75
         connection.settimeout(None)
-        global _current, _channel
-        _current = request["id"]
+        global _current, _runtime, _channel
+        _current, _runtime = request["id"], request["docker"]
         _channel = (connection, threading.Lock())
         try:
             value = handler(request["operation"])(request["arguments"])

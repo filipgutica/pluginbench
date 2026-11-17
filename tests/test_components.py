@@ -42,7 +42,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # A native task that sets Docker controls (DOCKER_*, BUILDX_*, BUILDKIT_*,
             # COMPOSE_*) in its environment is now refused; every task still admitted launches
             # exactly as before, so this stays v1.
-            "harbor_backend.py": "24604934154d421b36b8abe2f9cb01e7907c2cb5235be9afbfd80cdd1c593406",
+            # Containers, builds and trials now start only inside an operation, on the daemon
+            # it recorded; a launch inside one is unchanged, so this stays v1.
+            "harbor_backend.py": "a862f4d6d737c2873175ba50befb6260f291933db0001ea9f443acc7271a01da",
             # The same spawn callback; launches are unchanged. A failed process-group cleanup
             # or output drain now also tells the host lock owner, which records it for the next
             # owner to check. Launches are unchanged.

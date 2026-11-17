@@ -16,6 +16,7 @@ import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import uuid4
 from types import SimpleNamespace
 from typing import Any
 
@@ -27,6 +28,7 @@ from pluginbench import (
     claude_treatments,
     evaluation,
     grade,
+    invocation_runtime,
     saved_usage,
 )
 from pluginbench import harbor_backend as harbor
@@ -253,7 +255,8 @@ class Container:
         )
         # Source export and the frozen-image guard are proven elsewhere.
         monkeypatch.setattr(harbor, "install_native_hooks", lambda *args: None)
-        return asyncio.run(harbor.run_trial(config))
+        # As `_native_process` hands it over: the trial of an operation.
+        return asyncio.run(harbor.run_trial({**config, harbor._INVOCATION_KEY: uuid4().hex}))
 
 
 @dataclass
@@ -591,9 +594,13 @@ def test_a_refused_variable_in_the_operator_env_stops_the_run_before_any_contain
     monkeypatch.setattr(
         harbor, "run_command", lambda *args, **kwargs: pytest.fail("worker started")
     )
+    runtime: dict[str, object] = {"docker_engine": {"id": "daemon", "endpoint": "unix:///d"}}
+    # Inside the coding operation, as `_native_process` always runs.
+    monkeypatch.setattr(invocation_runtime, "_current", uuid4().hex)
+    monkeypatch.setattr(invocation_runtime, "_runtime", runtime)
     with pytest.raises(ValueError, match=f"CLAUDE_CODE_OAUTH_TOKEN only; unset {name}"):
         harbor._native_process(
-            area=tmp_path, config={}, expected={}, harness="claude", timeout=60,
+            area=tmp_path, config={}, expected=runtime, harness="claude", timeout=60,
             install_only=False,
         )
     assert not (tmp_path / "private").exists()

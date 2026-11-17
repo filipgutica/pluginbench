@@ -74,6 +74,14 @@ def nested_collect(arguments: dict[str, Any]) -> Any:
     return report
 
 
+def recorded(arguments: dict[str, Any]) -> Any:
+    """The Docker daemon this operation may create containers on."""
+    try:
+        return invocation_runtime.container_invocation(arguments["runtime"])
+    except ValueError as exc:
+        return str(exc)
+
+
 def descriptors(arguments: dict[str, Any]) -> Any:
     found = []
     for name in os.listdir("/proc/self/fd"):
@@ -85,5 +93,5 @@ def descriptors(arguments: dict[str, Any]) -> Any:
 
 
 invocation_runtime.HANDLERS.update(
-    {name: f"sitecustomize:{name}" for name in ("echo", "escape", "hang", "fail", "chatty", "nested_collect", "descriptors")}
+    {name: f"sitecustomize:{name}" for name in ("echo", "escape", "hang", "fail", "chatty", "nested_collect", "recorded", "descriptors")}
 )
