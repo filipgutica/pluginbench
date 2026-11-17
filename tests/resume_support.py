@@ -24,7 +24,9 @@ from native_support import (
     synthetic_contract,
     task_entry,
 )
-from pluginbench import baselines, harbor_backend, ledger, study, submissions, trial_containers
+from pluginbench import baselines, codex, control_store, harbor_backend, ledger, study, submissions
+from pluginbench import run_lock, trial_containers
+from pluginbench.run_lock import ExecutionOwner
 from pluginbench.datasets import native_identity, portable_native_identity
 
 # Where the child kills itself, relative to its Nth native call or Nth completed attempt.
@@ -82,6 +84,38 @@ def _kill() -> None:
     os.kill(os.getpid(), signal.SIGKILL)
 
 
+# Where tests' temporary directories start; set for test processes and their children.
+GUIDANCE_CEILING = "PLUGINBENCH_TEST_GUIDANCE_CEILING"
+
+
+def bound_guidance(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Check a workspace's ancestors for guidance only up to GUIDANCE_CEILING, so guidance a
+    host keeps in /tmp or above cannot fail tests. Below it, the check is the real one."""
+    if not (ceiling := os.environ.get(GUIDANCE_CEILING)):
+        return
+    real, base = codex.reject_guidance, Path(ceiling)
+
+    def bounded(
+        workspace: Path, *, include_ancestors: bool = True, reject_git: bool = False
+    ) -> None:
+        root = workspace.resolve()
+        if not root.is_relative_to(base):
+            real(workspace, include_ancestors=include_ancestors, reject_git=reject_git)
+            return
+        real(workspace, include_ancestors=False, reject_git=reject_git)
+        found = sorted(
+            str(parent / name)
+            for parent in root.parents
+            if include_ancestors and parent.is_relative_to(base)
+            for name in codex.GUIDANCE_NAMES
+            if (parent / name).exists()
+        )
+        if found:
+            raise ValueError("custom guidance or unsupported fixture paths: " + ", ".join(found))
+
+    monkeypatch.setattr(codex, "reject_guidance", bounded)
+
+
 def install(
     monkeypatch: pytest.MonkeyPatch,
     calls: list[str],
@@ -90,12 +124,15 @@ def install(
     at: int = 0,
 ) -> None:
     """Fake every Harbor entry point a study reaches; record each native call's attempt ID."""
+    bound_guidance(monkeypatch)
     monkeypatch.setattr(submissions, "reviewed_contract", synthetic_contract)
     identity = runtime_identity()
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: identity)
     monkeypatch.setattr(harbor_backend, "preflight", lambda **kwargs: {"paid_calls": 0})
     # No killed attempt left a container running; test_resume covers the ones that did.
     monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
+    # The Docker daemon is the one the run recorded.
+    monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime, **kwargs: None)
     lock = threading.Lock()
     pair = threading.Barrier(2)
     counts = {"receipt": 0, "verify": 0, "complete": 0, "publish": 0}
@@ -223,6 +260,19 @@ def child() -> None:
 def child_resume() -> None:
     """argv: run, boundary. Resumes a study and kills itself at `boundary`."""
     root, boundary = sys.argv[1:3]
-    install(pytest.MonkeyPatch(), [], boundary=boundary, at=1)
-    study.resume_study(Path(root))
+    patch = pytest.MonkeyPatch()
+    install(patch, [], boundary=boundary, at=1)
+    # The killed calls left no process; test_control_store covers the check itself.
+    patch.setattr(control_store, "verify_invocation", lambda item: {"id": item["id"]})
+    # As the CLI does: recovering what the last crash left needs the host execution lock, and
+    # until P4b an earlier killed resume is cleared only by the operator's repair.
+    state = Path(root).parent / "host-state"
+    target = str(Path(root).resolve())
+    repairer = ExecutionOwner(kind="recovery", eval=target, root=target)
+    with run_lock.hold_execution(repairer, state=state) as lock:
+        if any(item.get("root") == target for item in lock.record["pending"]):
+            control_store.confirm_stopped(lock, Path(root))
+    owner = ExecutionOwner(kind="run", eval=root, root=root)
+    with control_store.execute(owner, state=state):
+        study.resume_study(Path(root))
     raise SystemExit("the resume finished without reaching its kill boundary")

@@ -36,6 +36,9 @@ from test_grade import HEALTHY, _coded
 from test_resume import _PATH, _killed_resume, _killed_run
 from test_provider_stops import codex_rollout
 
+# Every resume here recovers what a killed run left, which needs the host execution lock.
+pytestmark = pytest.mark.usefixtures("host_execution")
+
 
 def _invocations(root: Path) -> list[dict[str, Any]]:
     ledger = Ledger.read(root / LEDGER_NAME)
@@ -228,7 +231,9 @@ def test_the_one_regrade_of_a_filtered_patch_is_its_second_grading_invocation(
 # The ledger itself.
 
 
-def test_a_grading_pass_resolves_only_grading_invocations(tmp_path: Path) -> None:
+def test_a_grading_pass_resolves_only_grading_invocations_whose_cleanup_is_verified(
+    tmp_path: Path,
+) -> None:
     ledger = Ledger.create(
         tmp_path / LEDGER_NAME,
         [{"id": "a", "task_id": "t", "arm": "baseline", "attempt": 1}],
@@ -236,8 +241,11 @@ def test_a_grading_pass_resolves_only_grading_invocations(tmp_path: Path) -> Non
     )
     try:
         coding = ledger.intent(slot=0, stage="coding", attempt_id="a")
-        ledger.intent(slot=0, stage="grading", attempt_id="a")
-        assert ledger.resolve_crashed("grading") == 1
+        grading = ledger.intent(slot=0, stage="grading", attempt_id="a")
+        with pytest.raises(ValueError, match=f"{grading} is not verified"):
+            ledger.resolve_crashed("grading", cleaned=set())
+        assert _states(tmp_path, "grading") == ["intent"]
+        assert ledger.resolve_crashed("grading", cleaned={grading}) == 1
         assert {row["stage"]: row["state"] for row in ledger.invocations()} == {
             "coding": "intent",
             "grading": "unresolved",

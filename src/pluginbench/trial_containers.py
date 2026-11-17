@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -29,7 +30,20 @@ _FORMAT = (
 )
 
 
-def running(evidence: Path, *, expected_runtime: dict[str, object] | None) -> list[dict[str, str]]:
+def timeout(deadline: float | None) -> int:
+    """A Docker command's timeout: the usual one, capped by what is left before `deadline`, a
+    `time.monotonic()` value. Raises ValueError once it has passed."""
+    if deadline is None:
+        return harbor_backend._DOCKER_TIMEOUT
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise ValueError("the cleanup deadline passed")
+    return max(1, min(harbor_backend._DOCKER_TIMEOUT, int(left)))
+
+
+def running(
+    evidence: Path, *, expected_runtime: dict[str, object] | None, deadline: float | None = None
+) -> list[dict[str, str]]:
     """Running containers of this run's Harbor trials: id, name and compose project.
 
     `expected_runtime` pins the Docker CLI and engine, as for every other Docker call of a run;
@@ -49,6 +63,7 @@ def running(evidence: Path, *, expected_runtime: dict[str, object] | None) -> li
         "--format",
         _FORMAT,
         expected_runtime=expected_runtime,
+        timeout=timeout(deadline),
     )
     found = []
     for line in output.splitlines():
@@ -69,21 +84,29 @@ def stop_left_running(
     *,
     expected_runtime: dict[str, object],
     progress: Callable[[str], None] | None,
+    deadline: float | None = None,
 ) -> None:
     """Stop every running container of this run's trials. Only the run.lock holder calls this.
 
     The holder is the only process working on this run, so whatever is still running was left
     by an attempt that a kill interrupted.
     """
-    found = running(evidence, expected_runtime=expected_runtime)
+    found = running(evidence, expected_runtime=expected_runtime, deadline=deadline)
     for project in dict.fromkeys(container["project"] for container in found):
         ids = [container["id"] for container in found if container["project"] == project]
         try:
-            harbor_backend._docker("stop", "--time", "10", *ids, expected_runtime=expected_runtime)
+            harbor_backend._docker(
+                "stop",
+                "--time",
+                "10",
+                *ids,
+                expected_runtime=expected_runtime,
+                timeout=timeout(deadline),
+            )
         except ValueError:
             # A surviving Harbor worker may remove its own containers in the meantime; only a
             # container that is still running is a failure.
-            still = running(evidence, expected_runtime=expected_runtime)
+            still = running(evidence, expected_runtime=expected_runtime, deadline=deadline)
             if any(container["id"] in ids for container in still):
                 raise
             continue

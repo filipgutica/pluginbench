@@ -34,7 +34,7 @@ from uuid import uuid4
 
 from pydantic import TypeAdapter
 
-from pluginbench import codex, components, isolation, submissions, native_treatments
+from pluginbench import codex, components, isolation, run_lock, submissions, native_treatments
 from pluginbench import claude, claude_launch, claude_treatments, saved_usage
 from pluginbench.treatments import Treatment
 from pluginbench.native_treatments import NativeCapabilities
@@ -159,10 +159,14 @@ def _docker(
     return result.stdout
 
 
-def _assert_daemon(expected_runtime: dict[str, object]) -> None:
+def _assert_daemon(expected_runtime: dict[str, object], *, timeout: int = _DOCKER_TIMEOUT) -> None:
     engine = _object(expected_runtime.get("docker_engine"), "frozen Docker engine")
     actual = _object(
-        json.loads(_docker("info", "--format", "{{json .}}", expected_runtime=expected_runtime)),
+        json.loads(
+            _docker(
+                "info", "--format", "{{json .}}", expected_runtime=expected_runtime, timeout=timeout
+            )
+        ),
         "Docker daemon",
     )
     if not engine.get("id") or actual.get("ID") != engine["id"]:
@@ -789,6 +793,17 @@ def stopped_container_state(value: object) -> dict[str, object]:
 
 def cleanup(*, project: str, owner: str, expected_runtime: dict[str, object]) -> dict[str, object]:
     """Remove only this trial's labelled resources and verify that none remain."""
+    try:
+        return _cleanup(project=project, owner=owner, expected_runtime=expected_runtime)
+    except BaseException as error:
+        run_lock.note_leftover(
+            f"Harbor project {project} could not be cleaned up ({error}), so its containers may "
+            "still run"
+        )
+        raise
+
+
+def _cleanup(*, project: str, owner: str, expected_runtime: dict[str, object]) -> dict[str, object]:
     _assert_daemon(expected_runtime)
     containers = _project_ids("container", project, expected_runtime)
     if containers:

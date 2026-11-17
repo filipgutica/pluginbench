@@ -747,109 +747,112 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
     if progress:
         for warning in warnings:
             progress("Warning: " + warning)
-    root.mkdir(parents=True)
-    prepared = root / "inputs"
-    prepared.mkdir()
-    entries = []
-    profiles = {}
-    scopes: dict[str, object] = {}
-    task_environment: dict[str, object] = {}
-    capabilities: dict[str, object] = {}
-    matrix: dict[str, dict[str, dict[str, object]]] = {}
-    for task in config.tasks.task_ids:
-        if progress:
-            progress(f"Preparing native Harbor task {task}")
-        destination = prepared / task
-        effective = TypeAdapter(dict[str, int]).validate_python(
-            _object(_object(comparison["task_limits"])[task])["effective"]
-        )
-        identity = harbor_backend.prepare_native_task(
-            task_dir=suite / "tasks" / task,
-            destination=destination,
-            harness=config.runner.harness,
-            version=harness_versions[config.runner.harness],
-            limits={**limits, "setup_timeout": effective["build_timeout_seconds"]},
-            cache=caches.native,
-        )
-        native_task = Path(str(identity["task_dir"]))
-        fixture = Path(str(identity["fixture_dir"]))
-        if identity["original_task_assets_sha256"] != _object(comparison["tasks"])[task]:
-            raise ValueError("native task assets changed after planning")
-        # Before anything saves the identity: a task without a git identity gets PluginBench's.
-        git_probe = harbor_backend.probe_coding_environment(identity)
-        if "supplied_git_identity" in git_probe:
-            identity["supplied_git_identity"] = git_probe["supplied_git_identity"]
-            codex.write_json(destination / "artifacts/native-preparation.json", identity)
-        model = importlib.import_module("harbor.models.task.task").Task(native_task)
-        entries.append(
-            TaskEntry(
-                id=task,
-                prompt=model.instruction,
-                fixture=fixture.relative_to(prepared),
-                native_task=native_task.relative_to(prepared),
-                provenance={"native_task_identity": json.dumps(identity, sort_keys=True)},
+    # Image builds and probe containers start here. Cut off by an error, they may be left
+    # behind, so until they finish the host lock is not released as clean.
+    with run_lock.external_work():
+        root.mkdir(parents=True)
+        prepared = root / "inputs"
+        prepared.mkdir()
+        entries = []
+        profiles = {}
+        scopes: dict[str, object] = {}
+        task_environment: dict[str, object] = {}
+        capabilities: dict[str, object] = {}
+        matrix: dict[str, dict[str, dict[str, object]]] = {}
+        for task in config.tasks.task_ids:
+            if progress:
+                progress(f"Preparing native Harbor task {task}")
+            destination = prepared / task
+            effective = TypeAdapter(dict[str, int]).validate_python(
+                _object(_object(comparison["task_limits"])[task])["effective"]
             )
-        )
-        profiles[task] = prepare_profiles(
-            fixture,
-            destination / "measurements",
-            config.measurements,
-            config.measurement_settings,
-            identity,
-        )
-        provenance = json.loads(
-            (destination / "measurements/measurement-provenance.json").read_text()
-        )
-        scopes[task] = {
-            "source_scope": json.loads(provenance["source_scope"]),
-            "test_scope": json.loads(provenance["test_scope"]),
-            "version": provenance["measurement_profile_version"],
-        }
-        rows = probe_measurements(
-            fixture,
-            destination / "measurement-readiness",
-            profiles[task],
-            config.measurements,
-            _object(provenance["capabilities"]),
-        )
-        qualification = _object(identity.get("source_qualification", {}))
-        qualified = (
-            identity.get("source_policy") == submissions.SOURCE_POLICY
-            and qualification.get("status") == "complete"
-        )
-        submission_source: dict[str, object] = {
-            "status": "available" if qualified else "unavailable",
-            "source_policy": submissions.SOURCE_POLICY,
-            "reason": None
-            if qualified
-            else qualification.get(
-                "reason", "canonical submission source has no compatible preparation proof"
-            ),
-        }
-        # A task without a reviewed patch-grading contract has no submission source to qualify.
-        if _object(_object(plan["submission_sources"])[task])["status"] == "unsupported":
-            submission_source["configured"] = False
-        rows["submission_source"] = {
-            **submission_source,
-            "state": readiness_state(submission_source),
-        }
-        capabilities[task] = rows
-        task_environment[task] = portable_native_identity(identity)
-        matrix[task] = {
-            name: {"state": row["state"], "reason": row.get("reason")} for name, row in rows.items()
-        }
-        matrix[task]["coding_environment"] = _coding_environment_row(
-            _object(coding_images[task]), git_probe
-        )
-        matrix[task].update(
-            _reference_agents(identity, root / "check" / task, caches.reference_agents)
-        )
-        if progress:
-            for name, row in matrix[task].items():
-                if row["state"] != "ready":
-                    progress(f"{task}: {name} {row['state']} — {row['reason']}")
-                elif row.get("note"):
-                    progress(f"{task}: {name} ready — {row['note']}")
+            identity = harbor_backend.prepare_native_task(
+                task_dir=suite / "tasks" / task,
+                destination=destination,
+                harness=config.runner.harness,
+                version=harness_versions[config.runner.harness],
+                limits={**limits, "setup_timeout": effective["build_timeout_seconds"]},
+                cache=caches.native,
+            )
+            native_task = Path(str(identity["task_dir"]))
+            fixture = Path(str(identity["fixture_dir"]))
+            if identity["original_task_assets_sha256"] != _object(comparison["tasks"])[task]:
+                raise ValueError("native task assets changed after planning")
+            # Before anything saves the identity: a task without a git identity gets PluginBench's.
+            git_probe = harbor_backend.probe_coding_environment(identity)
+            if "supplied_git_identity" in git_probe:
+                identity["supplied_git_identity"] = git_probe["supplied_git_identity"]
+                codex.write_json(destination / "artifacts/native-preparation.json", identity)
+            model = importlib.import_module("harbor.models.task.task").Task(native_task)
+            entries.append(
+                TaskEntry(
+                    id=task,
+                    prompt=model.instruction,
+                    fixture=fixture.relative_to(prepared),
+                    native_task=native_task.relative_to(prepared),
+                    provenance={"native_task_identity": json.dumps(identity, sort_keys=True)},
+                )
+            )
+            profiles[task] = prepare_profiles(
+                fixture,
+                destination / "measurements",
+                config.measurements,
+                config.measurement_settings,
+                identity,
+            )
+            provenance = json.loads(
+                (destination / "measurements/measurement-provenance.json").read_text()
+            )
+            scopes[task] = {
+                "source_scope": json.loads(provenance["source_scope"]),
+                "test_scope": json.loads(provenance["test_scope"]),
+                "version": provenance["measurement_profile_version"],
+            }
+            rows = probe_measurements(
+                fixture,
+                destination / "measurement-readiness",
+                profiles[task],
+                config.measurements,
+                _object(provenance["capabilities"]),
+            )
+            qualification = _object(identity.get("source_qualification", {}))
+            qualified = (
+                identity.get("source_policy") == submissions.SOURCE_POLICY
+                and qualification.get("status") == "complete"
+            )
+            submission_source: dict[str, object] = {
+                "status": "available" if qualified else "unavailable",
+                "source_policy": submissions.SOURCE_POLICY,
+                "reason": None
+                if qualified
+                else qualification.get(
+                    "reason", "canonical submission source has no compatible preparation proof"
+                ),
+            }
+            # A task without a reviewed patch-grading contract has no submission source to qualify.
+            if _object(_object(plan["submission_sources"])[task])["status"] == "unsupported":
+                submission_source["configured"] = False
+            rows["submission_source"] = {
+                **submission_source,
+                "state": readiness_state(submission_source),
+            }
+            capabilities[task] = rows
+            task_environment[task] = portable_native_identity(identity)
+            matrix[task] = {
+                name: {"state": row["state"], "reason": row.get("reason")} for name, row in rows.items()
+            }
+            matrix[task]["coding_environment"] = _coding_environment_row(
+                _object(coding_images[task]), git_probe
+            )
+            matrix[task].update(
+                _reference_agents(identity, root / "check" / task, caches.reference_agents)
+            )
+            if progress:
+                for name, row in matrix[task].items():
+                    if row["state"] != "ready":
+                        progress(f"{task}: {name} {row['state']} — {row['reason']}")
+                    elif row.get("note"):
+                        progress(f"{task}: {name} ready — {row['note']}")
     _write(
         prepared / "tasks.json",
         TaskCatalog(schema_version=1, tasks=entries).model_dump(mode="json"),

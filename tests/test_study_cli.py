@@ -35,6 +35,7 @@ from pluginbench import (
     claude,
     cli,
     codex,
+    control_store,
     components,
     evaluation,
     harbor_backend,
@@ -42,6 +43,7 @@ from pluginbench import (
     language_analysis,
     mutation,
     parallel,
+    processes,
     remeasure,
     run_lock,
     run_status,
@@ -110,6 +112,7 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> evaluation.Evalua
     monkeypatch.setattr(harbor_backend, "probe_coding_environment", passing_git_probe)
     monkeypatch.setattr(harbor_backend, "run_reference_agents", passing_reference_agents)
     monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
+    monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime, **kwargs: None)
     monkeypatch.setattr(
         isolation, "codex_code_mode_host", lambda: Path("/fixture/codex-code-mode-host")
     )
@@ -138,6 +141,7 @@ def test_public_commands_cover_evaluations_reports_and_task_selection() -> None:
         "report",
         "review",
         "measure",
+        "repair",
         "tasks",
         "judge",
     }
@@ -3652,6 +3656,12 @@ def _finished_without_source_only_grades(
         graded.append(patch)
         # Correct only with the production test_set.py and without the agent's test files.
         reward = int("+flag = True" in patch and "tests/" not in patch and "conftest" not in patch)
+        if (spawned := kwargs.get("on_spawn")) is not None:
+            # As the real regrade runs its worker: reported, then stopped and drained.
+            processes.run_command(
+                [sys.executable, "-c", ""], cwd=tmp_path, env=os.environ, timeout=30,
+                on_spawn=spawned,
+            )
         return {
             "verifier_result": {"rewards": {"reward": reward}},
             "exception_info": None,
@@ -3762,6 +3772,7 @@ def test_source_only_replays_wait_for_the_frozen_grader_and_a_failed_try_is_clea
         else:
             assert grading["status"] == "complete" and row["source_only_reward"] == 1
     assert evaluation.plan_resume(root)["verifier_replays"] == len(packages)
+    _repair(root)
 
     monkeypatch.setattr(harbor_backend, "_assert_native_image", lambda image, expected: None)
     replay = harbor_backend.regrade_native
@@ -3778,6 +3789,7 @@ def test_source_only_replays_wait_for_the_frozen_grader_and_a_failed_try_is_clea
     directory = root / "evidence/source-only" / f"filter-{source_only.FILTER_REVISION}"
     assert len(list(directory.glob("*/*.try-*"))) == 1
     assert [_rows(root)[key]["correctness"] for key in packages].count("infra") == 1
+    _repair(root)
 
     result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
 
@@ -3859,9 +3871,19 @@ def test_status_report_and_compare_read_the_same_grade_for_every_attempt(
     monkeypatch.setattr(harbor_backend, "_assert_native_image", _grader_gone)
     assert CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"]).exit_code != 0
     assert set(agree().values()) == {"infra", "pass"}
+    _repair(root)
     monkeypatch.setattr(harbor_backend, "_assert_native_image", lambda image, expected: None)
     assert CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"]).exit_code == 0
     assert set(agree().values()) == {"pass"}
+
+
+def _repair(root: Path) -> None:
+    """A run that failed after it graded leaves the host fenced; until P4b only the operator
+    lifts that, and the next run is refused until then."""
+    refused = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+    assert refused.exit_code != 0 and "ended without a clean release" in refused.stderr
+    result = CliRunner().invoke(cli.app, ["repair", str(root), "--confirm-stopped"])
+    assert result.exit_code == 0, result.stderr + result.stdout
 
 
 def _grader_gone(image: object, expected: object) -> None:
@@ -4225,6 +4247,8 @@ def test_a_run_killed_after_its_last_attempt_finished_resumes_with_a_newer_launc
     )
     monkeypatch.setattr(codex, "invoke", backend)
     monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    # The simulated kill records no child process; test_control_store covers that check.
+    monkeypatch.setattr(control_store, "verify_invocation", lambda item: {"id": item["id"]})
     evidence = tmp_path / "run/evidence"
     killed = False
 
@@ -4773,3 +4797,29 @@ def test_fresh_iterations_only_evaluation_binds_saved_trace_counts(
     trace.write_text(trace.read_text().replace("pytest", "pytest -q"))
     with pytest.raises(ValueError, match="verification iteration evidence changed"):
         evaluation.regenerate_report(root)
+
+
+@pytest.mark.parametrize("failure", ["validation", "image build", "blocking finding"])
+def test_preparation_fences_the_host_only_while_its_external_work_runs(
+    checkable: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    output: Path = checkable["output"]
+    if failure == "validation":
+        output.mkdir()  # Refused before anything external starts.
+    elif failure == "image build":
+
+        def failed_build(**kwargs: Any) -> dict[str, object]:
+            raise ValueError("image build failed")
+
+        monkeypatch.setattr(harbor_backend, "prepare_native_task", failed_build)
+    else:
+        monkeypatch.setattr(evaluation, "blocking_findings", lambda *args, **kwargs: ["blocked"])
+    config = evaluation.load_evaluation(checkable["path"])
+    state = tmp_path / "host-state"
+    owner = run_lock.ExecutionOwner(kind="run", eval="config", root=str(output))
+    with pytest.raises(ValueError):
+        with control_store.execute(owner, state=state):
+            evaluation.prepare_evaluation(config, output)
+    record = json.loads((state / run_lock.EXECUTION_OWNER).read_text())
+    # A build cut off by its error may leave containers; a finished check leaves nothing.
+    assert (record["state"] == "released") is (failure != "image build")

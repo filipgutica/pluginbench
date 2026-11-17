@@ -20,11 +20,13 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
 from types import FrameType
+from typing import Any
+from uuid import uuid4
 
 from pluginbench import __version__
 
@@ -33,8 +35,9 @@ _PROBE_GRACE = 0.5
 EXECUTION_LOCK = "execution.lock"
 EXECUTION_OWNER = "execution-owner.json"
 EXECUTION_KINDS = ("run", "review", "measure", "preflight", "judge", "recovery")
-# The owner record is diagnostic: the flock and the control store authorize work.
-OWNER_STATES = ("acquiring", "active", "reconciling", "blocked")
+# The flock authorizes work. The owner record is also the fence recovery reads: until its owner
+# records `released`, a dead owner may have left something running at its root.
+OWNER_STATES = ("acquiring", "active", "reconciling", "blocked", "released")
 
 
 class RunMoved(ValueError):
@@ -294,6 +297,15 @@ def boot_id() -> str:
         return ""
 
 
+def pid_namespace() -> str:
+    """This process's PID namespace. A PID recorded in another namespace names another process
+    here, or none."""
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return ""
+
+
 @cache
 def execution_version() -> str:
     """The package version and a hash of its code. A changed checkout keeps the version number,
@@ -360,13 +372,97 @@ class LockSnapshot:
         )
 
 
-def _read_record(path: Path) -> dict[str, object] | None:
-    """The owner record at `path`; None when it is missing or malformed, which is unknown."""
+def _read_record(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    """The owner record at `path`, or None and why it cannot be trusted. A missing record has
+    no reason; an unreadable or invalid one is unknown, never an empty record."""
+    value, problem = _load_record(path)
+    if value is _MISSING:
+        return None, None
+    problem = problem or _record_problem(value)
+    return (None, problem) if problem else (value, None)
+
+
+# What _load_record returns for a record that does not exist. JSON `null` is a parsed value,
+# which validation refuses like any other record that is not an object.
+_MISSING = object()
+
+
+def _load_record(path: Path) -> tuple[Any, str | None]:
+    """The parsed JSON at `path`, or None and why it cannot be read; _MISSING if absent."""
     try:
-        value = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return None
-    return value if isinstance(value, dict) else None
+        return json.loads(path.read_text()), None
+    except FileNotFoundError:
+        return _MISSING, None
+    except (OSError, ValueError) as exc:
+        return None, f"it cannot be read: {exc}"
+
+
+def _record_problem(value: object) -> str | None:
+    """Why `value` is not an owner record whose release and obligations can be trusted; None
+    when it is."""
+    return "; ".join(_obligations(value)[1]) or None
+
+
+def _obligations(value: object) -> tuple[list[dict[str, Any]], list[str]]:
+    """The obligations an owner record carries, each that validates on its own, and every
+    reason any part of it cannot be trusted.
+
+    The owner itself counts unless the whole record validates and says `released`. A record
+    from before releases were recorded (schema 1) always counts as unreleased.
+    """
+    if not isinstance(value, dict):
+        return [], ["it is not a JSON object"]
+    problems: list[str] = []
+    schema = value.get("schema")
+    if type(schema) is not int or schema not in (1, 2):
+        problems.append(f"its schema {schema!r} is not 1 or 2")
+    elif schema == 2 and value.get("state") not in OWNER_STATES:
+        problems.append(f"its state {value.get('state')!r} is not one of {', '.join(OWNER_STATES)}")
+    kept: list[dict[str, Any]] = []
+    pending = value.get("pending", [] if schema == 1 else None)
+    if not isinstance(pending, list):
+        problems.append(f"its pending obligations are {type(pending).__name__}, not a list")
+    else:
+        for index, item in enumerate(pending):
+            if problem := _obligation_problem(item):
+                problems.append(f"pending obligation {index} {problem}")
+            else:
+                kept.append(item)
+    owner = {key: item for key, item in value.items() if key != "pending"}
+    if problem := _obligation_problem(owner):
+        problems.append(f"its owner {problem}")
+    elif problems or schema == 1 or value.get("state") != "released":
+        kept.append(owner)
+    return kept, problems
+
+
+def _obligation_problem(value: object) -> str | None:
+    """Why `value` cannot be checked as an owner that may have left work running. Its pid and
+    acquired_at are its identity, which a confirmation names; only the fence for an unreadable
+    record (kind `unknown`) has no pid."""
+    if not isinstance(value, dict):
+        return "is not an object"
+    for key, kind, required in (
+        ("root", str, True),
+        ("kind", str, True),
+        ("pid", int, value.get("kind") != "unknown"),
+        ("acquired_at", str, True),
+        ("runtimes", list, False),
+        ("leftovers", list, False),
+    ):
+        item = value.get(key)
+        if item is None and not required:
+            continue
+        if type(item) is not kind or (kind is str and not item):
+            return f"has {key} {item!r}, not a{'n' if kind is int else ''} {kind.__name__}"
+    if not all(isinstance(item, dict) for item in value.get("runtimes") or []):
+        return "has a runtime that is not an object"
+    if not all(
+        isinstance(item, dict) and isinstance(item.get("reason"), str)
+        for item in value.get("leftovers") or []
+    ):
+        return "has a failed cleanup without a reason"
+    return None
 
 
 def _holds(record: dict[str, object], lock: os.stat_result) -> bool:
@@ -395,7 +491,7 @@ def execution_owner(state: Path | None = None) -> LockSnapshot:
     """Observe the host execution lock without taking it."""
     state = state or state_root()
     path = state / EXECUTION_LOCK
-    record = _read_record(state / EXECUTION_OWNER)
+    record, _ = _read_record(state / EXECUTION_OWNER)
     try:
         fd = os.open(path, os.O_RDONLY)
     except FileNotFoundError:
@@ -414,15 +510,21 @@ def execution_owner(state: Path | None = None) -> LockSnapshot:
 
 
 def _write_atomic(path: Path, value: dict[str, object]) -> None:
-    """Replace `path` with `value` so a reader sees the old record or the new, never a mix."""
-    temporary = path.with_name(f".{path.name}.{os.getpid()}")
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    """Replace `path` with `value` so a reader sees the old record or the new, never a mix.
+
+    Each write has its own temporary file, so writes that overlap never share one.
+    """
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}")
     try:
-        os.write(fd, (json.dumps(value, indent=2) + "\n").encode())
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(temporary, path)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write((json.dumps(value, indent=2) + "\n").encode())
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
     directory = os.open(path.parent, os.O_RDONLY)
     try:
         os.fsync(directory)
@@ -436,7 +538,16 @@ class ExecutionLock:
 
     state: Path
     fd: int
-    record: dict[str, object]
+    record: dict[str, Any]
+    # Set once this owner records work it must clean up, or knows of cleanup it could not
+    # verify. Until a clean exit clears it, its release stays unrecorded, so the next owner
+    # recovers its root.
+    dirty: bool = False
+    # Set once a cleanup of something this owner started failed. Unlike `dirty`, a clean exit
+    # never clears it, and the record names each failure (`note_leftover`).
+    leftover: bool = False
+    # Worker threads update the record too; each change reads and writes it under this lock.
+    _updating: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def assert_owned(self) -> None:
         """Raise ExecutionLost unless the lock path still leads to the inode this process holds
@@ -448,15 +559,48 @@ class ExecutionLock:
             current = None
         if current is None or (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
             raise ExecutionLost(f"the host execution lock in {self.state} was replaced")
-        if _read_record(self.state / EXECUTION_OWNER) != self.record:
+        if _read_record(self.state / EXECUTION_OWNER)[0] != self.record:
             raise ExecutionLost(f"another owner record replaced this process's in {self.state}")
 
     def publish(self, state: str) -> None:
         """Atomically replace the owner record with this one in `state`."""
         if state not in OWNER_STATES:
             raise ValueError(f"unknown owner state {state}")
-        self.record = {**self.record, "state": state}
-        _write_atomic(self.state / EXECUTION_OWNER, self.record)
+        self._update(lambda record: {**record, "state": state})
+
+    def settle(self, pending: list[dict[str, Any]]) -> None:
+        """Replace the obligations this owner carries; the only write recovery makes."""
+        self._update(lambda record: {**record, "pending": pending})
+
+    def note_runtime(self, runtime: dict[str, object]) -> None:
+        """Record a Docker runtime before any container starts under it. If the record cannot be
+        written, this raises and nothing may start."""
+        docker = {key: runtime[key] for key in ("docker_cli", "docker_engine") if key in runtime}
+        self.dirty = True
+        self._update(
+            lambda record: record
+            if docker in record["runtimes"]
+            else {**record, "runtimes": [*record["runtimes"], docker]}
+        )
+
+    def note_leftover(self, reason: str) -> None:
+        """Keep this owner unreleased, and record why a cleanup failed so the next owner's error
+        can say so. The record is best-effort: an unreleased owner needs repair anyway."""
+        self.leftover = True
+        failure = {"reason": reason, "at": datetime.now(UTC).isoformat()}
+        try:
+            self._update(
+                lambda record: {**record, "leftovers": [*record.get("leftovers", []), failure]}
+            )
+        except OSError:
+            pass  # The in-memory flag alone keeps the release unrecorded.
+
+    def _update(self, change: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
+        # Adopt the record only once it is on disk, so a failed write never reaches it later.
+        with self._updating:
+            record = change(self.record)
+            _write_atomic(self.state / EXECUTION_OWNER, record)
+            self.record = record
 
 
 # The lock this process holds now, so recovery deep in a run can require it.
@@ -468,13 +612,79 @@ def held_execution() -> ExecutionLock | None:
     return _execution
 
 
+def note_work() -> None:
+    """Mark that the owner is about to start something it must clean up, such as a recorded
+    call. Without the host lock there is nothing to mark."""
+    if _execution is not None:
+        _execution.dirty = True
+
+
+@contextmanager
+def external_work() -> Iterator[None]:
+    """Hold the owner unclean while the block starts external work, such as image builds and
+    probe containers. A block left by an exception may leave that work behind; one that returns
+    has finished it, so the owner is then as clean as before."""
+    lock = _execution
+    if lock is None:
+        yield
+        return
+    before, lock.dirty = lock.dirty, True
+    yield
+    lock.dirty = before
+
+
+def started_at(pid: int) -> str | None:
+    """The start time of `pid`, or None once it has exited, as `child_identity` records it."""
+    try:
+        return process_start(pid)
+    except ProcessLookupError:
+        return None
+
+
+def note_leftover(reason: str) -> None:
+    """Record that cleanup of something the owner started failed, as `reason` says, so its
+    release stays unrecorded and the next owner cannot clear it by any check. Without the host
+    lock there is nothing to record."""
+    if _execution is not None:
+        _execution.note_leftover(reason)
+
+
+def note_runtime(runtime: dict[str, object]) -> None:
+    """Record the Docker runtime containers are about to start under; without the host lock
+    there is no owner record, and nothing to record."""
+    if _execution is not None:
+        _execution.note_runtime(runtime)
+
+
+def _carried(state: Path) -> list[dict[str, Any]]:
+    """The obligations the last owner left: those it carried, and itself unless it recorded a
+    clean release (see _obligations). Whatever part of the record cannot be read or fails
+    validation adds one more obligation, a fence whose root is the state directory. Every
+    obligation that validates on its own is kept with its own root and checks, so repairing
+    the fence never clears them."""
+    value, problem = _load_record(state / EXECUTION_OWNER)
+    if value is _MISSING:
+        return []
+    kept, problems = ([], [problem]) if problem else _obligations(value)
+    if problems:
+        # Named by when it was found, so confirming it never covers a later unreadable record.
+        found = datetime.now(UTC).isoformat()
+        kept.append(
+            {"kind": "unknown", "root": str(state), "pid": None, "acquired_at": found,
+             "problem": "; ".join(problems)}
+        )
+    return kept
+
+
 @contextmanager
 def hold_execution(owner: ExecutionOwner, *, state: Path | None = None) -> Iterator[ExecutionLock]:
     """Own this account's host execution lock while the block runs, or raise ExecutionBusy.
 
     The lock file is never unlinked or replaced: its inode is the lock. The flock ends with the
     process, even on SIGKILL, and is never inherited by a child. The owner record is published
-    before the block starts any work.
+    before the block starts any work, and carries every obligation the last owner left, so that
+    write either fences them again or fails with nothing started. Leaving the block records a
+    clean release, unless the owner knows of unverified cleanup.
     """
     global _execution
     if _execution is not None:
@@ -487,7 +697,7 @@ def hold_execution(owner: ExecutionOwner, *, state: Path | None = None) -> Itera
             state,
             fd,
             {
-                "schema": 1,
+                "schema": 2,
                 "pid": os.getpid(),
                 "start_time": process_start(os.getpid()),
                 "boot_id": boot_id(),
@@ -499,6 +709,9 @@ def hold_execution(owner: ExecutionOwner, *, state: Path | None = None) -> Itera
                 "version": execution_version(),
                 "state": "acquiring",
                 "acquired_at": datetime.now(UTC).isoformat(),
+                "runtimes": [],
+                "leftovers": [],
+                "pending": _carried(state),
             },
         )
         lock.publish("acquiring")
@@ -507,5 +720,12 @@ def hold_execution(owner: ExecutionOwner, *, state: Path | None = None) -> Itera
             yield lock
         finally:
             _execution = None
+            if not lock.dirty and not lock.leftover:
+                try:
+                    lock.publish("released")
+                except OSError:
+                    # The record stays unreleased, so the next owner recovers this root: safe,
+                    # and an exception already leaving the block is not hidden.
+                    pass
     finally:
         os.close(fd)

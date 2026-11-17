@@ -43,8 +43,9 @@ from pluginbench.native_treatments import NativeCapabilities, DELIVERY_POLICY, a
 from pluginbench.claude_launch import refuse_unenforced_limits
 from pluginbench import claude_launch, claude_treatments
 from pluginbench.baselines import BaselineCache
-from pluginbench import ledger as invocation_ledger
+from pluginbench import control_store, ledger as invocation_ledger
 from pluginbench.ledger import LEDGER_NAME, Ledger
+from pluginbench import run_lock
 from pluginbench.run_lock import RunMoved
 from pluginbench.parallel import run_jobs, validate_jobs
 from pluginbench.assessment import build_assessment, write_assessment
@@ -1297,11 +1298,19 @@ def resume_study(
         history=invocation_history(root),
     )
     try:
+        # An invocation still open, a cached attempt's regrade included, was cut off by a crash.
+        # Nothing it started may still run when its saved output is accepted or its row closed.
+        cleaned = control_store.verify_crashed(
+            ledger,
+            path,
+            ("coding", "grading"),
+            runtime=partial(prepared_runtime, frozen),
+            progress=progress,
+        )
         plan, manifest, states = _reconcile(root, run, ledger)
-        # After `_reconcile`, which accepts the output of any attempt with a record receipt:
-        # an invocation still open, a cached attempt's regrade included, was cut off by a crash.
+        # After `_reconcile`, which accepts the output of any attempt with a record receipt.
         for stage in ("coding", "grading"):
-            ledger.resolve_crashed(stage)
+            ledger.resolve_crashed(stage, cleaned=cleaned)
         exhausted = _exhausted(ledger, plan, states)
         if before_coding is not None and any(
             states[entry["id"]] != "complete"
@@ -1378,6 +1387,15 @@ def invocation_history(root: Path) -> list[invocation_ledger.HistoryRow]:
 def is_graded_run(plan: dict[str, Any]) -> bool:
     """Whether a run's plan was coded under the current grade contract, not a legacy one."""
     return plan.get("grade_contract") == grade.GRADE_CONTRACT
+
+
+def prepared_runtime(frozen: ResolvedStudy) -> dict[str, object]:
+    """The Docker runtime the run was prepared with, which its trials ran under unless a
+    resume moved them to another engine."""
+    runtime = native_identity(frozen.tasks[0]).get("isolation")
+    if not isinstance(runtime, dict):
+        raise ValueError(f"task {frozen.tasks[0].task_id} has no saved runtime")
+    return runtime
 
 
 def _assert_task_runtimes(frozen: ResolvedStudy, current: dict[str, object]) -> None:
@@ -1585,6 +1603,8 @@ def _run_attempts(
                 )
             )
             _assert_task_runtimes(frozen, expected_runtime)
+            # Before any trial starts: recovery stops its containers through this daemon.
+            run_lock.note_runtime(expected_runtime)
             if resumed:
                 trial_containers.stop_left_running(
                     root, expected_runtime=expected_runtime, progress=progress

@@ -388,3 +388,80 @@ def test_an_inherited_lock_descriptor_keeps_the_host_held_by_an_unknown_owner(
         time.sleep(0.02)
     with run_lock.hold_execution(_owner("run", tmp_path / "other"), state=state):
         pass
+
+
+def _owner_record(state: Path) -> dict[str, Any]:
+    value: dict[str, Any] = json.loads((state / run_lock.EXECUTION_OWNER).read_text())
+    return value
+
+
+def test_the_owner_record_is_released_only_by_a_clean_exit_and_carries_what_was_not(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    with run_lock.hold_execution(_owner("review", tmp_path / "a"), state=state):
+        pass
+    assert _owner_record(state)["state"] == "released"
+    with run_lock.hold_execution(_owner("review", tmp_path / "b"), state=state) as lock:
+        assert lock.record["pending"] == []  # A clean release leaves nothing to carry.
+        lock.dirty = True
+    assert _owner_record(state)["state"] == "acquiring"  # As the dirty owner last wrote it.
+    # The next owner carries the unreleased one in the record it claims the lock with, and keeps
+    # carrying it while nobody clears it.
+    for root in ("c", "d"):
+        with run_lock.hold_execution(_owner("measure", tmp_path / root), state=state) as lock:
+            [obligation] = lock.record["pending"]
+            assert obligation["root"] == str(tmp_path / "b") and "pending" not in obligation
+            assert _owner_record(state)["pending"] == [obligation]
+
+
+@pytest.mark.parametrize("previous", ["schema 1", "unreadable"])
+def test_a_record_from_before_releases_or_an_unreadable_one_is_an_obligation(
+    tmp_path: Path, previous: str
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    record = {"schema": 1, "pid": 7, "acquired_at": "earlier", "kind": "run", "root": str(tmp_path / "old")}
+    (state / run_lock.EXECUTION_OWNER).write_text(
+        json.dumps(record) if previous == "schema 1" else "{not json"
+    )
+    with run_lock.hold_execution(_owner("review", tmp_path / "new"), state=state) as lock:
+        [obligation] = lock.record["pending"]
+    expected = tmp_path / "old" if previous == "schema 1" else state
+    assert obligation["root"] == str(expected)
+
+
+@pytest.mark.parametrize("pending", [None, False, "bad", [None]])
+def test_malformed_schema_1_obligations_become_the_repairable_fence(
+    tmp_path: Path, pending: Any
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    record = {"schema": 1, "pid": 7, "acquired_at": "earlier", "kind": "run", "pending": pending}
+    (state / run_lock.EXECUTION_OWNER).write_text(
+        json.dumps({**record, "root": str(tmp_path / "old")})
+    )
+    with run_lock.hold_execution(_owner("review", tmp_path / "new"), state=state) as lock:
+        roots = sorted(item["root"] for item in lock.record["pending"])
+    # The legacy owner keeps its own root; its malformed obligations are one fence on the
+    # state directory.
+    assert roots == sorted([str(tmp_path / "old"), str(state)])
+
+
+def test_a_failed_record_write_is_never_adopted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    with run_lock.hold_execution(_owner("run", tmp_path / "a"), state=state) as lock:
+        write = run_lock._write_atomic
+
+        def unwritable(path: Path, value: Any) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(run_lock, "_write_atomic", unwritable)
+        with pytest.raises(OSError, match="disk full"):
+            lock.settle([])
+        with pytest.raises(OSError, match="disk full"):
+            run_lock.note_runtime({"docker_engine": {"id": "d"}})
+        assert lock.record["runtimes"] == [] and lock.record == _owner_record(state)
+        monkeypatch.setattr(run_lock, "_write_atomic", write)

@@ -306,6 +306,7 @@ def test_a_session_with_no_model_turn_is_never_graded(
     assert not list(root.glob("records/*.json"))  # Nothing complete, so nothing to grade.
 
 
+@pytest.mark.usefixtures("host_execution")
 @pytest.mark.parametrize(
     ("change", "reason"),
     [

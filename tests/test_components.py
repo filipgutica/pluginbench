@@ -22,7 +22,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # The optional artifact destination is judge-only; coding launch behavior stays v1.
             # The optional spawn callback reports the reviewer's PID to the invocation ledger;
             # no launch changes.
-            "codex.py": "b1cbb78fe3fdb2019bedd1dadc2c1c24f029ac63810106c4ea77c93ed27af796",
+            # The reviewer's failed cleanup is told to the host lock owner; launches are
+            # unchanged.
+            "codex.py": "9017df04931b2817beeb281f6153d3820d3461e3fa5ed17563fdd274ef390ff6",
             # The Claude launch contract; tests/test_codex_identity.py proves Codex launches equal.
             # Measurement and regrade skip launch-only runtime fields; coding checks are unchanged.
             # Audited command hooks keep native usage; with no audited_hooks every launch is
@@ -31,9 +33,14 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # payload bytes and bindings; coding launch behavior stays v1.
             # The optional spawn callback only reports the worker's PID to the invocation
             # ledger; what is launched, and how, is unchanged, so this stays v1.
-            "harbor_backend.py": "541feaf8625fbe434099aef3e08637498969a6115345f09f06611e4a64307da4",
-            # The same spawn callback; launches are unchanged.
-            "processes.py": "eb63b5afabfa461b6a5b394388c21999f8f6dfb96b34b86db9d32318a738fc58",
+            # The daemon check takes an optional timeout, which only cleanup after a crash
+            # passes; launches are unchanged. A failed trial cleanup now also tells the host
+            # lock owner, which records it for the next owner to check.
+            "harbor_backend.py": "f1ae45d2838e26c4bd13fc6d0dab65a4af0d7a0eaf0b894952da94a14e4f2b40",
+            # The same spawn callback; launches are unchanged. A failed process-group cleanup
+            # or output drain now also tells the host lock owner, which records it for the next
+            # owner to check. Launches are unchanged.
+            "processes.py": "a86b3c57bd280f01d5f0c9dbc0676186d9c0e1d2bc07e2e6aa2cd2564291ea66",
             # Claude admission dispatch, and the Codex config's V2 spawn-override hide. The
             # vanilla cache refuses a cohort saved without the hide by its config, so this stays v1.
             "native_treatments.py": "3c9a617c292e0fbc93bc07b46e012ab79bd5589efc6a3e9267e4652c71ba89b3",

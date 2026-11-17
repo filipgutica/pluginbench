@@ -60,6 +60,7 @@ only-include = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = ["real_guidance_check: run codex.reject_guidance unbounded, as production does"]
 
 [tool.ruff]
 target-version = "py312"

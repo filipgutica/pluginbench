@@ -31,6 +31,9 @@ from pluginbench import codex
 from test_codex import _OUTAGE, outage_trace, stream
 from test_provider_stops import CODEX_LIMITED_STDOUT, codex_rollout
 
+# Every resume here recovers what a killed run left, which needs the host execution lock.
+pytestmark = pytest.mark.usefixtures("host_execution")
+
 _REAL_RUNNING = trial_containers.running
 _PATH = os.pathsep.join([str(Path(pluginbench.__file__).parents[1]), str(Path(__file__).parent)])
 

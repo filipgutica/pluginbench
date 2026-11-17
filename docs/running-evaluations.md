@@ -548,6 +548,28 @@ Coding attempts, measurement inputs, and reviews run concurrently within their p
 
 On interruption or fatal failure, new jobs stop. Active jobs finish or time out; their receipts remain, and an attempt that finishes while the run drains is kept as complete.
 
+Only one PluginBench command executes on a host at a time. `run`, `check`, `review`, `measure`, and `judge run` share one execution lock for your user account, whatever run they target. While one runs, another fails at once and names the run and process that hold the host.
+
+A command that does not finish cleanly fences the host. A crash or a kill always does. Ctrl-C or an error does once the command has started building or probing tasks, recorded a model call, or recorded the Docker runtime its containers use. So does a failed cleanup of a call's processes or containers, even if the command then finishes.
+
+Until PluginBench runs each command in its own systemd scope and labels every container it starts, it cannot prove that everything a fenced command started has stopped: a process may have left its call's process group, and measurement and regrade containers carry no label a check can find. So no check clears a fence on its own. The next execution command, whatever run it targets, refuses to start with "... ended without a clean release ...", and names `pluginbench repair --confirm-stopped ROOT`. Check by hand that nothing the command started still runs, then run that command with the root exactly as the error names it.
+
+If the host's owner record itself is unreadable or invalid, its release cannot be trusted. The error then names the PluginBench state directory as the root: check that no PluginBench command, process or container still runs, and repair that directory. Any obligation in the record that is still valid stays, with its own root and checks, and needs its own repair.
+
+One case the interim rule cannot see: a process that a call started, which left its process group with `setsid`, can outlive a command that finished normally and released the host. Nothing finds it until PluginBench runs each command in its own systemd scope.
+
+The checks still run, as a diagnosis. Each tells you what it can see:
+
+- every process in the process group of each call that was still open, or that the command ended itself, since a call can end while its cleanup failed;
+- the run's trial containers, for each Docker daemon the command recorded, each checked on its own. Any it finds are stopped, and two later checks at least a second apart must find none. If the run's frozen suite is gone, its containers cannot be found, so they count as unknown;
+- the reason any cleanup failed, when it could be saved.
+
+The whole check has 120 seconds, and each Docker command gets only what is left of that time. Containers are checked only once every process is known to be gone, because a live process could still start one. A resume runs the same checks on its own run before it accepts saved output or marks a call unresolved.
+
+If a check finds something still running, the command refuses to start and names it. It gives the command to stop it only while the call's recorded leader process still runs; otherwise, check that the processes belong to that call before you stop them. Repair refuses while any check finds something running.
+
+Repair runs every check again first. It confirms only what still cannot be checked, never something it finds running, and it prints and records each confirmation with its time.
+
 A Codex session that fails before its first model turn is a fatal failure, not an outcome. This is a `turn.failed` event with no usage, commands, or agent messages, as when a network or backend outage cuts the container off from Codex. The run stops after the first one with an error that names the attempt and Codex's message. The attempt stays `interrupted` and never enters the vanilla cache. Resume once Codex is reachable: the attempt is discarded and its slot is coded again. Timeouts, and failures after the agent has used tokens, run a command, or sent a message, stay scored.
 
 A session that stops at its provider or account is not an outcome either, at any point in the session. The run stops after the first one with an error that names the attempt and the cause:

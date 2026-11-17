@@ -14,13 +14,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from pluginbench.run_lock import process_start
+from pluginbench.run_lock import boot_id, note_work, pid_namespace, process_start
 
 # Version 2 adds `invocations` and `budget`; a writable open migrates version 1 in place.
 SCHEMA_VERSION = 2
@@ -156,7 +156,8 @@ def default_ceiling(paid_slots: int) -> int:
 
 
 def child_identity(pid: int) -> dict[str, object]:
-    """A spawned child's PID, kernel start time and the process group it leads.
+    """A spawned child's PID, kernel start time and the process group it leads, with the boot
+    and PID namespace they are valid in, so recovery can find what is left of it.
 
     `processes.run_command` starts each child in a new session, so its group ID is its PID.
     A child that already exited has no start time left to read.
@@ -165,7 +166,13 @@ def child_identity(pid: int) -> dict[str, object]:
         start: str | None = process_start(pid)
     except ProcessLookupError:
         start = None
-    return {"pid": pid, "start_time": start, "process_group": pid}
+    return {
+        "pid": pid,
+        "start_time": start,
+        "process_group": pid,
+        "boot_id": boot_id(),
+        "pid_namespace": pid_namespace(),
+    }
 
 
 def outcome(error: BaseException, *, spawned: bool) -> tuple[str, str | None]:
@@ -458,7 +465,7 @@ class Ledger:
                     f"the run reached its ceiling of {self._ceiling()} paid invocations, so no "
                     "further model call starts"
                 )
-            return _insert(
+            invocation = _insert(
                 self._db,
                 slot=slot,
                 stage=stage,
@@ -466,6 +473,9 @@ class Ledger:
                 state="intent",
                 inputs=inputs,
             )
+        # Something may start from here, so only a clean exit releases the host lock.
+        note_work()
+        return invocation
 
     def _ceiling(self) -> int:
         ceiling: int = self._db.execute("SELECT paid_call_ceiling FROM budget").fetchone()[0]
@@ -503,13 +513,28 @@ class Ledger:
         if changed != 1:
             raise ValueError(f"ledger cannot end invocation {invocation} as {state}")
 
-    def resolve_crashed(self, stage: str) -> int:
+    def resolve_crashed(self, stage: str, *, cleaned: Collection[str]) -> int:
         """Mark the `stage` invocations a dead process left open `unresolved`; return how many.
 
-        Call it only while no live process of this run can own that stage. Their usage is
-        unknown, and each still counts toward its slot's cap.
+        `cleaned` holds the invocations whose cleanup was verified under the host execution lock
+        (`control_store.verify_crashed`); an open row outside it is refused and stays open. Their
+        usage is unknown, and each still counts toward its slot's cap.
         """
         with self._db:
+            self._db.execute("BEGIN IMMEDIATE")
+            unverified = sorted(
+                row[0]
+                for row in self._db.execute(
+                    f"SELECT id FROM invocations WHERE stage = ? AND state IN {OPEN_STATES}",
+                    (stage,),
+                )
+                if row[0] not in cleaned
+            )
+            if unverified:
+                raise ValueError(
+                    f"cleanup of {stage} invocations {', '.join(unverified)} is not verified, "
+                    "so none is marked unresolved"
+                )
             return self._db.execute(
                 "UPDATE invocations SET state = 'unresolved', updated_at = ?"
                 f" WHERE stage = ? AND state IN {OPEN_STATES}",
@@ -520,7 +545,10 @@ class Ledger:
         """Every invocation by slot, stage and order; none in a version 1 ledger."""
         if self._version == 1:
             return []
-        keys = ("id", "slot", "stage", "n", "attempt_id", "state", "scope", "container_label")
+        keys = (
+            "id", "slot", "stage", "n", "attempt_id", "state", "scope", "container_label",
+            "updated_at",
+        )
         rows = self._db.execute(
             f"SELECT {', '.join(keys)}, identity, error FROM invocations ORDER BY slot, stage, n"
         ).fetchall()

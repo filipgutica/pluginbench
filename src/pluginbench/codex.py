@@ -13,7 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from pluginbench import isolation
+from pluginbench import isolation, run_lock
 from pluginbench.codex_events import admit_version as admit_version
 from pluginbench.codex_events import observed_cli_version as observed_cli_version
 from pluginbench.codex_events import parse_events as parse_events
@@ -406,6 +406,10 @@ def invoke(
                 terminate_process_group(proc)
         except (OSError, subprocess.TimeoutExpired) as error:
             cleanup_error = error
+            run_lock.note_leftover(
+                f"the process group of an earlier review call could not be stopped ({error}), "
+                "so it may still run"
+            )
             if failure is not None:
                 failure.add_note(f"Process-group cleanup failed: {error}")
         try:
