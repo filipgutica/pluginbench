@@ -681,7 +681,7 @@ def _implementation() -> dict[str, object]:
     The PluginBench release, each observer's version and source bytes, the site finders among
     them, and the Python whose `ast` finds Python mutation sites.
     """
-    observers = ("analysis_observer", "coverage_observer", "mutation_observer")
+    observers = ("analysis_observer", "coverage_observer", "mutation_observer", "measurement_tools")
     return {
         "pluginbench": pluginbench.__version__,
         "observers": {

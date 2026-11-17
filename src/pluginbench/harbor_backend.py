@@ -43,6 +43,7 @@ from pluginbench.code_diff import _is_source_path, _is_test_path
 from pluginbench.assessment_metrics import inspect_snapshot
 from pluginbench.assessment_metrics import EXCLUDED_NAMES
 from pluginbench.processes import run_command
+from pluginbench.measurement_tools import CONTAINER_ROOT, ProvisionedTool, read_tool, staged_tool
 
 HARBOR_VERSION = "0.24.0"
 PROTOCOL = "harbor-docker-v1"
@@ -2909,6 +2910,7 @@ def run_native_command(
     command: list[str],
     report_path: str,
     timeout: int,
+    provisioned_tool: ProvisionedTool | None = None,
 ) -> dict[str, object]:
     """Run explicitly configured measurement commands in a fresh frozen image."""
     relative = Path(report_path)
@@ -2923,6 +2925,12 @@ def run_native_command(
         raise ValueError(
             "Native measurement requires argv, a safe relative report path and a positive timeout"
         )
+    provisioned_tool = read_tool(provisioned_tool)
+    if provisioned_tool is not None:
+        workdir_path = PurePosixPath(str(task_identity["workdir"]))
+        tool_path = PurePosixPath(CONTAINER_ROOT)
+        if workdir_path.is_relative_to(tool_path) or tool_path.is_relative_to(workdir_path):
+            raise ValueError("provisioned tool path must be outside the task workdir")
     original = inspect_snapshot(snapshot)
     original_inventory = _native_asset_inventory(snapshot)
     if relative.as_posix() in original_inventory or _is_source_path(relative.as_posix()):
@@ -2983,6 +2991,17 @@ def run_native_command(
             "sleep infinity",
         ).strip()
         docker("start", container_id)
+        if provisioned_tool is not None:
+            # The tool never enters the task snapshot, its Git tree, or its dependency paths.
+            with staged_tool(provisioned_tool) as staged:
+                docker(
+                    "exec", "--user", "0", container_id, "bash", "-c",
+                    "set -eu; test ! -L /opt; mkdir -p /opt; "
+                    "test ! -e /opt/pluginbench-tools; test ! -L /opt/pluginbench-tools; "
+                    "mkdir -m 755 /opt/pluginbench-tools",
+                )
+                docker("cp", str(staged) + "/.", container_id + ":" + CONTAINER_ROOT + "/", limit=300)
+            receipt["provisioned_tool"] = provisioned_tool.model_dump(mode="json")
         excluded = " -o ".join("-name " + shlex.quote(name) for name in sorted(EXCLUDED_NAMES))
         docker(
             "exec",

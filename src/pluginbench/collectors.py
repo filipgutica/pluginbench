@@ -385,6 +385,12 @@ def _native_coverage(
     for suffix, label in sidecars.items():
         if (root / (collector.report_path + suffix)).exists():
             raise ValueError(f"{label} must not exist in the frozen input snapshot")
+    from pluginbench.measurement_tools import read_tool
+
+    coverage = config.get("coverage", {})
+    if not isinstance(coverage, dict):
+        raise ValueError("native coverage settings must be an object")
+    tool = read_tool(coverage.get("provisioned_tool"))
     execution = run_native_command(
         snapshot=root,
         task_identity=identity,
@@ -392,6 +398,7 @@ def _native_coverage(
         command=collector.command,
         report_path=collector.report_path,
         timeout=collector.timeout_seconds,
+        **({"provisioned_tool": tool} if tool is not None else {}),
     )
     if execution.get("timed_out"):
         raise CollectorUnavailable("coverage command failed or timed out; see execution.json")

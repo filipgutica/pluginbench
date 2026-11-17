@@ -3,7 +3,7 @@
 These files give JavaScript tasks the per-test sidecar that
 [redundant added tests](../running-evaluations.md) need. A profile runs inside
 the task image without network access, so the profile command writes each
-helper script inline. The YAML files are `coverage_profiles` entries to copy
+helper script inline. Profiles can also request a [vendored coverage tool](#vendored-coverage-tools). The YAML files are `coverage_profiles` entries to copy
 into an evaluation config. A test checks that each embedded copy matches its
 script.
 
@@ -134,3 +134,56 @@ Limits beyond the Mocha ones:
 - Typecheck-only tests have no runtime sample and are not recorded.
 - Seeding changes `Math.random` for the whole suite, including tests that a
   submission adds.
+
+
+## Vendored coverage tools
+
+A coverage profile can supply a pinned tool when the task image lacks one.
+Declare `provisioned_tool` beside the existing command and version:
+
+```yaml
+measurement_settings:
+  coverage:
+    provisioned_tool: {name: coverage.py, version: 7.6.12}
+    tool_version: 7.6.12
+    format: coverage-py-json
+    report_path: coverage/coverage.json
+    command:
+      - bash
+      - -c
+      - |
+        export PYTHONPATH=/opt/pluginbench-tools/coverage.py${PYTHONPATH:+:$PYTHONPATH}
+        export COVERAGE_FILE=/app/coverage/.coverage
+        mkdir -p coverage
+        python -m coverage run --source=. -m pytest
+        status=$?
+        python -m coverage json -o coverage/coverage.json || exit $?
+        exit "$status"
+```
+
+Use the task image's Python executable. The portable wheel requires Python 3.9+
+and uses the Python tracer. `--source` must cover the declared source scope,
+including unloaded files. Keep task-specific exclusions in the profile.
+
+For c8, use `provisioned_tool: {name: c8, version: 10.1.3}` and
+`tool_version: 10.1.3`. The image must supply Node 18+. Invoke
+`node /opt/pluginbench-tools/c8/node_modules/c8/bin/c8.js`, followed by the
+existing c8 arguments and test command. Use `--all` and the appropriate `--src`
+for unloaded files. Build output still needs source maps for TypeScript coverage.
+
+PluginBench verifies the vendored artifact before runtime checks. Unknown names,
+unsupported versions, missing files, changed hashes, and incompatible provisioner
+versions refuse. Frozen profiles record the name, version, artifact SHA-256, and
+provisioner component version, so each change produces a measurement revision.
+The same tool is supplied when mutation reuses the coverage command.
+
+The selected distribution is copied into `/opt/pluginbench-tools/<name>` in each
+fresh container. Provisioning leaves `/app`, task dependencies, and Git state
+untouched. It refuses a workdir overlapping the tool directory or a symlink at
+`/opt` or the tool root. Commands choose when and how to invoke the tool.
+The container still runs without network access. Existing profiles without
+`provisioned_tool` retain their serialized shape and behavior.
+
+Only the two releases above are supplied. This does not provision runtimes,
+install task dependencies, qualify Route B tasks, or configure per-test coverage.
+See [artifact provenance and licences](../../src/pluginbench/coverage_tools/README.md).

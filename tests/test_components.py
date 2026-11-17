@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from pluginbench import collectors, components, evaluation, harbor_backend, isolation
-from pluginbench import language_analysis, mutation
+from pluginbench import language_analysis, mutation, measurement_tools
 
 PINNED: dict[str, tuple[int, dict[str, str]]] = {
     "launcher": (
@@ -44,7 +44,8 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # exactly as before, so this stays v1.
             # Containers, builds and trials now start only inside an operation, on the daemon
             # it recorded; a launch inside one is unchanged, so this stays v1.
-            "harbor_backend.py": "a862f4d6d737c2873175ba50befb6260f291933db0001ea9f443acc7271a01da",
+            # Optional measurement provisioning leaves coding launches unchanged (v1).
+            "harbor_backend.py": "b4f22cd0f4ac1209ea3d0eb2d3be37af3695334527de4ad2f1bbce1a42cea24e",
             # The same spawn callback; launches are unchanged. A failed process-group cleanup
             # or output drain now also tells the host lock owner, which records it for the next
             # owner to check. Launches are unchanged.
@@ -119,7 +120,8 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         1,
         {
             # Only report derivation changes; collection, sites, sampling and outcomes stay v1.
-            "mutation.py": "539472b97afb941b43adca1e86ea472477600cf9c8633cf971a5a36c7d7f5efb",
+            # Optional provisioning runs previously unsupported profiles; existing runs stay v1.
+            "mutation.py": "b35b86956ba00270747534e00c1a401ed87c3567bb1201e2f1096a5a0ee5106b",
             "mutation_sites.mjs": (
                 "f7a602774f3e6f2415c1745127134862a9a6f42e8e9807b4c28368e7a3c27c88"
             ),
@@ -127,6 +129,10 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
                 "ee3f96b8d281dc135ccfe706aadc250444ff686af0acfc10339510504c8e6eca"
             ),
         },
+    ),
+    "measurement_tools": (
+        1,
+        {"measurement_tools.py": "cb7e61e24ee75cc9fd11a6b8a174b5a18d02a1527838418216d60c03dbb0e404"},
     ),
     "local_sandbox": (
         3,
@@ -156,6 +162,7 @@ def test_the_pinned_files_are_the_files_the_code_hashes() -> None:
         "coverage_observer": set(collectors.observer_identity()),
         "mutation_observer": set(mutation.observer_identity()),
         "local_sandbox": {Path(isolation.__file__).name},
+        "measurement_tools": {Path(measurement_tools.__file__).name},
     }
     assert {name: set(files) for name, files in components.FILES.items()} == hashed
     assert Path(harbor_backend.__file__).name in hashed["launcher"]
