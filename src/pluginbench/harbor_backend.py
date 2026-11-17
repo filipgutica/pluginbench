@@ -34,7 +34,8 @@ from uuid import uuid4
 
 from pydantic import TypeAdapter
 
-from pluginbench import codex, components, isolation, run_lock, submissions, native_treatments
+from pluginbench import codex, components, invocation_runtime, isolation, run_lock, submissions
+from pluginbench import native_treatments
 from pluginbench import claude, claude_launch, claude_treatments, saved_usage
 from pluginbench.treatments import Treatment
 from pluginbench.native_treatments import NativeCapabilities
@@ -46,6 +47,27 @@ from pluginbench.processes import run_command
 HARBOR_VERSION = "0.24.0"
 PROTOCOL = "harbor-docker-v1"
 _OWNER_LABEL = "org.pluginbench.trial"
+# Inside an operation `_docker` sends only the commands PluginBench itself issues. The
+# subcommand comes first, so no global option can pick another daemon, context or builder.
+# Commands without subcommands:
+_OPERATION_COMMANDS = {
+    "commit", "cp", "create", "exec", "info", "inspect", "logs", "ps", "pull", "rm", "start",
+    "stop", "tag", "wait",
+}
+# Commands with subcommands, and the subcommands PluginBench uses, which must come second:
+_OPERATION_SUBCOMMANDS = {"image": {"inspect", "ls", "rm"}, "network": {"ls", "rm"}}
+# Commands admitted only in one exact form:
+_OPERATION_EXACT = {"compose": ("compose", "version", "--short"), "context": ("context", "inspect")}
+# The one build PluginBench issues (`_build_native_image`), word by word; it runs in the
+# engine's built-in builder (`_pin_builder`).
+_NATIVE_BUILD: tuple[str | re.Pattern[str], ...] = (
+    "build", "--quiet", "--provenance=false", "--tag",
+    re.compile(r"pluginbench-native-build:[0-9a-f]{32}"), re.compile(r"/.*"),
+)
+# Environment variables that choose Docker's daemon, client config, builder or Compose project.
+DOCKER_CONTROL_PREFIXES = ("DOCKER_", "BUILDX_", "BUILDKIT_", "COMPOSE_")
+# The trial config key that carries the operation's invocation ID to the Harbor worker.
+_INVOCATION_KEY = "pluginbench_invocation"
 _BASE_TOOLS = "curl bash node npm"
 CLI_VERSION_PATTERN = r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?"
 _DOCKER_TIMEOUT = 60
@@ -121,6 +143,13 @@ def _docker(
         argv.extend(["--host", endpoint])
         env.pop("DOCKER_CONTEXT", None)
         env.pop("DOCKER_HOST", None)
+    # Inside an operation every container it creates carries its label, so recovery finds it
+    # by that label alone.
+    if (invocation := invocation_runtime.current()) is not None:
+        _admit_operation_command(arguments)
+        arguments = invocation_runtime.with_label(arguments, invocation)
+        if arguments[0] == "build":
+            _pin_builder(argv, env, timeout)
     command = [*argv, *arguments]
     try:
         result = run_command(command, cwd=Path.cwd(), env=env, timeout=timeout)
@@ -157,6 +186,58 @@ def _docker(
     if result.returncode:
         raise ValueError(f"docker {arguments[0]} failed: {result.stderr.strip()}")
     return result.stdout
+
+
+def _native_build(arguments: tuple[str, ...]) -> bool:
+    return len(arguments) == len(_NATIVE_BUILD) and all(
+        item == word if isinstance(word, str) else word.fullmatch(item) is not None
+        for item, word in zip(arguments, _NATIVE_BUILD, strict=True)
+    )
+
+
+def _admit_operation_command(arguments: tuple[str, ...]) -> None:
+    """Refuse, inside an operation, any Docker command PluginBench does not issue itself: one
+    that could reach another daemon or context, or build in a builder that starts containers
+    without the invocation label."""
+    first, second = (*arguments, "", "")[:2]
+    if first in _OPERATION_EXACT:
+        admitted = arguments == _OPERATION_EXACT[first]
+    elif first == "build":
+        admitted = _native_build(arguments)
+    elif first in _OPERATION_SUBCOMMANDS:
+        admitted = second in _OPERATION_SUBCOMMANDS[first]
+    else:
+        admitted = first in _OPERATION_COMMANDS
+    if not admitted:
+        raise ValueError(
+            f"an operation sends Docker only the commands PluginBench issues, not `docker "
+            f"{' '.join(arguments[:3])}`"
+        )
+
+
+def _pin_builder(argv: list[str], env: dict[str, str], timeout: int) -> None:
+    """Make a build run in the engine's own BuildKit, which starts no container.
+
+    The operator's environment or Docker config may select a buildx builder whose driver
+    starts BuildKit in a container of its own, which would carry no invocation label. So the
+    build uses the context's built-in builder, with BuildKit on, once it is proven to use the
+    `docker` driver. No builder is changed or removed.
+    """
+    env.update(BUILDX_BUILDER="default", DOCKER_BUILDKIT="1")
+    result = run_command(
+        [*argv, "buildx", "inspect"], cwd=Path.cwd(), env=env, timeout=min(timeout, _DOCKER_TIMEOUT)
+    )
+    drivers = [
+        line.split(":", 1)[1].strip()
+        for line in result.stdout.splitlines()
+        if line.startswith("Driver:")
+    ]
+    if result.returncode or drivers != ["docker"]:
+        found = ", ".join(drivers) or result.stderr.strip() or f"exit {result.returncode}"
+        raise ValueError(
+            "an operation builds only with the Docker engine's built-in builder (driver "
+            f"docker), which starts no container; the default builder reports: {found}"
+        )
 
 
 def _assert_daemon(expected_runtime: dict[str, object], *, timeout: int = _DOCKER_TIMEOUT) -> None:
@@ -633,10 +714,23 @@ def _cli_guard(harness: str, version: str) -> str:
 
 
 async def run_trial(config: dict[str, Any]) -> dict[str, Any]:
-    """Run one native trial, without queue retries or Harbor resume behavior."""
+    """Run one native trial, without queue retries or Harbor resume behavior.
+
+    Run by an operation, the trial's containers carry its invocation label (`harbor_labels`).
+    """
+    config = dict(config)
+    invocation = config.pop(_INVOCATION_KEY, None)
+    if invocation is None:
+        return await _run_trial(config)
+    from pluginbench import harbor_labels
+
+    with harbor_labels.labelled(str(invocation)):
+        return await _run_trial(config)
+
+
+async def _run_trial(config: dict[str, Any]) -> dict[str, Any]:
     # Harbor's wheel is untyped. Keep its dynamic API at this single boundary,
     # without making reporting import its execution dependencies.
-    config = dict(config)
     boundary = config.pop("pluginbench_boundary", None)
     agent = _object(config.get("agent"), "native agent configuration")
     separate_codex = agent.get("name") == "codex" and config.get("source_trial") is None
@@ -999,6 +1093,18 @@ def validate_native_task(task_dir: Path) -> dict[str, object]:
     definition = modes.resolve_verifier_environment_definition(config, paths)
     if definition is None:
         raise ValueError("Native separate verifier definition is missing")
+    # Harbor passes task variables to its Compose commands, where these choose the daemon,
+    # client config and builder.
+    controls = sorted(
+        key
+        for env in (config.environment.env, config.verifier.env, definition.config.env)
+        for key in env
+        if key.startswith(DOCKER_CONTROL_PREFIXES)
+    )
+    if controls:
+        raise ValueError(
+            f"Native task environments must not set Docker controls: {', '.join(controls)}"
+        )
     for directory, configuration in (
         (paths.environment_dir, config.environment),
         (definition.directory, definition.config),
@@ -1570,6 +1676,8 @@ def _native_process(
             artifacts / "docker-client.json",
             _private_docker_config(private=private, env=env, expected_runtime=expected),
         )
+        if (invocation := invocation_runtime.current()) is not None:
+            config = {**config, _INVOCATION_KEY: invocation}
         codex.write_json(private / "trial.json", config)
         result = run_command(
             [

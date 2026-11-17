@@ -36,7 +36,13 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # The daemon check takes an optional timeout, which only cleanup after a crash
             # passes; launches are unchanged. A failed trial cleanup now also tells the host
             # lock owner, which records it for the next owner to check.
-            "harbor_backend.py": "f1ae45d2838e26c4bd13fc6d0dab65a4af0d7a0eaf0b894952da94a14e4f2b40",
+            # Inside a scoped operation, its containers carry the invocation label, a build
+            # uses the engine's built-in builder, and only the Docker commands PluginBench
+            # issues run; none changes a launch, and outside an operation nothing changes.
+            # A native task that sets Docker controls (DOCKER_*, BUILDX_*, BUILDKIT_*,
+            # COMPOSE_*) in its environment is now refused; every task still admitted launches
+            # exactly as before, so this stays v1.
+            "harbor_backend.py": "24604934154d421b36b8abe2f9cb01e7907c2cb5235be9afbfd80cdd1c593406",
             # The same spawn callback; launches are unchanged. A failed process-group cleanup
             # or output drain now also tells the host lock owner, which records it for the next
             # owner to check. Launches are unchanged.
