@@ -152,12 +152,11 @@ measurement_settings:
       - bash
       - -c
       - |
-        export PYTHONPATH=/opt/pluginbench-tools/coverage.py${PYTHONPATH:+:$PYTHONPATH}
         export COVERAGE_FILE=/app/coverage/.coverage
         mkdir -p coverage
-        python -m coverage run --source=. -m pytest
+        python -I -S /opt/pluginbench-tools/coverage.py/launch-coverage.py run --source=. -m pytest
         status=$?
-        python -m coverage json -o coverage/coverage.json || exit $?
+        python -I -S /opt/pluginbench-tools/coverage.py/launch-coverage.py json -o coverage/coverage.json || exit $?
         exit "$status"
 ```
 
@@ -167,8 +166,9 @@ including unloaded files. Keep task-specific exclusions in the profile.
 
 For c8, use `provisioned_tool: {name: c8, version: 10.1.3}` and
 `tool_version: 10.1.3`. The image must supply Node 18+. Invoke
-`node /opt/pluginbench-tools/c8/node_modules/c8/bin/c8.js`, followed by the
-existing c8 arguments and test command. Use `--all` and the appropriate `--src`
+`env -u NODE_OPTIONS -u NODE_PATH -u EXPERIMENTAL_MONOCART node
+/opt/pluginbench-tools/c8/launch-c8.cjs [options] -- <test command>`.
+The backend also clears these environment variables before starting Node. Use `--all` and the appropriate `--src`
 for unloaded files. Build output still needs source maps for TypeScript coverage.
 
 PluginBench verifies the vendored artifact before runtime checks. Unknown names,
@@ -187,3 +187,33 @@ The container still runs without network access. Existing profiles without
 Only the two releases above are supplied. This does not provision runtimes,
 install task dependencies, qualify Route B tasks, or configure per-test coverage.
 See [artifact provenance and licences](../../src/pluginbench/coverage_tools/README.md).
+
+
+The Python launcher starts with `-I -S`, places the staged distribution first,
+and checks `coverage.__file__` and its package dependencies before enabling task
+imports. A finder also refuses coverage submodules or a loaded optional `tomli`
+dependency that resolve outside the staged directory. Standard-library modules
+come from the isolated task interpreter. After verification, the launcher enables
+the image's site packages and the task's directory and `PYTHONPATH` for the
+measured program. Use the launcher for both collection and JSON reporting;
+`python -m coverage` can execute a task-local `coverage.py` instead.
+
+The c8 launcher uses the staged `c8-config.json` and constructs its argument parser
+outside the task tree, so `.c8rc*`, `.nycrc*`, and task `package.json` configuration
+are ignored. The reporter is fixed to built-in `lcovonly`; other reporters,
+configuration overrides, and alternative reporter implementations refuse.
+Supported options are `--all`, `--src`, `--include`, `--exclude`, `--extension`,
+`--reports-dir`/`--report-dir`, `--temp-directory`, `--exclude-after-remap`, and
+`--exclude-node-modules`. Separate these from the test command with `--`.
+`--reporter=lcovonly` is accepted for compatibility.
+
+Provisioning runs the launcher's isolated verification mode and records its
+resolved module, dependency origins, and c8 config/reporter paths in
+`execution.json` under `provisioned_tool.runtime_origin`. Provisioner version 2
+refuses saved version 1 profiles. Prepare a new measurement revision with the
+launcher commands. Resume fingerprints include the pins of the distributions
+actually selected by the profile; an unused catalog entry does not affect them.
+
+The portable wheel omits the optional `tomli` package. On Python 3.9/3.10,
+use INI coverage configuration or `--rcfile=/dev/null`. The measured program can
+still import its own optional dependencies after tool verification.

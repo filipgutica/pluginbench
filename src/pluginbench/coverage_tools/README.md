@@ -28,3 +28,29 @@ archive metadata; verify its contents and update its SHA-256 deliberately.
 Changing a release or its dependency bundle changes the measurement profile's
 identity. Changes to the provisioning behavior follow the `measurement_tools`
 component version in `components.py`. Coding launch identity stays unchanged.
+
+
+## Runtime entry points
+
+`launch-coverage.py`, `launch-c8.cjs`, and `c8-config.json` are PluginBench code
+bound by the `measurement_tools` component version. They are staged beside the
+selected distribution. Use the documented launchers, rather than the distributions'
+raw entry points. Provisioner version 2 verifies runtime origins before task code
+and pins c8's config and reporter. The c8 process receives empty `NODE_OPTIONS`,
+`NODE_PATH`, and `EXPERIMENTAL_MONOCART` before Node starts.
+
+## eastasianwidth 0.2.0 notice
+
+The npm tarball omits its MIT notice. The bundle now includes the maintained
+`MIT-LICENSE.txt` and `LICENSE-NOTES.md` under `node_modules/eastasianwidth`.
+The adjacent `eastasianwidth-LICENSE` and `eastasianwidth-NOTICE` are exact copies,
+retrieved 2026-11-17 from the maintainer's repository:
+
+- [MIT notice](https://github.com/komagata/eastasianwidth/blob/master/MIT-LICENSE.txt), Git blob `d176e6e6f3c5918d4b1709e854b9149b06d84bea`.
+- [Licensing notes](https://github.com/komagata/eastasianwidth/blob/master/LICENSE-NOTES.md), Git blob `ad971a6f5a606838d9f1082452080acb0e6b4e73`.
+
+The notes identify 0.2.0's source commit as `b89f04d44dc786885615e94cd6e2ba1ef7866fa4`
+and explain how the maintained notice applies to that historical package.
+Package source and dependency locks are unchanged. The archive was repacked with
+sorted paths, mode 0644, zero timestamps, and gzip mtime 0. Its new SHA-256 creates
+a new artifact identity. Retain these two notices when rebuilding the bundle.

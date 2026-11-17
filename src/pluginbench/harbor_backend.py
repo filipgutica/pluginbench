@@ -2963,6 +2963,10 @@ def run_native_command(
         "cleanup": {"status": "incomplete"},
     }
     failure: BaseException | None = None
+    tool_env = (
+        ["--env", "NODE_OPTIONS=", "--env", "NODE_PATH=", "--env", "EXPERIMENTAL_MONOCART="]
+        if provisioned_tool is not None and provisioned_tool.name == "c8" else []
+    )
 
     def docker(*arguments: str, limit: int = _DOCKER_TIMEOUT) -> str:
         return _docker(*arguments, timeout=limit, expected_runtime=expected)
@@ -3001,7 +3005,19 @@ def run_native_command(
                     "mkdir -m 755 /opt/pluginbench-tools",
                 )
                 docker("cp", str(staged) + "/.", container_id + ":" + CONTAINER_ROOT + "/", limit=300)
-            receipt["provisioned_tool"] = provisioned_tool.model_dump(mode="json")
+            tool_root = CONTAINER_ROOT + "/" + provisioned_tool.name
+            verify = (
+                ["python", "-I", "-S", tool_root + "/launch-coverage.py"]
+                if provisioned_tool.name == "coverage.py"
+                else ["node", tool_root + "/launch-c8.cjs"]
+            )
+            origin = json.loads(docker(
+                "exec", *tool_env, "--workdir", tool_root, container_id,
+                *verify, "--pluginbench-verify",
+            ))
+            receipt["provisioned_tool"] = {
+                **provisioned_tool.model_dump(mode="json"), "runtime_origin": origin,
+            }
         excluded = " -o ".join("-name " + shlex.quote(name) for name in sorted(EXCLUDED_NAMES))
         docker(
             "exec",
@@ -3043,6 +3059,7 @@ def run_native_command(
                 "--host",
                 str(_native_object(expected["docker_engine"], "measurement engine")["endpoint"]),
                 "exec",
+                *tool_env,
                 "--workdir",
                 workdir,
                 container_id,

@@ -17,6 +17,10 @@ from pluginbench import components
 
 ARTIFACTS = Path(__file__).with_name("coverage_tools")
 CONTAINER_ROOT = "/opt/pluginbench-tools"
+SUPPORT_FILES = {
+    "coverage.py": ("launch-coverage.py",),
+    "c8": ("launch-c8.cjs", "c8-config.json"),
+}
 # c8 includes its complete production dependency tree, not just the npm package tarball.
 CATALOG = {
     ("coverage.py", "7.6.12"): (
@@ -25,7 +29,7 @@ CATALOG = {
     ),
     ("c8", "10.1.3"): (
         "c8-10.1.3.tar.gz",
-        "0a5a1754d8f1ce9f9a7b72d9bef328ab5aba560bbee4a0aac398606c77ffb27a",
+        "d374743193106494d1b05b0e13eff115c66575f0652a9a876faf02359a299c1a",
     ),
 }
 
@@ -67,6 +71,9 @@ def artifact_bytes(tool: ProvisionedTool) -> bytes:
         raise ValueError(f"missing artifact for provisioned tool {tool.name}: {filename}") from error
     if hashlib.sha256(content).hexdigest() != expected:
         raise ValueError(f"provisioned tool {tool.name} artifact SHA-256 mismatch")
+    for name in SUPPORT_FILES[tool.name]:
+        if not (ARTIFACTS / name).is_file():
+            raise ValueError(f"missing artifact for provisioned tool {tool.name}: {name}")
     return content
 
 
@@ -92,4 +99,6 @@ def staged_tool(tool: ProvisionedTool) -> Iterator[Path]:
         else:
             with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as archive:
                 archive.extractall(target, filter="data")
+        for name in SUPPORT_FILES[tool.name]:
+            (target / name).write_bytes((ARTIFACTS / name).read_bytes())
         yield root

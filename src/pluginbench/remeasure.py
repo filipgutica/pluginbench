@@ -10,7 +10,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from functools import partial
 from threading import Event
@@ -675,13 +675,33 @@ def _checked_input(
     return CollectedInput(repeats=repeats, outcomes=outcomes)
 
 
-def _implementation() -> dict[str, object]:
+def _implementation(
+    profiles: dict[str, list[Collector]] | None = None,
+    *,
+    carried_kinds: Collection[str] = (),
+) -> dict[str, object]:
     """What decides measured values besides the frozen profiles, which a resume must run again.
 
     The PluginBench release, each observer's version and source bytes, the site finders among
     them, and the Python whose `ast` finds Python mutation sites.
     """
-    observers = ("analysis_observer", "coverage_observer", "mutation_observer", "measurement_tools")
+    from pluginbench.measurement_tools import read_tool
+
+    # Catalog bytes describe every available tool. A revision binds only its selected
+    # distributions and provisioner version; changing an unused release is irrelevant.
+    tools: dict[str, dict[str, object]] = {}
+    for collectors in (profiles or {}).values():
+        for collector in collectors:
+            if collector.kind in carried_kinds or collector.kind not in {"coverage", "mutation"} or (
+                collector.kind == "coverage" and collector.report_format is None
+            ):
+                continue
+            config = _object(json.loads(collector.config.read_text()))
+            coverage = _object(config.get("coverage", {}))
+            tool = read_tool(coverage.get("provisioned_tool"))
+            if tool is not None:
+                tools[tool.name + "@" + tool.version] = tool.model_dump(mode="json")
+    observers = ("analysis_observer", "coverage_observer", "mutation_observer")
     return {
         "pluginbench": pluginbench.__version__,
         "observers": {
@@ -692,6 +712,7 @@ def _implementation() -> dict[str, object]:
             for name in observers
         },
         "python": platform.python_version(),
+        **({"measurement_tools": dict(sorted(tools.items()))} if tools else {}),
     }
 
 
@@ -750,7 +771,7 @@ def propose_remeasurement(
         "source_run": study._reference(root, root / "run.json"),
         "source_assessment": run["assessment_input"],
         "preserved": protected,
-        "implementation": _implementation(),
+        "implementation": _implementation(profiles, carried_kinds=carried_kinds),
     }
     try:
         previous = directory / "previous"
@@ -826,7 +847,10 @@ def resume_remeasurement(
             f"measurement revision {revision} did not stop while collecting, so it cannot "
             "resume; choose a new --revision name"
         )
-    if state.get("implementation") != _implementation():
+    frozen = load_profiles(study._bound_path(root, state["frozen_profiles"]))
+    if state.get("implementation") != _implementation(
+        frozen, carried_kinds=_carried_kinds(state)
+    ):
         raise ValueError(
             f"PluginBench or its observers changed since measurement revision {revision} "
             "started, so a resume would mix two implementations; choose a new --revision name"
@@ -845,7 +869,6 @@ def resume_remeasurement(
             f"native evidence or frozen profiles changed since measurement revision {revision} "
             "started; choose a new --revision name"
         )
-    frozen = load_profiles(study._bound_path(root, state["frozen_profiles"]))
     state.pop("error", None)
     state.update(status="collecting", resumes=int(str(state.get("resumes", 0))) + 1)
     study._write(directory / "revision.json", state)

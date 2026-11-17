@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -78,6 +79,8 @@ def test_tool_version_hash_and_provisioner_bind_profile_identity(
     assert second["config_digest"] != original["config_digest"]
     artifact = tmp_path / "replacement.whl"
     artifact.write_bytes(b"replacement bytes")
+    for name in tools.SUPPORT_FILES["coverage.py"]:
+        shutil.copyfile(tools.ARTIFACTS / name, tmp_path / name)
     monkeypatch.setattr(tools, "ARTIFACTS", tmp_path)
     monkeypatch.setitem(tools.CATALOG, ("coverage.py", version), (
         artifact.name, hashlib.sha256(artifact.read_bytes()).hexdigest(),
@@ -110,11 +113,39 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
     monkeypatch.setattr(harbor, "assert_runtime", lambda expected, **kwargs: expected)
     monkeypatch.setattr(harbor, "_frozen_executable", lambda *a: {"resolved_path": "docker"})
     copies: list[str] = []
+    preload_marker = tmp_path / "node-preload-ran"
+    if suffix == "js":
+        (source / "preload.cjs").write_text(
+            f"require('fs').writeFileSync({json.dumps(str(preload_marker))}, 'injected');"
+        )
+        shutil.copyfile(source / "preload.cjs", app / "preload.cjs")
+
+    def container_env(arguments: tuple[str, ...] | list[str]) -> dict[str, str]:
+        env = dict(os.environ)
+        if suffix == "js":
+            env.update(NODE_OPTIONS="--require=" + str(app / "preload.cjs"),
+                       NODE_PATH=str(app), EXPERIMENTAL_MONOCART="1")
+            for index, argument in enumerate(arguments):
+                if argument == "--env":
+                    name, value = arguments[index + 1].split("=", 1)
+                    env[name] = value
+        return env
 
     def docker(*args: str, **kwargs: object) -> str:
         if args[0] == "create":
             assert args[args.index("--network") + 1] == "none"
             return "container"
+        if "--pluginbench-verify" in args:
+            command = list(args[args.index("container") + 1:])
+            command = [arg.replace("/opt/pluginbench-tools", str(container / "opt/pluginbench-tools"))
+                       for arg in command]
+            if command[0] == "python":
+                command[0] = sys.executable
+            result = subprocess.run(command, cwd=app, env=container_env(args),
+                                    capture_output=True, text=True)
+            assert not preload_marker.exists(), "task NODE_OPTIONS executed before c8 startup"
+            assert result.returncode == 0, result.stderr
+            return result.stdout
         if args[0] == "cp":
             target = args[2].split(":", 1)[1]
             copies.append(target)
@@ -135,21 +166,23 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
         command = argv[argv.index("container") + 1:]
         command = [arg.replace("/opt/pluginbench-tools", str(container / "opt/pluginbench-tools"))
                    for arg in command]
-        return subprocess.run(command, cwd=app, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(command, cwd=app, env=container_env(argv),
+                                capture_output=True, text=True, timeout=30)
+        assert not preload_marker.exists(), "task NODE_OPTIONS executed before c8 startup"
+        return result
 
     monkeypatch.setattr(harbor, "run_command", execute)
     monkeypatch.setattr(harbor, "cleanup", lambda **kwargs: {"status": "complete"})
     if suffix == "py":
         (source / ".coveragerc").write_text("[run]\nrelative_files = True\nsource = .\n")
         shutil.copyfile(source / ".coveragerc", app / ".coveragerc")
-        command = ["bash", "-c", f"export PYTHONPATH=/opt/pluginbench-tools/coverage.py; "
-                   f"{sys.executable} -S -m coverage run main.py && "
-                   f"{sys.executable} -S -m coverage json -o coverage.json"]
+        command = ["bash", "-c", f"{sys.executable} -I -S /opt/pluginbench-tools/coverage.py/launch-coverage.py run main.py && "
+                   f"{sys.executable} -I -S /opt/pluginbench-tools/coverage.py/launch-coverage.py json -o coverage.json"]
         report_path = "coverage.json"
         report_format = "coverage-py-json"
     else:
-        command = ["node", "/opt/pluginbench-tools/c8/node_modules/c8/bin/c8.js", "--all",
-                   "--reporter=lcovonly", "--reports-dir=coverage", "node", "main.js"]
+        command = ["node", "/opt/pluginbench-tools/c8/launch-c8.cjs", "--all",
+                   "--reporter=lcovonly", "--reports-dir=coverage", "--exclude=preload.cjs", "--", "node", "main.js"]
         report_path = "coverage/lcov.info"
         report_format = "lcov"
     frozen = tmp_path / "profile.json"
@@ -171,7 +204,10 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
     assert f"unloaded.{suffix}:1" not in lines["covered"]
     receipt = json.loads((tmp_path / "out/execution.json").read_text())
     assert coverage.provisioned_tool is not None
-    assert receipt["provisioned_tool"] == coverage.provisioned_tool.model_dump(mode="json")
+    provisioned = receipt["provisioned_tool"]
+    origin = provisioned.pop("runtime_origin")
+    assert provisioned == coverage.provisioned_tool.model_dump(mode="json")
+    assert str(container / "opt/pluginbench-tools" / name) in origin["module"]
     assert "/opt/pluginbench-tools/" in copies
     assert inspect_snapshot(source)["digest"] == before
     assert (app / ".git/HEAD").read_text() == "original git state\n"
