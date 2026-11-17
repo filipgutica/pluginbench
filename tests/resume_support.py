@@ -25,7 +25,7 @@ from native_support import (
     task_entry,
 )
 from pluginbench import baselines, codex, control_store, harbor_backend, ledger, study, submissions
-from pluginbench import trial_containers
+from pluginbench import run_lock, trial_containers
 from pluginbench.run_lock import ExecutionOwner
 from pluginbench.datasets import native_identity, portable_native_identity
 
@@ -264,8 +264,15 @@ def child_resume() -> None:
     install(patch, [], boundary=boundary, at=1)
     # The killed calls left no process; test_control_store covers the check itself.
     patch.setattr(control_store, "verify_invocation", lambda item: {"id": item["id"]})
-    # As the CLI does: recovering what the last crash left needs the host execution lock.
+    # As the CLI does: recovering what the last crash left needs the host execution lock, and
+    # until P4b an earlier killed resume is cleared only by the operator's repair.
+    state = Path(root).parent / "host-state"
+    target = str(Path(root).resolve())
+    repairer = ExecutionOwner(kind="recovery", eval=target, root=target)
+    with run_lock.hold_execution(repairer, state=state) as lock:
+        if any(item.get("root") == target for item in lock.record["pending"]):
+            control_store.confirm_stopped(lock, Path(root))
     owner = ExecutionOwner(kind="run", eval=root, root=root)
-    with control_store.execute(owner, state=Path(root).parent / "host-state"):
+    with control_store.execute(owner, state=state):
         study.resume_study(Path(root))
     raise SystemExit("the resume finished without reaching its kill boundary")

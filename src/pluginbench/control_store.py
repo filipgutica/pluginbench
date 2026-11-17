@@ -1,31 +1,27 @@
-"""Host recovery: what a dead owner may have left running is verified before any work starts.
+"""Host recovery: nothing starts on a host while a dead owner's work may still run.
 
 The host execution lock's owner record is the fence. Its owner writes it before starting any
-work, and records `released` only when it leaves cleanly. The next owner carries every unreleased
-record forward as an obligation, in that same write (`run_lock.hold_execution`). Before any other
-work, `execute` checks every obligation and clears them with one write, only once every check
-passes. Whatever a check cannot prove is unknown: the obligation stays, and nothing runs.
+work, and records `released` only when it leaves cleanly: its block returned and every cleanup
+on the way succeeded. The next owner carries every unreleased record forward as an obligation,
+in that same write (`run_lock.hold_execution`).
 
-The checks for an obligation at root R:
-- processes: each invocation R's ledger still has open, and each the owner ended, since a call
-  can end while its process-group cleanup failed. No live process may remain in the process
-  group the ledger recorded for it (`verify_invocation`).
-- containers: for each Docker runtime the owner recorded before starting containers, each on its
-  own, and only once every process is proven gone. The daemon at the runtime's endpoint must
-  still be the one it recorded, the trial containers R left running are stopped, and two
-  inventories at least a second apart find none (`verify_containers`). Without R's frozen suite
-  they cannot be found, so they are unknown.
+Until P4b labels every container and scopes every process, PluginBench cannot list everything a
+command starts: measurement and regrade containers, for one, fall outside any inventory. So an
+obligation never clears by itself. Each is one unknown check that only `pluginbench repair
+--confirm-stopped ROOT` clears, after checking again (`confirm_stopped`). Every crash needs that
+repair. The other checks are diagnostics for the operator and for repair:
+- processes: each invocation R's ledger still has open, and each the owner ended. A live process
+  in the group the ledger recorded for it blocks, with a hint to stop it (`verify_invocation`).
+- containers: for each Docker runtime the owner recorded, once the processes are confirmed. The
+  trial containers R left running are stopped, and two inventories at least a second apart must
+  find none (`verify_containers`). One pass has RECOVERY_SECONDS, and every Docker command in it
+  is capped by what is left.
+- each cleanup the owner recorded as failed (`run_lock.note_leftover`), with its reason.
 
-One recovery pass has RECOVERY_SECONDS; every Docker command in it is capped by what is left.
-- unrecorded work: `check`, `measure` and `judge run` start processes no ledger records, so until
-  per-invocation systemd scopes exist their obligations are unknown.
-
-A resume repeats the process and container checks for its own crashed calls before it accepts
-saved output or marks a call unresolved (`verify_crashed`). Only `pluginbench repair
---confirm-stopped ROOT` lifts an unknown check, after verifying again, and only for checks that
-remain unknown (`confirm_stopped`).
+Repair never confirms a check that finds something running. A resume repeats the process and
+container checks for its own crashed calls before it accepts saved output or marks a call
+unresolved (`verify_crashed`).
 """
-
 from __future__ import annotations
 
 import sqlite3
@@ -214,13 +210,6 @@ def verify_invocation(check: Check) -> dict[str, Any]:
                 else f"process group {group} of {name} still has processes {listed}, and its "
                 "leader has exited; check that they belong to this call before stopping them"
             )
-    if check.get("ended_clean") is False:
-        # An empty group proves nothing about a process that left it, so only a clean end the
-        # owner recorded does.
-        raise CleanupUnknown(
-            f"the previous owner stopped during {name}, so PluginBench can't prove its processes "
-            f"ended. {_repair(check['root'])}"
-        )
     return proof
 
 
@@ -390,13 +379,26 @@ def _invocations(rows: Sequence[dict[str, Any]], root: str) -> list[Check]:
 
 
 def _obligation_checks(obligation: dict[str, Any]) -> list[Check]:
-    """Everything to verify before a dead owner's root is known to have nothing running.
+    """What a dead owner may have left running, as checks.
 
-    Each cleanup the owner recorded as failed comes first, as an unknown check: an empty process
-    group or container inventory cannot show that an escaped process is gone.
+    Until P4b labels every container and scopes every process, no check can list all a command
+    starts, so the owner itself is always one unknown check: only `repair --confirm-stopped`
+    clears it. The other checks are diagnostics. They name processes and containers known to
+    still run, which repair never confirms, and each cleanup the owner recorded as failed.
     """
     root = str(obligation["root"])
     name = f"{obligation.get('pid')}-{obligation.get('acquired_at')}"
+    unreleased: Check = {
+        "id": f"{name}:unreleased",
+        "root": root,
+        "kind": "unrecorded",
+        "reason": (
+            f"`{obligation.get('kind')}` for {root} ended without a clean release, and until "
+            "P4b PluginBench cannot prove that everything a command starts has stopped"
+            if Path(root).is_dir()
+            else f"{root}, whose owner ended without a clean release, was moved or deleted"
+        ),
+    }
     leftovers = obligation.get("leftovers")
     failed: list[Check] = [
         {
@@ -409,7 +411,7 @@ def _obligation_checks(obligation: dict[str, Any]) -> list[Check]:
             leftovers if isinstance(leftovers, list) else [] if leftovers is None else [leftovers]
         )
     ]
-    return failed + _work_checks(obligation)
+    return [unreleased, *failed, *_work_checks(obligation)]
 
 
 def _work_checks(obligation: dict[str, Any]) -> list[Check]:
@@ -417,13 +419,7 @@ def _work_checks(obligation: dict[str, Any]) -> list[Check]:
     name = f"{obligation.get('pid')}-{obligation.get('acquired_at')}"
     path = _ledger(Path(root))
     if obligation.get("kind") in UNRECORDED_KINDS or path is None:
-        reason = (
-            f"{root}, whose owner ended without a clean release, was moved or deleted"
-            if not Path(root).is_dir()
-            else f"`{obligation.get('kind')}` for {root} ended without a clean release, and no "
-            "ledger records its processes"
-        )
-        return [{"id": f"{name}:unrecorded", "root": root, "kind": "unrecorded", "reason": reason}]
+        return []  # No ledger records its processes; the owner's own check covers them.
     since = _since(obligation.get("acquired_at"))
     ledger = Ledger.read(path)
     try:
@@ -431,17 +427,6 @@ def _work_checks(obligation: dict[str, Any]) -> list[Check]:
     finally:
         ledger.close()
     checks = _invocations(rows, root)
-    # A call the owner started counts as cleaned up only once it recorded the clean end, written
-    # after the call's group was stopped and its output drained (`run_lock.note_clean`).
-    clean = {
-        (item[0], item[1])
-        for item in obligation.get("clean") or []
-        if isinstance(item, list) and len(item) == 2
-    }
-    for check, row in zip(checks, rows, strict=True):
-        if row["identity"] and _touched(row, since):
-            identity = row["identity"]
-            check["ended_clean"] = (identity.get("pid"), identity.get("start_time")) in clean
     evidence = path.parent
     # A recorded runtime stays an obligation whatever its directory now holds.
     runtimes: list[dict[str, Any] | None] = list(obligation.get("runtimes") or [])
@@ -474,8 +459,9 @@ def execute(owner: ExecutionOwner, *, state: Path | None = None) -> Iterator[Exe
     """Take the host execution lock, verify every obligation it carries, then run the block.
 
     Every execution entry point enters here, before any run lock. While an obligation fails,
-    nothing runs, whatever this command targets. Clearing them is one write, made only once
-    every check passes.
+    nothing runs, whatever this command targets. Until P4b every obligation holds a check
+    that only `repair --confirm-stopped` passes, so the one write that clears them happens only
+    when a repair confirmed it but could not clear it itself.
     """
     with run_lock.hold_execution(owner, state=state) as lock:
         with ControlStore.open(lock.state) as store:

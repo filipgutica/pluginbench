@@ -3772,6 +3772,7 @@ def test_source_only_replays_wait_for_the_frozen_grader_and_a_failed_try_is_clea
         else:
             assert grading["status"] == "complete" and row["source_only_reward"] == 1
     assert evaluation.plan_resume(root)["verifier_replays"] == len(packages)
+    _repair(root)
 
     monkeypatch.setattr(harbor_backend, "_assert_native_image", lambda image, expected: None)
     replay = harbor_backend.regrade_native
@@ -3788,6 +3789,7 @@ def test_source_only_replays_wait_for_the_frozen_grader_and_a_failed_try_is_clea
     directory = root / "evidence/source-only" / f"filter-{source_only.FILTER_REVISION}"
     assert len(list(directory.glob("*/*.try-*"))) == 1
     assert [_rows(root)[key]["correctness"] for key in packages].count("infra") == 1
+    _repair(root)
 
     result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
 
@@ -3869,9 +3871,19 @@ def test_status_report_and_compare_read_the_same_grade_for_every_attempt(
     monkeypatch.setattr(harbor_backend, "_assert_native_image", _grader_gone)
     assert CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"]).exit_code != 0
     assert set(agree().values()) == {"infra", "pass"}
+    _repair(root)
     monkeypatch.setattr(harbor_backend, "_assert_native_image", lambda image, expected: None)
     assert CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"]).exit_code == 0
     assert set(agree().values()) == {"pass"}
+
+
+def _repair(root: Path) -> None:
+    """A run that failed after it graded leaves the host fenced; until P4b only the operator
+    lifts that, and the next run is refused until then."""
+    refused = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+    assert refused.exit_code != 0 and "ended without a clean release" in refused.stderr
+    result = CliRunner().invoke(cli.app, ["repair", str(root), "--confirm-stopped"])
+    assert result.exit_code == 0, result.stderr + result.stdout
 
 
 def _grader_gone(image: object, expected: object) -> None:

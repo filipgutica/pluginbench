@@ -20,12 +20,13 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
 from types import FrameType
 from typing import Any
+from uuid import uuid4
 
 from pluginbench import __version__
 
@@ -425,15 +426,21 @@ def execution_owner(state: Path | None = None) -> LockSnapshot:
 
 
 def _write_atomic(path: Path, value: dict[str, object]) -> None:
-    """Replace `path` with `value` so a reader sees the old record or the new, never a mix."""
-    temporary = path.with_name(f".{path.name}.{os.getpid()}")
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    """Replace `path` with `value` so a reader sees the old record or the new, never a mix.
+
+    Each write has its own temporary file, so writes that overlap never share one.
+    """
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}")
     try:
-        os.write(fd, (json.dumps(value, indent=2) + "\n").encode())
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(temporary, path)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write((json.dumps(value, indent=2) + "\n").encode())
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
     directory = os.open(path.parent, os.O_RDONLY)
     try:
         os.fsync(directory)
@@ -455,6 +462,8 @@ class ExecutionLock:
     # Set once a cleanup of something this owner started failed. Unlike `dirty`, a clean exit
     # never clears it, and the record names each failure (`note_leftover`).
     leftover: bool = False
+    # Worker threads update the record too; each change reads and writes it under this lock.
+    _updating: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def assert_owned(self) -> None:
         """Raise ExecutionLost unless the lock path still leads to the inode this process holds
@@ -473,42 +482,41 @@ class ExecutionLock:
         """Atomically replace the owner record with this one in `state`."""
         if state not in OWNER_STATES:
             raise ValueError(f"unknown owner state {state}")
-        self._write({**self.record, "state": state})
+        self._update(lambda record: {**record, "state": state})
 
     def settle(self, pending: list[dict[str, Any]]) -> None:
         """Replace the obligations this owner carries; the only write recovery makes."""
-        self._write({**self.record, "pending": pending})
+        self._update(lambda record: {**record, "pending": pending})
 
     def note_runtime(self, runtime: dict[str, object]) -> None:
         """Record a Docker runtime before any container starts under it. If the record cannot be
         written, this raises and nothing may start."""
         docker = {key: runtime[key] for key in ("docker_cli", "docker_engine") if key in runtime}
         self.dirty = True
-        if docker not in self.record["runtimes"]:
-            self._write({**self.record, "runtimes": [*self.record["runtimes"], docker]})
+        self._update(
+            lambda record: record
+            if docker in record["runtimes"]
+            else {**record, "runtimes": [*record["runtimes"], docker]}
+        )
 
     def note_leftover(self, reason: str) -> None:
-        """Record why a cleanup failed, so the next owner's error can say so. The call's missing
-        clean end already keeps it unknown, so a failed write here changes nothing."""
+        """Keep this owner unreleased, and record why a cleanup failed so the next owner's error
+        can say so. The record is best-effort: an unreleased owner needs repair anyway."""
         self.leftover = True
         failure = {"reason": reason, "at": datetime.now(UTC).isoformat()}
         try:
-            self._write({**self.record, "leftovers": [*self.record.get("leftovers", []), failure]})
+            self._update(
+                lambda record: {**record, "leftovers": [*record.get("leftovers", []), failure]}
+            )
         except OSError:
-            pass  # Without a clean end, the call stays unknown to the next owner anyway.
+            pass  # The in-memory flag alone keeps the release unrecorded.
 
-    def note_clean(self, pid: int, start: str | None) -> None:
-        """Record that a recorded call's process group, started at `start`, was stopped and its
-        output drained. Until this is on disk, the next owner cannot clear the call."""
-        try:
-            self._write({**self.record, "clean": [*self.record.get("clean", []), [pid, start]]})
-        except OSError:
-            pass  # The call stays unverified, which is the safe default.
-
-    def _write(self, record: dict[str, Any]) -> None:
+    def _update(self, change: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
         # Adopt the record only once it is on disk, so a failed write never reaches it later.
-        _write_atomic(self.state / EXECUTION_OWNER, record)
-        self.record = record
+        with self._updating:
+            record = change(self.record)
+            _write_atomic(self.state / EXECUTION_OWNER, record)
+            self.record = record
 
 
 # The lock this process holds now, so recovery deep in a run can require it.
@@ -539,13 +547,6 @@ def external_work() -> Iterator[None]:
     before, lock.dirty = lock.dirty, True
     yield
     lock.dirty = before
-
-
-def note_clean(pid: int, start: str | None) -> None:
-    """Record that the recorded call led by `pid` ended clean; see ExecutionLock.note_clean.
-    Without the host lock there is nothing to record."""
-    if _execution is not None:
-        _execution.note_clean(pid, start)
 
 
 def started_at(pid: int) -> str | None:
@@ -625,8 +626,6 @@ def hold_execution(owner: ExecutionOwner, *, state: Path | None = None) -> Itera
                 "acquired_at": datetime.now(UTC).isoformat(),
                 "runtimes": [],
                 "leftovers": [],
-                # Recorded calls whose cleanup was proven, as [PID, start time] pairs.
-                "clean": [],
                 "pending": _carried(state),
             },
         )

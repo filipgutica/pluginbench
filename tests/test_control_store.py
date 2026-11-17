@@ -30,6 +30,8 @@ from pluginbench.ledger import LEDGER_NAME, Ledger, child_identity, outcome
 from test_resume import _REAL_RUNNING, _Docker, _container, _killed_run
 
 _SOURCE = str(Path(pluginbench.__file__).parents[1])
+# Every owner that dies unreleased says this until repair clears it.
+_UNRELEASED = "ended without a clean release"
 
 
 def _owner(root: Path) -> run_lock.ExecutionOwner:
@@ -115,11 +117,14 @@ def test_unverified_cleanup_keeps_crashed_rows_open_and_fences_the_host(
     monkeypatch.setattr(control_store, "verify_invocation", verified)
     monkeypatch.setattr(study, "_reconcile", reconciled)
     monkeypatch.setattr(Ledger, "resolve_crashed", resolved)
+    # The failed resume's owner is unreleased: nothing clears it but the operator's repair.
+    assert not _admitted(isolated_host_state, tmp_path)
+    assert CliRunner().invoke(cli.app, ["repair", str(root), "--confirm-stopped"]).exit_code == 0
+    trace.clear()
     with control_store.execute(_owner(root)) as lock:
-        # Taking the lock verified the obligation the failed resume left, and cleared it.
-        assert trace == ["verify"] and lock.record["pending"] == []
+        assert lock.record["pending"] == []
         study.resume_study(root)
-    assert trace[:5] == ["verify", "verify", "reconcile", "resolve coding", "resolve grading"]
+    assert trace[:4] == ["verify", "reconcile", "resolve coding", "resolve grading"]
     [resolved_row, *new] = _rows(root)
     assert resolved_row["id"] == crashed["id"] and resolved_row["state"] == "unresolved"
     assert len(calls) == 1 and len(new) == 1
@@ -301,16 +306,12 @@ def _live_call(tmp_path: Path) -> tuple[Path, subprocess.Popen[bytes]]:
     return run, child
 
 
-def test_containers_are_checked_only_after_the_processes_and_on_every_retry(
+def test_repair_checks_containers_only_once_the_processes_are_gone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
 ) -> None:
-    run, child = _live_call(tmp_path)  # Left open by an earlier owner, and still running.
+    run, child = _live_call(tmp_path)
     (run / "frozen/suite").mkdir(parents=True)
-    later = datetime.now(UTC).isoformat()
-    _crashed_owner(
-        isolated_host_state, kind="run", root=run, runtimes=[{"docker_engine": {}}],
-        acquired_at=later,
-    )
+    _crashed_owner(isolated_host_state, kind="run", root=run, runtimes=[{"docker_engine": {}}])
     inventories: list[Path] = []
 
     def inventory(evidence: Path, **kwargs: Any) -> list[dict[str, str]]:
@@ -320,18 +321,21 @@ def test_containers_are_checked_only_after_the_processes_and_on_every_retry(
     monkeypatch.setattr(trial_containers, "running", inventory)
     monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime, **kwargs: None)
     try:
-        # A live producer could still create a container, so the containers are unknown too.
+        # A live producer could still create a container, so no container is checked yet, and
+        # repair refuses: it never confirms a known survivor.
         with pytest.raises(CleanupBlocked, match="a container may still be created"):
             with control_store.execute(_owner(tmp_path / "unrelated")):
                 pass
+        result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+        assert result.exit_code == 2 and f"has processes {child.pid}" in result.stderr
         assert inventories == []
-        assert not _admitted(isolated_host_state, tmp_path)
     finally:
         child.kill()
         child.wait(timeout=5)
-    # The retry checks the containers as well as the processes: the obligation lists both.
-    assert _admitted(isolated_host_state, tmp_path)
+    result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+    assert result.exit_code == 0, result.output
     assert len(inventories) == 3 and _record(isolated_host_state)["pending"] == []
+    assert _admitted(isolated_host_state, tmp_path)
 
 
 @pytest.mark.parametrize("unknown", ["daemon unreachable", "runtime unreadable"])
@@ -362,6 +366,7 @@ def test_containers_that_cannot_be_checked_during_a_resume_fence_the_host(
         assert calls == [] and _rows(root) == [crashed]
         # Its process is gone, but the run's containers are unknown: an unrelated run stays out.
         assert not _admitted(isolated_host_state, tmp_path)
+    assert CliRunner().invoke(cli.app, ["repair", str(root), "--confirm-stopped"]).exit_code == 0
     assert _admitted(isolated_host_state, tmp_path)
 
 
@@ -477,6 +482,199 @@ def test_an_owner_whose_container_cleanup_failed_stays_unreleased_after_a_normal
             pass
 
 
+_RUNTIME = {
+    "docker_engine": {"id": "fake", "endpoint": "unix:///fake"},
+    "resources": {"cpus": 1, "memory_mb": 64},
+}
+
+
+def _measurement_docker(record: Path, *, on_start: Callable[[], None]) -> Callable[..., str]:
+    """Fake Docker for a measurement: `create` saves the container to `record`, `start` marks it
+    running, then calls `on_start`."""
+
+    def docker(*args: str, **kwargs: Any) -> str:
+        if args[0] == "create":
+            record.write_text(json.dumps({"id": "m", "running": False}))
+            return "m"
+        if args[0] == "start":
+            record.write_text(json.dumps({"id": "m", "running": True}))
+            on_start()
+            return ""
+        raise AssertionError(args)
+
+    return docker
+
+
+def _measure(snapshot: Path, destination: Path) -> None:
+    snapshot.mkdir()
+    (snapshot / "index.ts").write_text("original\n")
+    harbor_backend.run_native_command(
+        snapshot=snapshot,
+        task_identity={"isolation": _RUNTIME, "image_identity": {"image_id": "fake"}, "workdir": "/app"},
+        destination=destination,
+        command=["coverage"],
+        report_path="coverage/lcov.info",
+        timeout=10,
+    )
+
+
+def test_a_failed_measurement_cleanup_leaves_a_normally_exiting_owner_unreleased(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
+) -> None:
+    daemon = {"up": True}
+    disk = {"full": False}
+    write = run_lock._write_atomic
+
+    def assert_daemon(runtime: Any, **kwargs: Any) -> None:
+        if not daemon["up"]:
+            raise ValueError("Cannot connect to the Docker daemon")
+
+    def daemon_lost() -> None:
+        daemon["up"] = False
+        disk["full"] = True
+        raise ValueError("Cannot connect to the Docker daemon")
+
+    def no_space(path: Path, value: Any) -> None:
+        if disk["full"]:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        write(path, value)
+
+    run = tmp_path / "measure"
+    (run / "frozen/suite").mkdir(parents=True)
+    Ledger.create(run / LEDGER_NAME, [], {}).close()
+    monkeypatch.setattr(harbor_backend, "assert_runtime", lambda *args, **kwargs: _RUNTIME)
+    monkeypatch.setattr(harbor_backend, "_assert_daemon", assert_daemon)
+    monkeypatch.setattr(
+        harbor_backend, "_docker", _measurement_docker(tmp_path / "container.json", on_start=daemon_lost)
+    )
+    monkeypatch.setattr(run_lock, "_write_atomic", no_space)
+    with control_store.execute(_owner(run)):
+        run_lock.note_runtime(_RUNTIME)
+        # The measurement fails, its cleanup fails, and the disk is full, so the reason is never
+        # saved. The caller handles the error and the owner leaves its block normally.
+        with pytest.raises(ValueError, match="Cannot connect"):
+            _measure(tmp_path / "snapshot", tmp_path / "measurement")
+        disk["full"] = False
+    assert json.loads((tmp_path / "container.json").read_text())["running"]
+    record = _record(isolated_host_state)
+    assert record["state"] != "released" and record["leftovers"] == []
+    # Docker answers again and lists nothing (no inventory finds a measurement container until
+    # P4b labels it), yet the unreleased owner keeps the host blocked until repair.
+    daemon["up"] = True
+    monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
+    with pytest.raises(CleanupBlocked, match=_UNRELEASED):
+        with control_store.execute(_owner(tmp_path / "unrelated")):
+            pass
+    result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+    assert result.exit_code == 0, result.output
+    assert _admitted(isolated_host_state, tmp_path)
+
+
+# Owns the host lock for a run, records its runtime and one clean coding call, then is killed
+# with a container still running: "measurement" kills itself when its measurement container
+# starts; "regrade" kills itself after its regrade worker timed out, before the regrade's
+# container cleanup. The fake container is saved to `container`.
+_KILLED_WITH_CONTAINER = """
+import json, os, signal, subprocess, sys
+from pathlib import Path
+from unittest.mock import patch
+from pluginbench import control_store, harbor_backend, processes, run_lock
+from pluginbench.ledger import LEDGER_NAME, Ledger
+state, run, mode, container = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
+runtime = json.loads(sys.argv[5])
+owner = run_lock.ExecutionOwner(kind="run", eval=str(run), root=str(run))
+with control_store.execute(owner, state=state):
+    run_lock.note_runtime(runtime)
+    ledger = Ledger.open(run / LEDGER_NAME)
+    call = ledger.intent(slot=0, stage="coding", attempt_id="a")
+    processes.run_command(
+        [sys.executable, "-c", ""], cwd=run, env=os.environ, timeout=10,
+        on_spawn=lambda pid: ledger.invocation_started(call, pid),
+    )
+    ledger.end(call, "finished")
+    if mode == "measurement":
+        def docker(*args, **kwargs):
+            if args[0] == "create":
+                container.write_text(json.dumps({"id": "m", "running": False}))
+                return "m"
+            if args[0] == "start":
+                container.write_text(json.dumps({"id": "m", "running": True}))
+                os.kill(os.getpid(), signal.SIGKILL)
+            raise AssertionError(args)
+        snapshot = run.parent / "snapshot"
+        snapshot.mkdir()
+        (snapshot / "index.ts").write_text("original\\n")
+        with patch.object(harbor_backend, "assert_runtime", lambda *a, **k: runtime), \\
+                patch.object(harbor_backend, "_docker", docker):
+            harbor_backend.run_native_command(
+                snapshot=snapshot,
+                task_identity={"isolation": runtime, "image_identity": {"image_id": "fake"}, "workdir": "/app"},
+                destination=run.parent / "measurement", command=["coverage"],
+                report_path="coverage/lcov.info", timeout=10,
+            )
+    else:
+        grading = ledger.intent(slot=1, stage="grading", attempt_id="a")
+        area = run.parent / "regrade"
+        (area / "artifacts").mkdir(parents=True)
+        code = (
+            "import json, sys, time; from pathlib import Path; "
+            "Path(sys.argv[1]).write_text(json.dumps({'id': 'g', 'running': True})); "
+            "Path(sys.argv[2]).write_text('{}'); time.sleep(30)"
+        )
+        def worker(argv, **kwargs):
+            kwargs["timeout"] = 0.2
+            return processes.run_command(
+                [sys.executable, "-c", code, str(container), str(area / "artifacts/worker.json")], **kwargs
+            )
+        with patch.object(harbor_backend, "_private_docker_config", lambda **k: {}), \\
+                patch.object(harbor_backend, "run_command", worker):
+            try:
+                harbor_backend._native_process(
+                    area=area, config={}, expected=runtime, harness="codex", timeout=5,
+                    install_only=True, on_spawn=lambda pid: ledger.invocation_started(grading, pid),
+                )
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                raise AssertionError("the regrade worker must time out")
+        # The worker's group stopped and its output drained; the regrade's containers were not
+        # cleaned up yet.
+        os.kill(os.getpid(), signal.SIGKILL)
+raise AssertionError("the owner must be killed with its container running")
+"""
+
+
+@pytest.mark.parametrize("mode", ["measurement", "regrade"])
+def test_an_owner_killed_with_a_container_running_needs_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path, mode: str
+) -> None:
+    run = tmp_path / "run"
+    (run / "frozen/suite").mkdir(parents=True)
+    Ledger.create(
+        run / LEDGER_NAME,
+        [{"id": "a", "task_id": "t", "arm": "coding", "attempt": 1}],
+        {"a": "running"},
+    ).close()
+    container = tmp_path / "container.json"
+    owner = subprocess.run(
+        [sys.executable, "-c", _KILLED_WITH_CONTAINER, str(isolated_host_state), str(run), mode,
+         str(container), json.dumps(_RUNTIME)],
+        env={**os.environ, "PYTHONPATH": _SOURCE}, timeout=60,
+    )
+    assert owner.returncode == -signal.SIGKILL
+    assert json.loads(container.read_text())["running"]
+    # No inventory can find this container until P4b labels it, and every call the owner
+    # recorded ended clean: nothing but the unreleased owner says it may still run.
+    monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime, **kwargs: None)
+    monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
+    with pytest.raises(CleanupBlocked, match=_UNRELEASED):
+        with control_store.execute(_owner(tmp_path / "unrelated")):
+            pass
+    result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+    assert result.exit_code == 0 and _UNRELEASED in result.stdout, result.output
+    assert _admitted(isolated_host_state, tmp_path)
+
+
 # Leads a call whose descendant leaves its process group with setsid() and keeps the call's
 # output pipes open: the group stops, but the output drain times out.
 _ESCAPING = """
@@ -540,8 +738,9 @@ def test_a_failed_save_after_an_escaped_drain_still_needs_repair(
                     )
             ledger.end(call, *outcome(failed.value, spawned=True))
         _wait_for(escaped)
-        # Nothing about the failure reached the disk, and the call's clean end never did either.
-        with pytest.raises(CleanupBlocked, match="previous owner stopped during review invocation"):
+        # Nothing about the failure reached the disk, but the owner was never released.
+        assert _record(isolated_host_state)["state"] != "released"
+        with pytest.raises(CleanupBlocked, match=_UNRELEASED):
             with control_store.execute(_owner(tmp_path / "unrelated")):
                 pass
     finally:
@@ -607,7 +806,7 @@ def test_an_owner_killed_during_a_call_needs_repair_even_once_its_group_is_gone(
         while control_store._group_members(leader):
             assert time.monotonic() < deadline
             time.sleep(0.02)
-        with pytest.raises(CleanupBlocked, match="previous owner stopped during review invocation"):
+        with pytest.raises(CleanupBlocked, match=_UNRELEASED):
             with control_store.execute(_owner(tmp_path / "unrelated")):
                 pass
     finally:
@@ -617,19 +816,20 @@ def test_an_owner_killed_during_a_call_needs_repair_even_once_its_group_is_gone(
         if escaped.exists() and escaped.read_text():
             _gone(int(escaped.read_text()))
     result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
-    assert result.exit_code == 0 and "previous owner stopped during" in result.stdout
+    assert result.exit_code == 0 and _UNRELEASED in result.stdout
     assert _admitted(isolated_host_state, tmp_path)
 
 
-def test_an_owner_killed_between_calls_recovers_without_repair(
+def test_an_owner_killed_between_calls_needs_repair_too(
     tmp_path: Path, isolated_host_state: Path
 ) -> None:
     run, _, owner = _killed_owner(tmp_path, isolated_host_state, "between")
     assert owner.wait(timeout=30) == -signal.SIGKILL
-    [row] = _rows(run)
-    identity = row["identity"]
-    # The call's clean end reached the disk before the owner died.
-    assert [identity["pid"], identity["start_time"]] in _record(isolated_host_state)["clean"]
+    # Every call it made ended clean, but no check can list everything it may have started.
+    with pytest.raises(CleanupBlocked, match=_UNRELEASED):
+        with control_store.execute(_owner(tmp_path / "unrelated")):
+            pass
+    assert CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"]).exit_code == 0
     assert _admitted(isolated_host_state, tmp_path)
 
 
@@ -647,8 +847,7 @@ def test_a_run_whose_calls_end_clean_is_released(
         )
         ledger.end(call, "finished")
     ledger.close()
-    record = _record(isolated_host_state)
-    assert record["state"] == "released" and len(record["clean"]) == 1
+    assert _record(isolated_host_state)["state"] == "released"
     assert _admitted(isolated_host_state, tmp_path)
 
 
@@ -772,14 +971,12 @@ def test_a_call_that_ended_while_its_process_lived_is_checked_after_its_owner_di
         isolated_host_state, kind="review", root=run, runtimes=[], acquired_at=acquired_at
     )
     try:
-        assert not _admitted(isolated_host_state, tmp_path)
+        # Repair refuses while the call's child lives: the check names it.
+        result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+        assert result.exit_code == 2 and f"has processes {child.pid}" in result.stderr
     finally:
         child.kill()
         child.wait(timeout=5)
-    # Its group is empty now, but the owner never recorded the call's clean end.
-    with pytest.raises(CleanupBlocked, match="previous owner stopped during review invocation"):
-        with control_store.execute(_owner(tmp_path / "unrelated")):
-            pass
     assert CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"]).exit_code == 0
     assert _admitted(isolated_host_state, tmp_path)
 
@@ -815,6 +1012,9 @@ def test_calls_that_ended_before_the_dead_owner_started_are_not_its_obligation(
     later = datetime.now(UTC).isoformat()
     _crashed_owner(isolated_host_state, kind="review", root=run, runtimes=[], acquired_at=later)
     try:
+        # Repair does not count it as a survivor of this owner.
+        result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+        assert result.exit_code == 0, result.output
         assert _admitted(isolated_host_state, tmp_path)
     finally:
         child.kill()
@@ -860,9 +1060,9 @@ def test_a_recorded_runtime_is_checked_even_when_the_frozen_suite_is_gone(
     )
     monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime, **kwargs: None)
     monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
-    with pytest.raises(CleanupBlocked, match="frozen suite .* is missing"):
-        with control_store.execute(_owner(tmp_path / "unrelated")):
-            pass
+    result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+    # Repair checks the recorded runtime, finds its containers cannot be listed, and says so.
+    assert result.exit_code == 0 and "frozen suite" in result.stdout, result.output
 
 
 def test_recovery_shares_one_deadline_that_caps_every_docker_command(
@@ -998,8 +1198,10 @@ def test_an_unverifiable_call_blocks_until_the_operator_confirms_it_stopped(
     assert f"{crashed['id']} (coding invocation {crashed['id']} has no verifiable" in result.stdout
     assert "The host is unblocked." in result.stdout
     with ControlStore.open(isolated_host_state) as store:
-        [confirmation] = store.confirmations()
-    assert confirmation["check_id"] == crashed["id"] and confirmation["root"] == str(root)
+        [confirmation] = [
+            item for item in store.confirmations() if item["check_id"] == crashed["id"]
+        ]
+    assert confirmation["root"] == str(root)
     assert confirmation["confirmed_at"]
     # The confirmation covers that call, so the resume closes it.
     with control_store.execute(_owner(root)):
