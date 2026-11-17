@@ -167,7 +167,8 @@ The backend also clears these environment variables before starting Node.
 The launcher accepts exactly that collection shape. PluginBench runs `report` in a
 fresh reporting container and writes `coverage/lcov.info`, including unloaded
 files and filtering output to the staged source-file list. Source-map remapping
-is unsupported: map comments and V8 map caches are ignored. Kysely changed-line
+is unsupported: both converter discovery functions are disabled, and V8 map
+caches are ignored. Kysely changed-line
 coverage is deferred to later suite work.
 
 PluginBench verifies the vendored artifact before runtime checks. Unknown names,
@@ -217,9 +218,13 @@ reporting.
 The c8 launcher calls the pinned report implementation with the staged
 `c8-config.json`, built-in `lcovonly`, and fixed output paths. It never invokes
 c8's option parser or discovers `.c8rc*`, `.nycrc*`, or task `package.json` config.
-It passes `exclude: []` and an explicit extension list derived from the frozen
-profile's source files using PluginBench's source classifier. Config-like names,
-`*-test.js`, `.mts`, and other in-scope source suffixes are not silently dropped.
+It passes `exclude: []` and explicit extensions derived from the frozen profile's
+JS/TS source files: `.js`, `.cjs`, `.mjs`, `.jsx`, `.ts`, `.cts`, `.mts`, and `.tsx`.
+PluginBench's source classifier excludes test paths, and `coverage_sources` excludes
+declarations (`.d.ts`, `.d.mts`, `.d.cts`). Other languages are not c8 populations.
+Config-like names, `*-test.js`, and `.mts` are not silently dropped. An empty source
+population refuses explicitly. Python selects literal database filenames rather
+than treating the staged source list as glob patterns.
 The pinned Python INI sets `include_namespace_packages = True`, so never-imported
 files beneath directories without `__init__.py` also stay in the population.
 
@@ -227,7 +232,8 @@ The reporting interpreter's absolute path and physical task root are resolved
 from the pinned image before snapshot copy. An interpreter inside that root or
 the tool tree refuses; reporting executes the resolved path without a PATH lookup.
 Signal-terminated collections retain their exit receipt without requiring raw
-data or starting reporting. Valid raw data from an ordinary nonzero test exit
+data or starting reporting. Node-ignored signals retain a nonzero fallback code.
+Valid raw data from an ordinary nonzero test exit
 can still be reported. Mutation collects only status/output and source-integrity
 receipts; it does not export raw coverage or start a reporting container.
 
@@ -237,12 +243,16 @@ credit unexecuted lines. The pinned INI clears `exclude_lines` and
 reporting launcher disables its single `_parseIgnore` method. This disables c8,
 v8, and `node:coverage` hints, including block and line forms.
 
-Residual risk: code inside the measured process can forge the raw collection data.
-Source-map remapping is not provided; kysely coverage remains a later suite item.
+Limitations:
+
+- Code inside the measured process can forge raw collection data.
+- coverage.py omits unloaded files whose names are not importable (for example,
+  `dotted.v2.py` and `plus+one.py`); downstream checks flag these as unmeasured.
+- Exit codes 129–255 are treated as signals, even if the program explicitly chose one.
 
 Provisioning records resolved module, dependency, configuration, and staged
 source-file-list origins in `execution.json` under
-`provisioned_tool.runtime_origin`. Provisioner version 5 refuses older saved
+`provisioned_tool.runtime_origin`. Provisioner version 6 refuses older saved
 profiles. Prepare a new measurement revision with these launcher commands.
 Resume fingerprints bind only the distributions selected by the profile.
 

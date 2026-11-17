@@ -89,8 +89,11 @@ def test_tool_version_hash_and_provisioner_bind_profile_identity(
     assert freeze("three")["config_digest"] != second["config_digest"]
 
 
-@pytest.mark.parametrize(("name", "version"), [("coverage.py", "7.6.12"), ("c8", "10.1.3")])
-@pytest.mark.parametrize("mode", ["tamper", "failed-tests", "signal", "docker-signal", "mutation", "path", "image-interpreter"])
+@pytest.mark.parametrize(("name", "version", "mode"), [
+    (name, version, mode)
+    for name, version in [("coverage.py", "7.6.12"), ("c8", "10.1.3")]
+    for mode in ["tamper", "failed-tests", "signal", "docker-signal", "mutation", "path", "image-interpreter"]
+] + [("c8", "10.1.3", mode) for mode in ["sigpipe", "sigpipe-mutation"]])
 def test_native_coverage_uses_vendored_tool_outside_task_tree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, version: str, mode: str,
 ) -> None:
@@ -277,6 +280,9 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
         # A shell normalizes SIGKILL to 137; observe the direct subprocess's -9 receipt.
         command = [sys.executable, "-I", "-S", "/opt/pluginbench-tools/coverage.py/launch-coverage.py",
                    "run", "runner.py"]
+    if mode.startswith("sigpipe"):
+        command = ["node", "/opt/pluginbench-tools/c8/launch-c8.cjs", "--all", "--",
+                   "sh", "-c", "node main.js; kill -PIPE $$"]
     frozen = tmp_path / "profile.json"
     coverage = profile(name, version).model_copy(update={"command": command, "report_path": report_path})
     frozen.write_text(json.dumps({"native_task_identity": identity, "test_scope": ["test_*"],
@@ -295,21 +301,21 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
         assert len(created) == 1
         assert "/app/" not in copies
         return
-    if mode in {"signal", "docker-signal", "mutation"}:
+    if mode in {"signal", "docker-signal", "mutation", "sigpipe", "sigpipe-mutation"}:
         tool = coverage.provisioned_tool
         assert tool is not None
         destination = tmp_path / "out"
-        if mode == "mutation":
+        if mode in {"mutation", "sigpipe-mutation"}:
             run = mutation.native_executor(identity, report_path, provisioned_tool=tool.model_dump())(
                 source, command, 30, destination,
             )
-            assert run.exit_code == 0
+            assert run.exit_code == (141 if mode == "sigpipe-mutation" else 0)
         else:
             execution = harbor.run_native_command(
                 snapshot=source, task_identity=identity, destination=destination,
                 command=command, report_path=report_path, timeout=30, provisioned_tool=tool,
             )
-            assert execution["exit_code"] == (137 if mode == "docker-signal" else -9)
+            assert execution["exit_code"] == ({"docker-signal": 137, "sigpipe": 141}.get(mode, -9))
             assert not execution["report_collected"]
         assert len(created) == 1
         assert stopped == created

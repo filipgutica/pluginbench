@@ -85,7 +85,15 @@ def main() -> int:
         source_files = json.loads((ROOT / "source-files.json").read_text())
         if source_files == []:
             raise SystemExit("PluginBench coverage: no files in the profile source scope")
-        measured.json_report(outfile=str(Path.cwd() / "coverage.json"), include=source_files)
+        # include= treats filenames as globs. Select literal paths already in the database;
+        # this does not invent data for unloaded files coverage.py itself could not discover.
+        files: list[str] | None = None
+        if source_files is not None:
+            allowed = {Path(name).resolve() for name in source_files}
+            files = [name for name in measured.get_data().measured_files() if Path(name).resolve() in allowed]
+            if not files:
+                raise SystemExit("PluginBench coverage: no measured files in the profile source scope")
+        measured.json_report(morfs=files, outfile=str(Path.cwd() / "coverage.json"))
         return 0
     # Each fresh measurement container permits one collection. No append, parallel
     # databases, or combine operation is exposed, and old data cannot be selected.

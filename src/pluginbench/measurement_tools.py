@@ -16,7 +16,7 @@ from typing import TypedDict
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from pluginbench import components
-from pluginbench.code_diff import _SOURCE_SUFFIXES, _is_source_path
+from pluginbench.assessment_metrics import coverage_sources
 
 ARTIFACTS = Path(__file__).with_name("coverage_tools")
 CONTAINER_ROOT = "/opt/pluginbench-tools"
@@ -24,6 +24,7 @@ SUPPORT_FILES = {
     "coverage.py": ("launch-coverage.py", "coverage-config.ini"),
     "c8": ("launch-c8.cjs", "c8-config.json"),
 }
+_JS_TS_SUFFIXES = {".js", ".cjs", ".mjs", ".jsx", ".ts", ".cts", ".mts", ".tsx"}
 # c8 includes its complete production dependency tree, not just the npm package tarball.
 CATALOG = {
     ("coverage.py", "7.6.12"): (
@@ -124,11 +125,14 @@ def staged_tool(
                 archive.extractall(target, filter="data")
         for name in SUPPORT_FILES[tool.name]:
             (target / name).write_bytes((ARTIFACTS / name).read_bytes())
+        if tool.name == "c8":
+            source_files = sorted(
+                name for name in coverage_sources(set(source_files or []), ["*"])
+                if Path(name).suffix.lower() in _JS_TS_SUFFIXES
+            )
+            extensions = {Path(name).suffix for name in source_files}
+            (target / "source-extensions.json").write_text(json.dumps(sorted(extensions)))
         (target / "source-files.json").write_text(json.dumps(source_files))
-        extensions = _SOURCE_SUFFIXES if source_files is None else {
-            Path(name).suffix for name in source_files if _is_source_path(name)
-        }
-        (target / "source-extensions.json").write_text(json.dumps(sorted(extensions)))
         if data is not None:
             (target / "data").mkdir()
             for file in collection_files(data, tool):

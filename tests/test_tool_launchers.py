@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import os
 from pathlib import Path
 import subprocess
@@ -76,7 +77,7 @@ def c8_command(root: Path, *arguments: str) -> list[str]:
 def test_task_c8_config_cannot_execute_custom_reporter(tmp_path: Path, config: str) -> None:
     marker = tmp_path / "reporter-ran"
     tool = tools.ProvisionedTool(name="c8", version="10.1.3")
-    with tools.staged_tool(tool) as stage:
+    with tools.staged_tool(tool, source_files=["main.js"]) as stage:
         root = stage / tool.name
         reporter = tmp_path / "reporter.cjs"
         reporter.write_text(
@@ -296,27 +297,33 @@ def test_c8_exclusion_hints_do_not_cover_unexecuted_lines(tmp_path: Path, hint: 
     (tmp_path / "main.js").write_text(
         f"function unused() {{\n  /* {hint} */ return 42;\n}}\nconsole.log(1);\n"
     )
-    with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3")) as stage:
+    with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3"), source_files=["main.js"]) as stage:
         result = subprocess.run(c8_command(stage / "c8", "--all", "--", "node", "main.js"),
                                 cwd=tmp_path, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     assert "DA:2,0" in (tmp_path / "coverage/lcov.info").read_text()
 
 
-def test_c8_ignores_source_maps(tmp_path: Path) -> None:
-    (tmp_path / "main.js").write_text(
-        "function unused() {\n return 42;\n}\nconsole.log(1);\n//# sourceMappingURL=main.js.map\n"
-    )
-    (tmp_path / "main.js.map").write_text(json.dumps({
-        "version": 3, "sources": ["outside.js"], "sourcesContent": ["forged"], "names": [], "mappings": "",
-    }))
-    with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3")) as stage:
+@pytest.mark.parametrize("comment", [
+    "//# sourceMappingURL={url}",
+    "/*# sourceMappingURL={url} */ //# sourceMappingURL=x",
+    "/*# sourceMappingURL={url} */ /*# sourceMappingURL=x */",
+    "/*# sourceMappingURL={inline} */ //# sourceMappingURL=x",
+])
+def test_c8_maps_cannot_credit_unloaded_source(tmp_path: Path, comment: str) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/big.js").write_text("".join(f"export const v{i} = {i};\n" for i in range(20)))
+    mapping = json.dumps({"version": 3, "sources": ["src/big.js"], "names": [], "mappings": "AAAA"})
+    inline = "data:application/json;base64," + base64.b64encode(mapping.encode()).decode()
+    (tmp_path / "main.js").write_text("console.log(1);\n" + comment.format(url="main.js.map", inline=inline) + "\n")
+    (tmp_path / "main.js.map").write_text(mapping)
+    with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3"), source_files=["src/big.js"]) as stage:
         result = subprocess.run(c8_command(stage / "c8", "--all", "--", "node", "main.js"),
                                 cwd=tmp_path, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     report = (tmp_path / "coverage/lcov.info").read_text()
-    assert "SF:main.js" in report and "DA:2,0" in report
-    assert "outside.js" not in report
+    assert "SF:src/big.js" in report
+    assert [line for line in report.splitlines() if line.startswith("DA:")] == [f"DA:{i},0" for i in range(1, 21)]
 
 
 def test_provisioned_c8_refuses_remapping_opt_in() -> None:
@@ -325,16 +332,19 @@ def test_provisioned_c8_refuses_remapping_opt_in() -> None:
 
 
 def test_c8_source_population_has_no_filename_or_extension_exclusions(tmp_path: Path) -> None:
-    from pluginbench.code_diff import _is_source_path
     from pluginbench.coverage_report import parse_lcov
 
-    names = ["src/rollup.config.js", "src/logic-test.js", "src/impl.mts", "src/upper.JS", "src/types.d.ts"]
+    names = ["src/rollup.config.js", "src/logic-test.js", "src/upper.JS", *[
+        f"src/impl{suffix}" for suffix in [".cjs", ".mjs", ".jsx", ".ts", ".cts", ".mts", ".tsx"]
+    ]]
+    excluded = ["src/types.d.ts", "src/types.d.mts", "src/types.d.cts", "src/tool.py", "src/x.vue",
+                "src/core.test.js", "src/view.test.tsx", "src/__tests__/a.ts"]
     (tmp_path / "src").mkdir()
-    for name in names:
-        assert _is_source_path(name)
+    for name in [*names, *excluded]:
+        (tmp_path / name).parent.mkdir(exist_ok=True)
         (tmp_path / name).write_text("export const value = 1;\n")
     (tmp_path / "main.cjs").write_text("console.log(1)\n")
-    with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3"), source_files=names) as stage:
+    with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3"), source_files=names + excluded) as stage:
         result = subprocess.run(c8_command(stage / "c8", "--all", "--", "node", "main.cjs"),
                                 cwd=tmp_path, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
@@ -344,6 +354,30 @@ def test_c8_source_population_has_no_filename_or_extension_exclusions(tmp_path: 
     assert isinstance(lines, dict)
     assert set(lines["total"]) == {f"{name}:1" for name in names}
     assert lines["covered"] == []
+
+
+def test_c8_refuses_scope_containing_only_tests(tmp_path: Path) -> None:
+    (tmp_path / "b.test.js").write_text("const value = 1;\n")
+    with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3"), source_files=["b.test.js"]) as stage:
+        result = subprocess.run(c8_command(stage / "c8", "--all", "--", "node", "-e", "1"),
+                                cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0
+    assert "PluginBench c8: no files in the profile source scope" in result.stderr
+
+
+@pytest.mark.parametrize("name", ["a[b].py", "a*b.py", "a?b.py", "a]b.py"])
+def test_python_source_scope_matches_literal_filenames(tmp_path: Path, name: str) -> None:
+    for filename in [name, "ab.py", "axb.py"]:
+        (tmp_path / filename).write_text("value = 1\n")
+    (tmp_path / "runner.py").write_text(f"import runpy\nrunpy.run_path({name!r})\nrunpy.run_path('ab.py')\n")
+    with tools.staged_tool(tools.ProvisionedTool(name="coverage.py", version="7.6.12"), source_files=[name]) as stage:
+        for operation in [("run", "runner.py"), ("json",)]:
+            command, env = python_command(stage / "coverage.py", *operation)
+            result = subprocess.run(command, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
+            assert result.returncode == 0, result.stderr
+    report = json.loads((tmp_path / "coverage.json").read_text())
+    assert set(report["files"]) == {name}
+    assert report["files"][name]["executed_lines"] == [1]
 
 
 def test_python_unloaded_namespace_package_files_remain_in_population(tmp_path: Path) -> None:

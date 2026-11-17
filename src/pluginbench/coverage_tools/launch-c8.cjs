@@ -2,6 +2,7 @@
 
 const fs = require('node:fs')
 const path = require('node:path')
+const { constants } = require('node:os')
 const { spawnSync } = require('node:child_process')
 const root = fs.realpathSync(__dirname)
 const cwd = fs.realpathSync(process.cwd())
@@ -22,6 +23,9 @@ for (const name of ['NODE_OPTIONS', 'NODE_PATH', 'EXPERIMENTAL_MONOCART']) delet
 
 const createReport = require('./node_modules/c8/lib/report')
 const convertSourceMap = require('./node_modules/convert-source-map')
+// c8 and v8-to-istanbul share this pinned copy. Never discover task-provided maps.
+convertSourceMap.fromSource = () => null
+convertSourceMap.fromMapFileSource = () => null
 // The pinned converter has no public ignore-hint switch. Disable its single hint parser.
 require('./node_modules/v8-to-istanbul/lib/source').prototype._parseIgnore = () => undefined
 const settings = JSON.parse(fs.readFileSync(config, 'utf8'))
@@ -55,32 +59,29 @@ async function main () {
     if (child.error) throw child.error
     if (child.signal) {
       process.kill(process.pid, child.signal)
+      // Node ignores some signals (including SIGPIPE); retain the child's failure anyway.
+      process.exitCode = 128 + constants.signals[child.signal]
       return
     }
     process.exitCode = child.status === null ? 1 : child.status
     return
   }
+  const sourceFiles = JSON.parse(fs.readFileSync(path.join(root, 'source-files.json'), 'utf8'))
+  if (!sourceFiles || sourceFiles.length === 0) refuse('no files in the profile source scope')
   const report = createReport({
     ...settings, exclude: [],
     extension: JSON.parse(fs.readFileSync(path.join(root, 'source-extensions.json'), 'utf8')),
     reportsDirectory: path.join(cwd, 'coverage'), tempDirectory,
     src: [cwd], resolve: cwd, omitRelative: true, excludeNodeModules: true
   })
-  report._getSourceMap = script => ({
-    // Blank map comments without shifting offsets. The converter cannot discover a map.
-    source: fs.readFileSync(script.url, 'utf8')
-      .replace(convertSourceMap.commentRegex, value => value.replace(/[^\r\n]/g, ' '))
-      .replace(convertSourceMap.mapFileCommentRegex, value => value.replace(/[^\r\n]/g, ' '))
-  })
-  const sourceFiles = JSON.parse(fs.readFileSync(path.join(root, 'source-files.json'), 'utf8'))
-  if (sourceFiles) {
-    const allowed = new Set(sourceFiles)
-    const coverageMap = report.getCoverageMapFromAllCoverageFiles.bind(report)
-    report.getCoverageMapFromAllCoverageFiles = async () => {
-      const map = await coverageMap()
-      map.filter(filename => allowed.has(path.relative(cwd, filename)))
-      return map
-    }
+  // Also ignore V8's map cache. Source bytes remain unchanged, preserving V8 offsets.
+  report._getSourceMap = () => ({})
+  const allowed = new Set(sourceFiles)
+  const coverageMap = report.getCoverageMapFromAllCoverageFiles.bind(report)
+  report.getCoverageMapFromAllCoverageFiles = async () => {
+    const map = await coverageMap()
+    map.filter(filename => allowed.has(path.relative(cwd, filename)))
+    return map
   }
   await report.run()
 }

@@ -131,12 +131,12 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         },
     ),
     "measurement_tools": (
-        5,
+        6,
         {
-            # v5 removes maps, completes populations, and pins report interpreters.
-            "measurement_tools.py": "82406277df16c22c31775339f6aae6ccbe62b32e2a7e0b9950d71cfa7a9325d3",
-            "coverage_tools/launch-coverage.py": "9551d8204e68bc3ec4b9fca3ff963dec8da962a6d8984d3e93c003c3895dcf78",
-            "coverage_tools/launch-c8.cjs": "7ef0c46a33e70986352114cf94d4603a69dca5541aaf6803b47a7828e2daf4c0",
+            # v6 disables map discovery, filters c8 sources, and preserves ignored signals.
+            "measurement_tools.py": "eb12353ca5548ac56258a1d42f04dfef77e23d2364d36b2d7dad3ac93b45dc99",
+            "coverage_tools/launch-coverage.py": "afc80136c0f8f1e436935063615a2bd6bfe9857dbaec00f6f1f0ab3469faf06f",
+            "coverage_tools/launch-c8.cjs": "f631d28528f16f00be8d088a454a56589d00cbf8e30264167f67308ee2e3c60f",
             "coverage_tools/c8-config.json": "2ee2372e0af85263890e3e052453e08a091d47225ffa7678ca8a6c963fcbb177",
             "coverage_tools/coverage-config.ini": "cbc139caa43cfefc8464c88db4af9c053a87a2c60cee43799b40c62c36c564dc",
         },
