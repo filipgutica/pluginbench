@@ -36,13 +36,17 @@ def isolated_host_state(
 
 @pytest.fixture(autouse=True)
 def guidance_outside_tests_is_ignored(
-    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+    request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Guidance a host keeps in /tmp or above cannot fail tests, here or in their children.
 
     Temporary workspaces PluginBench makes itself go below pytest's base directory too, so the
     ancestor check still covers everything a test creates.
     """
+    if request.node.get_closest_marker("real_guidance_check"):
+        return  # The guard's own tests check it as production runs it.
     base = tmp_path_factory.getbasetemp().resolve()
     temporary = base / "tempfile"
     temporary.mkdir(exist_ok=True)

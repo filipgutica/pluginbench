@@ -137,6 +137,7 @@ def test_malformed_trace_cannot_count_as_success(bad_trace: str) -> None:
     assert not parsed["successful_native_completion"]
 
 
+@pytest.mark.real_guidance_check
 @pytest.mark.parametrize(
     "name", ["AGENTS.md", "AGENTS.override.md", "CLAUDE.md", ".agents", ".claude", ".codex"]
 )
@@ -148,6 +149,7 @@ def test_fixture_guidance_is_rejected_even_when_nested(tmp_path: Path, name: str
         codex.reject_guidance(workspace, include_ancestors=False, reject_git=True)
 
 
+@pytest.mark.real_guidance_check
 @pytest.mark.parametrize("name", ["AGENTS.md", "AGENTS.override.md"])
 def test_guidance_guard_checks_ancestors_and_rejects_git_or_symlinks(
     tmp_path: Path, name: str
