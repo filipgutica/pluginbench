@@ -214,6 +214,39 @@ def test_an_interrupted_cleanup_keeps_the_owner_unreleased_though_the_interrupt_
     assert [item["id"] for item in record["operations"]] == [request.spec.id]
 
 
+def test_an_unverified_cleanup_replaces_the_handlers_retryable_error(
+    fake_systemd: FakeSystemd, owned: run_lock.ExecutionLock, docker: _Docker
+) -> None:
+    """A caller retries a ValueError and frees its slot; while a container of the operation
+    remains, it gets CleanupBlocked, with the handler's error as its context."""
+    request = _request("fail", _RUNTIME, message="boom")
+    docker.containers = {"mine": request.spec.id}
+    docker.removes = False
+
+    with pytest.raises(CleanupBlocked, match="remain: mine") as caught:
+        invocation_runtime.run_operation(request)
+
+    assert isinstance(caught.value.__context__, ValueError)
+    assert owned.leftover
+
+
+def test_a_collect_inside_an_operation_runs_in_that_operations_scope(
+    fake_systemd: FakeSystemd, owned: run_lock.ExecutionLock, tmp_path: Path
+) -> None:
+    """A preflight's readiness probe collects inside the preflight's scope, whose fresh entry
+    point holds no execution lock, so the collect cannot start an operation of its own."""
+    config = tmp_path / "coverage.yaml"
+    config.write_text("{}\n")
+    request = _request(
+        "nested_collect",
+        config=str(config),
+        root=str(tmp_path),
+        destination=str(tmp_path / "collected"),
+    )
+
+    assert invocation_runtime.run_operation(request) == {"collected": True}
+
+
 def test_the_handlers_progress_reaches_the_caller_and_a_long_line_never_ends_it(
     fake_systemd: FakeSystemd, owned: run_lock.ExecutionLock
 ) -> None:

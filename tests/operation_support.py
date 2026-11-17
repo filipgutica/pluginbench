@@ -31,7 +31,10 @@ def run_in_place(
     """`invocation_runtime.run_operation` without a scope: the arguments and the value go
     through JSON, and the exception comes back as the owner raises it. Before the handler,
     `started` gets the PID of a stand-in for the scope's entry point, which has exited by the
-    time any recovery checks it, and `progress` gets what the handler reports."""
+    time any recovery checks it, and `progress` gets what the handler reports. As in a scope,
+    whose entry point holds no execution lock, no operation starts inside another."""
+    if getattr(_operations, "current", None) is not None:
+        raise RuntimeError("an operation needs the host execution lock")
     if started is not None:
         stand_in = subprocess.Popen(["sleep", "60"], start_new_session=True)
         try:

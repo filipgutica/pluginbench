@@ -59,6 +59,21 @@ def chatty(arguments: dict[str, Any]) -> Any:
     return len(arguments["lines"])
 
 
+def nested_collect(arguments: dict[str, Any]) -> Any:
+    """A collect inside this operation, as a preflight's readiness probe runs one, with the
+    collector's own command stubbed."""
+    from pluginbench import collectors
+
+    setattr(collectors, "_run_collector", lambda *args: ({"collected": True}, "test", "true"))
+    collector = collectors.Collector(
+        kind="coverage", config=Path(arguments["config"]), command=["true"], tool_version="test"
+    )
+    report, _, _ = collectors._contained(
+        Path(arguments["root"]), collector, Path(arguments["destination"]), None
+    )
+    return report
+
+
 def descriptors(arguments: dict[str, Any]) -> Any:
     found = []
     for name in os.listdir("/proc/self/fd"):
@@ -70,5 +85,5 @@ def descriptors(arguments: dict[str, Any]) -> Any:
 
 
 invocation_runtime.HANDLERS.update(
-    {name: f"sitecustomize:{name}" for name in ("echo", "escape", "hang", "fail", "chatty", "descriptors")}
+    {name: f"sitecustomize:{name}" for name in ("echo", "escape", "hang", "fail", "chatty", "nested_collect", "descriptors")}
 )

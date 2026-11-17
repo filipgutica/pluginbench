@@ -530,9 +530,13 @@ def _collect(
 def _contained(
     root: Path, collector: Collector, destination: Path, baseline: Path | None
 ) -> tuple[dict[str, object], str, str]:
-    """`_run_collector` as one collect operation, in its own scope."""
-    from pluginbench import operations
+    """`_run_collector` as one collect operation, in its own scope. Inside an operation already
+    (a preflight's readiness probe), it runs in that operation's scope, under its budget: an
+    entry point holds no execution lock, so no operation starts inside another."""
+    from pluginbench import invocation_runtime, operations
 
+    if invocation_runtime.current() is not None:
+        return _run_collector(root, collector, destination, baseline)
     report, version, tool = operations.run(
         "collect",
         operations.Collect(

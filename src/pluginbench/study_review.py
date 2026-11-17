@@ -790,7 +790,9 @@ def review_study(
                 observed.mkdir(parents=True)
                 execution: dict[str, object] = {}
                 response = None
-                call_interrupted: KeyboardInterrupt | None = None
+                # An interrupt, or a cleanup that was not verified, ends the pass once this
+                # call's observation is saved.
+                call_interrupted: KeyboardInterrupt | control_store.CleanupBlocked | None = None
                 halted: study.ProviderStopped | None = None
                 row["status"] = "running"
                 with tempfile.TemporaryDirectory(prefix="pluginbench-judge-") as temporary:
@@ -884,7 +886,7 @@ def review_study(
                             status="interrupted" if isinstance(exc, KeyboardInterrupt) else "unknown",
                             reason=f"judge review failed: {type(exc).__name__}: {exc}",
                         )
-                        if isinstance(exc, KeyboardInterrupt):
+                        if isinstance(exc, (KeyboardInterrupt, control_store.CleanupBlocked)):
                             call_interrupted = exc
                     finally:
                         artifacts = area / "artifacts"

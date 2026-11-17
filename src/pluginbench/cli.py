@@ -43,6 +43,7 @@ from pluginbench.run_status import format_status, run_status
 _EXPECTED_RUN_ERRORS = (
     OSError,
     ValueError,
+    control_store.CleanupBlocked,
     yaml.YAMLError,
     subprocess.SubprocessError,
     RuntimeDriftError,
@@ -541,6 +542,7 @@ def check(
         yaml.YAMLError,
         subprocess.SubprocessError,
         RuntimeDriftError,
+        control_store.CleanupBlocked,
     ) as exc:
         _error(exc)
 
@@ -652,7 +654,7 @@ def repair(
         owner = run_lock.ExecutionOwner(kind="recovery", eval=target, root=target)
         with run_lock.hold_execution(owner) as lock:
             confirmed, at, remaining = control_store.confirm_stopped(lock, run)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, control_store.CleanupBlocked) as exc:
         _error(exc)
         return
     for check, reason in confirmed:
@@ -752,7 +754,7 @@ def review(
             if not yes and not _confirm("Start review?"):
                 raise typer.Exit()
             _review(run, revision, reviewer=reviewer, select=select)
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError, control_store.CleanupBlocked) as exc:
         _error(exc)
 
 
@@ -837,7 +839,13 @@ def measure(
             if not yes and not _confirm("Start measurement?"):
                 raise typer.Exit()
             _measure(run, names, revision, coverage_profiles, tasks=task_ids)
-    except (OSError, ValueError, yaml.YAMLError, subprocess.SubprocessError) as exc:
+    except (
+        OSError,
+        ValueError,
+        yaml.YAMLError,
+        subprocess.SubprocessError,
+        control_store.CleanupBlocked,
+    ) as exc:
         _error(exc)
 
 
@@ -928,7 +936,7 @@ def judge_run(
             failed = run_judges(
                 directory, judges=judges, timeout=timeout, jobs=jobs, progress=typer.echo
             )
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError, control_store.CleanupBlocked) as exc:
         _error(exc)
         return
     if failed:

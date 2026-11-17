@@ -32,6 +32,9 @@ AFTER_REVIEW = 120
 AROUND_COLLECTOR = 600
 # A requalification runs nop and oracle, one after the other.
 REFERENCE_AGENTS = 2
+# A task's measurement preparation: observer installs and profile setup, which apply no timeout
+# of their own.
+MEASUREMENT_PREPARATION = 1800
 
 
 def _absolute(path: Path) -> Path:
@@ -182,22 +185,45 @@ def collect_budget(collector: Collector) -> int:
     """One collector's whole budget. Mutation runs its suite for two baselines, a type check and
     two source-only baselines, then up to a check and four runs for each sampled mutant, each
     bounded by its mutant timeout; P7 replaces this coarse bound with its admitted one."""
-    from pluginbench import mutation
-
     if collector.kind != "mutation":
         return collector.timeout_seconds + AROUND_COLLECTOR
     config = json.loads(collector.config.read_text())
-    suite = int(config["coverage"]["timeout_seconds"])
+    return _mutation_budget(int(config["coverage"]["timeout_seconds"]))
+
+
+def _mutation_budget(suite: int) -> int:
+    """A mutation collect's budget, given its coverage suite's timeout (see `collect_budget`)."""
+    from pluginbench import mutation
+
     runs = 5 + 5 * mutation.SAMPLE_SIZE
     return runs * (mutation.TIMEOUT_FACTOR * suite + mutation.TIMEOUT_GRACE_SECONDS) + (
         AROUND_COLLECTOR
     )
 
 
+def readiness_budget(task_dir: Path, config: Evaluation) -> int:
+    """A task's measurement preparation, then every readiness repeat of each collector its
+    selected measures can use, each at its whole collect budget. A preflight's collects run
+    in its own scope (`collectors._contained`), so its budget holds them."""
+    from pluginbench import measurement_profiles as profiles
+
+    selected = profiles.selected_measurements(config.measurements)
+    coverage = profiles.coverage_settings(task_dir, config.measurement_settings)
+    suite = coverage.timeout_seconds if coverage is not None else 0
+    collects = 0
+    if selected & profiles.FALLOW_MEASUREMENTS:  # Analysis or Fallow, never both.
+        collects += profiles.OBSERVER_TIMEOUT + AROUND_COLLECTOR
+    if "coverage" in selected and coverage is not None:
+        collects += suite + AROUND_COLLECTOR
+    if "mutation" in selected and coverage is not None:
+        collects += _mutation_budget(suite)
+    return MEASUREMENT_PREPARATION + profiles.READINESS_REPEATS * collects
+
+
 def preflight_budget(config: Evaluation) -> int:
     """A check or preparation's whole budget, summed over its tasks and never divided by
-    parallelism: each task's image build and agent installation, then its nop and oracle, each
-    with its export and cleanup."""
+    parallelism: each task's image build and agent installation, its measurement preparation
+    and readiness, then its nop and oracle, each with its export and cleanup."""
     from pluginbench import harbor_backend
 
     source = config.tasks.resolve()
@@ -206,6 +232,7 @@ def preflight_budget(config: Evaluation) -> int:
     for task in config.tasks.task_ids:
         task_dir = suite / "tasks" / task
         total += harbor_backend._native_worker_budget(task_dir=task_dir, prepare=True)
+        total += readiness_budget(task_dir, config)
         total += requalify_budget(task_dir) + AFTER_WORKER
     return total
 

@@ -22,6 +22,7 @@ from pluginbench import (
     operations,
 )
 from pluginbench.collectors import Collector
+from pluginbench.measurement_profiles import CoverageSettings, MeasurementSettings
 
 
 def _evaluation(tmp_path: Path) -> evaluation.Evaluation:
@@ -204,7 +205,8 @@ _ROUTED = {
     "invoke_native": set(),
     "regrade_native": set(),
     "invoke": set(),
-    "_run_collector": set(),
+    # Only when already inside an operation, whose scope and budget it runs under.
+    "_run_collector": {("collectors", "_contained")},
     "check_evaluation": set(),
     # Inside the preflight operation's own check.
     "run_reference_agents": {("evaluation", "_reference_agents")},
@@ -255,5 +257,21 @@ def test_each_operation_budget_outlasts_its_implementations_own_timeouts(
     # Every run a mutation may make, each at its longest mutant timeout.
     assert operations.collect_budget(Collector(kind="mutation", config=mutation)) > 55 * (3 * 100 + 60)
     tasks = SimpleNamespace(resolve=lambda: tmp_path / "tasks", task_ids=["one", "two"])
+    for name in tasks.task_ids:
+        (tmp_path / "tasks" / name).mkdir(parents=True, exist_ok=True)
+        (tmp_path / "tasks" / name / "task.toml").write_text('[metadata]\nlanguage = "python"\n')
+    coverage = CoverageSettings(
+        command=["pytest"], report_path="coverage.json", tool_version="7",
+        format="coverage-py-json", timeout_seconds=7200,
+    )
+    config = SimpleNamespace(
+        tasks=tasks,
+        measurements=["coverage", "cyclomatic"],
+        measurement_settings=MeasurementSettings(coverage=coverage),
+    )
+    # Each task: preparation, nop and oracle, then both readiness repeats of its coverage and
+    # analysis commands, each at the longest timeout it may have (#134's review: 11,400 s was
+    # given where two 7,200 s coverage runs alone need 14,400 s).
     one = worker(task_dir=task, prepare=True) + operations.requalify_budget(task)
-    assert operations.preflight_budget(cast(Any, SimpleNamespace(tasks=tasks))) > 2 * one
+    readiness = 2 * (7200 + 7200)
+    assert operations.preflight_budget(cast(Any, config)) > 2 * (one + readiness)

@@ -113,7 +113,9 @@ class OperationFailed(ValueError):
     by type, or it never got past a gate. Callers treat it as an infrastructure error.
 
     `type` names the handler's exception, or is empty for a launch failure. Either way its
-    bootstrap had started, so the call counts as spent (`ledger.outcome`)."""
+    bootstrap had started, so the call counts as spent (`launched`, read by `ledger.outcome`)."""
+
+    launched = True
 
     def __init__(self, message: str, *, type: str = "") -> None:
         super().__init__(f"{type}: {message}" if type else message)
@@ -332,10 +334,11 @@ def run_operation(
     """Run `request` in its scope and return its handler's value, once its cleanup is verified.
 
     `started` gets the entry point's PID after the scope is checked and before the handler may
-    run; if it raises, nothing runs. `progress` gets each line the handler reports (`report`). The handler's own exception becomes OperationFailed; a
-    handler past its deadline is killed and raises OperationDeadlineExceeded. Before anything
-    spawns this raises only HostUnavailable or ValueError. A cleanup that cannot be verified
-    raises control_store.CleanupBlocked and keeps the owner unreleased.
+    run; if it raises, nothing runs. `progress` gets each line the handler reports (`report`).
+    The handler's own exception becomes OperationFailed; a handler past its deadline is killed
+    and raises OperationDeadlineExceeded. Before anything spawns this raises only
+    HostUnavailable or ValueError. A cleanup that cannot be verified raises
+    control_store.CleanupBlocked whatever the operation did, and keeps the owner unreleased.
     """
     lock = _lock()
     launcher = require_user_manager()
@@ -352,22 +355,24 @@ def run_operation(
         {"id": spec.id, "scope": spec.scope, "label": spec.label, "docker": spec.docker,
          "dir": str(directory), "bootstrap": None, "payload": None}
     )
-    failure: BaseException | None = None
     try:
         return _launch(
             lock, request, _scope_command(launcher, request, path), directory, started, progress
         )
-    except BaseException as exc:
-        failure = exc
-        raise
     finally:
         try:
             verify_cleanup(lock.record_operation(spec.id), lock=lock)
         except Exception as exc:
+            from pluginbench.control_store import CleanupBlocked
+
             lock.note_leftover(f"cleanup of invocation {spec.id} was not verified: {exc}")
-            if failure is None:
+            # It replaces the operation's own outcome (chained as its context): while anything
+            # of it may run, its slot stays taken and no more work starts.
+            if isinstance(exc, CleanupBlocked):
                 raise
-            failure.add_note(f"Cleanup was not verified: {exc}")
+            raise CleanupBlocked(
+                f"cleanup of invocation {spec.id} was not verified: {exc}"
+            ) from exc
 
 
 def _launch(

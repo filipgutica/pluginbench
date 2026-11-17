@@ -118,6 +118,12 @@ class CoverageSettings(BaseModel):
         return self
 
 
+# Analysis and Fallow each run one command, at most this long.
+OBSERVER_TIMEOUT = 7200
+# Readiness collects every measure this many times before coding.
+READINESS_REPEATS = 2
+
+
 class MeasurementSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -529,7 +535,7 @@ def prepare_profiles(
                 config=analysis_config,
                 scope=source_scope,
                 tool_version=VERSION,
-                timeout_seconds=7200,
+                timeout_seconds=OBSERVER_TIMEOUT,
             )
         )
     if any(
@@ -560,7 +566,7 @@ def prepare_profiles(
                     parser["sha256"],
                 ],
                 tool_version="3.18.0",
-                timeout_seconds=7200,
+                timeout_seconds=OBSERVER_TIMEOUT,
             )
         )
     if "coverage" in selected and capabilities["coverage"]["status"] == "available":
@@ -759,7 +765,7 @@ def probe_measurements(
 ) -> dict[str, dict[str, object]]:
     """Exercise fixed collectors twice before coding; malformed evidence stays fatal."""
     repeats = []
-    for index in range(2):
+    for index in range(READINESS_REPEATS):
         directory = output / str(index)
         directory.mkdir(parents=True)
         refs = collect_measurements(snapshot, directory, collectors, before=snapshot)

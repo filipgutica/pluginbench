@@ -511,8 +511,11 @@ class CodingInfrastructure(_Reasoned, ValueError):
     """A coding attempt that ended without gradable evidence: an infrastructure error.
 
     It is never complete, graded or cached; the next resume codes its slot again while the slot
-    has invocations left.
+    has invocations left. `launched` keeps a launched scope's spend (`ledger.outcome`) when its
+    operation failed before the call was admitted.
     """
+
+    launched = False
 
 
 def _call_error(error: BaseException) -> str:
@@ -561,6 +564,7 @@ def _execute_stage(
     _assert_frozen(root)
     interrupted: KeyboardInterrupt | None = None
     worker_error: str | None = None
+    launched = False  # The call's scope was launched, so it is spent even if never admitted.
     try:
         codex.reject_guidance(area / "workspace", include_ancestors=True, reject_git=False)
         from pluginbench import operations
@@ -633,6 +637,7 @@ def _execute_stage(
             interrupted = exc
         else:
             worker_error = _call_error(exc)
+            launched = getattr(exc, "launched", False)
     mixed = None
     if reused_vanilla:
         receipt = _discovery_receipt(execution, area / "artifacts")
@@ -774,7 +779,9 @@ def _execute_stage(
             except ValueError as error:
                 execution["error"] = str(error)
                 _write(target / "execution.json", execution)
-        raise _infrastructure(target, entry, infrastructure)
+        failed = _infrastructure(target, entry, infrastructure)
+        failed.launched = launched
+        raise failed
     try:
         exported = inspect_snapshot(area / "workspace")
         if exported["digest"] != execution.get("submission_export_digest"):

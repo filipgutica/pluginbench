@@ -27,6 +27,7 @@ from native_support import execution as native_execution, runtime_identity, synt
 from pluginbench import harbor_backend, processes, provider_stops, source_only, study, study_review
 from pluginbench import codex, invocation_runtime, submissions, trial_containers
 from pluginbench import ledger as invocation_ledger
+from pluginbench.control_store import CleanupBlocked
 from pluginbench.ledger import (
     LEDGER_NAME,
     SCHEMA_VERSION,
@@ -725,3 +726,86 @@ def test_an_operation_whose_scope_was_launched_counts_as_spent_though_never_admi
     assert invocation_ledger.outcome(ValueError("refused"), spawned=False) == (
         "aborted_prespawn", None
     )
+
+
+# The owner's real `run_operation`, which the autouse fixture replaces with `run_in_place`.
+_RUN_OPERATION = invocation_runtime.run_operation
+
+
+def _through_run_operation(
+    monkeypatch: pytest.MonkeyPatch, *, launch: Any, cleanup: Any
+) -> None:
+    """Run the study's operations through the owner's real `run_operation`: it records each
+    operation and verifies its cleanup. `launch` stands in for the scope, `cleanup` for the
+    verification."""
+    monkeypatch.setattr(invocation_runtime, "run_operation", _RUN_OPERATION)
+    monkeypatch.setattr(invocation_runtime, "_launch", launch)
+    monkeypatch.setattr(invocation_runtime, "verify_cleanup", cleanup)
+
+
+def test_an_unverified_cleanup_holds_its_slot_and_starts_no_other_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_execution: Any
+) -> None:
+    """The call ran, then a container of it survived its removal. A retryable error would free
+    its slot for the next task; this stops the run with the call spent, and the host fenced."""
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+
+    def launch(lock: Any, request: Any, command: Any, directory: Any, started: Any, progress: Any) -> Any:
+        return operation_support.run_in_place(request, started=started, progress=progress)
+
+    def survived(operation: dict[str, Any], *, lock: Any) -> None:
+        raise CleanupBlocked(f"a container of invocation {operation['id']} survived its removal")
+
+    _through_run_operation(monkeypatch, launch=launch, cleanup=survived)
+    resolved = study.load_study(
+        resume_support.recipe(tmp_path / "config", tasks=3, treatments=0, repeats=1, jobs=1)
+    )
+
+    with pytest.raises(CleanupBlocked, match="survived its removal"):
+        study.run_study(resolved, tmp_path / "run")
+
+    assert len(calls) == 1
+    assert _states(tmp_path / "run") == ["unresolved"]  # Spent, never refunded.
+    assert host_execution.leftover
+
+
+def test_a_coding_call_whose_scope_never_admitted_it_is_spent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its bootstrap ran, so it is no refundable abort, though coding saves the failure as an
+    infrastructure error."""
+    resume_support.install(monkeypatch, [])
+
+    def never_admitted(*args: Any) -> Any:
+        raise invocation_runtime.OperationFailed("the operation's scope did not start")
+
+    _through_run_operation(monkeypatch, launch=never_admitted, cleanup=lambda operation, *, lock: None)
+
+    with pytest.raises(study.CodingInfrastructure, match="scope did not start"):
+        study.run_study(_one_slot(tmp_path), tmp_path / "run")
+
+    assert _states(tmp_path / "run") == ["failed_transient"]
+
+
+def test_an_unverified_review_cleanup_ends_the_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A review pass records a failed call and goes on; a call whose cleanup was not verified
+    stops it, with the call spent."""
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    calls = test_study_review._judge(monkeypatch, root, behavior="clean")
+
+    def launch(lock: Any, request: Any, command: Any, directory: Any, started: Any, progress: Any) -> Any:
+        return operation_support.run_in_place(request, started=started, progress=progress)
+
+    def survived(operation: dict[str, Any], *, lock: Any) -> None:
+        raise CleanupBlocked(f"a process of invocation {operation['id']} survived its scope")
+
+    _through_run_operation(monkeypatch, launch=launch, cleanup=survived)
+
+    with pytest.raises(CleanupBlocked, match="survived its scope"):
+        study_review.review_study(root)
+
+    assert len(calls) == 1
+    assert _states(root, "review") == ["unresolved"]
