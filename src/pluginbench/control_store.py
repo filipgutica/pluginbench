@@ -386,7 +386,29 @@ def _invocations(rows: Sequence[dict[str, Any]], root: str) -> list[Check]:
 
 
 def _obligation_checks(obligation: dict[str, Any]) -> list[Check]:
-    """Everything to verify before a dead owner's root is known to have nothing running."""
+    """Everything to verify before a dead owner's root is known to have nothing running.
+
+    Each cleanup the owner recorded as failed comes first, as an unknown check: an empty process
+    group or container inventory cannot show that an escaped process is gone.
+    """
+    root = str(obligation["root"])
+    name = f"{obligation.get('pid')}-{obligation.get('acquired_at')}"
+    leftovers = obligation.get("leftovers")
+    failed: list[Check] = [
+        {
+            "id": f"{name}:leftover:{index}",
+            "root": root,
+            "kind": "unrecorded",
+            "reason": str(item.get("reason") if isinstance(item, dict) else item),
+        }
+        for index, item in enumerate(
+            leftovers if isinstance(leftovers, list) else [] if leftovers is None else [leftovers]
+        )
+    ]
+    return failed + _work_checks(obligation)
+
+
+def _work_checks(obligation: dict[str, Any]) -> list[Check]:
     root = str(obligation["root"])
     name = f"{obligation.get('pid')}-{obligation.get('acquired_at')}"
     path = _ledger(Path(root))

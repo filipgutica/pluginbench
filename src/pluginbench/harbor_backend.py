@@ -795,9 +795,11 @@ def cleanup(*, project: str, owner: str, expected_runtime: dict[str, object]) ->
     """Remove only this trial's labelled resources and verify that none remain."""
     try:
         return _cleanup(project=project, owner=owner, expected_runtime=expected_runtime)
-    except BaseException:
-        # Its containers may remain, so the host lock owner can no longer exit clean.
-        run_lock.note_leftover()
+    except BaseException as error:
+        run_lock.note_leftover(
+            f"Harbor project {project} could not be cleaned up ({error}), so its containers may "
+            "still run"
+        )
         raise
 
 

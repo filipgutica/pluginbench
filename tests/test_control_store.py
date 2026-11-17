@@ -445,6 +445,10 @@ def test_an_owner_whose_call_cleanup_failed_stays_unreleased_after_a_normal_exit
     finally:
         os.killpg(child, signal.SIGKILL)
         os.waitpid(child, 0)
+    # Its group is gone now, but only the operator can clear the recorded cleanup failure.
+    assert not _admitted(isolated_host_state, tmp_path)
+    result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+    assert result.exit_code == 0 and "could not be stopped" in result.stdout, result.output
     assert _admitted(isolated_host_state, tmp_path)
 
 
@@ -454,11 +458,107 @@ def test_an_owner_whose_container_cleanup_failed_stays_unreleased_after_a_normal
     def unreachable(runtime: Any, **kwargs: Any) -> None:
         raise ValueError("Cannot connect to the Docker daemon")
 
+    run = tmp_path / "trial"
+    run.mkdir()
+    Ledger.create(run / LEDGER_NAME, [], {}).close()  # Nothing else for the next owner to check.
     monkeypatch.setattr(harbor_backend, "_assert_daemon", unreachable)
-    with control_store.execute(_owner(tmp_path / "trial")):
+    with control_store.execute(_owner(run)):
         with pytest.raises(ValueError, match="Cannot connect"):
             harbor_backend.cleanup(project="p", owner="o", expected_runtime={})
     assert _record(isolated_host_state)["state"] != "released"
+    # The failure is on disk, so the next owner checks it however this one ended.
+    with pytest.raises(CleanupBlocked, match="Harbor project p could not be cleaned up"):
+        with control_store.execute(_owner(tmp_path / "unrelated")):
+            pass
+
+
+# Leads a call whose descendant leaves its process group with setsid() and keeps the call's
+# output pipes open: the group stops, but the output drain times out.
+_ESCAPING = """
+import subprocess, sys, time
+code = "import os, sys, time; os.setsid(); open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(30)"
+subprocess.Popen([sys.executable, "-c", code, sys.argv[1]])
+time.sleep(30)
+"""
+
+
+def _gone(pid: int) -> None:
+    os.kill(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 10
+    while control_store._leader_runs(pid, run_lock.process_start(pid)) if Path(
+        f"/proc/{pid}"
+    ).exists() else False:
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+
+def test_an_escaped_process_holding_a_calls_output_blocks_until_repair_confirms_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
+) -> None:
+    monkeypatch.setattr(processes, "_CLEANUP_TIMEOUT", 0.2)
+    run = tmp_path / "review"
+    run.mkdir()
+    escaped = tmp_path / "escaped.pid"
+    ledger = Ledger.create(
+        run / LEDGER_NAME,
+        [{"id": "a", "task_id": "t", "arm": "vanilla", "attempt": 1}],
+        {"a": "running"},
+    )
+    try:
+        with control_store.execute(_owner(run)):
+            call = ledger.intent(slot=0, stage="review", attempt_id="a")
+            with pytest.raises(subprocess.TimeoutExpired) as timed_out:
+                processes.run_command(
+                    [sys.executable, "-c", _ESCAPING, str(escaped)],
+                    cwd=run, env=os.environ, timeout=0.5,
+                    on_spawn=lambda pid: ledger.invocation_started(call, pid),
+                )
+            assert any("Final output drain" in note for note in timed_out.value.__notes__)
+            ledger.end(call, *outcome(timed_out.value, spawned=True))
+        ledger.close()
+        # Its recorded group is empty, but that proves nothing about the escaped process.
+        with pytest.raises(CleanupBlocked, match="held open by an escaped process") as refused:
+            with control_store.execute(_owner(tmp_path / "unrelated")):
+                pass
+        assert f"repair --confirm-stopped {run}" in str(refused.value)
+    finally:
+        ledger.close()
+        if escaped.exists():
+            _gone(int(escaped.read_text()))
+    result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+    assert result.exit_code == 0 and "held open by an escaped process" in result.stdout
+    assert _admitted(isolated_host_state, tmp_path)
+
+
+# Takes the host lock for a run, records a failed cleanup, and is killed before it returns.
+_KILLED_AFTER_LEFTOVER = """
+import os, signal, sys
+from pathlib import Path
+from pluginbench import control_store, run_lock
+state, run = Path(sys.argv[1]), sys.argv[2]
+with control_store.execute(run_lock.ExecutionOwner(kind="review", eval=run, root=run), state=state):
+    run_lock.note_leftover("output from an earlier call may still be held open by an escaped process")
+    os.kill(os.getpid(), signal.SIGKILL)
+"""
+
+
+def test_a_failed_cleanup_survives_its_owner_being_killed(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    run = tmp_path / "review"
+    run.mkdir()
+    Ledger.create(run / LEDGER_NAME, [], {}).close()
+    killed = subprocess.run(
+        [sys.executable, "-c", _KILLED_AFTER_LEFTOVER, str(isolated_host_state), str(run)],
+        env={**os.environ, "PYTHONPATH": _SOURCE},
+        check=False,
+    )
+    assert killed.returncode == -signal.SIGKILL
+    with pytest.raises(CleanupBlocked, match="held open by an escaped process"):
+        with control_store.execute(_owner(tmp_path / "unrelated")):
+            pass
+
+
 
 
 def test_an_error_before_any_recorded_work_releases_the_host(

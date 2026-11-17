@@ -453,7 +453,7 @@ class ExecutionLock:
     # recovers its root.
     dirty: bool = False
     # Set once a cleanup of something this owner started failed. Unlike `dirty`, a clean exit
-    # never clears it: the next owner verifies this root whatever happens.
+    # never clears it, and the record names each failure (`note_leftover`).
     leftover: bool = False
 
     def assert_owned(self) -> None:
@@ -486,6 +486,14 @@ class ExecutionLock:
         self.dirty = True
         if docker not in self.record["runtimes"]:
             self._write({**self.record, "runtimes": [*self.record["runtimes"], docker]})
+
+    def note_leftover(self, reason: str) -> None:
+        """Record that a cleanup failed, before the caller goes on. No check can prove such a
+        failure harmless, so the next owner keeps it as unknown until an operator confirms it;
+        if the record cannot be written, this raises."""
+        self.leftover = True
+        failure = {"reason": reason, "at": datetime.now(UTC).isoformat()}
+        self._write({**self.record, "leftovers": [*self.record.get("leftovers", []), failure]})
 
     def _write(self, record: dict[str, Any]) -> None:
         # Adopt the record only once it is on disk, so a failed write never reaches it later.
@@ -523,11 +531,12 @@ def external_work() -> Iterator[None]:
     lock.dirty = before
 
 
-def note_leftover() -> None:
-    """Mark that cleanup of something the owner started failed, so its release stays
-    unrecorded even if it exits cleanly. Without the host lock there is nothing to mark."""
+def note_leftover(reason: str) -> None:
+    """Record that cleanup of something the owner started failed, as `reason` says, so its
+    release stays unrecorded and the next owner cannot clear it by any check. Without the host
+    lock there is nothing to record."""
     if _execution is not None:
-        _execution.leftover = True
+        _execution.note_leftover(reason)
 
 
 def note_runtime(runtime: dict[str, object]) -> None:
@@ -590,6 +599,7 @@ def hold_execution(owner: ExecutionOwner, *, state: Path | None = None) -> Itera
                 "state": "acquiring",
                 "acquired_at": datetime.now(UTC).isoformat(),
                 "runtimes": [],
+                "leftovers": [],
                 "pending": _carried(state),
             },
         )
