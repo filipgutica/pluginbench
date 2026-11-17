@@ -392,6 +392,8 @@ def _admit(
         lock.assert_owned()
         if started is not None:
             started(pid)
+            # The lock can be lost while the callback waits; check again before the permit.
+            lock.assert_owned()
         _send(connection, {"permit": spec.id})
     except BaseException:
         connection.close()

@@ -263,6 +263,26 @@ def test_the_handler_never_runs_when_started_refuses_it(
     assert _record(owned.state)["operations"] == []
 
 
+def test_the_handler_never_runs_when_the_lock_is_lost_during_started(
+    fake_systemd: FakeSystemd, tmp_path: Path
+) -> None:
+    marker = tmp_path / "ran"
+    with run_lock.hold_execution(_owner(tmp_path)) as lock:
+
+        def replace_lock(pid: int) -> None:
+            path = lock.state / run_lock.EXECUTION_LOCK
+            path.rename(path.with_suffix(".old"))
+            path.touch()
+
+        with pytest.raises(run_lock.ExecutionLost):
+            invocation_runtime.run_operation(
+                _request("echo", marker=str(marker)), started=replace_lock
+            )
+
+    time.sleep(0.5)
+    assert not marker.exists()
+
+
 def test_a_process_outside_the_scope_is_never_admitted(
     fake_systemd: FakeSystemd,
     owned: run_lock.ExecutionLock,
