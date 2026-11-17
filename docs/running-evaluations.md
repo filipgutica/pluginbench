@@ -562,8 +562,8 @@ Each check tells you what it can see:
 
 - each recorded operation's scope, which is stopped, so every process in it ends however it left its group, and every container labelled with that operation, which is removed;
 - every process in the process group of each call that was still open, or that the command ended itself, since a call can end while its cleanup failed;
-- the run's trial containers, for each Docker daemon the command recorded, each checked on its own. Any it finds are stopped, and two later checks at least a second apart must find none. If the run's frozen suite is gone, its containers cannot be found, so they count as unknown;
-- the reason any cleanup failed, when it could be saved.
+- for a command from an earlier build, the run's trial containers, for each Docker daemon the command recorded, each checked on its own. Any it finds are stopped, and two later checks at least a second apart must find none. If the run's frozen suite is gone, its containers cannot be found, so they count as unknown. A current command's containers all carry an operation's label, so the first check finds them;
+- the reason any cleanup failed, when it could be saved. A failed cleanup of an operation clears once that operation's own check passes; any other needs repair.
 
 The whole check has 120 seconds, and each Docker command gets only what is left of that time. Containers are checked only once every process is known to be gone, because a live process could still start one. A resume runs the same checks on its own run before it accepts saved output or marks a call unresolved.
 

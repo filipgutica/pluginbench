@@ -187,7 +187,7 @@ def test_the_entry_point_creates_containers_only_on_the_daemon_its_operation_rec
     )
 
 
-def test_a_container_that_survives_removal_keeps_the_owner_unreleased_though_the_error_is_caught(
+def test_a_container_that_survives_removal_fences_the_host_until_a_later_check_removes_it(
     fake_systemd: FakeSystemd, docker: _Docker, tmp_path: Path, isolated_host_state: Path
 ) -> None:
     request = _request("echo", _RUNTIME, value=1)
@@ -203,10 +203,38 @@ def test_a_container_that_survives_removal_keeps_the_owner_unreleased_though_the
     record = _record(isolated_host_state)
     assert record["state"] != "released"
     assert [item["id"] for item in record["operations"]] == [request.spec.id]
+    assert [item["operation"] for item in record["leftovers"]] == [request.spec.id]
     # The next owner carries the operation forward and verifies it before anything starts.
     with pytest.raises(CleanupBlocked, match="remain: mine"):
         with control_store.execute(_owner(tmp_path / "unrelated")):
             pass
+    # Once its container can be removed, that same check clears the fence, with no repair.
+    docker.removes = True
+    with control_store.execute(_owner(tmp_path / "unrelated")) as recovered:
+        assert recovered.record["pending"] == []
+    assert docker.containers == {}
+    assert (isolated_host_state / "invocations" / request.spec.id / "cleanup.json").is_file()
+
+
+def test_a_contained_owner_needs_only_its_operations_proof_not_its_runs_frozen_suite(
+    fake_systemd: FakeSystemd, docker: _Docker, tmp_path: Path, isolated_host_state: Path
+) -> None:
+    """Every container a contained owner started carries a recorded operation's label, so its
+    label inventory alone proves them gone, even with the run's frozen suite missing."""
+    from pluginbench.ledger import LEDGER_NAME, Ledger
+
+    run = tmp_path / "run"
+    run.mkdir()
+    Ledger.create(run / LEDGER_NAME, [], {}).close()
+    with pytest.raises(RuntimeError, match="killed"):
+        with run_lock.hold_execution(_owner(run)) as lock:
+            lock.note_runtime(_RUNTIME)
+            invocation_runtime.run_operation(_request("echo", _RUNTIME, value=1))
+            raise RuntimeError("killed")  # Its owner never records a clean release.
+    assert _record(isolated_host_state)["state"] != "released"
+
+    with control_store.execute(_owner(tmp_path / "unrelated")) as lock:
+        assert lock.record["pending"] == []
 
 
 def test_an_interrupted_cleanup_keeps_the_owner_unreleased_though_the_interrupt_is_caught(

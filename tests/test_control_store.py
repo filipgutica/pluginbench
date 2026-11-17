@@ -347,10 +347,13 @@ def test_repair_checks_containers_only_once_the_processes_are_gone(
     assert _admitted(isolated_host_state, tmp_path)
 
 
+@pytest.mark.usefixtures("earlier_build")
 @pytest.mark.parametrize("unknown", ["daemon unreachable", "runtime unreadable"])
 def test_containers_that_cannot_be_checked_during_a_resume_fence_the_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path, unknown: str
 ) -> None:
+    """For a resume by an earlier build. A contained owner's containers all carry a recorded
+    operation's label, so its own operations' checks prove them, never the run's inventory."""
     root = _crashed(tmp_path, "after-identity")
     [crashed] = _rows(root)
     calls: list[str] = []

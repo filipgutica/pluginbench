@@ -919,6 +919,25 @@ def test_a_revision_saved_with_more_jobs_than_a_host_runs_does_not_resume(tmp_pa
     assert list(directory.iterdir()) == [directory / "revision.json"]
 
 
+def test_measuring_a_run_saved_with_more_jobs_than_a_host_runs_prepares_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from pluginbench import evaluation
+
+    monkeypatch.setattr(evaluation, "_load_selection", lambda root: {"jobs": 3})
+    monkeypatch.setattr(evaluation, "_saved_evaluation", lambda selection: SimpleNamespace(jobs=3))
+    monkeypatch.setattr(
+        evaluation, "_measure_inputs", lambda *args: pytest.fail("measurement inputs read")
+    )
+    monkeypatch.setattr(
+        evaluation, "_prepare_measure", lambda *args: pytest.fail("measurement prepared")
+    )
+    with pytest.raises(ValueError, match="jobs=3 is more than the 2 task jobs"):
+        evaluation.measure_evaluation(tmp_path, ["coverage"], "wide")
+
+
 def test_parallel_observer_fatal_failure_drains_active_receipts_without_new_repeats(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

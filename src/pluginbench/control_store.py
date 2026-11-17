@@ -9,7 +9,7 @@ An owner whose record has schema 3 (`run_lock.CONTAINED_SCHEMA`) ran every codin
 review, collect and preflight call inside an operation it recorded first, and started every
 container, build and trial only inside one, labelled with its invocation. Its checks below then
 cover all those may have left, so its obligation clears by itself once they pass. The owner's
-own host commands (image pulls, git) run unscoped and start no container, so no check covers
+own host commands (such as `git apply`) run unscoped and start no container, so no check covers
 them. An owner record from an earlier build, or one that cannot be read, is one more unknown
 check that only `pluginbench repair --confirm-stopped ROOT` clears, after checking again
 (`confirm_stopped`). The checks:
@@ -18,11 +18,14 @@ check that only `pluginbench repair --confirm-stopped ROOT` clears, after checki
   For a contained owner, a call with no process record is covered by its operation: one still
   recorded is checked below, one whose cleanup was proven left `cleanup.json`, and one with no
   runtime directory never started, since the directory comes before anything spawns.
-- containers: for each Docker runtime the owner recorded, once the processes are confirmed. The
-  trial containers R left running are stopped, and two inventories at least a second apart must
-  find none (`verify_containers`). One pass has RECOVERY_SECONDS, and every Docker command in it
-  is capped by what is left.
-- each cleanup the owner recorded as failed (`run_lock.note_leftover`), with its reason.
+- containers, for an owner from an earlier build: for each Docker runtime it recorded, once the
+  processes are confirmed. The trial containers R left running are stopped, and two inventories
+  at least a second apart must find none (`verify_containers`). One pass has RECOVERY_SECONDS,
+  and every Docker command in it is capped by what is left. A contained owner's containers all
+  carry a recorded operation's label, so the operation checks below find them.
+- each cleanup the owner recorded as failed (`run_lock.note_leftover`), with its reason, unless
+  it is a contained owner's failed cleanup of an operation it still records: that operation's
+  checks prove it.
 - each operation the owner recorded (`invocation_runtime.run_operation`): its systemd scope is
   stopped and proven gone with the processes in it, then the containers carrying its label are
   removed and proven gone (`invocation_runtime.verify_scope`, `verify_labelled`).
@@ -458,13 +461,17 @@ def _obligation_checks(obligation: dict[str, Any], state: Path) -> list[Check]:
             "commands left is unknown. Check that no PluginBench command, process or container "
             "still runs; repair takes this directory as the root"
             if "problem" in obligation
-            else f"`{obligation.get('kind')}` for {root} ended without a clean release, and until "
-            "P4b PluginBench cannot prove that everything a command starts has stopped"
+            else f"`{obligation.get('kind')}` for {root} ended without a clean release, and the "
+            "earlier PluginBench build that ran it cannot prove that everything it started has "
+            "stopped"
             if Path(root).is_dir()
             else f"{root}, whose owner ended without a clean release, was moved or deleted"
         ),
     }
-    # The owner record was validated when it was read (run_lock._record_problem).
+    # The owner record was validated when it was read (run_lock._record_problem). A contained
+    # owner's failed cleanup of an operation it still records is proven by that operation's
+    # checks below; any other failed cleanup is unknown until repair.
+    recorded = {item["id"] for item in obligation.get("operations") or []}
     failed: list[Check] = [
         {
             "id": f"{name}:leftover:{index}",
@@ -473,6 +480,7 @@ def _obligation_checks(obligation: dict[str, Any], state: Path) -> list[Check]:
             "reason": item["reason"],
         }
         for index, item in enumerate(obligation.get("leftovers") or [])
+        if not (contained(obligation) and item.get("operation") in recorded)
     ]
     # Each operation it recorded: its scope first, then the containers carrying its label.
     operations: list[Check] = [
@@ -504,6 +512,8 @@ def _work_checks(obligation: dict[str, Any], state: Path) -> list[Check]:
         # Only a call this owner touched is its own; an older one needs its own proof.
         own = contained(obligation) and since is not None and _touched(row, since)
         check["covered"] = _coverage(check["id"], state, recorded, contained=own)
+    if contained(obligation):
+        return checks  # Each container it started carries a recorded operation's label.
     evidence = path.parent
     # A recorded runtime stays an obligation whatever its directory now holds.
     runtimes: list[dict[str, Any] | None] = list(obligation.get("runtimes") or [])

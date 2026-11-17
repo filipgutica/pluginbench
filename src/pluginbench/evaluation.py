@@ -1834,6 +1834,8 @@ def measure_evaluation(
     """
     root = root.expanduser().resolve()
     selection = _load_selection(root)
+    # Before any preparation or readiness probe: a saved run keeps its jobs.
+    require_host_jobs(_saved_evaluation(selection).jobs)
     settings, plan = _measure_inputs(
         root, selection, measurements, revision, coverage_profiles, tasks
     )

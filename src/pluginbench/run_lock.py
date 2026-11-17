@@ -470,6 +470,11 @@ def _obligation_problem(value: object) -> str | None:
         for item in value.get("leftovers") or []
     ):
         return "has a failed cleanup without a reason"
+    if not all(
+        "operation" not in item or is_invocation_id(item["operation"])
+        for item in value.get("leftovers") or []
+    ):
+        return "has a failed cleanup of an operation without a valid ID"
     for item in value.get("operations") or []:
         if problem := _operation_problem(item):
             return f"has an operation that {problem}"
@@ -633,11 +638,15 @@ class ExecutionLock:
             else {**record, "runtimes": [*record["runtimes"], docker]}
         )
 
-    def note_leftover(self, reason: str) -> None:
+    def note_leftover(self, reason: str, *, operation: str | None = None) -> None:
         """Keep this owner unreleased, and record why a cleanup failed so the next owner's error
-        can say so. The record is best-effort: an unreleased owner needs repair anyway."""
+        can say so. With `operation`, the failed cleanup is that recorded operation's, which its
+        own checks prove later (`control_store`). The record is best-effort: the in-memory flag
+        alone keeps the release unrecorded."""
         self.leftover = True
-        failure = {"reason": reason, "at": datetime.now(UTC).isoformat()}
+        failure: dict[str, str] = {"reason": reason, "at": datetime.now(UTC).isoformat()}
+        if operation is not None:
+            failure["operation"] = operation
         try:
             self._update(
                 lambda record: {**record, "leftovers": [*record.get("leftovers", []), failure]}
