@@ -550,7 +550,7 @@ On interruption or fatal failure, new jobs stop. Active jobs finish or time out;
 
 Only one PluginBench command executes on a host at a time. `run`, `check`, `review`, `measure`, and `judge run` share one execution lock for your user account, whatever run they target. While one runs, another fails at once and names the run and process that hold the host.
 
-A command that does not finish cleanly fences the host. A crash or a kill always does. Ctrl-C or an error does once the command has started building or probing tasks, recorded a model call, or recorded the Docker runtime its containers use. The next execution command, whatever run it targets, first checks that the fenced command left nothing running:
+A command that does not finish cleanly fences the host. A crash or a kill always does. Ctrl-C or an error does once the command has started building or probing tasks, recorded a model call, or recorded the Docker runtime its containers use. So does a failed cleanup of a call's processes or containers, even if the command then finishes. The next execution command, whatever run it targets, first checks that the fenced command left nothing running:
 
 - every process in the process group of each call that was still open, or that the command ended itself, since a call can end while its cleanup failed;
 - the run's trial containers, for each Docker daemon the command recorded, each checked on its own. Any it finds are stopped, and two later checks at least a second apart must find none. If the run's frozen suite is gone, its containers cannot be found, so they count as unknown.
@@ -559,7 +559,7 @@ The whole check has 120 seconds, and each Docker command gets only what is left 
 
 Containers are checked only once every process is known to be gone, because a live process could still start one. A resume runs the same checks on its own run before it accepts saved output or marks a call unresolved.
 
-If something still runs, the command refuses to start. The error names what still runs and how to stop it. Run your command again once it has stopped.
+If something still runs, the command refuses to start. The error names what still runs. It gives the command to stop it only while the call's recorded leader process still runs; otherwise, check that the processes belong to that call before you stop them. Run your command again once it has stopped.
 
 Sometimes PluginBench cannot check what a command left. The call may have been killed before its process was recorded, Docker may be unreachable, or the command may not record its processes. In that case, check by hand that nothing of it still runs. Then confirm with `pluginbench repair --confirm-stopped ROOT`, with the root exactly as the error names it. Repair runs every check again first. It confirms only what still cannot be checked, never something it finds running, and it prints and records each confirmation with its time.
 

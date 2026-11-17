@@ -158,6 +158,14 @@ def _group_members(group: int) -> list[int]:
     return members
 
 
+def _start_of(pid: int) -> str | None:
+    """The start time of the live process `pid`, or None when none runs."""
+    try:
+        return run_lock.process_start(pid)
+    except ProcessLookupError:
+        return None
+
+
 def _leader_runs(pid: int, start: object) -> bool:
     """Whether `pid` is still the recorded process, started at `start`, and not a zombie."""
     try:
@@ -195,13 +203,23 @@ def verify_invocation(check: Check) -> dict[str, Any]:
         raise CleanupUnknown(
             f"{name} was recorded in another PID namespace. {_repair(check['root'])}"
         )
+    start = identity.get("start_time")
+    if start is not None and _start_of(group) not in (None, start):
+        # Linux frees a PID only once no process uses it as a process-group ID, so a newer
+        # process holding the leader's PID proves the recorded group has ended.
+        return {**proof, "checked": "process group ended"}
     members = set(_group_members(group))
-    if _leader_runs(pid, identity.get("start_time")):
+    leader = _leader_runs(pid, start)
+    if leader:
         members.add(pid)
     if members:
+        listed = ", ".join(map(str, sorted(members)))
         raise CleanupBlocked(
-            f"process group {group} of {name} still has processes "
-            f"{', '.join(map(str, sorted(members)))}; stop them with `kill -TERM -- -{group}`"
+            f"process group {group} of {name} still has processes {listed}; stop them with "
+            f"`kill -TERM -- -{group}`"
+            if leader
+            else f"process group {group} of {name} still has processes {listed}, and its leader "
+            "has exited; check that they belong to this call before stopping them"
         )
     return proof
 

@@ -32,10 +32,12 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # The optional spawn callback only reports the worker's PID to the invocation
             # ledger; what is launched, and how, is unchanged, so this stays v1.
             # The daemon check takes an optional timeout, which only cleanup after a crash
-            # passes; launches are unchanged.
-            "harbor_backend.py": "d562847ec6016a2b506b658044f9e4c12713a1bd5f2366b8b9764a8b95eab1a2",
-            # The same spawn callback; launches are unchanged.
-            "processes.py": "eb63b5afabfa461b6a5b394388c21999f8f6dfb96b34b86db9d32318a738fc58",
+            # passes; launches are unchanged. A failed trial cleanup now also tells the host
+            # lock owner, which only keeps its release unrecorded.
+            "harbor_backend.py": "5616f8ed494fd621e6a3583d5ec08ade31a0d264f08b07202078d0ff7376c813",
+            # The same spawn callback; launches are unchanged. A failed process-group cleanup
+            # now also tells the host lock owner, which only keeps its release unrecorded.
+            "processes.py": "c6a63643ba0d152668dccc99e09312b522ca65438340a174637809d904dbf651",
             # Claude admission dispatch, and the Codex config's V2 spawn-override hide. The
             # vanilla cache refuses a cohort saved without the hide by its config, so this stays v1.
             "native_treatments.py": "3c9a617c292e0fbc93bc07b46e012ab79bd5589efc6a3e9267e4652c71ba89b3",

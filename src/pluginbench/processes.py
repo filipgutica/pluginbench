@@ -9,6 +9,8 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
+from pluginbench import run_lock
+
 _CLEANUP_TIMEOUT = 1.0
 
 
@@ -80,6 +82,8 @@ def run_command(
             try:
                 terminate_process_group(proc)
             except (OSError, subprocess.TimeoutExpired) as cleanup_error:
+                # Its group may live on, so the host lock owner can no longer exit clean.
+                run_lock.note_leftover()
                 if failure is None:
                     raise
                 failure.add_note(f"Process-group cleanup failed: {cleanup_error}")
@@ -87,6 +91,7 @@ def run_command(
         try:
             stdout, stderr = proc.communicate(timeout=_CLEANUP_TIMEOUT)
         except subprocess.TimeoutExpired:
+            run_lock.note_leftover()  # An escaped descendant still holds the pipes.
             error.add_note(
                 f"Final output drain exceeded {_CLEANUP_TIMEOUT:g} seconds; "
                 "a descendant may hold pipes open."

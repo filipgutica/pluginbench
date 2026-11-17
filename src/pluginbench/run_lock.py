@@ -452,6 +452,9 @@ class ExecutionLock:
     # verify. Until a clean exit clears it, its release stays unrecorded, so the next owner
     # recovers its root.
     dirty: bool = False
+    # Set once a cleanup of something this owner started failed. Unlike `dirty`, a clean exit
+    # never clears it: the next owner verifies this root whatever happens.
+    leftover: bool = False
 
     def assert_owned(self) -> None:
         """Raise ExecutionLost unless the lock path still leads to the inode this process holds
@@ -518,6 +521,13 @@ def external_work() -> Iterator[None]:
     before, lock.dirty = lock.dirty, True
     yield
     lock.dirty = before
+
+
+def note_leftover() -> None:
+    """Mark that cleanup of something the owner started failed, so its release stays
+    unrecorded even if it exits cleanly. Without the host lock there is nothing to mark."""
+    if _execution is not None:
+        _execution.leftover = True
 
 
 def note_runtime(runtime: dict[str, object]) -> None:
@@ -589,7 +599,7 @@ def hold_execution(owner: ExecutionOwner, *, state: Path | None = None) -> Itera
             yield lock
         finally:
             _execution = None
-            if not lock.dirty:
+            if not lock.dirty and not lock.leftover:
                 try:
                     lock.publish("released")
                 except OSError:

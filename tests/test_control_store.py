@@ -21,10 +21,11 @@ from typer.testing import CliRunner
 
 import pluginbench
 import resume_support
-from pluginbench import cli, control_store, harbor_backend, isolation, judge, run_lock, study
+from pluginbench import cli, control_store, harbor_backend, isolation, judge, processes
+from pluginbench import run_lock, study
 from pluginbench import trial_containers
 from pluginbench.control_store import CleanupBlocked, CleanupUnknown, ControlStore, OwnerWatch
-from pluginbench.ledger import LEDGER_NAME, Ledger, child_identity
+from pluginbench.ledger import LEDGER_NAME, Ledger, child_identity, outcome
 from test_resume import _REAL_RUNNING, _Docker, _container, _killed_run
 
 _SOURCE = str(Path(pluginbench.__file__).parents[1])
@@ -190,6 +191,39 @@ def test_a_zombie_leader_is_not_counted_as_running(tmp_path: Path) -> None:
         assert control_store.verify_invocation(_check(identity, tmp_path))
     finally:
         leader.wait(timeout=5)
+
+
+def test_a_reused_process_group_id_is_not_the_recorded_group(tmp_path: Path) -> None:
+    # A new process now has the recorded leader's PID, which Linux frees only once no process
+    # uses it as a process-group ID: the recorded group has ended, whatever runs as group N now.
+    newcomer = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    try:
+        recorded = {**child_identity(newcomer.pid), "start_time": "1"}
+        proof = control_store.verify_invocation(_check(recorded, tmp_path))
+        assert proof["checked"] == "process group ended"
+    finally:
+        newcomer.kill()
+        newcomer.wait(timeout=5)
+
+
+def test_a_kill_hint_is_given_only_for_the_recorded_leader(tmp_path: Path) -> None:
+    leader = subprocess.Popen(
+        [sys.executable, "-c", _LEADER], stdout=subprocess.PIPE, text=True, start_new_session=True
+    )
+    assert leader.stdout is not None
+    member = int(leader.stdout.readline())
+    identity = child_identity(leader.pid)
+    leader.wait(timeout=10)
+    try:
+        # The leader has exited, so the group's members cannot be matched to the record.
+        with pytest.raises(CleanupBlocked) as caught:
+            control_store.verify_invocation(_check(identity, tmp_path))
+        assert f"has processes {member}" in str(caught.value)
+        assert "kill" not in str(caught.value) and "belong to this call" in str(caught.value)
+    finally:
+        os.kill(member, signal.SIGKILL)
 
 
 def _entry_points(
@@ -371,6 +405,60 @@ def test_a_command_left_by_an_exception_stays_unreleased_until_the_next_owner_ve
     assert result.exit_code == 0 and "The host is unblocked." in result.stdout
     assert _admitted(isolated_host_state, tmp_path)
     assert _record(isolated_host_state)["pending"] == []
+
+
+def test_an_owner_whose_call_cleanup_failed_stays_unreleased_after_a_normal_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
+) -> None:
+    run = tmp_path / "cleanup-failed"
+    run.mkdir()
+    ledger = Ledger.create(
+        run / LEDGER_NAME,
+        [{"id": "a", "task_id": "t", "arm": "vanilla", "attempt": 1}],
+        {"a": "running"},
+    )
+    children: list[int] = []
+
+    def spawned(pid: int) -> None:
+        children.append(pid)
+        ledger.invocation_started(call, pid)
+
+    def failed_cleanup(proc: Any) -> None:
+        raise OSError("process-group cleanup failed")
+
+    with monkeypatch.context() as broken:
+        broken.setattr(processes, "terminate_process_group", failed_cleanup)
+        with control_store.execute(_owner(run)):
+            call = ledger.intent(slot=0, stage="review", attempt_id="a")
+            with pytest.raises(subprocess.TimeoutExpired):
+                processes.run_command(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    cwd=run, env=os.environ, timeout=0.05, on_spawn=spawned,
+                )
+            ledger.end(call, *outcome(subprocess.TimeoutExpired("x", 0.05), spawned=True))
+    ledger.close()
+    [child] = children
+    try:
+        # The owner returned normally, but its call's child may live: no clean release.
+        assert _record(isolated_host_state)["state"] != "released"
+        assert not _admitted(isolated_host_state, tmp_path)
+    finally:
+        os.killpg(child, signal.SIGKILL)
+        os.waitpid(child, 0)
+    assert _admitted(isolated_host_state, tmp_path)
+
+
+def test_an_owner_whose_container_cleanup_failed_stays_unreleased_after_a_normal_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
+) -> None:
+    def unreachable(runtime: Any, **kwargs: Any) -> None:
+        raise ValueError("Cannot connect to the Docker daemon")
+
+    monkeypatch.setattr(harbor_backend, "_assert_daemon", unreachable)
+    with control_store.execute(_owner(tmp_path / "trial")):
+        with pytest.raises(ValueError, match="Cannot connect"):
+            harbor_backend.cleanup(project="p", owner="o", expected_runtime={})
+    assert _record(isolated_host_state)["state"] != "released"
 
 
 def test_an_error_before_any_recorded_work_releases_the_host(
