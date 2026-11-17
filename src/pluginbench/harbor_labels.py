@@ -62,6 +62,12 @@ def _services(path: Path) -> set[str]:
     return {str(name) for name in services}
 
 
+def _host_control(key: str) -> bool:
+    """Whether an environment variable chooses a host program, its loader, or Docker's
+    daemon, config or builder."""
+    return key == "PATH" or key.startswith(("LD_", "DYLD_", *DOCKER_CONTROL_PREFIXES))
+
+
 @contextmanager
 def labelled(invocation: str) -> Iterator[None]:
     """Label every container Harbor creates in this process until the block ends."""
@@ -69,12 +75,14 @@ def labelled(invocation: str) -> Iterator[None]:
     paths = docker.__dict__.get("_docker_compose_paths")
     engine = docker.__dict__.get("_engine_cmd")
     compose_env = docker.__dict__.get("_compose_env_vars")
+    infra_env = docker.__dict__.get("_compose_infra_env_vars")
     if (
         importlib.metadata.version("harbor") != HARBOR_VERSION
         or not isinstance(paths, property)
         or paths.fget is None
         or not isinstance(engine, classmethod)
         or not callable(compose_env)
+        or not callable(infra_env)
     ):
         raise ValueError(
             "Harbor's Docker environment differs from the pinned shape, so its containers "
@@ -109,21 +117,18 @@ def labelled(invocation: str) -> Iterator[None]:
             return command
 
         def worker_env(self: Any, include_os_env: bool = True) -> dict[str, str]:
-            # Harbor merges task variables into its Compose commands' environment; the
-            # Docker controls there must be this worker's own.
-            env: dict[str, str] = compose_env(self, include_os_env)
-            own = os.environ if include_os_env else {}
-            changed = sorted(
-                key
-                for key in {*env, *own}
-                if key.startswith(DOCKER_CONTROL_PREFIXES) and env.get(key) != own.get(key)
-            )
-            if changed:
+            # Harbor merges the task's variables into the host environment of its Compose
+            # commands, where PATH alone picks which `docker` runs. The containers get those
+            # variables from Harbor's own environment overlay, and Harbor's Compose files
+            # interpolate only its infrastructure values. So these commands get this worker's
+            # environment and those values, and no task variable.
+            infra: dict[str, str] = infra_env(self)
+            if host := sorted(key for key in infra if _host_control(key)):
                 raise ValueError(
-                    f"the trial's Compose environment changes {', '.join(changed)}, which "
-                    "choose its Docker daemon, config or builder; nothing started"
+                    f"Harbor's Compose values set {', '.join(host)}, which choose the host's "
+                    "Docker executable, daemon or builder; nothing started"
                 )
-            return env
+            return {**(os.environ if include_os_env else {}), **infra}
 
         docker._docker_compose_paths = property(labelled_paths)
         docker._engine_cmd = classmethod(labelled_engine)

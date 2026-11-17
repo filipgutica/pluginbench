@@ -49,11 +49,14 @@ PROTOCOL = "harbor-docker-v1"
 _OWNER_LABEL = "org.pluginbench.trial"
 # Inside an operation `_docker` sends only the commands PluginBench itself issues. The
 # subcommand comes first, so no global option can pick another daemon, context or builder.
+# Commands without subcommands:
 _OPERATION_COMMANDS = {
-    "build", "commit", "cp", "create", "exec", "image", "images", "info", "inspect", "logs",
-    "network", "ps", "pull", "rm", "start", "stop", "tag", "volume", "wait",
+    "commit", "cp", "create", "exec", "info", "inspect", "logs", "ps", "pull", "rm", "start",
+    "stop", "tag", "wait",
 }
-# The two-word commands among them whose second word is fixed.
+# Commands with subcommands, and the subcommands PluginBench uses, which must come second:
+_OPERATION_SUBCOMMANDS = {"image": {"inspect", "ls", "rm"}, "network": {"ls", "rm"}}
+# Commands admitted only in one exact form:
 _OPERATION_EXACT = {"compose": ("compose", "version", "--short"), "context": ("context", "inspect")}
 # The one build PluginBench issues (`_build_native_image`), word by word; it runs in the
 # engine's built-in builder (`_pin_builder`).
@@ -196,14 +199,15 @@ def _admit_operation_command(arguments: tuple[str, ...]) -> None:
     """Refuse, inside an operation, any Docker command PluginBench does not issue itself: one
     that could reach another daemon or context, or build in a builder that starts containers
     without the invocation label."""
-    first = arguments[0] if arguments else ""
-    admitted = (
-        arguments == _OPERATION_EXACT[first]
-        if first in _OPERATION_EXACT
-        else first in _OPERATION_COMMANDS
-        and (first != "build" or _native_build(arguments))
-        and arguments[:2] != ("image", "build")
-    )
+    first, second = (*arguments, "", "")[:2]
+    if first in _OPERATION_EXACT:
+        admitted = arguments == _OPERATION_EXACT[first]
+    elif first == "build":
+        admitted = _native_build(arguments)
+    elif first in _OPERATION_SUBCOMMANDS:
+        admitted = second in _OPERATION_SUBCOMMANDS[first]
+    else:
+        admitted = first in _OPERATION_COMMANDS
     if not admitted:
         raise ValueError(
             f"an operation sends Docker only the commands PluginBench issues, not `docker "

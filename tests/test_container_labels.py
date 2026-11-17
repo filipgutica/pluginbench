@@ -7,11 +7,11 @@ suite or the Compose project. Docker is a fake CLI or a fake daemon: no containe
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import importlib
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -65,15 +65,25 @@ def docker_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path
     docker._egress_control_kernel_support.cache_clear()
 
 
-def _start(tmp_path: Path, invocation: str | None, role: str) -> None:
-    """Start Harbor's real Docker environment for the native task's agent or separate verifier."""
+def _start(
+    tmp_path: Path, invocation: str | None, role: str, task_env: dict[str, str] | None = None
+) -> None:
+    """Start Harbor's real Docker environment for the native task's agent or separate verifier,
+    the agent's with `task_env` as its `[environment.env]`."""
     # Harbor's wheel is untyped.
     environment_type = importlib.import_module(
         "harbor.environments.docker.docker"
     ).DockerEnvironment
     task_config = importlib.import_module("harbor.models.task.config")
     NetworkMode, NetworkPolicy = task_config.NetworkMode, task_config.NetworkPolicy
-    task = importlib.import_module("harbor.models.task.task").Task(native_task(tmp_path))
+    task_dir = native_task(tmp_path)
+    if task_env:
+        toml = (task_dir / "task.toml").read_text()
+        lines = "".join(f'{key}="{value}"\n' for key, value in task_env.items())
+        (task_dir / "task.toml").write_text(
+            toml.replace("[verifier]", f"[environment.env]\n{lines}[verifier]", 1)
+        )
+    task = importlib.import_module("harbor.models.task.task").Task(task_dir)
     paths = importlib.import_module("harbor.models.trial.paths").TrialPaths(
         tmp_path / f"trial-{role}"
     )
@@ -424,6 +434,11 @@ def test_a_build_inside_an_operation_runs_only_in_the_engines_own_builder(
         ("--host", "unix:///other.sock", "create", "image"),
         ("compose", "up"),
         ("run", "image"),
+        ("image", "--help=false", "build", "/context"),
+        ("image", "prune", "--force"),
+        ("network", "create", "other"),
+        ("volume", "rm", "x"),
+        ("images",),
     ],
 )
 def test_an_operation_sends_only_the_docker_commands_pluginbench_issues(
@@ -437,14 +452,45 @@ def test_an_operation_sends_only_the_docker_commands_pluginbench_issues(
     assert daemon.containers == {}
 
 
-def test_every_docker_command_pluginbench_issues_is_admitted() -> None:
-    """The allowlist covers each `_docker` call in the source, so routing breaks none of them."""
-    source = Path(harbor_backend.__file__).read_text()
-    first = set(re.findall(r'\b_?docker\(\s*"([a-z]+)"', source))
-    assert first and first <= harbor_backend._OPERATION_COMMANDS | set(
-        harbor_backend._OPERATION_EXACT
-    )
-    for arguments in [_BUILD, ("context", "inspect"), ("compose", "version", "--short")]:
+def test_every_leading_docker_word_pair_pluginbench_issues_is_admitted() -> None:
+    """Each `_docker` (or local `docker`) call in harbor_backend whose leading words are
+    literals is admitted: its first word, and for a command with subcommands or an exact form,
+    its literal second word too. Calls that spread a list are checked by their known shapes.
+    The allowlist then breaks none of PluginBench's own commands once they run in operations.
+    """
+    tree = ast.parse(Path(harbor_backend.__file__).read_text())
+    pairs: set[tuple[str, ...]] = set()
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in ("_docker", "docker")
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        ):
+            continue
+        words = []
+        for argument in node.args[:2]:
+            if not (isinstance(argument, ast.Constant) and isinstance(argument.value, str)):
+                break
+            words.append(argument.value)
+        pairs.add(tuple(words))
+    assert ("image", "inspect") in pairs and ("build", "--quiet") in pairs
+    for first, *rest in pairs:
+        if first in harbor_backend._OPERATION_EXACT:
+            assert harbor_backend._OPERATION_EXACT[first][: 1 + len(rest)] == (first, *rest)
+        elif first == "build":
+            assert harbor_backend._NATIVE_BUILD[: 1 + len(rest)] == (first, *rest)
+        elif first in harbor_backend._OPERATION_SUBCOMMANDS:
+            assert rest and rest[0] in harbor_backend._OPERATION_SUBCOMMANDS[first], first
+        else:
+            assert first in harbor_backend._OPERATION_COMMANDS, first
+    # The spread calls: `_project_ids`, and the git probe's and measurement's `create`.
+    for arguments in [
+        ("ps", "-aq", "--filter", "label=x"), ("network", "ls", "--quiet", "--filter", "x"),
+        ("create", "--label", "x", "image"), _BUILD, ("context", "inspect"),
+        ("compose", "version", "--short"),
+    ]:
         harbor_backend._admit_operation_command(arguments)
 
 
@@ -502,20 +548,48 @@ def test_a_native_task_cannot_set_docker_controls(tmp_path: Path, key: str, wher
         harbor_backend.validate_native_task(task)
 
 
-@pytest.mark.parametrize("key", ["DOCKER_HOST", "DOCKER_CONFIG", "BUILDX_BUILDER", "COMPOSE_FILE"])
-def test_harbors_compose_commands_keep_the_workers_docker_controls(
-    tmp_path: Path, docker_cli: Path, monkeypatch: pytest.MonkeyPatch, key: str
+def test_a_task_environment_never_reaches_the_hosts_docker_commands(
+    tmp_path: Path, docker_cli: Path
 ) -> None:
-    """A task variable Harbor merges into Compose's environment cannot redirect it."""
-    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path / "private-config"))
+    """Harbor merges task variables into its Compose commands' host environment, where PATH
+    picks the `docker` that runs. The task's own `docker` must never run on the host."""
+    task_bin = tmp_path / "task-bin"
+    task_bin.mkdir()
+    task_log = tmp_path / "task-docker.jsonl"
+    fake = task_bin / "docker"
+    fake.write_text(f"#!/bin/sh\necho \"$*\" >> {task_log}\n")
+    fake.chmod(0o755)
+    task_env = {
+        "PATH": f"{task_bin}:/usr/bin:/bin",
+        "LD_PRELOAD": str(tmp_path / "loader.so"),
+        "DOCKER_CONFIG": str(tmp_path / "task-config"),
+        "TASK_SETTING": "kept",
+    }
+    _start(tmp_path, uuid4().hex, "agent", task_env)
+    assert not task_log.exists()
+    compose = [entry["argv"] for entry in _creates(docker_cli) if entry["argv"][0] == "compose"]
+    assert any("up" in argv for argv in compose)  # The worker's own `docker` started it.
+    # The container still gets the task's variables, from Harbor's environment overlay.
+    environment = [
+        entry["files"][path]
+        for entry in _creates(docker_cli)
+        for path in entry["files"]
+        if "TASK_SETTING" in entry["files"][path]
+    ]
+    assert environment
+
+
+def test_harbors_own_values_cannot_choose_the_hosts_docker(
+    tmp_path: Path, docker_cli: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     docker = importlib.import_module("harbor.environments.docker.docker").DockerEnvironment
-    original = docker.__dict__["_compose_env_vars"]
+    original = docker.__dict__["_compose_infra_env_vars"]
 
-    def with_task_env(self: Any, include_os_env: bool = True) -> dict[str, str]:
-        env: dict[str, str] = original(self, include_os_env)
-        return {**env, key: "/elsewhere"}
+    def with_path(self: Any) -> dict[str, str]:
+        values: dict[str, str] = original(self)
+        return {**values, "PATH": "/elsewhere"}
 
-    monkeypatch.setattr(docker, "_compose_env_vars", with_task_env)
-    with pytest.raises(ValueError, match=f"changes {key}"):
+    monkeypatch.setattr(docker, "_compose_infra_env_vars", with_path)
+    with pytest.raises(ValueError, match="Compose values set PATH"):
         _start(tmp_path, uuid4().hex, "agent")
     assert not [entry for entry in _creates(docker_cli) if entry["argv"][0] == "compose"]
