@@ -335,10 +335,10 @@ _NOTHING_LEFT = ("aborted_prespawn", "unresolved")
 
 
 def _owned(ledger: Ledger, since: object) -> list[dict[str, Any]]:
-    """Every invocation a dead owner may have left running: each open one, and each it ended
-    with a recorded process, since that process may live on if its cleanup failed. An ended
-    call without one started nothing: the runner stops a child whose record fails. `since` is
-    when the owner took the lock; without a readable one, every ended call counts."""
+    """Every invocation a dead owner may have left running: each open one, and each it ended,
+    since a call can end while its process-group cleanup failed. An ended call with no process
+    record is unknown: its record may have failed while its child ran. `since` is when the
+    owner took the lock; without a readable one, every ended call counts."""
     try:
         start = datetime.fromisoformat(str(since))
     except ValueError:
@@ -349,7 +349,6 @@ def _owned(ledger: Ledger, since: object) -> list[dict[str, Any]]:
         if row["state"] in OPEN_STATES
         or (
             row["state"] not in _NOTHING_LEFT
-            and row["identity"] is not None
             and (start is None or datetime.fromisoformat(row["updated_at"]) >= start)
         )
     ]

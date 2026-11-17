@@ -431,6 +431,26 @@ def test_a_call_that_ended_while_its_process_lived_is_checked_after_its_owner_di
     assert _admitted(isolated_host_state, tmp_path)
 
 
+def test_a_call_that_ended_without_its_process_record_is_unknown(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    # Its child ran, but the record of it failed, so the call ended with no process to check.
+    run = tmp_path / "unrecorded"
+    run.mkdir()
+    ledger = Ledger.create(
+        run / LEDGER_NAME,
+        [{"id": "a", "task_id": "t", "arm": "vanilla", "attempt": 1}],
+        {"a": "running"},
+    )
+    call = ledger.intent(slot=0, stage="grading", attempt_id="a")
+    ledger.end(call, "failed_transient", "OSError: the start record could not be written")
+    ledger.close()
+    _crashed_owner(isolated_host_state, kind="run", root=run, runtimes=[])
+    with pytest.raises(CleanupBlocked, match=f"grading invocation {call} has no verifiable"):
+        with control_store.execute(_owner(tmp_path / "unrelated")):
+            pass
+
+
 def test_calls_that_ended_before_the_dead_owner_started_are_not_its_obligation(
     tmp_path: Path, isolated_host_state: Path
 ) -> None:

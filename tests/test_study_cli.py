@@ -3655,6 +3655,11 @@ def _finished_without_source_only_grades(
         graded.append(patch)
         # Correct only with the production test_set.py and without the agent's test files.
         reward = int("+flag = True" in patch and "tests/" not in patch and "conftest" not in patch)
+        if (spawned := kwargs.get("on_spawn")) is not None:
+            # As the real regrade reports its worker, which has exited once the grade returns.
+            worker = subprocess.Popen([sys.executable, "-c", ""])
+            worker.wait(timeout=10)
+            spawned(worker.pid)
         return {
             "verifier_result": {"rewards": {"reward": reward}},
             "exception_info": None,
