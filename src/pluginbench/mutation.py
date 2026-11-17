@@ -488,6 +488,7 @@ def native_executor(
                 command=command,
                 report_path=report_path,
                 timeout=timeout,
+                produce_report=False,
                 **tool_options,
             )
         except (OSError, subprocess.TimeoutExpired, ValueError) as error:
@@ -508,8 +509,7 @@ def native_executor(
             (destination / PRELAUNCH_FAILURE).write_text(json.dumps({"error": reason}))
             raise InfrastructureFailure(reason) from error
         finally:
-            # execution.json keeps the digests of both exports and of the coverage report,
-            # which mutation never reads; the copies themselves are not kept.
+            # Mutation keeps status/integrity receipts, never coverage reports or source copies.
             for name in ("before", "after"):
                 shutil.rmtree(destination / name, ignore_errors=True)
             for report in destination.glob("report.raw*"):

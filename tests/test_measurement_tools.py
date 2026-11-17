@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 
@@ -89,8 +90,9 @@ def test_tool_version_hash_and_provisioner_bind_profile_identity(
 
 
 @pytest.mark.parametrize(("name", "version"), [("coverage.py", "7.6.12"), ("c8", "10.1.3")])
+@pytest.mark.parametrize("mode", ["tamper", "failed-tests", "signal", "docker-signal", "mutation", "path", "image-interpreter"])
 def test_native_coverage_uses_vendored_tool_outside_task_tree(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, version: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, version: str, mode: str,
 ) -> None:
     """A filesystem-backed fake Docker runs the actual vendored coverage command."""
     if name == "c8" and shutil.which("node") is None:
@@ -130,6 +132,24 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
             "fs.appendFileSync(path.join(root, 'node_modules/istanbul-reports/lib/lcovonly/index.js'),"
             + json.dumps(payload) + ");\n"
         )
+    if mode == "failed-tests":
+        runner = source / ("runner.py" if suffix == "py" else "runner.cjs")
+        with runner.open("a") as stream:
+            stream.write("raise SystemExit(1)\n" if suffix == "py" else "process.exitCode = 1\n")
+    if mode in {"signal", "docker-signal"}:
+        (source / ("runner.py" if suffix == "py" else "runner.cjs")).write_text(
+            "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n" if suffix == "py" else
+            "process.kill(process.pid, 'SIGKILL')\n"
+        )
+    path_marker = tmp_path / "snapshot-interpreter-ran"
+    if mode == "path":
+        (source / "bin").mkdir()
+        for program, interpreter in [("python", sys.executable), ("node", shutil.which("node"))]:
+            if interpreter is not None:
+                shim = source / "bin" / program
+                shim.write_text("#!/bin/sh\nprintf ran > " + shlex.quote(str(path_marker)) +
+                                "\nexec " + shlex.quote(interpreter) + ' "$@"\n')
+                shim.chmod(0o755)
     (source / f"unloaded.{suffix}").write_text("value = 2\n" if suffix == "py" else "const value = 2\n")
     (source / ".git").mkdir()
     (source / ".git/HEAD").write_text("original git state\n")
@@ -156,6 +176,8 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
 
     def container_env(arguments: tuple[str, ...] | list[str]) -> dict[str, str]:
         env = dict(os.environ)
+        if mode == "path" and len(created) > 1:
+            env["PATH"] = str(app / "bin") + os.pathsep + env["PATH"]
         if suffix == "js":
             env.update(NODE_OPTIONS="--require=" + str(app / "preload.cjs"),
                        NODE_PATH=str(app), EXPERIMENTAL_MONOCART="1")
@@ -184,12 +206,19 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
             command = list(args[args.index(container_id) + 1:])
             command = [arg.replace("/opt/pluginbench-tools", str(container / "opt/pluginbench-tools"))
                        for arg in command]
-            if command[0] == "python":
-                command[0] = sys.executable
+            # Preflight runs before snapshot copy; emulate the original image interpreter.
+            if command[0] in {"python", "node"}:
+                interpreter = sys.executable if command[0] == "python" else shutil.which("node")
+                assert interpreter is not None
+                command[0] = interpreter
             result = subprocess.run(command, cwd=app, env=container_env(args),
                                     capture_output=True, text=True)
             assert not preload_marker.exists(), "task NODE_OPTIONS executed before c8 startup"
             assert result.returncode == 0, result.stderr
+            if mode == "image-interpreter":
+                origin = json.loads(result.stdout)
+                origin.update(executable=str(app / "bin/python"), workdir=str(app))
+                return json.dumps(origin)
             return result.stdout
         if args[0] == "stop":
             stopped.append(args[-1])
@@ -220,11 +249,14 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
         command = argv[argv.index(container_id) + 1:]
         command = [arg.replace("/opt/pluginbench-tools", str(container / "opt/pluginbench-tools"))
                    for arg in command]
-        if command[0] == "python":
+        if command[0] == "python" and mode != "path":
             command[0] = sys.executable
         result = subprocess.run(command, cwd=app, env=container_env(argv),
                                 capture_output=True, text=True, timeout=30)
         assert not preload_marker.exists(), "task NODE_OPTIONS executed before c8 startup"
+        if mode == "docker-signal" and result.returncode < 0:
+            # Docker CLI represents a killed exec as 128 + signal, rather than -signal.
+            result = subprocess.CompletedProcess(result.args, 128 - result.returncode, result.stdout, result.stderr)
         return result
 
     monkeypatch.setattr(harbor, "run_command", execute)
@@ -241,6 +273,10 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
                    "--", "node", "runner.cjs"]
         report_path = "coverage/lcov.info"
         report_format = "lcov"
+    if mode == "signal" and suffix == "py":
+        # A shell normalizes SIGKILL to 137; observe the direct subprocess's -9 receipt.
+        command = [sys.executable, "-I", "-S", "/opt/pluginbench-tools/coverage.py/launch-coverage.py",
+                   "run", "runner.py"]
     frozen = tmp_path / "profile.json"
     coverage = profile(name, version).model_copy(update={"command": command, "report_path": report_path})
     frozen.write_text(json.dumps({"native_task_identity": identity, "test_scope": ["test_*"],
@@ -250,8 +286,39 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
         "tool_version": version, "report_format": report_format, "report_path": report_path,
     })
     before = inspect_snapshot(source)["digest"]
+    if mode == "image-interpreter":
+        with pytest.raises(ValueError, match="interpreter.*outside"):
+            harbor.run_native_command(
+                snapshot=source, task_identity=identity, destination=tmp_path / "out", command=command,
+                report_path=report_path, timeout=30, provisioned_tool=coverage.provisioned_tool,
+            )
+        assert len(created) == 1
+        assert "/app/" not in copies
+        return
+    if mode in {"signal", "docker-signal", "mutation"}:
+        tool = coverage.provisioned_tool
+        assert tool is not None
+        destination = tmp_path / "out"
+        if mode == "mutation":
+            run = mutation.native_executor(identity, report_path, provisioned_tool=tool.model_dump())(
+                source, command, 30, destination,
+            )
+            assert run.exit_code == 0
+        else:
+            execution = harbor.run_native_command(
+                snapshot=source, task_identity=identity, destination=destination,
+                command=command, report_path=report_path, timeout=30, provisioned_tool=tool,
+            )
+            assert execution["exit_code"] == (137 if mode == "docker-signal" else -9)
+            assert not execution["report_collected"]
+        assert len(created) == 1
+        assert stopped == created
+        assert not (destination / "reporting").exists()
+        assert not (destination / "collection-data").exists()
+        return
     report, observed_version = collectors._native_coverage(source, collector, tmp_path / "out")
     assert observed_version == version
+    assert not path_marker.exists(), "the report exec ran an interpreter from the copied snapshot"
     assert report and (tmp_path / "out/report.raw").is_file()
     lines = report["lines"]
     assert isinstance(lines, dict)
@@ -269,6 +336,10 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
     assert coverage.provisioned_tool is not None
     provisioned = receipt["provisioned_tool"]
     origin = provisioned.pop("runtime_origin")
+    assert Path(origin["executable"]).is_absolute()
+    assert not Path(origin["executable"]).is_relative_to(Path(origin["workdir"]))
+    reporting = receipt["reporting"]
+    assert reporting["command"][0] == origin["executable"]
     assert provisioned == coverage.provisioned_tool.model_dump(mode="json")
     assert str(container / "opt/pluginbench-tools" / name) in origin["module"]
     assert "/opt/pluginbench-tools/" in copies
@@ -313,6 +384,7 @@ def test_mutation_forwards_the_same_frozen_tool(
 
     def native(**kwargs: object) -> dict[str, object]:
         assert kwargs["provisioned_tool"] == tool
+        assert kwargs["produce_report"] is False
         return {"exit_code": 0}
 
     monkeypatch.setattr(harbor, "run_native_command", native)

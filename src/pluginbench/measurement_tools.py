@@ -16,6 +16,7 @@ from typing import TypedDict
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from pluginbench import components
+from pluginbench.code_diff import _SOURCE_SUFFIXES, _is_source_path
 
 ARTIFACTS = Path(__file__).with_name("coverage_tools")
 CONTAINER_ROOT = "/opt/pluginbench-tools"
@@ -42,9 +43,6 @@ class ProvisionedTool(BaseModel):
     name: str = Field(description="Selects the vendored coverage.py or c8 tool.")
     version: str = Field(description="Pins an exact release supplied by PluginBench.")
     # Operators declare name/version. Preparation fills these pins and saved profiles retain them.
-    source_maps: bool = Field(
-        default=False, description="Enables validated c8 remapping; leave off except for profiles needing it."
-    )
     sha256: str = Field(
         default="", description="Records the verified artifact SHA-256; filled when omitted."
     )
@@ -57,8 +55,6 @@ class ProvisionedTool(BaseModel):
     def pinned_artifact(self) -> ProvisionedTool:
         if (self.name, self.version) not in CATALOG:
             raise ValueError(f"unsupported provisioned tool: {self.name} {self.version}")
-        if self.source_maps and self.name != "c8":
-            raise ValueError("source_maps is supported only for c8")
         _, expected = CATALOG[(self.name, self.version)]
         if self.sha256 and self.sha256 != expected:
             raise ValueError("provisioned tool SHA-256 differs from the pinned artifact")
@@ -129,7 +125,10 @@ def staged_tool(
         for name in SUPPORT_FILES[tool.name]:
             (target / name).write_bytes((ARTIFACTS / name).read_bytes())
         (target / "source-files.json").write_text(json.dumps(source_files))
-        (target / "source-maps.json").write_text(json.dumps(tool.source_maps))
+        extensions = _SOURCE_SUFFIXES if source_files is None else {
+            Path(name).suffix for name in source_files if _is_source_path(name)
+        }
+        (target / "source-extensions.json").write_text(json.dumps(sorted(extensions)))
         if data is not None:
             (target / "data").mkdir()
             for file in collection_files(data, tool):

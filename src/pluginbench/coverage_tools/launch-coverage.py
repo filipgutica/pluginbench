@@ -63,7 +63,8 @@ def main() -> int:
         for name, module in tuple(sys.modules.items())
         if name.split(".")[0] in TOOL_PACKAGES and module is not None
     }
-    origin = {"module": checked_origin(coverage.__file__), "dependencies": modules,
+    origin = {"executable": str(Path(sys.executable).resolve()), "workdir": str(Path.cwd().resolve()),
+              "module": checked_origin(coverage.__file__), "dependencies": modules,
               "config": checked_origin(str(CONFIG)), "data_file": str(DATA),
               "source_files": checked_origin(str(ROOT / "source-files.json"))}
     if sys.argv[1:] == ["--pluginbench-verify"]:

@@ -45,7 +45,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # Containers, builds and trials now start only inside an operation, on the daemon
             # it recorded; a launch inside one is unchanged, so this stays v1.
             # Optional measurement provisioning leaves coding launches unchanged (v1).
-            "harbor_backend.py": "69e113f4ce3e91a98a782352684fc9e24e8f614304eb17159950cce215fc7330",
+            "harbor_backend.py": "e28e95bf6a2058762402c9ff5edd79297399c0cf1796cd210daea4450a54d625",
             # The same spawn callback; launches are unchanged. A failed process-group cleanup
             # or output drain now also tells the host lock owner, which records it for the next
             # owner to check. Launches are unchanged.
@@ -121,7 +121,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         {
             # Only report derivation changes; collection, sites, sampling and outcomes stay v1.
             # Optional provisioning runs previously unsupported profiles; existing runs stay v1.
-            "mutation.py": "1daa2608157db47654b293c5ec74ed175b8cfa3c6d7042820d339cfb865e69cd",
+            "mutation.py": "a2b592ba8298be5eb4042b4c66e70d812de2ab4a3843f08294324789aeb6fa64",
             "mutation_sites.mjs": (
                 "f7a602774f3e6f2415c1745127134862a9a6f42e8e9807b4c28368e7a3c27c88"
             ),
@@ -131,14 +131,14 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         },
     ),
     "measurement_tools": (
-        4,
+        5,
         {
-            # v4 reports in fresh containers, validates maps, and disables exclusion hints.
-            "measurement_tools.py": "57d5bffdd4badcbbe9d37f44a149679e5de02ae321eb429ca5d73665bccc16bf",
-            "coverage_tools/launch-coverage.py": "297461d2032e34f917392c9eba9b45c9b08769c496565fb37ad989ba86a39cfa",
-            "coverage_tools/launch-c8.cjs": "4f2507a5afc9d92685c166856612f5c47ffa81f188b14d7f0283188424d88b2f",
+            # v5 removes maps, completes populations, and pins report interpreters.
+            "measurement_tools.py": "82406277df16c22c31775339f6aae6ccbe62b32e2a7e0b9950d71cfa7a9325d3",
+            "coverage_tools/launch-coverage.py": "9551d8204e68bc3ec4b9fca3ff963dec8da962a6d8984d3e93c003c3895dcf78",
+            "coverage_tools/launch-c8.cjs": "7ef0c46a33e70986352114cf94d4603a69dca5541aaf6803b47a7828e2daf4c0",
             "coverage_tools/c8-config.json": "2ee2372e0af85263890e3e052453e08a091d47225ffa7678ca8a6c963fcbb177",
-            "coverage_tools/coverage-config.ini": "1ff3036ad9b40af6c1b0c195c4cb5b87ab2f308a9ac4287c58778639f13ba2a4",
+            "coverage_tools/coverage-config.ini": "cbc139caa43cfefc8464c88db4af9c053a87a2c60cee43799b40c62c36c564dc",
         },
     ),
     "local_sandbox": (

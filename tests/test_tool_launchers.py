@@ -267,57 +267,6 @@ def test_reporting_does_not_run_image_pth_or_task_sitecustomize(tmp_path: Path) 
     assert report == [2]
 
 
-@pytest.mark.parametrize("mode", ["matching", "forged", "outside", "empty", "empty-no-content", "unmapped-source", "missing-line"])
-@pytest.mark.parametrize("mapping", ["external", "inline"])
-def test_c8_map_content_must_match_frozen_source(tmp_path: Path, mode: str, mapping: str) -> None:
-    import base64
-
-    app = tmp_path / "app"
-    (app / "src").mkdir(parents=True)
-    (app / "dist").mkdir()
-    source = "function unused() {\n  return 42;\n}\nconsole.log(1);\n"
-    (app / "src/subject.js").write_text(source)
-    outside = tmp_path / "outside.js"
-    outside.write_text(source)
-    content = source.replace("  return 42;", "  /* c8 ignore next */ return 42;") if mode == "forged" else source
-    source_map = json.dumps({"version": 3, "file": "subject.js", "names": [],
-                             "sources": [str(outside) if mode == "outside" else "../src/subject.js"],
-                             "sourcesContent": [content], "mappings": "AAAA;AACA;AACA;AACA"})
-    parsed_map = json.loads(source_map)
-    if mode.startswith("empty"):
-        parsed_map["mappings"] = ""
-    if mode == "empty-no-content":
-        del parsed_map["sourcesContent"]
-    if mode == "missing-line":
-        parsed_map["mappings"] = "AAAA;;;AAGA"
-    if mode == "unmapped-source":
-        (app / "src/other.js").write_text(source)
-        parsed_map["sources"].append("../src/other.js")
-        parsed_map["sourcesContent"].append(source)
-    source_map = json.dumps(parsed_map)
-    if mapping == "external":
-        (app / "dist/subject.js.map").write_text(source_map)
-        url = "subject.js.map"
-    else:
-        url = "data:application/json;base64," + base64.b64encode(source_map.encode()).decode()
-    (app / "dist/subject.js").write_text(source + "//# sourceMappingURL=" + url + "\n")
-    with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3").model_copy(update={"source_maps": True})) as stage:
-        result = subprocess.run(c8_command(stage / "c8", "--all", "--", "node", "dist/subject.js"),
-                                cwd=app, capture_output=True, text=True, timeout=30)
-    if mode == "matching":
-        assert result.returncode == 0, result.stderr
-        from pluginbench.coverage_report import parse_lcov
-        report = parse_lcov(app / "coverage/lcov.info", snapshot=app, source_scope=["src/**"],
-                            test_scope=["test/**"], workdir=str(app))
-        lines = report["lines"]
-        assert isinstance(lines, dict)
-        assert lines["covered"] == ["src/subject.js:4"]
-    else:
-        assert result.returncode != 0, "c8 accepted forged or external source-map content"
-        assert "PluginBench c8" in result.stderr
-        assert not (app / "coverage/lcov.info").exists()
-
-
 @pytest.mark.parametrize("damage", ["additional", "symlink", "missing"])
 def test_raw_transfer_refuses_non_data_files(tmp_path: Path, damage: str) -> None:
     data = tmp_path / "data"
@@ -354,7 +303,7 @@ def test_c8_exclusion_hints_do_not_cover_unexecuted_lines(tmp_path: Path, hint: 
     assert "DA:2,0" in (tmp_path / "coverage/lcov.info").read_text()
 
 
-def test_c8_remapping_is_off_unless_profile_enables_it(tmp_path: Path) -> None:
+def test_c8_ignores_source_maps(tmp_path: Path) -> None:
     (tmp_path / "main.js").write_text(
         "function unused() {\n return 42;\n}\nconsole.log(1);\n//# sourceMappingURL=main.js.map\n"
     )
@@ -368,3 +317,44 @@ def test_c8_remapping_is_off_unless_profile_enables_it(tmp_path: Path) -> None:
     report = (tmp_path / "coverage/lcov.info").read_text()
     assert "SF:main.js" in report and "DA:2,0" in report
     assert "outside.js" not in report
+
+
+def test_provisioned_c8_refuses_remapping_opt_in() -> None:
+    with pytest.raises(ValueError, match="source_maps"):
+        tools.ProvisionedTool.model_validate({"name": "c8", "version": "10.1.3", "source_maps": True})
+
+
+def test_c8_source_population_has_no_filename_or_extension_exclusions(tmp_path: Path) -> None:
+    from pluginbench.code_diff import _is_source_path
+    from pluginbench.coverage_report import parse_lcov
+
+    names = ["src/rollup.config.js", "src/logic-test.js", "src/impl.mts", "src/upper.JS", "src/types.d.ts"]
+    (tmp_path / "src").mkdir()
+    for name in names:
+        assert _is_source_path(name)
+        (tmp_path / name).write_text("export const value = 1;\n")
+    (tmp_path / "main.cjs").write_text("console.log(1)\n")
+    with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3"), source_files=names) as stage:
+        result = subprocess.run(c8_command(stage / "c8", "--all", "--", "node", "main.cjs"),
+                                cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    report = parse_lcov(tmp_path / "coverage/lcov.info", snapshot=tmp_path, source_scope=["src/**"],
+                        test_scope=["tests/**"], workdir=str(tmp_path))
+    lines = report["lines"]
+    assert isinstance(lines, dict)
+    assert set(lines["total"]) == {f"{name}:1" for name in names}
+    assert lines["covered"] == []
+
+
+def test_python_unloaded_namespace_package_files_remain_in_population(tmp_path: Path) -> None:
+    (tmp_path / "src/pkg").mkdir(parents=True)
+    (tmp_path / "src/pkg/__init__.py").write_text("")
+    (tmp_path / "src/pkg/used.py").write_text("value = 1\n")
+    (tmp_path / "src/pkg/unused.py").write_text("value = 2\n")
+    (tmp_path / "runner.py").write_text("import src.pkg.used\n")
+    with tools.staged_tool(tools.ProvisionedTool(name="coverage.py", version="7.6.12")) as stage:
+        for operation in [("run", "runner.py"), ("json",)]:
+            command, env = python_command(stage / "coverage.py", *operation)
+            subprocess.run(command, cwd=tmp_path, env=env, check=True, capture_output=True, text=True)
+    report = json.loads((tmp_path / "coverage.json").read_text())
+    assert report["files"]["src/pkg/unused.py"]["missing_lines"] == [1]

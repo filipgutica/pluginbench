@@ -2914,6 +2914,7 @@ def run_native_command(
     provisioned_tool: ProvisionedTool | None = None,
     provisioned_scope: list[str] | None = None,
     reporting_data: Path | None = None,
+    produce_report: bool = True,
 ) -> dict[str, object]:
     """Run explicitly configured measurement commands in a fresh frozen image."""
     relative = Path(report_path)
@@ -2966,6 +2967,7 @@ def run_native_command(
         "cleanup": {"status": "incomplete"},
     }
     failure: BaseException | None = None
+    raw_data: Path | None = None
     tool_env = (
         ["--env", "NODE_OPTIONS=", "--env", "NODE_PATH=", "--env", "EXPERIMENTAL_MONOCART="]
         if provisioned_tool is not None and provisioned_tool.name == "c8" else []
@@ -3018,10 +3020,23 @@ def run_native_command(
                 if provisioned_tool.name == "coverage.py"
                 else ["node", tool_root + "/launch-c8.cjs"]
             )
-            origin = json.loads(docker(
-                "exec", *tool_env, "--workdir", tool_root, container_id,
+            # Resolve the interpreter and physical task root in the pinned image BEFORE
+            # copying source. Reporting never looks up an executable through the task PATH.
+            origin = _native_object(json.loads(docker(
+                "exec", *tool_env, "--workdir", workdir, container_id,
                 *verify, "--pluginbench-verify",
-            ))
+            )), "coverage runtime origin")
+            interpreter, image_workdir = origin.get("executable"), origin.get("workdir")
+            if (
+                not isinstance(interpreter, str) or not PurePosixPath(interpreter).is_absolute()
+                or not isinstance(image_workdir, str) or not PurePosixPath(image_workdir).is_absolute()
+                or PurePosixPath(interpreter).is_relative_to(PurePosixPath(image_workdir))
+                or PurePosixPath(interpreter).is_relative_to(PurePosixPath(CONTAINER_ROOT))
+            ):
+                raise ValueError("report interpreter must resolve outside the copied snapshot and tool tree")
+            if reporting_data is not None:
+                command = [interpreter, *command[1:]]
+                receipt["command"] = command
             receipt["provisioned_tool"] = {
                 **provisioned_tool.model_dump(mode="json"), "runtime_origin": origin,
             }
@@ -3107,24 +3122,33 @@ def run_native_command(
             report_path=report_path,
         )
         receipt["source_integrity"] = "verified"
-        if provisioned_tool is not None and reporting_data is None and not receipt["timed_out"]:
-            # Stop before copying raw data. Nothing executable from this container is reused.
-            raw = destination / "collection-data"
-            raw.mkdir()
-            docker("cp", container_id + ":" + tool_root + "/data/.", str(raw), limit=300)
-            receipt["raw_data_sha256"] = {
-                file.name: hashlib.sha256(file.read_bytes()).hexdigest()
-                for file in collection_files(raw, provisioned_tool)
-            }
-        elif not receipt["timed_out"]:
-            report = destination / "after" / relative
-            # Included-source export rejects all symlinks before reaching this read.
-            if report.is_file():
-                shutil.copyfile(report, destination / "report.raw")
-                receipt.update(
-                    report_collected=True,
-                    report_sha256=hashlib.sha256(report.read_bytes()).hexdigest(),
-                )
+        exit_code = receipt["exit_code"]
+        collection_killed = (
+            provisioned_tool is not None and reporting_data is None
+            and isinstance(exit_code, int) and (exit_code < 0 or 128 < exit_code < 256)
+        )
+        if produce_report and not receipt["timed_out"] and not collection_killed:
+            if provisioned_tool is not None and reporting_data is None:
+                # A failed/signal-terminated suite can leave no data. Keep its exit receipt;
+                # still reject malformed nonempty transfers and report valid failed-test data.
+                raw = destination / "collection-data"
+                raw.mkdir()
+                docker("cp", container_id + ":" + tool_root + "/data/.", str(raw), limit=300)
+                if any(raw.iterdir()) or exit_code == 0:
+                    receipt["raw_data_sha256"] = {
+                        file.name: hashlib.sha256(file.read_bytes()).hexdigest()
+                        for file in collection_files(raw, provisioned_tool)
+                    }
+                    raw_data = raw
+            else:
+                report = destination / "after" / relative
+                # Included-source export rejects all symlinks before reaching this read.
+                if report.is_file():
+                    shutil.copyfile(report, destination / "report.raw")
+                    receipt.update(
+                        report_collected=True,
+                        report_sha256=hashlib.sha256(report.read_bytes()).hexdigest(),
+                    )
     except BaseException as error:
         failure = error
         receipt["error"] = str(error)
@@ -3146,7 +3170,7 @@ def run_native_command(
         codex.write_json(destination / "execution.json", receipt)
     if failure is not None:
         raise failure
-    if provisioned_tool is not None and reporting_data is None and not receipt["timed_out"]:
+    if provisioned_tool is not None and raw_data is not None:
         # Re-enter the same labelled create/copy/exec/cleanup path with the pinned image,
         # frozen host source, and a NEW artifact extraction. Transfer only opaque raw data.
         report_command = (
@@ -3158,7 +3182,7 @@ def run_native_command(
                 snapshot=snapshot, task_identity=task_identity, destination=destination / "reporting",
                 command=report_command, report_path=report_path, timeout=timeout,
                 provisioned_tool=provisioned_tool, provisioned_scope=provisioned_scope,
-                reporting_data=destination / "collection-data",
+                reporting_data=raw_data,
             )
             receipt["reporting"] = reporting
             receipt["provisioned_tool"] = reporting["provisioned_tool"]
