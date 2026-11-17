@@ -554,6 +554,10 @@ A command that does not finish cleanly fences the host. A crash or a kill always
 
 Until PluginBench runs each command in its own systemd scope and labels every container it starts, it cannot prove that everything a fenced command started has stopped: a process may have left its call's process group, and measurement and regrade containers carry no label a check can find. So no check clears a fence on its own. The next execution command, whatever run it targets, refuses to start with "... ended without a clean release ...", and names `pluginbench repair --confirm-stopped ROOT`. Check by hand that nothing the command started still runs, then run that command with the root exactly as the error names it.
 
+If the host's owner record itself is unreadable or invalid, nothing in it can be trusted, not even a clean release. The error then names the PluginBench state directory as the root: check that no PluginBench command, process or container still runs, and repair that directory.
+
+One case the interim rule cannot see: a process that a call started, which left its process group with `setsid`, can outlive a command that finished normally and released the host. Nothing finds it until PluginBench runs each command in its own systemd scope.
+
 The checks still run, as a diagnosis. Each tells you what it can see:
 
 - every process in the process group of each call that was still open, or that the command ended itself, since a call can end while its cleanup failed;
