@@ -47,13 +47,22 @@ from pluginbench.processes import run_command
 HARBOR_VERSION = "0.24.0"
 PROTOCOL = "harbor-docker-v1"
 _OWNER_LABEL = "org.pluginbench.trial"
-# The Docker commands that build an image; inside an operation they run only in the engine's
-# built-in builder (`_pin_builder`). One that creates a builder is refused there.
-_BUILDS = (
-    ("build",), ("image", "build"), ("builder", "build"), ("buildx", "build"), ("buildx", "b"),
-    ("buildx", "bake"),
+# Inside an operation `_docker` sends only the commands PluginBench itself issues. The
+# subcommand comes first, so no global option can pick another daemon, context or builder.
+_OPERATION_COMMANDS = {
+    "build", "commit", "cp", "create", "exec", "image", "images", "info", "inspect", "logs",
+    "network", "ps", "pull", "rm", "start", "stop", "tag", "volume", "wait",
+}
+# The two-word commands among them whose second word is fixed.
+_OPERATION_EXACT = {"compose": ("compose", "version", "--short"), "context": ("context", "inspect")}
+# The one build PluginBench issues (`_build_native_image`), word by word; it runs in the
+# engine's built-in builder (`_pin_builder`).
+_NATIVE_BUILD: tuple[str | re.Pattern[str], ...] = (
+    "build", "--quiet", "--provenance=false", "--tag",
+    re.compile(r"pluginbench-native-build:[0-9a-f]{32}"), re.compile(r"/.*"),
 )
-_BUILDER_CREATES = (("buildx", "create"), ("builder", "create"))
+# Environment variables that choose Docker's daemon, client config, builder or Compose project.
+DOCKER_CONTROL_PREFIXES = ("DOCKER_", "BUILDX_", "BUILDKIT_", "COMPOSE_")
 # The trial config key that carries the operation's invocation ID to the Harbor worker.
 _INVOCATION_KEY = "pluginbench_invocation"
 _BASE_TOOLS = "curl bash node npm"
@@ -134,11 +143,9 @@ def _docker(
     # Inside an operation every container it creates carries its label, so recovery finds it
     # by that label alone.
     if (invocation := invocation_runtime.current()) is not None:
+        _admit_operation_command(arguments)
         arguments = invocation_runtime.with_label(arguments, invocation)
-        if any(arguments[: len(create)] == create for create in _BUILDER_CREATES):
-            raise ValueError("an operation cannot create a buildx builder: its containers are "
-                             "not the operation's")
-        if any(arguments[: len(build)] == build for build in _BUILDS):
+        if arguments[0] == "build":
             _pin_builder(argv, env, timeout)
     command = [*argv, *arguments]
     try:
@@ -176,6 +183,32 @@ def _docker(
     if result.returncode:
         raise ValueError(f"docker {arguments[0]} failed: {result.stderr.strip()}")
     return result.stdout
+
+
+def _native_build(arguments: tuple[str, ...]) -> bool:
+    return len(arguments) == len(_NATIVE_BUILD) and all(
+        item == word if isinstance(word, str) else word.fullmatch(item) is not None
+        for item, word in zip(arguments, _NATIVE_BUILD, strict=True)
+    )
+
+
+def _admit_operation_command(arguments: tuple[str, ...]) -> None:
+    """Refuse, inside an operation, any Docker command PluginBench does not issue itself: one
+    that could reach another daemon or context, or build in a builder that starts containers
+    without the invocation label."""
+    first = arguments[0] if arguments else ""
+    admitted = (
+        arguments == _OPERATION_EXACT[first]
+        if first in _OPERATION_EXACT
+        else first in _OPERATION_COMMANDS
+        and (first != "build" or _native_build(arguments))
+        and arguments[:2] != ("image", "build")
+    )
+    if not admitted:
+        raise ValueError(
+            f"an operation sends Docker only the commands PluginBench issues, not `docker "
+            f"{' '.join(arguments[:3])}`"
+        )
 
 
 def _pin_builder(argv: list[str], env: dict[str, str], timeout: int) -> None:
@@ -1056,6 +1089,18 @@ def validate_native_task(task_dir: Path) -> dict[str, object]:
     definition = modes.resolve_verifier_environment_definition(config, paths)
     if definition is None:
         raise ValueError("Native separate verifier definition is missing")
+    # Harbor passes task variables to its Compose commands, where these choose the daemon,
+    # client config and builder.
+    controls = sorted(
+        key
+        for env in (config.environment.env, config.verifier.env, definition.config.env)
+        for key in env
+        if key.startswith(DOCKER_CONTROL_PREFIXES)
+    )
+    if controls:
+        raise ValueError(
+            f"Native task environments must not set Docker controls: {', '.join(controls)}"
+        )
     for directory, configuration in (
         (paths.environment_dir, config.environment),
         (definition.directory, definition.config),

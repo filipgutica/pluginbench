@@ -167,33 +167,21 @@ def current() -> str | None:
     return _current
 
 
-def _label_keys(arguments: tuple[str, ...]) -> list[str]:
-    """The label keys in Docker `arguments`, in every form Docker accepts: `--label K=V`,
-    `--label=K=V`, `-l K=V` and `-lK=V`. A `--label-file` cannot be checked, so it is refused."""
-    keys: list[str] = []
-    for index, item in enumerate(arguments):
-        if item == "--label-file" or item.startswith("--label-file="):
-            raise ValueError("an operation's container cannot take labels from a file")
-        if item in ("--label", "-l"):
-            value = arguments[index + 1] if index + 1 < len(arguments) else ""
-        elif item.startswith(("--label=", "-l")) and item != "-l":
-            value = item.removeprefix("--label=") if item.startswith("--") else item[2:]
-        else:
-            continue
-        keys.append(value.split("=", 1)[0])
-    return keys
-
-
 def with_label(arguments: tuple[str, ...], invocation: str) -> tuple[str, ...]:
     """Docker `arguments` with the invocation's label right after the subcommand, when they
-    create a container; otherwise unchanged. Docker keeps the last value of a repeated label,
-    so arguments that set the invocation label themselves are refused."""
+    create a container; otherwise unchanged.
+
+    Docker keeps the last of repeated labels and accepts many spellings of the option, so no
+    argument may name the invocation label at all, and no label file is taken.
+    """
+    if any(LABEL_KEY in item or item.startswith("--label-file") for item in arguments):
+        raise ValueError(
+            f"inside an operation, only PluginBench sets the {LABEL_KEY} label, and no label "
+            "file is read"
+        )
     for create in _CREATES:
-        if arguments[: len(create)] != create:
-            continue
-        if LABEL_KEY in _label_keys(arguments):
-            raise ValueError(f"an operation's container cannot set its own {LABEL_KEY} label")
-        return (*create, "--label", f"{LABEL_KEY}={invocation}", *arguments[len(create):])
+        if arguments[: len(create)] == create:
+            return (*create, "--label", f"{LABEL_KEY}={invocation}", *arguments[len(create):])
     return arguments
 
 

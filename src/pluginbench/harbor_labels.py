@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import importlib.metadata
+import os
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -26,7 +27,7 @@ from typing import Any
 
 import yaml
 
-from pluginbench.harbor_backend import HARBOR_VERSION
+from pluginbench.harbor_backend import DOCKER_CONTROL_PREFIXES, HARBOR_VERSION
 from pluginbench.invocation_runtime import LABEL_KEY, with_label
 
 
@@ -67,11 +68,13 @@ def labelled(invocation: str) -> Iterator[None]:
     docker = importlib.import_module("harbor.environments.docker.docker").DockerEnvironment
     paths = docker.__dict__.get("_docker_compose_paths")
     engine = docker.__dict__.get("_engine_cmd")
+    compose_env = docker.__dict__.get("_compose_env_vars")
     if (
         importlib.metadata.version("harbor") != HARBOR_VERSION
         or not isinstance(paths, property)
         or paths.fget is None
         or not isinstance(engine, classmethod)
+        or not callable(compose_env)
     ):
         raise ValueError(
             "Harbor's Docker environment differs from the pinned shape, so its containers "
@@ -105,10 +108,29 @@ def labelled(invocation: str) -> Iterator[None]:
             command: list[str] = original_engine(cls, *with_label(arguments, invocation))
             return command
 
+        def worker_env(self: Any, include_os_env: bool = True) -> dict[str, str]:
+            # Harbor merges task variables into its Compose commands' environment; the
+            # Docker controls there must be this worker's own.
+            env: dict[str, str] = compose_env(self, include_os_env)
+            own = os.environ if include_os_env else {}
+            changed = sorted(
+                key
+                for key in {*env, *own}
+                if key.startswith(DOCKER_CONTROL_PREFIXES) and env.get(key) != own.get(key)
+            )
+            if changed:
+                raise ValueError(
+                    f"the trial's Compose environment changes {', '.join(changed)}, which "
+                    "choose its Docker daemon, config or builder; nothing started"
+                )
+            return env
+
         docker._docker_compose_paths = property(labelled_paths)
         docker._engine_cmd = classmethod(labelled_engine)
+        docker._compose_env_vars = worker_env
         try:
             yield
         finally:
             docker._docker_compose_paths = paths
             docker._engine_cmd = engine
+            docker._compose_env_vars = compose_env

@@ -11,6 +11,7 @@ import asyncio
 import importlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -214,9 +215,6 @@ def test_an_operations_trial_worker_gets_its_invocation(
     ("arguments", "labelled"),
     [
         (("create", "--name", "x", "image"), True),
-        (("run", "--rm", "image"), True),
-        (("container", "run", "image"), True),
-        (("container", "create", "image"), True),
         (("ps", "--all"), False),
         (("rm", "--force", "x"), False),
         (("exec", "x", "create"), False),
@@ -238,11 +236,21 @@ def test_a_direct_docker_create_inside_an_operation_carries_the_label(
     harbor_backend._docker(*arguments)
     outside, inside = calls
     assert outside == ["docker", *arguments]
-    label = ["--label", f"{LABEL}={invocation}"]
-    assert (inside != outside) is labelled
-    if labelled:
-        command = 2 if arguments[0] == "container" else 1
-        assert inside == ["docker", *arguments[:command], *label, *arguments[command:]]
+    expected = ["docker", "create", "--label", f"{LABEL}={invocation}", *arguments[1:]]
+    assert inside == (expected if labelled else outside)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [("run", "--rm", "image"), ("container", "run", "image"), ("container", "create", "image")],
+)
+def test_harbors_container_runs_carry_the_label(arguments: tuple[str, ...]) -> None:
+    """Harbor's engine commands go through `with_label` (`harbor_labels`)."""
+    invocation = uuid4().hex
+    command = 2 if arguments[0] == "container" else 1
+    assert invocation_runtime.with_label(arguments, invocation) == (
+        *arguments[:command], "--label", f"{LABEL}={invocation}", *arguments[command:],
+    )
 
 
 class _Daemon:
@@ -335,41 +343,31 @@ def test_recovery_removes_a_crashed_measurements_container_by_its_label_alone(
         ("create", f"--label={LABEL}=other", "image"),
         ("create", "-l", f"{LABEL}=other", "image"),
         ("create", f"-l{LABEL}=other", "image"),
-        ("container", "run", "--label", LABEL, "image"),
+        ("create", f"-l={LABEL}=other", "image"),
+        ("create", f"-il{LABEL}=other", "image"),
+        ("create", f"-il={LABEL}=other", "image"),
+        ("create", "--label", f"{LABEL}.note=x", "image"),
         ("create", "--label-file", "labels.txt", "image"),
-        ("run", "--label-file=labels.txt", "image"),
+        ("create", "--label-file=labels.txt", "image"),
     ],
 )
-def test_a_create_that_sets_the_invocation_label_itself_is_refused(
+def test_an_argument_naming_the_invocation_label_is_refused(
     monkeypatch: pytest.MonkeyPatch, arguments: tuple[str, ...]
 ) -> None:
-    """Docker keeps the last of repeated labels, so another value would win over ours."""
+    """Docker keeps the last of repeated labels, in many spellings, so no argument may name it."""
     daemon = _Daemon()
     monkeypatch.setattr(harbor_backend, "run_command", daemon)
     monkeypatch.setattr(invocation_runtime, "_current", uuid4().hex)
-    with pytest.raises(ValueError, match="label"):
+    with pytest.raises(ValueError, match="only PluginBench sets"):
         harbor_backend._docker(*arguments)
     assert daemon.containers == {}
     # The same refusal guards Harbor's own `docker container run`.
-    with pytest.raises(ValueError, match="label"):
-        invocation_runtime.with_label(arguments, uuid4().hex)
+    with pytest.raises(ValueError, match="only PluginBench sets"):
+        invocation_runtime.with_label(("container", "run", *arguments[1:]), uuid4().hex)
 
 
-def test_a_label_that_only_resembles_ours_is_kept(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[list[str]] = []
-
-    def record(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        calls.append(command)
-        return subprocess.CompletedProcess(command, 0, "", "")
-
-    monkeypatch.setattr(harbor_backend, "run_command", record)
-    invocation = uuid4().hex
-    monkeypatch.setattr(invocation_runtime, "_current", invocation)
-    harbor_backend._docker("create", "--label", f"{LABEL}.note=x", "image", "ls", "-la")
-    assert calls == [[
-        "docker", "create", "--label", f"{LABEL}={invocation}", "--label", f"{LABEL}.note=x",
-        "image", "ls", "-la",
-    ]]
+_BUILD = ("build", "--quiet", "--provenance=false", "--tag",
+          f"pluginbench-native-build:{'0' * 32}", "/context")
 
 
 @pytest.mark.parametrize("driver", ["docker", "docker-container"])
@@ -389,31 +387,65 @@ def test_a_build_inside_an_operation_runs_only_in_the_engines_own_builder(
         return subprocess.CompletedProcess(command, 0, output, "")
 
     monkeypatch.setattr(harbor_backend, "run_command", record)
-    harbor_backend._docker("build", "--tag", "t", "context")
+    harbor_backend._docker(*_BUILD)
     outside = calls.pop()
     assert outside[1]["BUILDX_BUILDER"] == "operator-builder"  # Outside an operation, unchanged.
     monkeypatch.setattr(invocation_runtime, "_current", uuid4().hex)
     if driver != "docker":
         with pytest.raises(ValueError, match="built-in builder"):
-            harbor_backend._docker("build", "--tag", "t", "context")
+            harbor_backend._docker(*_BUILD)
         assert [command[1] for command, _ in calls] == ["buildx"]  # Never built.
         return
-    harbor_backend._docker("build", "--tag", "t", "context")
+    harbor_backend._docker(*_BUILD)
     (inspect, inspect_env), (build, build_env) = calls
-    assert inspect[1:] == ["buildx", "inspect"] and build[1:] == ["build", "--tag", "t", "context"]
+    assert inspect[1:] == ["buildx", "inspect"] and tuple(build[1:]) == _BUILD
     for env in (inspect_env, build_env):
         assert (env["BUILDX_BUILDER"], env["DOCKER_BUILDKIT"]) == ("default", "1")
 
 
-@pytest.mark.parametrize("arguments", [("buildx", "create", "--use"), ("builder", "create")])
-def test_an_operation_cannot_create_a_builder(
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("build", "--builder", "other", *_BUILD[1:]),
+        (*_BUILD[:4], "--builder=other", *_BUILD[4:]),
+        (*_BUILD, "--builder", "other"),
+        ("build", "--tag", "t", "/context"),
+        ("image", "build", *_BUILD[1:]),
+        ("builder", "build", *_BUILD[1:]),
+        ("buildx", "build", "--builder=other", "/context"),
+        ("buildx", "--builder", "other", "build", "/context"),
+        ("buildx", "--builder", "other", "create", "--use"),
+        ("buildx", "create", "--use"),
+        ("buildx", "inspect"),
+        ("context", "use", "other"),
+        ("--context", "other", "create", "image"),
+        ("-c", "other", "create", "image"),
+        ("-H", "unix:///other.sock", "create", "image"),
+        ("--host", "unix:///other.sock", "create", "image"),
+        ("compose", "up"),
+        ("run", "image"),
+    ],
+)
+def test_an_operation_sends_only_the_docker_commands_pluginbench_issues(
     monkeypatch: pytest.MonkeyPatch, arguments: tuple[str, ...]
 ) -> None:
     daemon = _Daemon()
     monkeypatch.setattr(harbor_backend, "run_command", daemon)
     monkeypatch.setattr(invocation_runtime, "_current", uuid4().hex)
-    with pytest.raises(ValueError, match="cannot create a buildx builder"):
+    with pytest.raises(ValueError, match="only the commands PluginBench issues"):
         harbor_backend._docker(*arguments)
+    assert daemon.containers == {}
+
+
+def test_every_docker_command_pluginbench_issues_is_admitted() -> None:
+    """The allowlist covers each `_docker` call in the source, so routing breaks none of them."""
+    source = Path(harbor_backend.__file__).read_text()
+    first = set(re.findall(r'\b_?docker\(\s*"([a-z]+)"', source))
+    assert first and first <= harbor_backend._OPERATION_COMMANDS | set(
+        harbor_backend._OPERATION_EXACT
+    )
+    for arguments in [_BUILD, ("context", "inspect"), ("compose", "version", "--short")]:
+        harbor_backend._admit_operation_command(arguments)
 
 
 @pytest.mark.parametrize(
@@ -454,3 +486,36 @@ def test_compose_extension_fields_are_not_services(
         assert yaml.safe_load(overlay.read_text()) == {
             "services": {"main": {"labels": {LABEL: invocation}}}
         }
+
+
+@pytest.mark.parametrize("key", ["DOCKER_HOST", "DOCKER_CONFIG", "BUILDX_BUILDER", "COMPOSE_FILE"])
+@pytest.mark.parametrize("where", ["environment", "verifier"])
+def test_a_native_task_cannot_set_docker_controls(tmp_path: Path, key: str, where: str) -> None:
+    task = native_task(tmp_path)
+    toml = (task / "task.toml").read_text()
+    section = "[environment.env]" if where == "environment" else "[verifier.env]"
+    anchor = "[verifier]" if where == "environment" else "[verifier.environment]"
+    (task / "task.toml").write_text(
+        toml.replace(anchor, f'{section}\n{key}="/elsewhere"\n{anchor}', 1)
+    )
+    with pytest.raises(ValueError, match=f"must not set Docker controls: {key}"):
+        harbor_backend.validate_native_task(task)
+
+
+@pytest.mark.parametrize("key", ["DOCKER_HOST", "DOCKER_CONFIG", "BUILDX_BUILDER", "COMPOSE_FILE"])
+def test_harbors_compose_commands_keep_the_workers_docker_controls(
+    tmp_path: Path, docker_cli: Path, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    """A task variable Harbor merges into Compose's environment cannot redirect it."""
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path / "private-config"))
+    docker = importlib.import_module("harbor.environments.docker.docker").DockerEnvironment
+    original = docker.__dict__["_compose_env_vars"]
+
+    def with_task_env(self: Any, include_os_env: bool = True) -> dict[str, str]:
+        env: dict[str, str] = original(self, include_os_env)
+        return {**env, key: "/elsewhere"}
+
+    monkeypatch.setattr(docker, "_compose_env_vars", with_task_env)
+    with pytest.raises(ValueError, match=f"changes {key}"):
+        _start(tmp_path, uuid4().hex, "agent")
+    assert not [entry for entry in _creates(docker_cli) if entry["argv"][0] == "compose"]
