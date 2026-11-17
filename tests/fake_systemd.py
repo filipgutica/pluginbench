@@ -166,5 +166,5 @@ def fake_systemd_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Ite
 
 def register_handlers(monkeypatch: pytest.MonkeyPatch) -> None:
     """Allow the test handlers in this process too, which validates each request."""
-    for name in ("echo", "escape", "hang", "fail", "descriptors"):
+    for name in ("echo", "escape", "hang", "fail", "chatty", "descriptors"):
         monkeypatch.setitem(invocation_runtime.HANDLERS, name, f"sitecustomize:{name}")

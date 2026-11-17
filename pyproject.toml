@@ -63,6 +63,7 @@ addopts = "-ra"
 markers = [
     "real_guidance_check: run codex.reject_guidance unbounded, as production does",
     "systemd: needs a real systemd user manager and cgroup v2; skipped without one unless PLUGINBENCH_REQUIRE_SYSTEMD_TESTS=1",
+    "real_operations: runs operations in systemd scopes, real or fake, rather than in the test's process",
 ]
 
 [tool.ruff]

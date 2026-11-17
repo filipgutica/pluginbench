@@ -527,6 +527,23 @@ def _collect(
     return report, collector.tool_version, collector.command[0]
 
 
+def _contained(
+    root: Path, collector: Collector, destination: Path, baseline: Path | None
+) -> tuple[dict[str, object], str, str]:
+    """`_run_collector` as one collect operation, in its own scope."""
+    from pluginbench import operations
+
+    report, version, tool = operations.run(
+        "collect",
+        operations.Collect(
+            root=root, collector=collector, destination=destination.resolve(), baseline=baseline
+        ),
+        timeout=operations.collect_budget(collector),
+        docker=container_runtime(collector),
+    )
+    return report, version, tool
+
+
 def collect_measurements(
     snapshot: Path, evidence_dir: Path, collectors: list[Collector], *, before: Path | None = None
 ) -> dict[str, Path]:
@@ -552,7 +569,7 @@ def collect_measurements(
                     baseline = Path(temporary) / "before"
                     shutil.copytree(before, baseline)
                 try:
-                    report, version, tool = _run_collector(root, collector, destination, baseline)
+                    report, version, tool = _contained(root, collector, destination, baseline)
                 finally:
                     # Failed commands are not exempt from source/profile integrity checks.
                     if inspect_snapshot(root)["digest"] != source_digest:

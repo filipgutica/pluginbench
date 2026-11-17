@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
+import json
 from pathlib import Path
-from typing import Any, Literal
+from types import SimpleNamespace
+from typing import Any, Literal, cast
 
 import pytest
 import yaml
@@ -108,11 +111,11 @@ def test_preflight_runs_the_check_or_the_preparation_on_the_same_evaluation(
     config = _evaluation(tmp_path)
     calls: list[tuple[str, evaluation.Evaluation, Path]] = []
 
-    def check(config: evaluation.Evaluation, output: Path) -> dict[str, object]:
+    def check(config: evaluation.Evaluation, output: Path, **kwargs: Any) -> dict[str, object]:
         calls.append(("check", config, output))
         return {"report": True}
 
-    def prepare(config: evaluation.Evaluation, output: Path) -> Path:
+    def prepare(config: evaluation.Evaluation, output: Path, **kwargs: Any) -> Path:
         calls.append(("prepare", config, output))
         return output / "run"
 
@@ -193,3 +196,64 @@ def test_a_relative_path_nested_in_the_evaluation_is_refused(tmp_path: Path, fie
         config["measurement_settings"]["fallow_config"] = "fallow.json"
     with pytest.raises(ValidationError, match="is not an absolute path"):
         operations.Preflight.model_validate(arguments)
+
+
+# What each handler runs, and the callers that may still call it directly: only code that
+# already runs inside an operation, or a helper with no production caller.
+_ROUTED = {
+    "invoke_native": set(),
+    "regrade_native": set(),
+    "invoke": set(),
+    "_run_collector": set(),
+    "check_evaluation": set(),
+    # Inside the preflight operation's own check.
+    "run_reference_agents": {("evaluation", "_reference_agents")},
+    # `run_evaluation` is a test helper that no production code calls.
+    "prepare_evaluation": {("evaluation", "run_evaluation")},
+}
+
+
+def test_every_handled_implementation_is_called_only_through_its_operation() -> None:
+    """A model call, trial or container started outside `operations.run` would carry no scope
+    and no label, so recovery could not find it."""
+    package = Path(operations.__file__).parent
+    direct: list[tuple[str, str, str]] = []
+    for path in sorted(package.glob("*.py")):
+        if path.stem == "operations":
+            continue
+        tree = ast.parse(path.read_text())
+        for function in ast.walk(tree):
+            if not isinstance(function, ast.FunctionDef):
+                continue
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+                if name in _ROUTED and (path.stem, function.name) not in _ROUTED[name]:
+                    direct.append((path.stem, function.name, name))
+    # `codex.invoke` aside, `invoke` names no other function PluginBench calls.
+    assert sorted(set(direct)) == []
+
+
+def test_each_operation_budget_outlasts_its_implementations_own_timeouts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scope's deadline kills a hung operation; it must never cut short a call whose own
+    timeout would end it first, and a preflight's is summed over its tasks, not divided."""
+
+    def worker(*, task_dir: Path, agent_seconds: int = 0, prepare: bool = False) -> int:
+        return (5000 if prepare else 1000) + agent_seconds
+
+    monkeypatch.setattr(harbor_backend, "_native_worker_budget", worker)
+    task = tmp_path / "tasks/one"
+    assert operations.coding_budget(task, 900) > worker(task_dir=task, agent_seconds=900)
+    assert operations.grading_budget(task) > worker(task_dir=task)
+    assert operations.review_budget(600) > 600
+    assert operations.collect_budget(_collector(tmp_path)) > _collector(tmp_path).timeout_seconds
+    mutation = tmp_path / "mutation.json"
+    mutation.write_text(json.dumps({"coverage": {"timeout_seconds": 100}}))
+    # Every run a mutation may make, each at its longest mutant timeout.
+    assert operations.collect_budget(Collector(kind="mutation", config=mutation)) > 55 * (3 * 100 + 60)
+    tasks = SimpleNamespace(resolve=lambda: tmp_path / "tasks", task_ids=["one", "two"])
+    one = worker(task_dir=task, prepare=True) + operations.requalify_budget(task)
+    assert operations.preflight_budget(cast(Any, SimpleNamespace(tasks=tasks))) > 2 * one

@@ -35,12 +35,12 @@ def _run(tmp_path: Path, *extra: str) -> Any:
 
 
 def _prepared(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    def prepare(config: object, output: Path, *, progress: Callable[[str], None]) -> Path:
+    def prepare(mode: str, config: object, output: Path, progress: Callable[[str], None]) -> Path:
         progress("Preparing native Harbor task a")
         (tmp_path / "run").mkdir()
         return tmp_path / "run"
 
-    monkeypatch.setattr(cli, "prepare_evaluation", prepare)
+    monkeypatch.setattr(cli, "_preflight", prepare)
 
 
 def test_notifies_once_when_coding_starts_and_when_the_run_finishes(
@@ -64,11 +64,11 @@ def test_notifies_once_when_coding_starts_and_when_the_run_finishes(
 def test_notifies_when_preparation_fails_before_coding(
     notices: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def prepare(config: object, output: Path, *, progress: Callable[[str], None]) -> Path:
+    def prepare(mode: str, config: object, output: Path, progress: Callable[[str], None]) -> Path:
         progress("Preparing native Harbor task a")
         raise ValueError("measurements are not ready")
 
-    monkeypatch.setattr(cli, "prepare_evaluation", prepare)
+    monkeypatch.setattr(cli, "_preflight", prepare)
     result = _run(tmp_path, "--notify")
     assert result.exit_code == 2
     assert notices == ["Run failed: measurements are not ready"]
@@ -92,11 +92,11 @@ def test_notify_without_a_notifier_warns_before_the_run_starts(
     installed: bool, notices: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Preparation fails, so a warning in the output was printed before it.
-    def prepare(config: object, output: Path, *, progress: Callable[[str], None]) -> Path:
+    def prepare(mode: str, config: object, output: Path, progress: Callable[[str], None]) -> Path:
         raise ValueError("measurements are not ready")
 
     which = shutil.which
-    monkeypatch.setattr(cli, "prepare_evaluation", prepare)
+    monkeypatch.setattr(cli, "_preflight", prepare)
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(
         shutil,

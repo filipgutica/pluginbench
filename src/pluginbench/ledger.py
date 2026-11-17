@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from pluginbench.invocation_runtime import OperationFailed
 from pluginbench.run_lock import boot_id, note_work, pid_namespace, process_start
 
 # Version 2 adds `invocations` and `budget`; a writable open migrates version 1 in place.
@@ -178,11 +179,12 @@ def child_identity(pid: int) -> dict[str, object]:
 def outcome(error: BaseException, *, spawned: bool) -> tuple[str, str | None]:
     """The state and error signature that end an invocation which raised `error`.
 
-    Nothing external started unless the spawn reported its child, so that is the one refund
-    besides an operator interrupt. The signature is what the short-circuit compares: the
-    error's stable `reason` when it has one, which holds no attempt ID or temporary path.
+    Nothing external started unless the spawn reported its child, or an operation's scope was
+    launched but failed its startup gate, so that is the one refund besides an operator
+    interrupt. The signature is what the short-circuit compares: the error's stable `reason`
+    when it has one, which holds no attempt ID or temporary path.
     """
-    if not spawned:
+    if not spawned and not isinstance(error, OperationFailed):
         return "aborted_prespawn", None
     if isinstance(error, KeyboardInterrupt):
         return "interrupted_operator", None

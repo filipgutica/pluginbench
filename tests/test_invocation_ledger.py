@@ -19,12 +19,14 @@ from typing import Any
 
 import pytest
 
+import operation_support
 import resume_support
 import test_baselines
 import test_study_review
 from native_support import execution as native_execution, runtime_identity, synthetic_contract
 from pluginbench import harbor_backend, processes, provider_stops, source_only, study, study_review
-from pluginbench import codex, submissions, trial_containers
+from pluginbench import codex, invocation_runtime, submissions, trial_containers
+from pluginbench import ledger as invocation_ledger
 from pluginbench.ledger import (
     LEDGER_NAME,
     SCHEMA_VERSION,
@@ -143,7 +145,6 @@ def test_the_same_infrastructure_error_twice_ends_the_slot_without_a_third_try(
 
     def undelivered(**kwargs: Any) -> dict[str, Any]:
         calls.append(str(kwargs["entry"]["id"]))
-        kwargs["on_spawn"](os.getpid())
         area = kwargs["area"]
         execution = native_execution(area, kwargs["protocol"]["native_task_identity"], reward=1)
         cause = "missing skill" if same else f"missing skill {len(calls)}"
@@ -174,7 +175,6 @@ def _regrade(
     replays: list[str], *, exception: str | None, reward: int | None = None
 ) -> Any:
     def regrade(**kwargs: Any) -> dict[str, object]:
-        kwargs["on_spawn"](os.getpid())
         replays.append(str(kwargs["directory"]))
         if exception is None:
             rewards = {} if reward is None else {"reward": reward}
@@ -368,7 +368,6 @@ def test_a_migrated_ledger_counts_the_calls_its_receipts_record(
 
     def undelivered(**kwargs: Any) -> dict[str, Any]:
         calls.append(str(kwargs["entry"]["id"]))
-        kwargs["on_spawn"](os.getpid())
         execution = native_execution(
             kwargs["area"], kwargs["protocol"]["native_task_identity"], reward=1
         )
@@ -418,7 +417,6 @@ def test_cached_vanilla_regrades_spend_the_slot_s_grading_invocations(
     monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
 
     def invoke(**kwargs: Any) -> dict[str, Any]:
-        kwargs["on_spawn"](os.getpid())
         area = kwargs["area"]
         (area / "workspace/answer.py").write_text("answer = 1\n")
         return native_execution(
@@ -432,8 +430,6 @@ def test_cached_vanilla_regrades_spend_the_slot_s_grading_invocations(
     regrades: list[str] = []
 
     def regrade(**kwargs: Any) -> dict[str, object]:
-        if "on_spawn" in kwargs:  # The worker reports itself when the caller asks.
-            kwargs["on_spawn"](os.getpid())
         regrades.append(str(kwargs["directory"]))
         raise OSError(f"docker went away {len(regrades)}")
 
@@ -545,6 +541,7 @@ def test_a_run_without_a_ledger_is_not_reviewed(
 def _review_child() -> None:
     """argv: run. Reviews it with a judge call that SIGKILLs this process as it starts."""
     patch = pytest.MonkeyPatch()
+    operation_support.in_place(patch)
     patch.setattr(submissions, "reviewed_contract", synthetic_contract)
     patch.setattr(codex, "invoke", lambda **kwargs: os.kill(os.getpid(), signal.SIGKILL))
     study_review.review_study(Path(sys.argv[1]))
@@ -584,7 +581,6 @@ def test_coding_resumed_after_a_review_counts_the_review_s_calls(
 
     def vanilla_fails(**kwargs: Any) -> dict[str, Any]:
         calls.append(str(kwargs["entry"]["id"]))
-        kwargs["on_spawn"](os.getpid())
         area = kwargs["area"]
         (area / "workspace/src/answer.py").write_text("answer = 1\n")
         execution = native_execution(area, kwargs["protocol"]["native_task_identity"], reward=1)
@@ -719,3 +715,13 @@ def test_a_reviewed_row_without_an_observation_is_rejected(
     path.write_text(json.dumps(state))
     with pytest.raises(ValueError, match="reviewed row has no bound observation"):
         study_review.validate_review_revision(root, "review")
+
+
+def test_an_operation_whose_scope_was_launched_counts_as_spent_though_never_admitted() -> None:
+    """Its bootstrap ran, so a scope that failed its startup gate is no refundable abort; a
+    call refused before anything spawned still is."""
+    launched = invocation_runtime.OperationFailed("the operation's scope did not start")
+    assert invocation_ledger.outcome(launched, spawned=False)[0] == "failed_transient"
+    assert invocation_ledger.outcome(ValueError("refused"), spawned=False) == (
+        "aborted_prespawn", None
+    )

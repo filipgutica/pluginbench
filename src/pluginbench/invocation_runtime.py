@@ -31,6 +31,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from collections.abc import Callable
@@ -70,7 +71,15 @@ LABEL_KEY = "pluginbench.invocation"
 
 # The invocation whose handler this process runs; set once by the entry point, in the scope.
 _current: str | None = None
+# The entry point's connection to its owner, for `report`, and the lock its senders share.
+_channel: tuple[socket.socket, threading.Lock] | None = None
 _CREATES = (("run",), ("create",), ("container", "run"), ("container", "create"))
+# Handler exceptions the owner raises again as themselves, so callers keep handling them by
+# type, beside builtin ones. Any other becomes OperationFailed.
+_KNOWN_ERRORS = {
+    "pluginbench.collectors.CollectorUnavailable": "pluginbench.collectors:CollectorUnavailable",
+    "pluginbench.isolation.RuntimeDriftError": "pluginbench.isolation:RuntimeDriftError",
+}
 
 _MESSAGE_LIMIT = 4096
 _PEER = struct.Struct("3i")
@@ -99,10 +108,12 @@ class HostUnavailable(ValueError):
         self.reason = reason
 
 
-class OperationFailed(RuntimeError):
-    """The operation ended without a result: its handler raised, or it never got past a gate.
+class OperationFailed(ValueError):
+    """The operation ended without a result: its handler raised an exception no caller handles
+    by type, or it never got past a gate. Callers treat it as an infrastructure error.
 
-    `type` names the handler's exception, or is empty for a launch failure."""
+    `type` names the handler's exception, or is empty for a launch failure. Either way its
+    bootstrap had started, so the call counts as spent (`ledger.outcome`)."""
 
     def __init__(self, message: str, *, type: str = "") -> None:
         super().__init__(f"{type}: {message}" if type else message)
@@ -165,6 +176,22 @@ class CleanupProof:
 def current() -> str | None:
     """The invocation ID of the operation this process runs as, or None outside one."""
     return _current
+
+
+def report(text: str) -> None:
+    """Send one progress line to the operation's owner, which passes it to its caller; outside
+    an operation, nothing. A line too long for one message is shortened. Progress is only
+    shown, so a send that fails is dropped: an owner that is gone stops this scope anyway."""
+    if _channel is None:
+        return
+    connection, sending = _channel
+    while len(message := json.dumps({"progress": text}).encode() + b"\n") > _MESSAGE_LIMIT:
+        text = text[: len(text) // 2]
+    with sending:
+        try:
+            connection.sendall(message)
+        except OSError:
+            pass
 
 
 def with_label(arguments: tuple[str, ...], invocation: str) -> tuple[str, ...]:
@@ -297,12 +324,15 @@ def _lock() -> run_lock.ExecutionLock:
 
 
 def run_operation(
-    request: OperationRequest, *, started: Callable[[int], None] | None = None
+    request: OperationRequest,
+    *,
+    started: Callable[[int], None] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> Any:
     """Run `request` in its scope and return its handler's value, once its cleanup is verified.
 
     `started` gets the entry point's PID after the scope is checked and before the handler may
-    run; if it raises, nothing runs. The handler's own exception becomes OperationFailed; a
+    run; if it raises, nothing runs. `progress` gets each line the handler reports (`report`). The handler's own exception becomes OperationFailed; a
     handler past its deadline is killed and raises OperationDeadlineExceeded. Before anything
     spawns this raises only HostUnavailable or ValueError. A cleanup that cannot be verified
     raises control_store.CleanupBlocked and keeps the owner unreleased.
@@ -315,7 +345,8 @@ def run_operation(
     directory.mkdir(mode=0o700)
     path = directory / "request.json"
     _write_private(
-        path, {"id": spec.id, "operation": request.operation, "arguments": request.arguments}
+        path,
+        {"id": spec.id, "operation": request.operation, "arguments": request.arguments},
     )
     lock.note_operation(
         {"id": spec.id, "scope": spec.scope, "label": spec.label, "docker": spec.docker,
@@ -323,7 +354,9 @@ def run_operation(
     )
     failure: BaseException | None = None
     try:
-        return _launch(lock, request, _scope_command(launcher, request, path), directory, started)
+        return _launch(
+            lock, request, _scope_command(launcher, request, path), directory, started, progress
+        )
     except BaseException as exc:
         failure = exc
         raise
@@ -343,6 +376,7 @@ def _launch(
     command: list[str],
     directory: Path,
     started: Callable[[int], None] | None,
+    progress: Callable[[str], None] | None,
 ) -> Any:
     spec = request.spec
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
@@ -377,7 +411,7 @@ def _launch(
             finally:
                 os.close(write_end)
             with _admit(listener, lock, spec, started) as connection:
-                outcome = _wait(connection, spec, request.timeout)
+                outcome = _wait(connection, spec, request.timeout, progress)
         finally:
             # The bootstrap, or the entry point it became, is this process's unreaped child, so
             # its PID cannot have been reused.
@@ -391,6 +425,26 @@ def _launch(
             f"operation {request.operation} did not return within {request.timeout:g} seconds"
         )
     return _result(directory, request.operation, proc.returncode)
+
+
+def rebuild(result: dict[str, Any]) -> Exception:
+    """The handler's exception from its saved `type` and `message`: a builtin one or one in
+    _KNOWN_ERRORS as itself, a timeout with its command and limit, and any other as
+    OperationFailed. Nothing is unpickled."""
+    name, message = str(result.get("type")), str(result.get("message"))
+    module, _, attribute = name.rpartition(".")
+    source = _KNOWN_ERRORS.get(name) or (f"builtins:{attribute}" if module == "builtins" else "")
+    try:
+        if name == "subprocess.TimeoutExpired":
+            return subprocess.TimeoutExpired(result["cmd"], float(result["timeout"]))
+        if source:
+            located, _, attribute = source.partition(":")
+            error = getattr(importlib.import_module(located), attribute, None)
+            if isinstance(error, type) and issubclass(error, Exception):
+                return error(message)
+    except (KeyError, TypeError, ValueError):
+        pass  # Its saved fields do not rebuild it, so it is an unknown failure.
+    return OperationFailed(message, type=name)
 
 
 def _admit(
@@ -431,18 +485,25 @@ def _admit(
     return connection
 
 
-def _wait(connection: socket.socket, spec: InvocationSpec, timeout: float) -> str:
-    """Wait for the entry point to exit, which closes its end; past `timeout`, stop the scope:
-    SIGTERM, then SIGKILL after KILL_GRACE. Return "exited" or "deadline"."""
+def _wait(
+    connection: socket.socket,
+    spec: InvocationSpec,
+    timeout: float,
+    progress: Callable[[str], None] | None,
+) -> str:
+    """Pass on the handler's progress until the entry point exits, which closes its end; past
+    `timeout`, stop the scope: SIGTERM, then SIGKILL after KILL_GRACE. Return "exited" or
+    "deadline"."""
     deadline = time.monotonic() + timeout
     from pluginbench.control_store import CleanupUnknown
 
-    if _closed(connection, deadline):
+    follow = _Follow(connection, progress)
+    if follow.closed_before(deadline):
         return "exited"
     # A kill that fails is left to the cleanup that follows, which proves the scope gone.
     try:
         _systemctl("kill", "--kill-whom=all", "--signal=SIGTERM", spec.scope, timeout=QUERY_SECONDS)
-        if not _closed(connection, time.monotonic() + KILL_GRACE):
+        if not follow.closed_before(time.monotonic() + KILL_GRACE):
             _systemctl(
                 "kill", "--kill-whom=all", "--signal=SIGKILL", spec.scope, timeout=QUERY_SECONDS
             )
@@ -451,19 +512,46 @@ def _wait(connection: socket.socket, spec: InvocationSpec, timeout: float) -> st
     return "deadline"
 
 
-def _closed(connection: socket.socket, deadline: float) -> bool:
-    """Whether the peer closes the connection before `deadline`. It sends nothing after its
-    hello, so any data is discarded."""
-    while (left := deadline - time.monotonic()) > 0:
-        connection.settimeout(min(left, 1.0))
-        try:
-            if not connection.recv(_MESSAGE_LIMIT):
+class _Follow:
+    """The entry point's messages after its permit: one `{"progress": text}` JSON line each.
+
+    Only its exit closes the connection. A line that is not such a message, or is longer than
+    _MESSAGE_LIMIT, is dropped; it never reads as an exit."""
+
+    def __init__(
+        self, connection: socket.socket, progress: Callable[[str], None] | None
+    ) -> None:
+        self._connection = connection
+        self._progress = progress
+        self._pending = b""
+
+    def closed_before(self, deadline: float) -> bool:
+        """Whether the peer closes the connection before `deadline`."""
+        while (left := deadline - time.monotonic()) > 0:
+            self._connection.settimeout(min(left, 1.0))
+            try:
+                data = self._connection.recv(_MESSAGE_LIMIT)
+            except TimeoutError:
+                continue
+            except OSError:
                 return True
-        except TimeoutError:
-            continue
-        except OSError:
-            return True
-    return False
+            if not data:
+                return True
+            self._take(data)
+        return False
+
+    def _take(self, data: bytes) -> None:
+        *lines, self._pending = (self._pending + data).split(b"\n")
+        if len(self._pending) > _MESSAGE_LIMIT:
+            self._pending = b""  # Not a message; the next newline starts the next one.
+        for line in lines:
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            text = message.get("progress") if isinstance(message, dict) else None
+            if isinstance(text, str) and len(line) <= _MESSAGE_LIMIT and self._progress:
+                self._progress(text)
 
 
 def _result(directory: Path, operation: str, status: int) -> Any:
@@ -476,7 +564,9 @@ def _result(directory: Path, operation: str, status: int) -> Any:
     (directory / "result.json").unlink()
     if result.get("ok") is True:
         return result.get("value")
-    raise OperationFailed(str(result.get("message")), type=str(result.get("type")))
+    error = rebuild(result)
+    error.add_note(f"Operation {operation} raised it; see {directory / 'traceback.txt'}")
+    raise error
 
 
 def _systemctl(*arguments: str, timeout: float) -> subprocess.CompletedProcess[str]:
@@ -656,6 +746,26 @@ def verify_labelled(operation: dict[str, Any], *, deadline: float) -> dict[str, 
     return {"removed": removed, "inventories": 2, "at": _now()}
 
 
+def handler(operation: str) -> Callable[[dict[str, Any]], Any]:
+    """The function HANDLERS names for `operation`."""
+    module, name = HANDLERS[operation].split(":")
+    function: Callable[[dict[str, Any]], Any] = getattr(importlib.import_module(module), name)
+    return function
+
+
+def failure(error: Exception) -> dict[str, Any]:
+    """A handler's exception as its saved result, which the owner raises again (`rebuild`)."""
+    kind = type(error)
+    result = {"ok": False, "type": f"{kind.__module__}.{kind.__qualname__}", "message": str(error)}
+    if isinstance(error, subprocess.TimeoutExpired):
+        command = error.cmd
+        result.update(
+            cmd=[str(item) for item in command] if isinstance(command, (list, tuple)) else str(command),
+            timeout=error.timeout,
+        )
+    return result
+
+
 def _execute(path: Path) -> int:
     """The entry point inside the scope: pass the second gate, run the handler, save its result.
 
@@ -675,17 +785,14 @@ def _execute(path: Path) -> int:
         if _receive(connection) != {"permit": request["id"]}:
             return 75
         connection.settimeout(None)
-        global _current
+        global _current, _channel
         _current = request["id"]
+        _channel = (connection, threading.Lock())
         try:
-            target = HANDLERS[request["operation"]]
-            module, name = target.split(":")
-            value = getattr(importlib.import_module(module), name)(request["arguments"])
+            value = handler(request["operation"])(request["arguments"])
             result: dict[str, Any] = {"ok": True, "value": value}
         except Exception as exc:
-            error = type(exc)
-            result = {"ok": False, "type": f"{error.__module__}.{error.__qualname__}",
-                      "message": str(exc)}
+            result = failure(exc)
             (path.parent / "traceback.txt").write_text(traceback.format_exc())
         _write_private(path.parent / "result.json", result)
     return 0

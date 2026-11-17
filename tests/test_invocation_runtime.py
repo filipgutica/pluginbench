@@ -33,6 +33,8 @@ from pluginbench.invocation_runtime import (
     OperationRequest,
 )
 
+pytestmark = pytest.mark.real_operations
+
 _SOURCE = str(Path(pluginbench.__file__).parents[1])
 _RUNTIME: dict[str, object] = {"docker_engine": {"id": "daemon", "endpoint": "unix:///fake.sock"}}
 
@@ -212,15 +214,47 @@ def test_an_interrupted_cleanup_keeps_the_owner_unreleased_though_the_interrupt_
     assert [item["id"] for item in record["operations"]] == [request.spec.id]
 
 
-def test_a_handler_error_becomes_operation_failed_after_cleanup(
+def test_the_handlers_progress_reaches_the_caller_and_a_long_line_never_ends_it(
     fake_systemd: FakeSystemd, owned: run_lock.ExecutionLock
 ) -> None:
-    request = _request("fail", message="boom")
+    """A preflight's progress is what `check` and `run` print while they prepare."""
+    long = "é" * 5000  # Longer than one message, even before JSON escapes it.
+    lines: list[str] = []
 
-    with pytest.raises(OperationFailed, match="ValueError: boom") as caught:
+    value = invocation_runtime.run_operation(
+        _request("chatty", lines=["one", long, "two"]), progress=lines.append
+    )
+
+    assert value == 3
+    assert lines[0] == "one" and lines[2] == "two"
+    assert lines[1] and long.startswith(lines[1])
+
+
+@pytest.mark.parametrize(
+    ("kind", "raised", "text"),
+    [
+        ("ValueError", ValueError, "boom"),
+        ("TimeoutExpired", subprocess.TimeoutExpired, "timed out after 7.0 seconds"),
+        ("Unexpected", OperationFailed, "sitecustomize.Unexpected: boom"),
+    ],
+)
+def test_a_handler_error_comes_back_as_its_callers_handle_it_after_cleanup(
+    fake_systemd: FakeSystemd,
+    owned: run_lock.ExecutionLock,
+    kind: str,
+    raised: type[Exception],
+    text: str,
+) -> None:
+    """Callers handle a timeout, a ValueError or a collector's error by type, so these come
+    back as themselves; any other is an infrastructure failure."""
+    request = _request("fail", message="boom", kind=kind)
+
+    with pytest.raises(raised, match=text) as caught:
         invocation_runtime.run_operation(request)
 
-    assert caught.value.type == "builtins.ValueError"
+    assert type(caught.value) is raised
+    if isinstance(caught.value, subprocess.TimeoutExpired):
+        assert caught.value.cmd == ["worker", "boom"]
     assert (owned.state / "invocations" / request.spec.id / "traceback.txt").is_file()
     assert _record(owned.state)["operations"] == []
 

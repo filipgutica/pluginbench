@@ -818,18 +818,26 @@ def review_study(
                         study._on_coordinator(
                             emit, partial(commit_review, index, copy.deepcopy(row), native_start=True)
                         )
-                        execution = codex.invoke(
-                            area=area,
-                            entry={"host": harness, "arm": "baseline"},
-                            protocol={
-                                "models": {harness: model},
-                                "reasoning": effort,
-                                **({"auth_file": str(auth_file)} if auth_file else {}),
-                            },
-                            prompt=prompt,
-                            timeout=timeout,
-                            output_schema=area / "workspace/response-schema.json",
-                            on_spawn=spawn,
+                        from pluginbench import operations
+
+                        execution = operations.run(
+                            "review",
+                            operations.Review(
+                                area=area,
+                                entry={"host": harness, "arm": "baseline"},
+                                protocol={
+                                    "models": {harness: model},
+                                    "reasoning": effort,
+                                    **({"auth_file": str(auth_file)} if auth_file else {}),
+                                },
+                                prompt=prompt,
+                                timeout=timeout,
+                                output_schema=area / "workspace/response-schema.json",
+                            ),
+                            timeout=operations.review_budget(timeout),
+                            docker=None,
+                            invocation=invocation,
+                            started=spawn,
                         )
                         if (stopped := provider_stop(area)) is not None:
                             raise stopped

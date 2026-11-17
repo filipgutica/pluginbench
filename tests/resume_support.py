@@ -18,6 +18,8 @@ from typing import Any
 import pytest
 import yaml
 
+import operation_support
+
 from native_support import (
     execution as native_execution,
     runtime_identity,
@@ -25,7 +27,8 @@ from native_support import (
     task_entry,
 )
 from pluginbench import baselines, codex, control_store, harbor_backend, ledger, study, submissions
-from pluginbench import run_lock, trial_containers
+from pluginbench import invocation_runtime, run_lock, trial_containers
+from pluginbench.invocation_runtime import OperationRequest
 from pluginbench.run_lock import ExecutionOwner
 from pluginbench.datasets import native_identity, portable_native_identity
 
@@ -135,7 +138,7 @@ def install(
     monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime, **kwargs: None)
     lock = threading.Lock()
     pair = threading.Barrier(2)
-    counts = {"receipt": 0, "verify": 0, "complete": 0, "publish": 0}
+    counts = {"receipt": 0, "verify": 0, "complete": 0, "publish": 0, "admit": 0}
 
     def counted(name: str) -> int:
         with lock:
@@ -149,10 +152,7 @@ def install(
         with lock:
             calls.append(str(kwargs["entry"]["id"]))
             ordinal = len(calls)
-        if boundary == "during-call" and ordinal == at:
-            _kill()
-        # As the real worker does once it runs; this process stands in for it.
-        kwargs["on_spawn"](os.getpid())
+        # Its operation was admitted, so its identity is recorded.
         if boundary == "after-identity" and ordinal == at:
             _kill()
         if boundary == "two-in-flight" and ordinal in (at, at + 1):
@@ -162,6 +162,15 @@ def install(
         (area / "workspace/src/answer.py").write_text("answer = 1\n")
         return native_execution(area, kwargs["protocol"]["native_task_identity"], reward=1)
 
+    operation_support.in_place(monkeypatch)  # Also in a child, which has no conftest.
+
+    def run_operation(request: OperationRequest, **kwargs: Any) -> Any:
+        # Killed once its scope runs, before the operation is admitted and its identity recorded.
+        if request.operation == "coding" and boundary == "during-call" and counted("admit") == at:
+            _kill()
+        return operation_support.run_in_place(request, **kwargs)
+
+    monkeypatch.setattr(invocation_runtime, "run_operation", run_operation)
     verify = study._verify_snapshot
 
     def verify_snapshot(**kwargs: Any) -> dict[str, Any]:

@@ -42,8 +42,21 @@ def hang(arguments: dict[str, Any]) -> Any:
         time.sleep(1)
 
 
+class Unexpected(Exception):
+    """An exception no caller handles by type."""
+
+
 def fail(arguments: dict[str, Any]) -> Any:
-    raise ValueError(arguments["message"])
+    message, kind = arguments["message"], arguments.get("kind", "ValueError")
+    if kind == "TimeoutExpired":
+        raise subprocess.TimeoutExpired(["worker", message], 7)
+    raise Unexpected(message) if kind == "Unexpected" else ValueError(message)
+
+
+def chatty(arguments: dict[str, Any]) -> Any:
+    for text in arguments["lines"]:
+        invocation_runtime.report(text)
+    return len(arguments["lines"])
 
 
 def descriptors(arguments: dict[str, Any]) -> Any:
@@ -57,5 +70,5 @@ def descriptors(arguments: dict[str, Any]) -> Any:
 
 
 invocation_runtime.HANDLERS.update(
-    {name: f"sitecustomize:{name}" for name in ("echo", "escape", "hang", "fail", "descriptors")}
+    {name: f"sitecustomize:{name}" for name in ("echo", "escape", "hang", "fail", "chatty", "descriptors")}
 )

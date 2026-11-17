@@ -43,7 +43,6 @@ from pluginbench import (
     language_analysis,
     mutation,
     parallel,
-    processes,
     remeasure,
     run_lock,
     run_status,
@@ -156,7 +155,7 @@ def test_config_dry_run_includes_fresh_vanilla_and_every_package(
     path = tmp_path / "eval.yaml"
     path.write_text(yaml.safe_dump(config.model_dump(mode="json")))
     monkeypatch.setattr(
-        cli, "prepare_evaluation", lambda *args, **kwargs: pytest.fail("dry run cannot execute")
+        cli, "_preflight", lambda *args, **kwargs: pytest.fail("dry run cannot execute")
     )
     result = CliRunner().invoke(cli.app, ["run", str(path), "--dry-run", "--json"])
     assert result.exit_code == 0, result.stderr
@@ -194,7 +193,7 @@ def test_run_confirms_from_piped_input_and_explains_a_missing_answer(
         calls.append(args)
         raise typer.Exit(3)
 
-    monkeypatch.setattr(cli, "prepare_evaluation", prepare)
+    monkeypatch.setattr(cli, "_preflight", prepare)
     # CliRunner's stdin is a pipe, like a script or an agent shell.
     result = CliRunner().invoke(cli.app, ["run", str(path), "--foreground"], input=answer)
     assert result.exit_code == exit_code, result.output
@@ -1340,7 +1339,7 @@ def test_check_reports_a_runtime_refusal_like_other_refusals(
     def refused(*args: object, **kwargs: object) -> object:
         raise isolation.RuntimeDriftError("Docker capacity no longer fits this run's measurement")
 
-    monkeypatch.setattr(cli, "check_evaluation", refused)
+    monkeypatch.setattr(cli, "_preflight", refused)
     result = CliRunner().invoke(
         cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"])]
     )
@@ -3656,12 +3655,6 @@ def _finished_without_source_only_grades(
         graded.append(patch)
         # Correct only with the production test_set.py and without the agent's test files.
         reward = int("+flag = True" in patch and "tests/" not in patch and "conftest" not in patch)
-        if (spawned := kwargs.get("on_spawn")) is not None:
-            # As the real regrade runs its worker: reported, then stopped and drained.
-            processes.run_command(
-                [sys.executable, "-c", ""], cwd=tmp_path, env=os.environ, timeout=30,
-                on_spawn=spawned,
-            )
         return {
             "verifier_result": {"rewards": {"reward": reward}},
             "exception_info": None,

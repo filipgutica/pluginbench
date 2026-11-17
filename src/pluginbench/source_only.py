@@ -294,18 +294,28 @@ def _replay(
         spawned = True  # Set first: the worker runs whether or not its record lands.
         ledger.invocation_started(invocation, pid)
 
+    from pluginbench import operations
+
     try:
-        regraded = harbor_backend.regrade_native(
-            artifacts=staging / "source",
-            task_dir=task.native_task,
-            identity=native_identity(task),
-            directory=staging / "regrade",
-            # regrade_native proves the copy equals the graded trial but for the replayed patch.
-            artifact_hashes={
-                **hashes,
-                submissions.PATCH_ARTIFACT: record["filtered_patch_sha256"],
-            },
-            on_spawn=spawn,
+        identity = native_identity(task)
+        regraded: dict[str, Any] = operations.run(
+            "grading",
+            operations.Grading(
+                artifacts=staging / "source",
+                task_dir=task.native_task,
+                identity=identity,
+                directory=staging / "regrade",
+                # regrade_native proves the copy equals the graded trial but for the replayed
+                # patch.
+                artifact_hashes={
+                    **hashes,
+                    submissions.PATCH_ARTIFACT: record["filtered_patch_sha256"],
+                },
+            ),
+            timeout=operations.grading_budget(task.native_task),
+            docker=harbor_backend._native_object(identity["isolation"], "native regrade runtime"),
+            invocation=invocation,
+            started=spawn,
         )
         if (reason := grade.replay_infrastructure(regraded.get("exception_info"))) is not None:
             raise ValueError(reason)  # Infrastructure, as `_grade` records any replay error.
