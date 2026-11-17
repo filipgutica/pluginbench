@@ -45,7 +45,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # Containers, builds and trials now start only inside an operation, on the daemon
             # it recorded; a launch inside one is unchanged, so this stays v1.
             # Optional measurement provisioning leaves coding launches unchanged (v1).
-            "harbor_backend.py": "28e3d38df28c3dc4f568039397850d5814043dd1b05324ad59967de04dce60d4",
+            "harbor_backend.py": "10315f8025c806c7af9786331cf9add58af96f88e6dd83a59de2d2bfddf38c56",
             # The same spawn callback; launches are unchanged. A failed process-group cleanup
             # or output drain now also tells the host lock owner, which records it for the next
             # owner to check. Launches are unchanged.
@@ -121,7 +121,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         {
             # Only report derivation changes; collection, sites, sampling and outcomes stay v1.
             # Optional provisioning runs previously unsupported profiles; existing runs stay v1.
-            "mutation.py": "b35b86956ba00270747534e00c1a401ed87c3567bb1201e2f1096a5a0ee5106b",
+            "mutation.py": "1daa2608157db47654b293c5ec74ed175b8cfa3c6d7042820d339cfb865e69cd",
             "mutation_sites.mjs": (
                 "f7a602774f3e6f2415c1745127134862a9a6f42e8e9807b4c28368e7a3c27c88"
             ),
@@ -131,13 +131,14 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         },
     ),
     "measurement_tools": (
-        2,
+        3,
         {
-            # v2 pins executable origins, reporter policy, and the staged config.
-            "measurement_tools.py": "5da46c249f7ee4ce77c12a8f38214c17eb2b34f58f9433837ca2f809128cec9b",
-            "coverage_tools/launch-coverage.py": "7c9b1ed349a617b8efbfff697fbe203b6ff21b5d158aac4ea9cddd1fee3ab075",
-            "coverage_tools/launch-c8.cjs": "d364e63ce80425d6584e889c5395698ee85da9b652d66557ec358944ed20f9aa",
-            "coverage_tools/c8-config.json": "f5c1f0af97707aff98bcb908ebb4e6d4c108dd59bf33e169932da8c2f9feab47",
+            # v3 isolates Python reporting/configuration/data and validates c8 map sources.
+            "measurement_tools.py": "00bd8484ecd59d723aba79f3b3c67f90fbeacc36281c56ae4c3a4120f1365ecc",
+            "coverage_tools/launch-coverage.py": "7b174ddaf8e0d2cc9cfde3627a43f78a9843ae8a7d254dba406556a1925150de",
+            "coverage_tools/launch-c8.cjs": "de7cf978eabfabeb9001ce38da4c91f013f59055d9450b479352208ba9e9e9c0",
+            "coverage_tools/c8-config.json": "2ee2372e0af85263890e3e052453e08a091d47225ffa7678ca8a6c963fcbb177",
+            "coverage_tools/coverage-config.ini": "613e235e58afd7710f96d6d7baa21eb7c6379b428003c084f8b8782a0f8da587",
         },
     ),
     "local_sandbox": (
@@ -171,7 +172,7 @@ def test_the_pinned_files_are_the_files_the_code_hashes() -> None:
         "measurement_tools": {
             Path(measurement_tools.__file__).name,
             "coverage_tools/launch-coverage.py", "coverage_tools/launch-c8.cjs",
-            "coverage_tools/c8-config.json",
+            "coverage_tools/c8-config.json", "coverage_tools/coverage-config.ini",
         },
     }
     assert {name: set(files) for name, files in components.FILES.items()} == hashed

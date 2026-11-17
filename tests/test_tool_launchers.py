@@ -35,7 +35,7 @@ def test_task_coverage_module_cannot_shadow_pinned_distribution(tmp_path: Path) 
     )
     tool = tools.ProvisionedTool(name="coverage.py", version="7.6.12")
     with tools.staged_tool(tool) as stage:
-        command, env = python_command(stage / tool.name, "run", "-m", "task_main")
+        command, env = python_command(stage / tool.name, "run-module", "task_main")
         result = subprocess.run(command, cwd=app, env=env, capture_output=True, text=True, timeout=30)
     assert not marker.exists(), "task-local coverage.py executed instead of the pinned tool"
     assert result.returncode == 0, result.stderr
@@ -181,3 +181,139 @@ def test_measured_program_keeps_its_own_unused_optional_dependency(tmp_path: Pat
         result = subprocess.run(command, cwd=app, env=env, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     assert (app / "result").read_text() == "task dependency"
+
+
+def python_fixture(app: Path) -> None:
+    (app / "src").mkdir(parents=True)
+    (app / "src/subject.py").write_text("def unused():\n    return 42\n\nvalue = 1\n")
+    (app / "runner.py").write_text("import src.subject\n")
+
+
+def python_measure(root: Path, app: Path, executable: str = sys.executable) -> list[int]:
+    for operation in [("run", "runner.py"), ("json",)]:
+        command, env = python_command(root, *operation)
+        command[0] = executable
+        result = subprocess.run(command, cwd=app, env=env, capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stderr
+    report = json.loads((app / "coverage.json").read_text())
+    missing: list[int] = report["files"]["src/subject.py"]["missing_lines"]
+    return missing
+
+
+REPORTER_PATCH = """import coverage.jsonreport as reporter
+original = reporter.JsonReporter.report
+def forge(self, morfs, outfile):
+    import io, json
+    buffer = io.StringIO()
+    result = original(self, morfs, buffer)
+    data = json.loads(buffer.getvalue())
+    for record in data['files'].values():
+        record['executed_lines'] += record['missing_lines']
+        record['missing_lines'] = []
+    json.dump(data, outfile)
+    return result
+reporter.JsonReporter.report = forge
+def coverage_init(reg, options): pass
+"""
+
+
+@pytest.mark.parametrize(("filename", "config"), [
+    (".coveragerc", "[run]\nplugins = evil\n"),
+    ("setup.cfg", "[coverage:run]\nplugins = evil\n"),
+    ("tox.ini", "[coverage:run]\nplugins = evil\n"),
+    ("pyproject.toml", '[tool.coverage.run]\nplugins = ["evil"]\n'),
+])
+def test_task_python_config_cannot_replace_report(tmp_path: Path, filename: str, config: str) -> None:
+    app = tmp_path / "app"
+    python_fixture(app)
+    (app / filename).write_text(config)
+    (app / "evil.py").write_text(REPORTER_PATCH)
+    with tools.staged_tool(tools.ProvisionedTool(name="coverage.py", version="7.6.12")) as stage:
+        report = python_measure(stage / "coverage.py", app)
+    assert report == [2]
+
+
+def test_task_parallel_config_cannot_select_stale_database(tmp_path: Path) -> None:
+    app = tmp_path / "app"
+    python_fixture(app)
+    (app / ".coveragerc").write_text("[run]\ndata_file = chosen.sqlite\nparallel = True\n")
+    with tools.staged_tool(tools.ProvisionedTool(name="coverage.py", version="7.6.12")) as stage:
+        root = stage / "coverage.py"
+        seed = ("import sys; sys.path.insert(0, sys.argv[1]); from coverage import CoverageData; "
+                "from pathlib import Path; data=CoverageData(basename='chosen.sqlite'); "
+                "data.add_lines({str(Path('src/subject.py').resolve()): {1,2,4}}); data.write()")
+        subprocess.run([sys.executable, "-I", "-S", "-c", seed, str(root)], cwd=app, check=True)
+        report = python_measure(root, app)
+    assert report == [2]
+
+
+def test_reporting_does_not_run_image_pth_or_task_sitecustomize(tmp_path: Path) -> None:
+    app = tmp_path / "app"
+    python_fixture(app)
+    (app / "sitecustomize.py").write_text(REPORTER_PATCH)
+    venv = tmp_path / "image-venv"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True)
+    site = next((venv / "lib").glob("python*/site-packages"))
+    (site / "editable-task.pth").write_text(f"import sys; sys.path.insert(0, {str(app)!r})\n")
+    with tools.staged_tool(tools.ProvisionedTool(name="coverage.py", version="7.6.12")) as stage:
+        report = python_measure(stage / "coverage.py", app, str(venv / "bin/python"))
+    assert report == [2]
+
+
+@pytest.mark.parametrize("mode", ["matching", "forged", "outside"])
+@pytest.mark.parametrize("mapping", ["external", "inline"])
+def test_c8_map_content_must_match_frozen_source(tmp_path: Path, mode: str, mapping: str) -> None:
+    import base64
+
+    app = tmp_path / "app"
+    (app / "src").mkdir(parents=True)
+    (app / "dist").mkdir()
+    source = "function unused() {\n  return 42;\n}\nconsole.log(1);\n"
+    (app / "src/subject.js").write_text(source)
+    outside = tmp_path / "outside.js"
+    outside.write_text(source)
+    content = source.replace("  return 42;", "  /* c8 ignore next */ return 42;") if mode == "forged" else source
+    source_map = json.dumps({"version": 3, "file": "subject.js", "names": [],
+                             "sources": [str(outside) if mode == "outside" else "../src/subject.js"],
+                             "sourcesContent": [content], "mappings": "AAAA;AACA;AACA;AACA"})
+    if mapping == "external":
+        (app / "dist/subject.js.map").write_text(source_map)
+        url = "subject.js.map"
+    else:
+        url = "data:application/json;base64," + base64.b64encode(source_map.encode()).decode()
+    (app / "dist/subject.js").write_text(source + "//# sourceMappingURL=" + url + "\n")
+    with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3")) as stage:
+        result = subprocess.run(c8_command(stage / "c8", "--all", "--", "node", "dist/subject.js"),
+                                cwd=app, capture_output=True, text=True, timeout=30)
+    if mode == "matching":
+        assert result.returncode == 0, result.stderr
+        from pluginbench.coverage_report import parse_lcov
+        report = parse_lcov(app / "coverage/lcov.info", snapshot=app, source_scope=["src/**"],
+                            test_scope=["test/**"], workdir=str(app))
+        lines = report["lines"]
+        assert isinstance(lines, dict)
+        assert lines["covered"] == ["src/subject.js:4"]
+    else:
+        assert result.returncode != 0, "c8 accepted forged or external source-map content"
+        assert "PluginBench c8" in result.stderr
+        assert not (app / "coverage/lcov.info").exists()
+
+
+@pytest.mark.parametrize("tamper", ["additional", "changed"])
+def test_python_reporting_refuses_data_not_written_by_this_run(tmp_path: Path, tamper: str) -> None:
+    app = tmp_path / "app"
+    python_fixture(app)
+    with tools.staged_tool(tools.ProvisionedTool(name="coverage.py", version="7.6.12")) as stage:
+        root = stage / "coverage.py"
+        command, env = python_command(root, "run", "runner.py")
+        subprocess.run(command, cwd=app, env=env, check=True, capture_output=True, text=True)
+        if tamper == "additional":
+            (root / "data/.coverage.stale").write_bytes((root / "data/.coverage").read_bytes())
+        else:
+            with (root / "data/.coverage").open("ab") as stream:
+                stream.write(b"tampered database")
+        command, env = python_command(root, "json")
+        result = subprocess.run(command, cwd=app, env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0
+    assert "PluginBench coverage" in result.stderr
+    assert not (app / "coverage.json").exists()

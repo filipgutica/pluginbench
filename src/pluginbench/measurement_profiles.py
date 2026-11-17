@@ -387,9 +387,13 @@ def coverage_settings(task_dir: Path, settings: MeasurementSettings) -> Coverage
     metadata = tomllib.loads((task_dir / "task.toml").read_text()).get("metadata", {})
     repository = str(metadata.get("repository_url", ""))
     language = str(metadata.get("language", "")).lower()
-    return settings.coverage_profiles.get(
+    selected = settings.coverage_profiles.get(
         repository, settings.coverage_profiles.get(language, settings.coverage)
     )
+    if selected is not None and selected.provisioned_tool is not None and selected.source_scope is None:
+        # Mutation freezes this same profile, so resolve inheritance before either collector.
+        return selected.model_copy(update={"source_scope": settings.source_scope or ["*"]})
+    return selected
 
 
 def _fallow_capability(language: str) -> tuple[str | None, str | None]:

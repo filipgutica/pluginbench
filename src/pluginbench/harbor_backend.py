@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import fcntl
+import fnmatch
 import hashlib
 import importlib
 import importlib.metadata
@@ -2911,6 +2912,7 @@ def run_native_command(
     report_path: str,
     timeout: int,
     provisioned_tool: ProvisionedTool | None = None,
+    provisioned_scope: list[str] | None = None,
 ) -> dict[str, object]:
     """Run explicitly configured measurement commands in a fresh frozen image."""
     relative = Path(report_path)
@@ -2997,7 +2999,10 @@ def run_native_command(
         docker("start", container_id)
         if provisioned_tool is not None:
             # The tool never enters the task snapshot, its Git tree, or its dependency paths.
-            with staged_tool(provisioned_tool) as staged:
+            with staged_tool(provisioned_tool, source_files=[
+                filename for filename in original_inventory
+                if any(fnmatch.fnmatchcase(filename, pattern) for pattern in (provisioned_scope or ["*"]))
+            ]) as staged:
                 docker(
                     "exec", "--user", "0", container_id, "bash", "-c",
                     "set -eu; test ! -L /opt; mkdir -p /opt; "

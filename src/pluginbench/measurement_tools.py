@@ -6,10 +6,12 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 import hashlib
 import io
+import json
 from pathlib import Path
 import tarfile
 import tempfile
 import zipfile
+from typing import TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -18,7 +20,7 @@ from pluginbench import components
 ARTIFACTS = Path(__file__).with_name("coverage_tools")
 CONTAINER_ROOT = "/opt/pluginbench-tools"
 SUPPORT_FILES = {
-    "coverage.py": ("launch-coverage.py",),
+    "coverage.py": ("launch-coverage.py", "coverage-config.ini"),
     "c8": ("launch-c8.cjs", "c8-config.json"),
 }
 # c8 includes its complete production dependency tree, not just the npm package tarball.
@@ -62,6 +64,11 @@ class ProvisionedTool(BaseModel):
         return self
 
 
+class ProvisionedCommandOptions(TypedDict, total=False):
+    provisioned_tool: ProvisionedTool
+    provisioned_scope: list[str] | None
+
+
 def artifact_bytes(tool: ProvisionedTool) -> bytes:
     """Verify before runtime checks, and verify the exact bytes unpacked for Docker cp."""
     filename, expected = CATALOG[(tool.name, tool.version)]
@@ -87,7 +94,7 @@ def read_tool(value: object) -> ProvisionedTool | None:
 
 
 @contextmanager
-def staged_tool(tool: ProvisionedTool) -> Iterator[Path]:
+def staged_tool(tool: ProvisionedTool, *, source_files: list[str] | None = None) -> Iterator[Path]:
     content = artifact_bytes(tool)
     with tempfile.TemporaryDirectory(prefix="pluginbench-tool-") as directory:
         root = Path(directory)
@@ -101,4 +108,5 @@ def staged_tool(tool: ProvisionedTool) -> Iterator[Path]:
                 archive.extractall(target, filter="data")
         for name in SUPPORT_FILES[tool.name]:
             (target / name).write_bytes((ARTIFACTS / name).read_bytes())
+        (target / "source-files.json").write_text(json.dumps(source_files))
         yield root

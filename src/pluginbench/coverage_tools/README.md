@@ -32,11 +32,13 @@ component version in `components.py`. Coding launch identity stays unchanged.
 
 ## Runtime entry points
 
-`launch-coverage.py`, `launch-c8.cjs`, and `c8-config.json` are PluginBench code
+`launch-coverage.py`, `coverage-config.ini`, `launch-c8.cjs`, and `c8-config.json` are PluginBench code
 bound by the `measurement_tools` component version. They are staged beside the
 selected distribution. Use the documented launchers, rather than the distributions'
-raw entry points. Provisioner version 2 verifies runtime origins before task code
-and pins c8's config and reporter. The c8 process receives empty `NODE_OPTIONS`,
+raw entry points. Provisioner version 3 isolates Python reporting, pins configuration
+and data paths, and validates c8 map content against source files. The staged
+`source-files.json` comes from the frozen snapshot and profile scope, not task
+configuration. It limits report output without exposing tool options. The c8 process receives empty `NODE_OPTIONS`,
 `NODE_PATH`, and `EXPERIMENTAL_MONOCART` before Node starts.
 
 ## eastasianwidth 0.2.0 notice

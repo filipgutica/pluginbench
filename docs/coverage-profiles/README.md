@@ -147,29 +147,32 @@ measurement_settings:
     provisioned_tool: {name: coverage.py, version: 7.6.12}
     tool_version: 7.6.12
     format: coverage-py-json
-    report_path: coverage/coverage.json
+    report_path: coverage.json
     command:
       - bash
       - -c
       - |
-        export COVERAGE_FILE=/app/coverage/.coverage
-        mkdir -p coverage
-        python -I -S /opt/pluginbench-tools/coverage.py/launch-coverage.py run --source=. -m pytest
+        python -I -S /opt/pluginbench-tools/coverage.py/launch-coverage.py run-module pytest
         status=$?
-        python -I -S /opt/pluginbench-tools/coverage.py/launch-coverage.py json -o coverage/coverage.json || exit $?
+        python -I -S /opt/pluginbench-tools/coverage.py/launch-coverage.py json || exit $?
         exit "$status"
 ```
 
 Use the task image's Python executable. The portable wheel requires Python 3.9+
-and uses the Python tracer. `--source` must cover the declared source scope,
-including unloaded files. Keep task-specific exclusions in the profile.
+and uses the Python tracer. Use `run <script> [arguments]` or
+`run-module <module> [arguments]`, followed by a separate `json` invocation.
+Reporting writes `coverage.json`. Other coverage.py options and operations refuse.
+PluginBench stages the profile's exact source-file list outside the task tree;
+reports include only those files, including unloaded files.
 
 For c8, use `provisioned_tool: {name: c8, version: 10.1.3}` and
 `tool_version: 10.1.3`. The image must supply Node 18+. Invoke
 `env -u NODE_OPTIONS -u NODE_PATH -u EXPERIMENTAL_MONOCART node
-/opt/pluginbench-tools/c8/launch-c8.cjs [options] -- <test command>`.
-The backend also clears these environment variables before starting Node. Use `--all` and the appropriate `--src`
-for unloaded files. Build output still needs source maps for TypeScript coverage.
+/opt/pluginbench-tools/c8/launch-c8.cjs --all -- <test command>`.
+The backend also clears these environment variables before starting Node.
+The launcher accepts exactly that shape and writes `coverage/lcov.info`. It collects
+unloaded files and filters remapped output to the staged source-file list. Build
+output still needs source maps for TypeScript coverage.
 
 PluginBench verifies the vendored artifact before runtime checks. Unknown names,
 unsupported versions, missing files, changed hashes, and incompatible provisioner
@@ -190,30 +193,46 @@ See [artifact provenance and licences](../../src/pluginbench/coverage_tools/READ
 
 
 The Python launcher starts with `-I -S`, places the staged distribution first,
-and checks `coverage.__file__` and its package dependencies before enabling task
-imports. A finder also refuses coverage submodules or a loaded optional `tomli`
-dependency that resolve outside the staged directory. Standard-library modules
-come from the isolated task interpreter. After verification, the launcher enables
-the image's site packages and the task's directory and `PYTHONPATH` for the
-measured program. Use the launcher for both collection and JSON reporting;
-`python -m coverage` can execute a task-local `coverage.py` instead.
+and checks `coverage.__file__` and package dependencies. A finder also refuses
+coverage submodules or a loaded optional `tomli` dependency outside that directory.
+Collection passes the staged `coverage-config.ini` with `--rcfile`; reporting
+passes that same absolute file through coverage.py's `config_file` API. Neither
+operation discovers task coverage configuration. The pinned config loads no
+plugins, disables parallel mode, and selects one absolute data file outside `/app`.
+Reporting refuses extra data files or a database changed since collection's
+SHA-256 receipt. There is no append or combine operation.
 
-The c8 launcher uses the staged `c8-config.json` and constructs its argument parser
-outside the task tree, so `.c8rc*`, `.nycrc*`, and task `package.json` configuration
-are ignored. The reporter is fixed to built-in `lcovonly`; other reporters,
-configuration overrides, and alternative reporter implementations refuse.
-Supported options are `--all`, `--src`, `--include`, `--exclude`, `--extension`,
-`--reports-dir`/`--report-dir`, `--temp-directory`, `--exclude-after-remap`, and
-`--exclude-node-modules`. Separate these from the test command with `--`.
-`--reporter=lcovonly` is accepted for compatibility.
+Collection enables image site packages and task imports because it executes the
+measured program. JSON reporting runs in its own `-I -S` process, clears the
+environment, and never calls `site.main()` or enables task import paths. It uses
+the reporting API because coverage.py's JSON CLI adds the working directory to
+`sys.path`. Standard-library code comes from the task interpreter; coverage code
+comes from the staged directory. Always invoke the launcher in a new process for
+reporting.
 
-Provisioning runs the launcher's isolated verification mode and records its
-resolved module, dependency origins, and c8 config/reporter paths in
-`execution.json` under `provisioned_tool.runtime_origin`. Provisioner version 2
-refuses saved version 1 profiles. Prepare a new measurement revision with the
-launcher commands. Resume fingerprints include the pins of the distributions
-actually selected by the profile; an unused catalog entry does not affect them.
+The c8 launcher calls the pinned report implementation with the staged
+`c8-config.json`, built-in `lcovonly`, and fixed output paths. It never invokes
+c8's option parser or discovers `.c8rc*`, `.nycrc*`, or task `package.json` config.
+Before conversion, it validates cached, external, and inline source maps against
+the frozen source files. Every mapped source must resolve inside the task tree;
+any embedded `sourcesContent` must match its source file byte for byte. A mismatch
+refuses the measurement before LCOV is written.
 
-The portable wheel omits the optional `tomli` package. On Python 3.9/3.10,
-use INI coverage configuration or `--rcfile=/dev/null`. The measured program can
-still import its own optional dependencies after tool verification.
+The profile schema has no separate ignore-hint exclusion policy. These launchers
+retain the tools' default treatment of ignore hints present in frozen source
+files. Source-map text cannot introduce different hints.
+
+This isolates reporting from task configuration and startup hooks. It does not
+protect collection from task code executing inside the measured process. Such
+code can alter tracing or collected data; the data receipt is a consistency check,
+not an authenticity guarantee against that process.
+
+Provisioning records resolved module, dependency, configuration, and staged
+source-file-list origins in `execution.json` under
+`provisioned_tool.runtime_origin`. Provisioner version 3 refuses older saved
+profiles. Prepare a new measurement revision with these launcher commands.
+Resume fingerprints bind only the distributions selected by the profile.
+
+The portable wheel omits optional `tomli`. The pinned INI configuration works on
+Python 3.9/3.10. The measured program can still import its own optional dependencies
+after tool verification.

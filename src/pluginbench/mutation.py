@@ -466,13 +466,17 @@ def tsc_errors(stdout: str, site: Site | None = None) -> Counter[str]:
 
 
 def native_executor(
-    identity: dict[str, object], report_path: str, *, provisioned_tool: object = None
+    identity: dict[str, object], report_path: str, *, provisioned_tool: object = None,
+    provisioned_scope: list[str] | None = None
 ) -> Executor:
     """Run commands with `run_native_command` in the frozen task image, timing each run."""
     from pluginbench.harbor_backend import run_native_command
-    from pluginbench.measurement_tools import read_tool
+    from pluginbench.measurement_tools import ProvisionedCommandOptions, read_tool
 
     tool = read_tool(provisioned_tool)
+    tool_options: ProvisionedCommandOptions = (
+        {"provisioned_tool": tool, "provisioned_scope": provisioned_scope} if tool is not None else {}
+    )
 
     def execute(tree: Path, command: list[str], timeout: int, destination: Path) -> Run:
         started = time.monotonic()
@@ -484,7 +488,7 @@ def native_executor(
                 command=command,
                 report_path=report_path,
                 timeout=timeout,
-                **({"provisioned_tool": tool} if tool is not None else {}),
+                **tool_options,
             )
         except (OSError, subprocess.TimeoutExpired, ValueError) as error:
             # The launcher, a pinned file, raises ValueError for an integrity violation and for a
@@ -682,7 +686,8 @@ def _collect(
     assert isinstance(coverage, dict) and isinstance(identity, dict)
     if execute is None:
         execute = native_executor(
-            identity, str(coverage["report_path"]), provisioned_tool=coverage.get("provisioned_tool")
+            identity, str(coverage["report_path"]), provisioned_tool=coverage.get("provisioned_tool"),
+            provisioned_scope=_strings(coverage.get("source_scope") or ["*"])
         )
     run = _Runner(execute, destination, _process_exit(config))
     change = compare_snapshots(before, root)

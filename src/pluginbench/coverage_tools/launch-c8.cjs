@@ -2,10 +2,11 @@
 
 const fs = require('node:fs')
 const path = require('node:path')
+const { pathToFileURL } = require('node:url')
+const { spawnSync } = require('node:child_process')
 const root = fs.realpathSync(__dirname)
-const cwd = process.cwd()
+const cwd = fs.realpathSync(process.cwd())
 const config = path.join(root, 'c8-config.json')
-const bin = path.join(root, 'node_modules/c8/bin/c8.js')
 
 function refuse (reason) {
   throw new Error('PluginBench c8: ' + reason)
@@ -17,62 +18,90 @@ function checkedOrigin (filename) {
   return origin
 }
 
-// The backend clears Node startup injection before starting this process. Never pass it
-// to the instrumentee, and do not enable c8's alternative reporter implementation.
+// The backend clears startup injection before Node starts; do not pass it to the child.
 for (const name of ['NODE_OPTIONS', 'NODE_PATH', 'EXPERIMENTAL_MONOCART']) delete process.env[name]
 
-const parseArgs = require('./node_modules/c8/lib/parse-args')
-const buildYargs = parseArgs.buildYargs
-const reporter = checkedOrigin(require.resolve('./node_modules/istanbul-reports/lib/lcovonly'))
+const createReport = require('./node_modules/c8/lib/report')
+const convertSourceMap = require('./node_modules/convert-source-map')
+const v8ToIstanbul = require('./node_modules/v8-to-istanbul')
+const settings = JSON.parse(fs.readFileSync(config, 'utf8'))
+if (JSON.stringify(settings) !== '{"reporter":["lcovonly"],"all":true}') refuse('unexpected pinned config')
 const origin = {
-  module: checkedOrigin(bin),
-  reporter,
+  module: checkedOrigin(require.resolve('./node_modules/c8/lib/report')),
+  reporter: checkedOrigin(require.resolve('./node_modules/istanbul-reports/lib/lcovonly')),
   config: checkedOrigin(config),
+  source_files: checkedOrigin(path.join(root, 'source-files.json')),
   dependencies: Object.fromEntries(Object.keys(require.cache).map(file => [file, checkedOrigin(file)]))
 }
-if (process.argv.slice(2).join(' ') === '--pluginbench-verify') {
-  console.log(JSON.stringify(origin))
-} else {
-  const input = process.argv.slice(2)
-  const separator = input.indexOf('--')
-  if (separator < 0 || separator === input.length - 1) refuse('use [options] -- command [arguments]')
-  const options = []
-  const values = new Set(['--src', '--include', '--exclude', '--extension', '--reports-dir',
-    '--report-dir', '--temp-directory', '--reporter', '-r'])
-  const booleans = new Set(['--all', '--exclude-after-remap', '--exclude-node-modules'])
-  for (let index = 0; index < separator; index++) {
-    const [name, ...parts] = input[index].split('=')
-    if (booleans.has(name)) {
-      if (parts.length && !['true', 'false'].includes(parts.join('='))) refuse('invalid boolean: ' + name)
-      options.push(input[index])
-    } else if (values.has(name)) {
-      const value = parts.length ? parts.join('=') : input[++index]
-      if (index >= separator || value === undefined) refuse('missing value: ' + name)
-      if (['--reporter', '-r'].includes(name)) {
-        if (value !== 'lcovonly') refuse('only the built-in lcovonly reporter is allowed')
-      } else options.push(name + '=' + value)
-    } else refuse('unsupported option: ' + name)
-  }
-  // c8 also merges package.json config even with --config. Construct AND parse yargs
-  // outside the task tree, then restore cwd before running the measured command.
-  parseArgs.buildYargs = withCommands => ({
-    parse (args) {
-      process.chdir(root)
-      try {
-        const argv = buildYargs(withCommands).parse(args)
-        const reporters = Array.isArray(argv.reporter) ? argv.reporter : [argv.reporter]
-        if (reporters.some(name => name !== 'lcovonly')) refuse('only lcovonly is allowed')
-        const reports = path.resolve(cwd, argv.reportsDir)
-        argv.reportsDir = argv['reports-dir'] = reports
-        argv.tempDirectory = options.some(value => value.startsWith('--temp-directory='))
-          ? path.resolve(cwd, argv.tempDirectory) : path.join(reports, 'tmp')
-        return argv
-      } finally {
-        process.chdir(cwd)
-      }
+
+function verifiedMap (map, script) {
+  if (!Array.isArray(map.sources) || !map.sources.length || map.sections) refuse('unsupported source map')
+  if (map.sourcesContent && map.sourcesContent.length !== map.sources.length) refuse('invalid sourcesContent')
+  // Reuse the pinned converter's resolver, including sourceRoot and file/webpack URLs.
+  const converter = v8ToIstanbul(script)
+  const contents = map.sources.map((source, index) => {
+    const filename = fs.realpathSync(converter._resolveSource({ sourcemap: map }, source))
+    if (!filename.startsWith(cwd + path.sep)) refuse('source map resolves outside task tree: ' + filename)
+    const frozen = fs.readFileSync(filename)
+    const embedded = map.sourcesContent && map.sourcesContent[index]
+    if (embedded != null && (typeof embedded !== 'string' || !Buffer.from(embedded).equals(frozen))) {
+      refuse('sourcesContent differs from frozen source: ' + filename)
     }
+    return frozen.toString('utf8')
   })
-  process.argv = [process.execPath, bin, '--config=' + config, ...options,
-    ...input.slice(separator + 1)]
-  require(bin)
+  return { ...map, sourcesContent: contents }
 }
+
+async function main () {
+  const input = process.argv.slice(2)
+  if (input.length === 1 && input[0] === '--pluginbench-verify') {
+    console.log(JSON.stringify(origin))
+    return
+  }
+  // This is the entire launcher interface. Task arguments never reach c8's option parser.
+  if (input[0] !== '--all' || input[1] !== '--' || input.length < 3 || input[2].startsWith('-')) {
+    refuse('use --all -- command [arguments]')
+  }
+  const tempDirectory = fs.mkdtempSync(path.join(root, 'data-'))
+  const child = spawnSync(input[2], input.slice(3), {
+    cwd, stdio: 'inherit', env: { ...process.env, NODE_V8_COVERAGE: tempDirectory }
+  })
+  if (child.error) throw child.error
+  const report = createReport({
+    ...settings, reportsDirectory: path.join(cwd, 'coverage'), tempDirectory,
+    src: [cwd], resolve: cwd, omitRelative: true, excludeNodeModules: true
+  })
+  const merge = report._getMergedProcessCov.bind(report)
+  report._getMergedProcessCov = () => {
+    const merged = merge()
+    // Validate before c8's conversion loop, which catches and drops converter errors.
+    // Cover V8's cache, disk maps, inline maps, and the --all unloaded-file path.
+    for (const script of merged.result) {
+      const key = pathToFileURL(script.url).href
+      const cached = report.sourceMapCache[key]
+      const source = fs.readFileSync(script.url, 'utf8')
+      const fallback = convertSourceMap.fromSource(source) || convertSourceMap.fromMapFileSource(
+        source, filename => fs.readFileSync(path.resolve(path.dirname(script.url), filename), 'utf8'))
+      const map = (cached && cached.data) || (fallback && fallback.sourcemap)
+      if (map) report.sourceMapCache[key] = { ...cached, data: verifiedMap(map, script.url) }
+    }
+    return merged
+  }
+  const sourceFiles = JSON.parse(fs.readFileSync(path.join(root, 'source-files.json'), 'utf8'))
+  if (sourceFiles) {
+    const allowed = new Set(sourceFiles)
+    const coverageMap = report.getCoverageMapFromAllCoverageFiles.bind(report)
+    report.getCoverageMapFromAllCoverageFiles = async () => {
+      const map = await coverageMap()
+      map.filter(filename => allowed.has(path.relative(cwd, filename)))
+      return map
+    }
+  }
+  await report.run()
+  process.exitCode = child.status === null ? 1 : child.status
+}
+
+main().catch(error => {
+  console.error(error.stack)
+  process.exitCode = 1
+})

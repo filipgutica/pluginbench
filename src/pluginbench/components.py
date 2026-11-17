@@ -20,8 +20,8 @@ VERSIONS: dict[str, int] = {
     # Version 2 adds Go line populations, so a profile version 1 froze reads differently.
     "coverage_observer": 2,
     "mutation_observer": 1,
-    # Version 2 verifies Python origins and pins c8 configuration/reporters.
-    "measurement_tools": 2,
+    # Version 3 isolates Python reporting/configuration/data and validates c8 map sources.
+    "measurement_tools": 3,
     # Version 3 resolves Codex launches and grants its selected release and helper binaries.
     "local_sandbox": 3,
 }
@@ -53,7 +53,7 @@ FILES: dict[str, tuple[str, ...]] = {
     ),
     "local_sandbox": ("isolation.py",),
     "measurement_tools": (
-        "measurement_tools.py", "coverage_tools/launch-coverage.py",
+        "measurement_tools.py", "coverage_tools/launch-coverage.py", "coverage_tools/coverage-config.ini",
         "coverage_tools/launch-c8.cjs", "coverage_tools/c8-config.json",
     ),
 }

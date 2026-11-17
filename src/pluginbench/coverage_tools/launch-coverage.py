@@ -10,6 +10,7 @@ if not sys.flags.isolated or not sys.flags.no_site:
 import importlib
 from importlib.abc import MetaPathFinder
 from importlib.machinery import ModuleSpec, PathFinder
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,9 @@ from types import ModuleType
 from collections.abc import Sequence
 
 ROOT = Path(__file__).resolve().parent
+CONFIG = ROOT / "coverage-config.ini"
+DATA = ROOT / "data/.coverage"
+RECEIPT = ROOT / "coverage-data.json"
 # tomli is coverage's only optional third-party dependency (on Python before 3.11).
 TOOL_PACKAGES = {"coverage", "tomli"}
 
@@ -42,6 +46,15 @@ class StagedImports(MetaPathFinder):
 
 
 def main() -> int:
+    arguments = sys.argv[1:]
+    reporting = arguments == ["json"]
+    if reporting or arguments == ["--pluginbench-verify"]:
+        os.environ.clear()
+    else:
+        for name in tuple(os.environ):
+            if name.startswith("COVERAGE_"):
+                del os.environ[name]
+    os.environ["PLUGINBENCH_COVERAGE_DATA"] = str(DATA)
     sys.path.insert(0, str(ROOT))
     # Check every coverage submodule before executing it, including later lazy imports.
     sys.meta_path.insert(0, StagedImports())
@@ -52,24 +65,51 @@ def main() -> int:
         for name, module in tuple(sys.modules.items())
         if name.split(".")[0] in TOOL_PACKAGES and module is not None
     }
-    origin = {"module": checked_origin(coverage.__file__), "dependencies": modules}
+    origin = {"module": checked_origin(coverage.__file__), "dependencies": modules,
+              "config": checked_origin(str(CONFIG)), "data_file": str(DATA),
+              "source_files": checked_origin(str(ROOT / "source-files.json"))}
     if sys.argv[1:] == ["--pluginbench-verify"]:
         print(json.dumps(origin, sort_keys=True))
         return 0
-    # Reserve only dependencies coverage actually imported. An unused optional
-    # package name can still belong to the measured program.
+    if not reporting and (
+        len(arguments) < 2 or arguments[0] not in {"run", "run-module"}
+        or arguments[1].startswith("-")
+    ):
+        raise SystemExit("PluginBench coverage: use run <script>, run-module <module>, or json")
+    if reporting:
+        if set(DATA.parent.iterdir()) != {DATA}:
+            raise SystemExit("PluginBench coverage: unexpected data files; combining is forbidden")
+        expected = {"sha256": hashlib.sha256(DATA.read_bytes()).hexdigest(), "cwd": os.getcwd()}
+        if json.loads(RECEIPT.read_text()) != expected:
+            raise SystemExit("PluginBench coverage: data differs from this run's receipt")
+        # config_file is the API equivalent of the pinned --rcfile used for run.
+        # The CLI's reporting path inserts cwd on sys.path, so use the reporting API.
+        measured = coverage.Coverage(config_file=str(CONFIG), data_file=str(DATA))
+        measured.load()
+        source_files = json.loads((ROOT / "source-files.json").read_text())
+        if source_files == []:
+            raise SystemExit("PluginBench coverage: no files in the profile source scope")
+        measured.json_report(outfile=str(Path.cwd() / "coverage.json"), include=source_files)
+        return 0
+    # Each fresh measurement container permits one collection. No append, parallel
+    # databases, or combine operation is exposed, and old data cannot be selected.
+    DATA.parent.mkdir()
     TOOL_PACKAGES.intersection_update(sys.modules)
-    # Site packages belong to the task image. Load them while the task's directory and
-    # PYTHONPATH are still absent, so a task-local sitecustomize cannot run at startup.
     site.main()
     for name, module in tuple(sys.modules.items()):
         if name.split(".")[0] in TOOL_PACKAGES and module is not None:
             checked_origin(module.__file__)
     task_paths = [os.getcwd(), *filter(None, os.environ.get("PYTHONPATH", "").split(os.pathsep))]
     sys.path[:] = [str(ROOT), *task_paths, *(item for item in sys.path if item != str(ROOT))]
-    result: object = command.main()
+    program = (["-m"] if arguments[0] == "run-module" else ["--"]) + arguments[1:]
+    result: object = command.main([
+        "run", "--rcfile=" + str(CONFIG), "--data-file=" + str(DATA), *program,
+    ])
     if not isinstance(result, int):
         raise RuntimeError("coverage CLI did not return an exit code")
+    RECEIPT.write_text(json.dumps({
+        "sha256": hashlib.sha256(DATA.read_bytes()).hexdigest(), "cwd": os.getcwd(),
+    }))
     return result
 
 

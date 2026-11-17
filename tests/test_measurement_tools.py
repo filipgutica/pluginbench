@@ -177,12 +177,12 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
         (source / ".coveragerc").write_text("[run]\nrelative_files = True\nsource = .\n")
         shutil.copyfile(source / ".coveragerc", app / ".coveragerc")
         command = ["bash", "-c", f"{sys.executable} -I -S /opt/pluginbench-tools/coverage.py/launch-coverage.py run main.py && "
-                   f"{sys.executable} -I -S /opt/pluginbench-tools/coverage.py/launch-coverage.py json -o coverage.json"]
+                   f"{sys.executable} -I -S /opt/pluginbench-tools/coverage.py/launch-coverage.py json"]
         report_path = "coverage.json"
         report_format = "coverage-py-json"
     else:
         command = ["node", "/opt/pluginbench-tools/c8/launch-c8.cjs", "--all",
-                   "--reporter=lcovonly", "--reports-dir=coverage", "--exclude=preload.cjs", "--", "node", "main.js"]
+                   "--", "node", "main.js"]
         report_path = "coverage/lcov.info"
         report_format = "lcov"
     frozen = tmp_path / "profile.json"
@@ -255,3 +255,16 @@ def test_mutation_forwards_the_same_frozen_tool(
     monkeypatch.setattr(harbor, "run_native_command", native)
     execute = mutation.native_executor({}, "coverage.json", provisioned_tool=tool.model_dump())
     assert execute(tmp_path, ["suite"], 10, tmp_path / "run").exit_code == 0
+
+
+@pytest.mark.parametrize("explicit", [None, ["lib/**"]])
+def test_provisioned_profile_resolves_scope_before_mutation_freezes_it(
+    tmp_path: Path, explicit: list[str] | None,
+) -> None:
+    (tmp_path / "task.toml").write_text('[metadata]\nlanguage = "python"\n')
+    coverage = profile("coverage.py", "7.6.12").model_copy(update={"source_scope": explicit})
+    settings = measurement_profiles.MeasurementSettings(coverage=coverage, source_scope=["src/**"])
+    selected = measurement_profiles.coverage_settings(tmp_path, settings)
+    assert selected is not None
+    assert selected.source_scope == (explicit or ["src/**"])
+    assert coverage.source_scope == explicit
