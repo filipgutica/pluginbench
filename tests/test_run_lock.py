@@ -421,7 +421,7 @@ def test_a_record_from_before_releases_or_an_unreadable_one_is_an_obligation(
 ) -> None:
     state = tmp_path / "state"
     state.mkdir()
-    record = {"schema": 1, "pid": 7, "kind": "run", "root": str(tmp_path / "old")}
+    record = {"schema": 1, "pid": 7, "acquired_at": "earlier", "kind": "run", "root": str(tmp_path / "old")}
     (state / run_lock.EXECUTION_OWNER).write_text(
         json.dumps(record) if previous == "schema 1" else "{not json"
     )
@@ -429,6 +429,23 @@ def test_a_record_from_before_releases_or_an_unreadable_one_is_an_obligation(
         [obligation] = lock.record["pending"]
     expected = tmp_path / "old" if previous == "schema 1" else state
     assert obligation["root"] == str(expected)
+
+
+@pytest.mark.parametrize("pending", [None, False, "bad", [None]])
+def test_malformed_schema_1_obligations_become_the_repairable_fence(
+    tmp_path: Path, pending: Any
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    record = {"schema": 1, "pid": 7, "acquired_at": "earlier", "kind": "run", "pending": pending}
+    (state / run_lock.EXECUTION_OWNER).write_text(
+        json.dumps({**record, "root": str(tmp_path / "old")})
+    )
+    with run_lock.hold_execution(_owner("review", tmp_path / "new"), state=state) as lock:
+        roots = sorted(item["root"] for item in lock.record["pending"])
+    # The legacy owner keeps its own root; its malformed obligations are one fence on the
+    # state directory.
+    assert roots == sorted([str(tmp_path / "old"), str(state)])
 
 
 def test_a_failed_record_write_is_never_adopted(

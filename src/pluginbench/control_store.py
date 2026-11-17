@@ -118,8 +118,10 @@ class ControlStore:
                 (reason, _now(), reason),
             )
 
-    def confirmed(self) -> set[str]:
-        return {row[0] for row in self._db.execute("SELECT check_id FROM confirmations")}
+    def confirmed(self) -> set[tuple[str, str]]:
+        """Each confirmed check as (check id, root): a confirmation covers only the check with
+        that identity under that root."""
+        return {(row[0], row[1]) for row in self._db.execute("SELECT check_id, root FROM confirmations")}
 
     def confirmations(self) -> list[dict[str, str]]:
         keys = ("check_id", "root", "reason", "confirmed_at")
@@ -273,7 +275,7 @@ def verify_containers(
 
 def _verify(
     checks: Sequence[Check],
-    confirmed: Collection[str],
+    confirmed: Collection[tuple[str, str]],
     progress: Callable[[str], None] | None,
     deadline: float,
 ) -> tuple[list[str], list[tuple[Check, str]]]:
@@ -288,7 +290,7 @@ def _verify(
     producers = [check for check in checks if check["kind"] != "containers"]
     containers = [check for check in checks if check["kind"] == "containers"]
     for check in producers:
-        if check["id"] in confirmed:
+        if (check["id"], check["root"]) in confirmed:
             continue
         try:
             if check["kind"] == "invocation":
@@ -301,7 +303,7 @@ def _verify(
             blocked.append(str(exc))
     producers_gone = not blocked and not unknown
     for check in containers:
-        if check["id"] in confirmed:
+        if (check["id"], check["root"]) in confirmed:
             continue
         try:
             if not producers_gone:
@@ -564,7 +566,7 @@ def confirm_stopped(
         # processes, check the containers for real before confirming anything.
         processes = [(check, reason) for check, reason in unknown if check["kind"] != "containers"]
         if not blocked and processes and len(processes) < len(unknown):
-            vouched = {*confirmed, *(check["id"] for check, _ in processes)}
+            vouched = {*confirmed, *((check["id"], check["root"]) for check, _ in processes)}
             blocked, containers = _verify(checks, vouched, None, deadline)
             unknown = [*processes, *containers]
         if blocked:

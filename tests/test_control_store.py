@@ -993,7 +993,78 @@ def test_a_corrupt_owner_record_is_unknown_until_repair(
         with control_store.execute(_owner(tmp_path / "unrelated")):
             pass
     result = CliRunner().invoke(cli.app, ["repair", str(isolated_host_state), "--confirm-stopped"])
-    assert result.exit_code == 0 and "The host is unblocked." in result.stdout, result.output
+    assert result.exit_code == 0, result.output
+    if corrupt not in ("only released", "truncated"):
+        # The owner itself still validates, so it stays an obligation under its own root;
+        # repairing the fence never clears it.
+        assert "1 other run still wait" in result.stdout
+        assert not _admitted(isolated_host_state, tmp_path)
+        result = CliRunner().invoke(cli.app, ["repair", str(earlier), "--confirm-stopped"])
+        assert result.exit_code == 0, result.output
+    assert "The host is unblocked." in result.stdout
+    assert _admitted(isolated_host_state, tmp_path)
+
+
+def test_a_confirmation_covers_only_its_own_root_and_identity(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    # Two unreleased owners with the same identity under different roots, as a hand edit
+    # could leave them.
+    same = {"schema": 2, "pid": 7, "acquired_at": "earlier", "kind": "measure", "state": "active"}
+    path = isolated_host_state / run_lock.EXECUTION_OWNER
+    path.write_text(json.dumps({
+        **same, "pid": 8, "root": str(tmp_path / "released"), "state": "released",
+        "pending": [{**same, "root": str(first)}, {**same, "root": str(second)}],
+    }))
+    result = CliRunner().invoke(cli.app, ["repair", str(first), "--confirm-stopped"])
+    assert result.exit_code == 0 and "1 other run still wait" in result.stdout, result.output
+    # The first root's confirmation never covers the second.
+    assert not _admitted(isolated_host_state, tmp_path)
+    # Without its identity, an obligation is invalid: a new fence, never a shared identity.
+    record = _record(isolated_host_state)
+    [remaining] = [item for item in record["pending"] if item["root"] == str(second)]
+    del remaining["pid"], remaining["acquired_at"]
+    path.write_text(json.dumps(record))
+    with pytest.raises(CleanupBlocked, match="pending obligation 0 has pid None, not an int"):
+        with control_store.execute(_owner(tmp_path / "unrelated")):
+            pass
+    assert CliRunner().invoke(cli.app, ["repair", str(second), "--confirm-stopped"]).exit_code == 2
+    result = CliRunner().invoke(cli.app, ["repair", str(isolated_host_state), "--confirm-stopped"])
+    assert result.exit_code == 0, result.output
+    # The release of the owner whose record held the bad entry is not trusted either, so it
+    # waits for repair under its own root.
+    assert "1 other run still wait" in result.stdout
+    result = CliRunner().invoke(cli.app, ["repair", record["root"], "--confirm-stopped"])
+    assert result.exit_code == 0, result.output
+    assert _admitted(isolated_host_state, tmp_path)
+
+
+def test_a_malformed_entry_never_hides_a_valid_obligation_or_its_survivor(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    run, child = _live_call(tmp_path)
+    _crashed_owner(isolated_host_state, kind="review", root=run, runtimes=[])
+    record = _record(isolated_host_state)
+    record["pending"] = ["broken unrelated obligation"]
+    (isolated_host_state / run_lock.EXECUTION_OWNER).write_text(json.dumps(record))
+    try:
+        result = CliRunner().invoke(
+            cli.app, ["repair", str(isolated_host_state), "--confirm-stopped"]
+        )
+        # Repairing the fence leaves the valid owner, whose call's child still runs.
+        assert result.exit_code == 0 and "1 other run still wait" in result.stdout, result.output
+        with pytest.raises(CleanupBlocked, match=f"has processes {child.pid}"):
+            with control_store.execute(_owner(tmp_path / "unrelated")):
+                pass
+        result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+        assert result.exit_code == 2 and f"has processes {child.pid}" in result.stderr
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+    assert CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"]).exit_code == 0
     assert _admitted(isolated_host_state, tmp_path)
 
 

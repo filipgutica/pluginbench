@@ -375,46 +375,71 @@ class LockSnapshot:
 def _read_record(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     """The owner record at `path`, or None and why it cannot be trusted. A missing record has
     no reason; an unreadable or invalid one is unknown, never an empty record."""
+    value, problem = _load_record(path)
+    problem = problem or (None if value is None else _record_problem(value))
+    return (None, problem) if problem else (value, None)
+
+
+def _load_record(path: Path) -> tuple[Any, str | None]:
+    """The parsed JSON at `path`, or None and why it cannot be read; (None, None) if missing."""
     try:
-        value = json.loads(path.read_text())
+        return json.loads(path.read_text()), None
     except FileNotFoundError:
         return None, None
     except (OSError, ValueError) as exc:
         return None, f"it cannot be read: {exc}"
-    problem = _record_problem(value)
-    return (None, problem) if problem else (value, None)
 
 
 def _record_problem(value: object) -> str | None:
     """Why `value` is not an owner record whose release and obligations can be trusted; None
-    when it is. A record from before releases were recorded (schema 1) only has to name its
-    owner, since it always counts as unreleased."""
+    when it is."""
+    return "; ".join(_obligations(value)[1]) or None
+
+
+def _obligations(value: object) -> tuple[list[dict[str, Any]], list[str]]:
+    """The obligations an owner record carries, each that validates on its own, and every
+    reason any part of it cannot be trusted.
+
+    The owner itself counts unless the whole record validates and says `released`. A record
+    from before releases were recorded (schema 1) always counts as unreleased.
+    """
     if not isinstance(value, dict):
-        return "it is not a JSON object"
+        return [], ["it is not a JSON object"]
+    problems: list[str] = []
     schema = value.get("schema")
     if type(schema) is not int or schema not in (1, 2):
-        return f"its schema {schema!r} is not 1 or 2"
-    if schema == 2:
-        if value.get("state") not in OWNER_STATES:
-            return f"its state {value.get('state')!r} is not one of {', '.join(OWNER_STATES)}"
-        pending = value.get("pending")
-        if not isinstance(pending, list):
-            return f"its pending obligations are {type(pending).__name__}, not a list"
+        problems.append(f"its schema {schema!r} is not 1 or 2")
+    elif schema == 2 and value.get("state") not in OWNER_STATES:
+        problems.append(f"its state {value.get('state')!r} is not one of {', '.join(OWNER_STATES)}")
+    kept: list[dict[str, Any]] = []
+    pending = value.get("pending", [] if schema == 1 else None)
+    if not isinstance(pending, list):
+        problems.append(f"its pending obligations are {type(pending).__name__}, not a list")
+    else:
         for index, item in enumerate(pending):
             if problem := _obligation_problem(item):
-                return f"pending obligation {index} {problem}"
-    return _obligation_problem(value)
+                problems.append(f"pending obligation {index} {problem}")
+            else:
+                kept.append(item)
+    owner = {key: item for key, item in value.items() if key != "pending"}
+    if problem := _obligation_problem(owner):
+        problems.append(f"its owner {problem}")
+    elif problems or schema == 1 or value.get("state") != "released":
+        kept.append(owner)
+    return kept, problems
 
 
 def _obligation_problem(value: object) -> str | None:
-    """Why `value` cannot be checked as an owner that may have left work running."""
+    """Why `value` cannot be checked as an owner that may have left work running. Its pid and
+    acquired_at are its identity, which a confirmation names; only the fence for an unreadable
+    record (kind `unknown`) has no pid."""
     if not isinstance(value, dict):
         return "is not an object"
     for key, kind, required in (
         ("root", str, True),
         ("kind", str, True),
-        ("pid", int, False),
-        ("acquired_at", str, False),
+        ("pid", int, value.get("kind") != "unknown"),
+        ("acquired_at", str, True),
         ("runtimes", list, False),
         ("leftovers", list, False),
     ):
@@ -626,23 +651,22 @@ def note_runtime(runtime: dict[str, object]) -> None:
 
 def _carried(state: Path) -> list[dict[str, Any]]:
     """The obligations the last owner left: those it carried, and itself unless it recorded a
-    clean release. A record from before releases were recorded counts as unreleased. An
-    unreadable or invalid one is a single obligation whose root is the state directory, since
-    nothing in it can be trusted, not even its release."""
-    previous, problem = _read_record(state / EXECUTION_OWNER)
-    if problem is not None:
+    clean release (see _obligations). Whatever part of the record cannot be read or fails
+    validation adds one more obligation, a fence whose root is the state directory. Every
+    obligation that validates on its own is kept with its own root and checks, so repairing
+    the fence never clears them."""
+    value, problem = _load_record(state / EXECUTION_OWNER)
+    if value is None and problem is None:
+        return []
+    kept, problems = ([], [problem]) if problem else _obligations(value)
+    if problems:
         # Named by when it was found, so confirming it never covers a later unreadable record.
         found = datetime.now(UTC).isoformat()
-        return [
+        kept.append(
             {"kind": "unknown", "root": str(state), "pid": None, "acquired_at": found,
-             "problem": problem}
-        ]
-    if previous is None:
-        return []
-    pending: list[dict[str, Any]] = list(previous.get("pending", []))
-    if previous.get("schema") == 1 or previous["state"] != "released":
-        pending.append({key: value for key, value in previous.items() if key != "pending"})
-    return pending
+             "problem": "; ".join(problems)}
+        )
+    return kept
 
 
 @contextmanager
