@@ -270,7 +270,8 @@ class _Daemon:
         self.containers: dict[str, dict[str, str]] = {}
 
     def __call__(self, command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        arguments = command[3:]  # After the CLI and its --host.
+        # After the CLI, and its --host when the command runs against a frozen engine.
+        arguments = command[3:] if command[1:2] == ["--host"] else command[1:]
         output, status = "", 0
         if arguments[0] == "create":
             key = f"{len(self.containers):064x}"
@@ -562,7 +563,6 @@ def test_a_task_environment_never_reaches_the_hosts_docker_commands(
     task_env = {
         "PATH": f"{task_bin}:/usr/bin:/bin",
         "LD_PRELOAD": str(tmp_path / "loader.so"),
-        "DOCKER_CONFIG": str(tmp_path / "task-config"),
         "TASK_SETTING": "kept",
     }
     _start(tmp_path, uuid4().hex, "agent", task_env)
