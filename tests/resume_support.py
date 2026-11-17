@@ -24,7 +24,7 @@ from native_support import (
     synthetic_contract,
     task_entry,
 )
-from pluginbench import baselines, control_store, harbor_backend, ledger, study, submissions
+from pluginbench import baselines, codex, control_store, harbor_backend, ledger, study, submissions
 from pluginbench import trial_containers
 from pluginbench.run_lock import ExecutionOwner
 from pluginbench.datasets import native_identity, portable_native_identity
@@ -84,6 +84,38 @@ def _kill() -> None:
     os.kill(os.getpid(), signal.SIGKILL)
 
 
+# Where tests' temporary directories start; set for test processes and their children.
+GUIDANCE_CEILING = "PLUGINBENCH_TEST_GUIDANCE_CEILING"
+
+
+def bound_guidance(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Check a workspace's ancestors for guidance only up to GUIDANCE_CEILING, so guidance a
+    host keeps in /tmp or above cannot fail tests. Below it, the check is the real one."""
+    if not (ceiling := os.environ.get(GUIDANCE_CEILING)):
+        return
+    real, base = codex.reject_guidance, Path(ceiling)
+
+    def bounded(
+        workspace: Path, *, include_ancestors: bool = True, reject_git: bool = False
+    ) -> None:
+        root = workspace.resolve()
+        if not root.is_relative_to(base):
+            real(workspace, include_ancestors=include_ancestors, reject_git=reject_git)
+            return
+        real(workspace, include_ancestors=False, reject_git=reject_git)
+        found = sorted(
+            str(parent / name)
+            for parent in root.parents
+            if include_ancestors and parent.is_relative_to(base)
+            for name in codex.GUIDANCE_NAMES
+            if (parent / name).exists()
+        )
+        if found:
+            raise ValueError("custom guidance or unsupported fixture paths: " + ", ".join(found))
+
+    monkeypatch.setattr(codex, "reject_guidance", bounded)
+
+
 def install(
     monkeypatch: pytest.MonkeyPatch,
     calls: list[str],
@@ -92,6 +124,7 @@ def install(
     at: int = 0,
 ) -> None:
     """Fake every Harbor entry point a study reaches; record each native call's attempt ID."""
+    bound_guidance(monkeypatch)
     monkeypatch.setattr(submissions, "reviewed_contract", synthetic_contract)
     identity = runtime_identity()
     monkeypatch.setattr(harbor_backend, "runtime_identity", lambda **kwargs: identity)

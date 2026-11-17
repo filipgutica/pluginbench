@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import resume_support
 from pluginbench import control_store, run_lock
 from pluginbench.run_lock import ExecutionLock
 
@@ -30,6 +32,24 @@ def isolated_host_state(
     # Recovery's two container inventories need not be a real second apart in tests.
     monkeypatch.setattr(control_store, "INVENTORY_INTERVAL", 0.0)
     return state
+
+
+@pytest.fixture(autouse=True)
+def guidance_outside_tests_is_ignored(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guidance a host keeps in /tmp or above cannot fail tests, here or in their children.
+
+    Temporary workspaces PluginBench makes itself go below pytest's base directory too, so the
+    ancestor check still covers everything a test creates.
+    """
+    base = tmp_path_factory.getbasetemp().resolve()
+    temporary = base / "tempfile"
+    temporary.mkdir(exist_ok=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(temporary))
+    monkeypatch.setenv("TMPDIR", str(temporary))
+    monkeypatch.setenv(resume_support.GUIDANCE_CEILING, str(base))
+    resume_support.bound_guidance(monkeypatch)
 
 
 @pytest.fixture
