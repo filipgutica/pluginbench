@@ -42,9 +42,12 @@ from typing import Any
 from pluginbench import run_lock
 
 # The operations a scope may run, as "module:function". Each takes the request's JSON arguments
-# and returns a JSON value. Nothing else runs in a scope: an unknown name is refused before
-# anything spawns, and again by the entry point.
-HANDLERS: dict[str, str] = {}
+# and returns a JSON value; `operations` holds them and their argument models. Nothing else runs
+# in a scope: an unknown name is refused before anything spawns, and again by the entry point.
+HANDLERS: dict[str, str] = {
+    name: f"pluginbench.operations:{name}"
+    for name in ("coding", "grading", "review", "collect", "preflight")
+}
 
 # Each startup gate's bound: the bootstrap's wait for its permit, and the entry point's
 # connection and wait for the second permit.
@@ -64,6 +67,10 @@ UNIT_POLL = 0.25
 MINIMUM_SYSTEMD = 255
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 LABEL_KEY = "pluginbench.invocation"
+
+# The invocation whose handler this process runs; set once by the entry point, in the scope.
+_current: str | None = None
+_CREATES = (("run",), ("create",), ("container", "run"), ("container", "create"))
 
 _MESSAGE_LIMIT = 4096
 _PEER = struct.Struct("3i")
@@ -153,6 +160,20 @@ class CleanupProof:
     scope: dict[str, Any]
     containers: dict[str, Any]
     at: str
+
+
+def current() -> str | None:
+    """The invocation ID of the operation this process runs as, or None outside one."""
+    return _current
+
+
+def with_label(arguments: tuple[str, ...], invocation: str) -> tuple[str, ...]:
+    """Docker `arguments` with the invocation's label right after the subcommand, when they
+    create a container; otherwise unchanged."""
+    for create in _CREATES:
+        if arguments[: len(create)] == create:
+            return (*create, "--label", f"{LABEL_KEY}={invocation}", *arguments[len(create):])
+    return arguments
 
 
 def _now() -> str:
@@ -645,6 +666,8 @@ def _execute(path: Path) -> int:
         if _receive(connection) != {"permit": request["id"]}:
             return 75
         connection.settimeout(None)
+        global _current
+        _current = request["id"]
         try:
             target = HANDLERS[request["operation"]]
             module, name = target.split(":")

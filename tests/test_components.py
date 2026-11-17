@@ -36,7 +36,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # The daemon check takes an optional timeout, which only cleanup after a crash
             # passes; launches are unchanged. A failed trial cleanup now also tells the host
             # lock owner, which records it for the next owner to check.
-            "harbor_backend.py": "f1ae45d2838e26c4bd13fc6d0dab65a4af0d7a0eaf0b894952da94a14e4f2b40",
+            # Inside a scoped operation, its containers carry the invocation label; a label
+            # changes no launch, and outside an operation nothing changes, so this stays v1.
+            "harbor_backend.py": "012e643415d6bd82c2440a1ab0c86754528c15edb935a69eceec462e78fa9c06",
             # The same spawn callback; launches are unchanged. A failed process-group cleanup
             # or output drain now also tells the host lock owner, which records it for the next
             # owner to check. Launches are unchanged.

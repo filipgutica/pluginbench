@@ -34,7 +34,8 @@ from uuid import uuid4
 
 from pydantic import TypeAdapter
 
-from pluginbench import codex, components, isolation, run_lock, submissions, native_treatments
+from pluginbench import codex, components, invocation_runtime, isolation, run_lock, submissions
+from pluginbench import native_treatments
 from pluginbench import claude, claude_launch, claude_treatments, saved_usage
 from pluginbench.treatments import Treatment
 from pluginbench.native_treatments import NativeCapabilities
@@ -46,6 +47,8 @@ from pluginbench.processes import run_command
 HARBOR_VERSION = "0.24.0"
 PROTOCOL = "harbor-docker-v1"
 _OWNER_LABEL = "org.pluginbench.trial"
+# The trial config key that carries the operation's invocation ID to the Harbor worker.
+_INVOCATION_KEY = "pluginbench_invocation"
 _BASE_TOOLS = "curl bash node npm"
 CLI_VERSION_PATTERN = r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?"
 _DOCKER_TIMEOUT = 60
@@ -121,6 +124,10 @@ def _docker(
         argv.extend(["--host", endpoint])
         env.pop("DOCKER_CONTEXT", None)
         env.pop("DOCKER_HOST", None)
+    # Inside an operation every container it creates carries its label, so recovery finds it
+    # by that label alone.
+    if (invocation := invocation_runtime.current()) is not None:
+        arguments = invocation_runtime.with_label(arguments, invocation)
     command = [*argv, *arguments]
     try:
         result = run_command(command, cwd=Path.cwd(), env=env, timeout=timeout)
@@ -633,10 +640,23 @@ def _cli_guard(harness: str, version: str) -> str:
 
 
 async def run_trial(config: dict[str, Any]) -> dict[str, Any]:
-    """Run one native trial, without queue retries or Harbor resume behavior."""
+    """Run one native trial, without queue retries or Harbor resume behavior.
+
+    Run by an operation, the trial's containers carry its invocation label (`harbor_labels`).
+    """
+    config = dict(config)
+    invocation = config.pop(_INVOCATION_KEY, None)
+    if invocation is None:
+        return await _run_trial(config)
+    from pluginbench import harbor_labels
+
+    with harbor_labels.labelled(str(invocation)):
+        return await _run_trial(config)
+
+
+async def _run_trial(config: dict[str, Any]) -> dict[str, Any]:
     # Harbor's wheel is untyped. Keep its dynamic API at this single boundary,
     # without making reporting import its execution dependencies.
-    config = dict(config)
     boundary = config.pop("pluginbench_boundary", None)
     agent = _object(config.get("agent"), "native agent configuration")
     separate_codex = agent.get("name") == "codex" and config.get("source_trial") is None
@@ -1570,6 +1590,8 @@ def _native_process(
             artifacts / "docker-client.json",
             _private_docker_config(private=private, env=env, expected_runtime=expected),
         )
+        if (invocation := invocation_runtime.current()) is not None:
+            config = {**config, _INVOCATION_KEY: invocation}
         codex.write_json(private / "trial.json", config)
         result = run_command(
             [
