@@ -5,6 +5,7 @@ Nothing here starts a container, a systemd unit or a model. Docker is a fake; pr
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import signal
@@ -303,9 +304,13 @@ def _live_call(tmp_path: Path) -> tuple[Path, subprocess.Popen[bytes]]:
 def test_containers_are_checked_only_after_the_processes_and_on_every_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
 ) -> None:
-    run, child = _live_call(tmp_path)
+    run, child = _live_call(tmp_path)  # Left open by an earlier owner, and still running.
     (run / "frozen/suite").mkdir(parents=True)
-    _crashed_owner(isolated_host_state, kind="run", root=run, runtimes=[{"docker_engine": {}}])
+    later = datetime.now(UTC).isoformat()
+    _crashed_owner(
+        isolated_host_state, kind="run", root=run, runtimes=[{"docker_engine": {}}],
+        acquired_at=later,
+    )
     inventories: list[Path] = []
 
     def inventory(evidence: Path, **kwargs: Any) -> list[dict[str, str]]:
@@ -483,13 +488,168 @@ time.sleep(30)
 
 
 def _gone(pid: int) -> None:
-    os.kill(pid, signal.SIGKILL)
+    """Kill an orphan and wait until it no longer runs; init reaps it."""
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
     deadline = time.monotonic() + 10
-    while control_store._leader_runs(pid, run_lock.process_start(pid)) if Path(
-        f"/proc/{pid}"
-    ).exists() else False:
+    while control_store._leader_runs(pid, run_lock.started_at(pid)):
         assert time.monotonic() < deadline
         time.sleep(0.02)
+
+
+def _wait_for(path: Path) -> int:
+    deadline = time.monotonic() + 10
+    while not path.exists() or not path.read_text():
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    return int(path.read_text())
+
+
+def _review_ledger(run: Path) -> Ledger:
+    return Ledger.create(
+        run / LEDGER_NAME,
+        [{"id": "a", "task_id": "t", "arm": "vanilla", "attempt": 1}],
+        {"a": "running"},
+    )
+
+
+def test_a_failed_save_after_an_escaped_drain_still_needs_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
+) -> None:
+    monkeypatch.setattr(processes, "_CLEANUP_TIMEOUT", 0.2)
+    run = tmp_path / "review"
+    run.mkdir()
+    escaped = tmp_path / "escaped.pid"
+    ledger = _review_ledger(run)
+
+    def no_space(path: Path, value: Any) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    try:
+        with control_store.execute(_owner(run)):
+            call = ledger.intent(slot=0, stage="review", attempt_id="a")
+            with monkeypatch.context() as full:
+                full.setattr(run_lock, "_write_atomic", no_space)
+                with pytest.raises((subprocess.TimeoutExpired, OSError)) as failed:
+                    processes.run_command(
+                        [sys.executable, "-c", _ESCAPING, str(escaped)],
+                        cwd=run, env=os.environ, timeout=0.5,
+                        on_spawn=lambda pid: ledger.invocation_started(call, pid),
+                    )
+            ledger.end(call, *outcome(failed.value, spawned=True))
+        _wait_for(escaped)
+        # Nothing about the failure reached the disk, and the call's clean end never did either.
+        with pytest.raises(CleanupBlocked, match="previous owner stopped during review invocation"):
+            with control_store.execute(_owner(tmp_path / "unrelated")):
+                pass
+    finally:
+        ledger.close()
+        if escaped.exists() and escaped.read_text():
+            _gone(int(escaped.read_text()))
+    assert CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"]).exit_code == 0
+    assert _admitted(isolated_host_state, tmp_path)
+
+
+# Owns the host lock and makes one recorded call. With "mid-call", the call starts a descendant
+# that escapes its group and the owner waits to be killed; with "between", the call ends clean
+# and the owner kills itself before its next call.
+_OWNER = """
+import os, signal, subprocess, sys
+from pathlib import Path
+from pluginbench import control_store, processes, run_lock
+from pluginbench.ledger import LEDGER_NAME, Ledger
+state, run, mode, escaped = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+owner = run_lock.ExecutionOwner(kind="review", eval=str(run), root=str(run))
+with control_store.execute(owner, state=state):
+    ledger = Ledger.open(run / LEDGER_NAME)
+    call = ledger.intent(slot=0, stage="review", attempt_id="a")
+    escaping = "import os, sys, time; os.setsid(); open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(30)"
+    code = (
+        f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {escaping!r}, {escaped!r}]); time.sleep(30)"
+        if mode == "mid-call" else ""
+    )
+    processes.run_command(
+        [sys.executable, "-c", code], cwd=run, env=os.environ, timeout=60,
+        on_spawn=lambda pid: ledger.invocation_started(call, pid),
+    )
+    ledger.end(call, "finished")
+    os.kill(os.getpid(), signal.SIGKILL)
+"""
+
+
+def _killed_owner(tmp_path: Path, state: Path, mode: str) -> tuple[Path, Path, subprocess.Popen[bytes]]:
+    run = tmp_path / "review"
+    run.mkdir()
+    _review_ledger(run).close()
+    escaped = tmp_path / "escaped.pid"
+    owner = subprocess.Popen(
+        [sys.executable, "-c", _OWNER, str(state), str(run), mode, str(escaped)],
+        env={**os.environ, "PYTHONPATH": _SOURCE},
+    )
+    return run, escaped, owner
+
+
+def test_an_owner_killed_during_a_call_needs_repair_even_once_its_group_is_gone(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    run, escaped, owner = _killed_owner(tmp_path, isolated_host_state, "mid-call")
+    leader = None
+    try:
+        _wait_for(escaped)
+        owner.kill()  # Before it can save anything about the call.
+        owner.wait(timeout=10)
+        [row] = _rows(run)
+        leader = row["identity"]["pid"]
+        os.killpg(leader, signal.SIGKILL)  # The recorded group is now empty.
+        deadline = time.monotonic() + 10
+        while control_store._group_members(leader):
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        with pytest.raises(CleanupBlocked, match="previous owner stopped during review invocation"):
+            with control_store.execute(_owner(tmp_path / "unrelated")):
+                pass
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait(timeout=10)
+        if escaped.exists() and escaped.read_text():
+            _gone(int(escaped.read_text()))
+    result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+    assert result.exit_code == 0 and "previous owner stopped during" in result.stdout
+    assert _admitted(isolated_host_state, tmp_path)
+
+
+def test_an_owner_killed_between_calls_recovers_without_repair(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    run, _, owner = _killed_owner(tmp_path, isolated_host_state, "between")
+    assert owner.wait(timeout=30) == -signal.SIGKILL
+    [row] = _rows(run)
+    identity = row["identity"]
+    # The call's clean end reached the disk before the owner died.
+    assert [identity["pid"], identity["start_time"]] in _record(isolated_host_state)["clean"]
+    assert _admitted(isolated_host_state, tmp_path)
+
+
+def test_a_run_whose_calls_end_clean_is_released(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    run = tmp_path / "review"
+    run.mkdir()
+    ledger = _review_ledger(run)
+    with control_store.execute(_owner(run)):
+        call = ledger.intent(slot=0, stage="review", attempt_id="a")
+        processes.run_command(
+            [sys.executable, "-c", ""], cwd=run, env=os.environ, timeout=30,
+            on_spawn=lambda pid: ledger.invocation_started(call, pid),
+        )
+        ledger.end(call, "finished")
+    ledger.close()
+    record = _record(isolated_host_state)
+    assert record["state"] == "released" and len(record["clean"]) == 1
+    assert _admitted(isolated_host_state, tmp_path)
 
 
 def test_an_escaped_process_holding_a_calls_output_blocks_until_repair_confirms_it(
@@ -616,6 +776,11 @@ def test_a_call_that_ended_while_its_process_lived_is_checked_after_its_owner_di
     finally:
         child.kill()
         child.wait(timeout=5)
+    # Its group is empty now, but the owner never recorded the call's clean end.
+    with pytest.raises(CleanupBlocked, match="previous owner stopped during review invocation"):
+        with control_store.execute(_owner(tmp_path / "unrelated")):
+            pass
+    assert CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"]).exit_code == 0
     assert _admitted(isolated_host_state, tmp_path)
 
 

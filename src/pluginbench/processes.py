@@ -69,6 +69,10 @@ def run_command(
         encoding="utf-8",
         start_new_session=True,
     )
+    # A recorded call stays unverified to the next host lock owner until its group is stopped
+    # and its output drained; only then is its clean end recorded.
+    start = run_lock.started_at(proc.pid) if on_spawn is not None else None
+    stopped = False
     failure: BaseException | None = None
     try:
         try:
@@ -81,6 +85,7 @@ def run_command(
         finally:
             try:
                 terminate_process_group(proc)
+                stopped = True
             except (OSError, subprocess.TimeoutExpired) as cleanup_error:
                 run_lock.note_leftover(
                     f"the process group of an earlier call could not be stopped ({cleanup_error}), "
@@ -106,9 +111,13 @@ def run_command(
             if isinstance(error, subprocess.TimeoutExpired):
                 error.output = stdout.encode("utf-8")
                 error.stderr = stderr.encode("utf-8")
+            if stopped and on_spawn is not None:
+                run_lock.note_clean(proc.pid, start)
         finally:
             for pipe in (proc.stdout, proc.stderr):
                 if pipe is not None:
                     pipe.close()
         raise
+    if on_spawn is not None:
+        run_lock.note_clean(proc.pid, start)
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)

@@ -13,7 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from pluginbench import isolation
+from pluginbench import isolation, run_lock
 from pluginbench.codex_events import admit_version as admit_version
 from pluginbench.codex_events import observed_cli_version as observed_cli_version
 from pluginbench.codex_events import parse_events as parse_events
@@ -345,6 +345,7 @@ def invoke(
     started = time.monotonic()
     timed_out = False
     proc = None
+    start: str | None = None
     traces = []
     failure: BaseException | None = None
     try:
@@ -390,6 +391,7 @@ def invoke(
                 start_new_session=True,
             )
             if on_spawn is not None:
+                start = run_lock.started_at(proc.pid)
                 on_spawn(proc.pid)  # Inside the block whose cleanup stops the group.
             try:
                 proc.communicate(prompt, timeout=timeout)
@@ -404,8 +406,15 @@ def invoke(
         try:
             if proc is not None:
                 terminate_process_group(proc)
+                if on_spawn is not None:
+                    # Its output goes to files, so a stopped group is a clean end.
+                    run_lock.note_clean(proc.pid, start)
         except (OSError, subprocess.TimeoutExpired) as error:
             cleanup_error = error
+            run_lock.note_leftover(
+                f"the process group of an earlier review call could not be stopped ({error}), "
+                "so it may still run"
+            )
             if failure is not None:
                 failure.add_note(f"Process-group cleanup failed: {error}")
         try:

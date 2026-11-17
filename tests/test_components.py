@@ -22,7 +22,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # The optional artifact destination is judge-only; coding launch behavior stays v1.
             # The optional spawn callback reports the reviewer's PID to the invocation ledger;
             # no launch changes.
-            "codex.py": "b1cbb78fe3fdb2019bedd1dadc2c1c24f029ac63810106c4ea77c93ed27af796",
+            # The reviewer's clean end and failed cleanup are told to the host lock owner;
+            # launches are unchanged.
+            "codex.py": "30c8aee79be217e222bed48a4215133a291ed47aa79a21c41a5b4b532b7948a1",
             # The Claude launch contract; tests/test_codex_identity.py proves Codex launches equal.
             # Measurement and regrade skip launch-only runtime fields; coding checks are unchanged.
             # Audited command hooks keep native usage; with no audited_hooks every launch is
@@ -36,8 +38,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # lock owner, which records it for the next owner to check.
             "harbor_backend.py": "f1ae45d2838e26c4bd13fc6d0dab65a4af0d7a0eaf0b894952da94a14e4f2b40",
             # The same spawn callback; launches are unchanged. A failed process-group cleanup
-            # now also tells the host lock owner, which records it for the next owner to check.
-            "processes.py": "eaefef7a9bc61d308552d3b13dd3114b6eb0b1a5be0718ae1becbfca2b0a5388",
+            # now also tells the host lock owner, which records it for the next owner to check,
+            # as it does a recorded call's clean end. Launches are unchanged.
+            "processes.py": "2d77710c3d90dea8848cc07eb8176152245062ddeb9d1cabdb35d48b68b0aa5f",
             # Claude admission dispatch, and the Codex config's V2 spawn-override hide. The
             # vanilla cache refuses a cohort saved without the hide by its config, so this stays v1.
             "native_treatments.py": "3c9a617c292e0fbc93bc07b46e012ab79bd5589efc6a3e9267e4652c71ba89b3",

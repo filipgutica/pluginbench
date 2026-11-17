@@ -488,12 +488,22 @@ class ExecutionLock:
             self._write({**self.record, "runtimes": [*self.record["runtimes"], docker]})
 
     def note_leftover(self, reason: str) -> None:
-        """Record that a cleanup failed, before the caller goes on. No check can prove such a
-        failure harmless, so the next owner keeps it as unknown until an operator confirms it;
-        if the record cannot be written, this raises."""
+        """Record why a cleanup failed, so the next owner's error can say so. The call's missing
+        clean end already keeps it unknown, so a failed write here changes nothing."""
         self.leftover = True
         failure = {"reason": reason, "at": datetime.now(UTC).isoformat()}
-        self._write({**self.record, "leftovers": [*self.record.get("leftovers", []), failure]})
+        try:
+            self._write({**self.record, "leftovers": [*self.record.get("leftovers", []), failure]})
+        except OSError:
+            pass  # Without a clean end, the call stays unknown to the next owner anyway.
+
+    def note_clean(self, pid: int, start: str | None) -> None:
+        """Record that a recorded call's process group, started at `start`, was stopped and its
+        output drained. Until this is on disk, the next owner cannot clear the call."""
+        try:
+            self._write({**self.record, "clean": [*self.record.get("clean", []), [pid, start]]})
+        except OSError:
+            pass  # The call stays unverified, which is the safe default.
 
     def _write(self, record: dict[str, Any]) -> None:
         # Adopt the record only once it is on disk, so a failed write never reaches it later.
@@ -529,6 +539,21 @@ def external_work() -> Iterator[None]:
     before, lock.dirty = lock.dirty, True
     yield
     lock.dirty = before
+
+
+def note_clean(pid: int, start: str | None) -> None:
+    """Record that the recorded call led by `pid` ended clean; see ExecutionLock.note_clean.
+    Without the host lock there is nothing to record."""
+    if _execution is not None:
+        _execution.note_clean(pid, start)
+
+
+def started_at(pid: int) -> str | None:
+    """The start time of `pid`, or None once it has exited, as `child_identity` records it."""
+    try:
+        return process_start(pid)
+    except ProcessLookupError:
+        return None
 
 
 def note_leftover(reason: str) -> None:
@@ -600,6 +625,8 @@ def hold_execution(owner: ExecutionOwner, *, state: Path | None = None) -> Itera
                 "acquired_at": datetime.now(UTC).isoformat(),
                 "runtimes": [],
                 "leftovers": [],
+                # Recorded calls whose cleanup was proven, as [PID, start time] pairs.
+                "clean": [],
                 "pending": _carried(state),
             },
         )

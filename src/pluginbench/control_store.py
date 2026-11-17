@@ -158,14 +158,6 @@ def _group_members(group: int) -> list[int]:
     return members
 
 
-def _start_of(pid: int) -> str | None:
-    """The start time of the live process `pid`, or None when none runs."""
-    try:
-        return run_lock.process_start(pid)
-    except ProcessLookupError:
-        return None
-
-
 def _leader_runs(pid: int, start: object) -> bool:
     """Whether `pid` is still the recorded process, started at `start`, and not a zombie."""
     try:
@@ -204,22 +196,30 @@ def verify_invocation(check: Check) -> dict[str, Any]:
             f"{name} was recorded in another PID namespace. {_repair(check['root'])}"
         )
     start = identity.get("start_time")
-    if start is not None and _start_of(group) not in (None, start):
+    if start is not None and run_lock.started_at(group) not in (None, start):
         # Linux frees a PID only once no process uses it as a process-group ID, so a newer
         # process holding the leader's PID proves the recorded group has ended.
-        return {**proof, "checked": "process group ended"}
-    members = set(_group_members(group))
-    leader = _leader_runs(pid, start)
-    if leader:
-        members.add(pid)
-    if members:
-        listed = ", ".join(map(str, sorted(members)))
-        raise CleanupBlocked(
-            f"process group {group} of {name} still has processes {listed}; stop them with "
-            f"`kill -TERM -- -{group}`"
-            if leader
-            else f"process group {group} of {name} still has processes {listed}, and its leader "
-            "has exited; check that they belong to this call before stopping them"
+        proof = {**proof, "checked": "process group ended"}
+    else:
+        members = set(_group_members(group))
+        leader = _leader_runs(pid, start)
+        if leader:
+            members.add(pid)
+        if members:
+            listed = ", ".join(map(str, sorted(members)))
+            raise CleanupBlocked(
+                f"process group {group} of {name} still has processes {listed}; stop them with "
+                f"`kill -TERM -- -{group}`"
+                if leader
+                else f"process group {group} of {name} still has processes {listed}, and its "
+                "leader has exited; check that they belong to this call before stopping them"
+            )
+    if check.get("ended_clean") is False:
+        # An empty group proves nothing about a process that left it, so only a clean end the
+        # owner recorded does.
+        raise CleanupUnknown(
+            f"the previous owner stopped during {name}, so PluginBench can't prove its processes "
+            f"ended. {_repair(check['root'])}"
         )
     return proof
 
@@ -352,23 +352,27 @@ def _open(ledger: Ledger, stages: Collection[str] | None = None) -> list[dict[st
 _NOTHING_LEFT = ("aborted_prespawn", "unresolved")
 
 
-def _owned(ledger: Ledger, since: object) -> list[dict[str, Any]]:
+def _since(acquired_at: object) -> datetime | None:
+    """When a dead owner took the lock; None when unreadable, so every call counts as its."""
+    try:
+        return datetime.fromisoformat(str(acquired_at))
+    except ValueError:
+        return None
+
+
+def _touched(row: dict[str, Any], since: datetime | None) -> bool:
+    return since is None or datetime.fromisoformat(row["updated_at"]) >= since
+
+
+def _owned(ledger: Ledger, since: datetime | None) -> list[dict[str, Any]]:
     """Every invocation a dead owner may have left running: each open one, and each it ended,
     since a call can end while its process-group cleanup failed. An ended call with no process
-    record is unknown: its record may have failed while its child ran. `since` is when the
-    owner took the lock; without a readable one, every ended call counts."""
-    try:
-        start = datetime.fromisoformat(str(since))
-    except ValueError:
-        start = None
+    record is unknown: its record may have failed while its child ran."""
     return [
         row
         for row in ledger.invocations()
         if row["state"] in OPEN_STATES
-        or (
-            row["state"] not in _NOTHING_LEFT
-            and (start is None or datetime.fromisoformat(row["updated_at"]) >= start)
-        )
+        or (row["state"] not in _NOTHING_LEFT and _touched(row, since))
     ]
 
 
@@ -420,11 +424,24 @@ def _work_checks(obligation: dict[str, Any]) -> list[Check]:
             "ledger records its processes"
         )
         return [{"id": f"{name}:unrecorded", "root": root, "kind": "unrecorded", "reason": reason}]
+    since = _since(obligation.get("acquired_at"))
     ledger = Ledger.read(path)
     try:
-        checks = _invocations(_owned(ledger, obligation.get("acquired_at")), root)
+        rows = _owned(ledger, since)
     finally:
         ledger.close()
+    checks = _invocations(rows, root)
+    # A call the owner started counts as cleaned up only once it recorded the clean end, written
+    # after the call's group was stopped and its output drained (`run_lock.note_clean`).
+    clean = {
+        (item[0], item[1])
+        for item in obligation.get("clean") or []
+        if isinstance(item, list) and len(item) == 2
+    }
+    for check, row in zip(checks, rows, strict=True):
+        if row["identity"] and _touched(row, since):
+            identity = row["identity"]
+            check["ended_clean"] = (identity.get("pid"), identity.get("start_time")) in clean
     evidence = path.parent
     # A recorded runtime stays an obligation whatever its directory now holds.
     runtimes: list[dict[str, Any] | None] = list(obligation.get("runtimes") or [])
