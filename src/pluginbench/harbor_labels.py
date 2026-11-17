@@ -30,6 +30,37 @@ from pluginbench.harbor_backend import HARBOR_VERSION
 from pluginbench.invocation_runtime import LABEL_KEY, with_label
 
 
+# Top-level Compose keys that add no service. Any other, such as `include` or `models`, could
+# start containers the overlay does not name, so it is refused.
+_PLAIN_KEYS = {"name", "version", "services", "networks", "volumes", "configs", "secrets"}
+# Service keys that take a definition from elsewhere or run something other than a container.
+_FOREIGN_SERVICE_KEYS = {"extends", "provider"}
+
+
+def _services(path: Path) -> set[str]:
+    """The services one Compose file defines, refusing any shape that could define others."""
+    document = yaml.safe_load(path.read_text()) or {}
+    if not isinstance(document, dict):
+        raise ValueError(f"Compose file {path} is not a mapping")
+    extra = {key for key in document if not str(key).startswith("x-")} - _PLAIN_KEYS
+    services = document.get("services") or {}
+    if not isinstance(services, dict) or not all(
+        isinstance(service, dict) for service in services.values()
+    ):
+        raise ValueError(f"Compose file {path} does not map its services")
+    foreign = {
+        f"{name}.{key}"
+        for name, service in services.items()
+        for key in _FOREIGN_SERVICE_KEYS & set(service)
+    }
+    if extra or foreign:
+        raise ValueError(
+            f"Compose file {path} uses {', '.join(sorted(extra | foreign))}, which could start "
+            "containers without the invocation label; nothing started"
+        )
+    return {str(name) for name in services}
+
+
 @contextmanager
 def labelled(invocation: str) -> Iterator[None]:
     """Label every container Harbor creates in this process until the block ends."""
@@ -54,8 +85,7 @@ def labelled(invocation: str) -> Iterator[None]:
             original: list[Path] = original_paths(self)
             services: set[str] = set()
             for path in original:
-                document = yaml.safe_load(Path(path).read_text()) or {}
-                services.update(document.get("services") or {})
+                services.update(_services(Path(path)))
             if not services:
                 raise ValueError("Harbor's Compose files name no service to label")
             session = hashlib.sha256(str(self.session_id).encode()).hexdigest()[:16]

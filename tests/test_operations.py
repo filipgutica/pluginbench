@@ -148,3 +148,48 @@ def test_an_unknown_argument_is_refused(tmp_path: Path) -> None:
     _, _, arguments = _cases(tmp_path)["coding"]
     with pytest.raises(ValidationError, match="extra"):
         operations.Coding.model_validate({**arguments, "on_spawn": "anything"})
+
+
+def _every_path_evaluation(tmp_path: Path) -> dict[str, Any]:
+    """A resolved evaluation that sets every nested host path, dumped as a caller sends it."""
+    for name in ("guidance.md", "review.md", "skill.md"):
+        (tmp_path / name).write_text("Text.\n")
+    (tmp_path / "fallow.json").write_text("{}\n")
+    (tmp_path / "tasks").mkdir()
+    raw = {
+        "runner": {"harness": "codex", "model": "gpt-6-luna", "reasoning": "low"},
+        "guidance": {"candidate": ["guidance.md"]},
+        "tasks": {"source": "tasks", "ids": ["one"]},
+        "measurements": ["tokens", "lines", "review"],
+        "reviewer": {
+            "harness": "codex", "model": "gpt-6-luna", "reasoning": "low",
+            "guidance": ["review.md"],
+        },
+        "measurement_settings": {"fallow_config": "fallow.json"},
+        "repeats": 1,
+    }
+    dumped: dict[str, Any] = evaluation.resolve_evaluation(raw, tmp_path).model_dump(mode="json")
+    return dumped
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["treatment guidance", "treatment skills", "task source", "reviewer guidance",
+     "fallow config"],
+)
+def test_a_relative_path_nested_in_the_evaluation_is_refused(tmp_path: Path, field: str) -> None:
+    config = _every_path_evaluation(tmp_path)
+    arguments = {"mode": "check", "config": config, "output": str(tmp_path / "runs")}
+    operations.Preflight.model_validate(arguments)  # Resolved, so every path is absolute.
+    if field == "treatment guidance":
+        config["treatments"]["candidate"]["guidance"] = ["guidance.md"]
+    elif field == "treatment skills":
+        config["treatments"]["candidate"]["skills"] = ["skills/one"]
+    elif field == "task source":
+        config["tasks"]["source"] = "tasks"
+    elif field == "reviewer guidance":
+        config["reviewer"]["guidance"] = ["review.md"]
+    else:
+        config["measurement_settings"]["fallow_config"] = "fallow.json"
+    with pytest.raises(ValidationError, match="is not an absolute path"):
+        operations.Preflight.model_validate(arguments)

@@ -47,6 +47,13 @@ from pluginbench.processes import run_command
 HARBOR_VERSION = "0.24.0"
 PROTOCOL = "harbor-docker-v1"
 _OWNER_LABEL = "org.pluginbench.trial"
+# The Docker commands that build an image; inside an operation they run only in the engine's
+# built-in builder (`_pin_builder`). One that creates a builder is refused there.
+_BUILDS = (
+    ("build",), ("image", "build"), ("builder", "build"), ("buildx", "build"), ("buildx", "b"),
+    ("buildx", "bake"),
+)
+_BUILDER_CREATES = (("buildx", "create"), ("builder", "create"))
 # The trial config key that carries the operation's invocation ID to the Harbor worker.
 _INVOCATION_KEY = "pluginbench_invocation"
 _BASE_TOOLS = "curl bash node npm"
@@ -128,6 +135,11 @@ def _docker(
     # by that label alone.
     if (invocation := invocation_runtime.current()) is not None:
         arguments = invocation_runtime.with_label(arguments, invocation)
+        if any(arguments[: len(create)] == create for create in _BUILDER_CREATES):
+            raise ValueError("an operation cannot create a buildx builder: its containers are "
+                             "not the operation's")
+        if any(arguments[: len(build)] == build for build in _BUILDS):
+            _pin_builder(argv, env, timeout)
     command = [*argv, *arguments]
     try:
         result = run_command(command, cwd=Path.cwd(), env=env, timeout=timeout)
@@ -164,6 +176,31 @@ def _docker(
     if result.returncode:
         raise ValueError(f"docker {arguments[0]} failed: {result.stderr.strip()}")
     return result.stdout
+
+
+def _pin_builder(argv: list[str], env: dict[str, str], timeout: int) -> None:
+    """Make a build run in the engine's own BuildKit, which starts no container.
+
+    The operator's environment or Docker config may select a buildx builder whose driver
+    starts BuildKit in a container of its own, which would carry no invocation label. So the
+    build uses the context's built-in builder, with BuildKit on, once it is proven to use the
+    `docker` driver. No builder is changed or removed.
+    """
+    env.update(BUILDX_BUILDER="default", DOCKER_BUILDKIT="1")
+    result = run_command(
+        [*argv, "buildx", "inspect"], cwd=Path.cwd(), env=env, timeout=min(timeout, _DOCKER_TIMEOUT)
+    )
+    drivers = [
+        line.split(":", 1)[1].strip()
+        for line in result.stdout.splitlines()
+        if line.startswith("Driver:")
+    ]
+    if result.returncode or drivers != ["docker"]:
+        found = ", ".join(drivers) or result.stderr.strip() or f"exit {result.returncode}"
+        raise ValueError(
+            "an operation builds only with the Docker engine's built-in builder (driver "
+            f"docker), which starts no container; the default builder reports: {found}"
+        )
 
 
 def _assert_daemon(expected_runtime: dict[str, object], *, timeout: int = _DOCKER_TIMEOUT) -> None:

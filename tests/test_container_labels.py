@@ -326,3 +326,131 @@ def test_recovery_removes_a_crashed_measurements_container_by_its_label_alone(
     )
     assert proof["removed"] == left
     assert list(daemon.containers) == ["f" * 64]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("create", "--label", f"{LABEL}=other", "image"),
+        ("create", f"--label={LABEL}=other", "image"),
+        ("create", "-l", f"{LABEL}=other", "image"),
+        ("create", f"-l{LABEL}=other", "image"),
+        ("container", "run", "--label", LABEL, "image"),
+        ("create", "--label-file", "labels.txt", "image"),
+        ("run", "--label-file=labels.txt", "image"),
+    ],
+)
+def test_a_create_that_sets_the_invocation_label_itself_is_refused(
+    monkeypatch: pytest.MonkeyPatch, arguments: tuple[str, ...]
+) -> None:
+    """Docker keeps the last of repeated labels, so another value would win over ours."""
+    daemon = _Daemon()
+    monkeypatch.setattr(harbor_backend, "run_command", daemon)
+    monkeypatch.setattr(invocation_runtime, "_current", uuid4().hex)
+    with pytest.raises(ValueError, match="label"):
+        harbor_backend._docker(*arguments)
+    assert daemon.containers == {}
+    # The same refusal guards Harbor's own `docker container run`.
+    with pytest.raises(ValueError, match="label"):
+        invocation_runtime.with_label(arguments, uuid4().hex)
+
+
+def test_a_label_that_only_resembles_ours_is_kept(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def record(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(harbor_backend, "run_command", record)
+    invocation = uuid4().hex
+    monkeypatch.setattr(invocation_runtime, "_current", invocation)
+    harbor_backend._docker("create", "--label", f"{LABEL}.note=x", "image", "ls", "-la")
+    assert calls == [[
+        "docker", "create", "--label", f"{LABEL}={invocation}", "--label", f"{LABEL}.note=x",
+        "image", "ls", "-la",
+    ]]
+
+
+@pytest.mark.parametrize("driver", ["docker", "docker-container"])
+def test_a_build_inside_an_operation_runs_only_in_the_engines_own_builder(
+    monkeypatch: pytest.MonkeyPatch, driver: str
+) -> None:
+    """An operator's buildx builder may run BuildKit in a container that carries no label."""
+    monkeypatch.setenv("BUILDX_BUILDER", "operator-builder")
+    monkeypatch.setenv("DOCKER_BUILDKIT", "0")  # The legacy builder's containers are unlabelled.
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def record(
+        command: list[str], *, env: dict[str, str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append((command, env))
+        output = f"Name: default\nDriver: {driver}\n" if command[1:3] == ["buildx", "inspect"] else ""
+        return subprocess.CompletedProcess(command, 0, output, "")
+
+    monkeypatch.setattr(harbor_backend, "run_command", record)
+    harbor_backend._docker("build", "--tag", "t", "context")
+    outside = calls.pop()
+    assert outside[1]["BUILDX_BUILDER"] == "operator-builder"  # Outside an operation, unchanged.
+    monkeypatch.setattr(invocation_runtime, "_current", uuid4().hex)
+    if driver != "docker":
+        with pytest.raises(ValueError, match="built-in builder"):
+            harbor_backend._docker("build", "--tag", "t", "context")
+        assert [command[1] for command, _ in calls] == ["buildx"]  # Never built.
+        return
+    harbor_backend._docker("build", "--tag", "t", "context")
+    (inspect, inspect_env), (build, build_env) = calls
+    assert inspect[1:] == ["buildx", "inspect"] and build[1:] == ["build", "--tag", "t", "context"]
+    for env in (inspect_env, build_env):
+        assert (env["BUILDX_BUILDER"], env["DOCKER_BUILDKIT"]) == ("default", "1")
+
+
+@pytest.mark.parametrize("arguments", [("buildx", "create", "--use"), ("builder", "create")])
+def test_an_operation_cannot_create_a_builder(
+    monkeypatch: pytest.MonkeyPatch, arguments: tuple[str, ...]
+) -> None:
+    daemon = _Daemon()
+    monkeypatch.setattr(harbor_backend, "run_command", daemon)
+    monkeypatch.setattr(invocation_runtime, "_current", uuid4().hex)
+    with pytest.raises(ValueError, match="cannot create a buildx builder"):
+        harbor_backend._docker(*arguments)
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"include": ["other.yaml"], "services": {"main": {"image": "x"}}},
+        {"models": {"llm": {"model": "x"}}, "services": {"main": {"image": "x"}}},
+        {"services": {"main": {"extends": {"file": "other.yaml", "service": "base"}}}},
+        {"services": {"main": {"provider": {"type": "model"}}}},
+        {"services": ["main"]},
+    ],
+)
+def test_a_compose_shape_that_could_add_unlabelled_services_starts_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, document: dict[str, Any]
+) -> None:
+    compose = tmp_path / "docker-compose.yaml"
+    compose.write_text(yaml.safe_dump(document))
+    docker = importlib.import_module("harbor.environments.docker.docker").DockerEnvironment
+    monkeypatch.setattr(docker, "_docker_compose_paths", property(lambda self: [compose]))
+    environment = SimpleNamespace(session_id="s")
+    with harbor_labels.labelled(uuid4().hex):
+        with pytest.raises(ValueError, match="nothing started|does not map"):
+            docker._docker_compose_paths.fget(environment)
+
+
+def test_compose_extension_fields_are_not_services(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    compose = tmp_path / "docker-compose.yaml"
+    compose.write_text(yaml.safe_dump(
+        {"x-common": {"image": "x"}, "networks": {"n": {}}, "services": {"main": {"image": "x"}}}
+    ))
+    docker = importlib.import_module("harbor.environments.docker.docker").DockerEnvironment
+    monkeypatch.setattr(docker, "_docker_compose_paths", property(lambda self: [compose]))
+    invocation = uuid4().hex
+    with harbor_labels.labelled(invocation):
+        *_, overlay = docker._docker_compose_paths.fget(SimpleNamespace(session_id="s"))
+        assert yaml.safe_load(overlay.read_text()) == {
+            "services": {"main": {"labels": {LABEL: invocation}}}
+        }

@@ -63,26 +63,37 @@ class Review(_Arguments):
     artifacts: AbsolutePath | None = None
 
 
-def _collector_config(collector: Collector) -> Collector:
-    _absolute(collector.config)
-    return collector
+def _absolute_paths(value: Any) -> Any:
+    """Refuse a relative path anywhere in `value`, a validated model, or its lists and maps."""
+    if isinstance(value, Path):
+        _absolute(value)
+    elif isinstance(value, BaseModel):
+        for item in value.__dict__.values():
+            _absolute_paths(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _absolute_paths(item)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            _absolute_paths(item)
+    return value
 
 
 class Collect(_Arguments):
     """`collectors._run_collector`: one collector over one prepared source tree."""
 
     root: AbsolutePath
-    collector: Annotated[Collector, AfterValidator(_collector_config)]
+    collector: Annotated[Collector, AfterValidator(_absolute_paths)]
     destination: AbsolutePath
     baseline: AbsolutePath | None = None
 
 
 class Preflight(_Arguments):
     """`evaluation.check_evaluation` or `prepare_evaluation`, as `mode` selects, for a resolved
-    evaluation (`evaluation.load_evaluation`)."""
+    evaluation (`evaluation.load_evaluation`): every path in it must be absolute."""
 
     mode: Literal["check", "prepare"]
-    config: Evaluation
+    config: Annotated[Evaluation, AfterValidator(_absolute_paths)]
     output: AbsolutePath
 
 
