@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -353,3 +354,63 @@ def test_a_reader_never_sees_the_schema_version_before_the_tables(
     creator.join(timeout=10)
     reader.join(timeout=10)
     assert errors == []
+
+
+def test_a_stop_that_cannot_be_read_delays_admission_and_never_fails_the_run(
+    isolated_host_state: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(control_store, "STOP_POLL", 3600.0)
+    monkeypatch.setattr(run_lock, "STOP_READ_RETRY", 0.01)
+    with ControlStore.open(isolated_host_state) as store:
+        launch = ticket(store, scope="pb-worker-test.scope")
+    failures = [3]  # The next three reads of the control database fail, as while it is locked.
+    opened = ControlStore.__init__
+
+    def flaky(self: ControlStore, path: Path, *args: Any, **kwargs: Any) -> None:
+        if failures[0] > 0:
+            failures[0] -= 1
+            raise sqlite3.OperationalError("database is locked")
+        opened(self, path, *args, **kwargs)
+
+    ran: list[int] = []
+    with control_store.execute(_owner(tmp_path, launch.launch_id)):
+        monkeypatch.setattr(ControlStore, "__init__", flaky)
+        parallel.run_jobs(range(4), jobs=2, operation=lambda slot, cancelled, emit: ran.append(slot))
+    assert sorted(ran) == [0, 1, 2, 3] and failures == [0]
+
+
+def test_a_stop_unreadable_past_its_limit_admits_nothing_more_and_admitted_jobs_finish(
+    isolated_host_state: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(control_store, "STOP_POLL", 3600.0)
+    monkeypatch.setattr(run_lock, "STOP_READ_RETRY", 0.01)
+    monkeypatch.setattr(run_lock, "STOP_READ_LIMIT", 0.3)
+    with ControlStore.open(isolated_host_state) as store:
+        launch = ticket(store, scope="pb-worker-test.scope")
+    broken = threading.Event()
+    opened = ControlStore.__init__
+
+    def unreadable(self: ControlStore, path: Path, *args: Any, **kwargs: Any) -> None:
+        if broken.is_set():
+            raise sqlite3.OperationalError("database is locked")
+        opened(self, path, *args, **kwargs)
+
+    monkeypatch.setattr(ControlStore, "__init__", unreadable)
+    both = threading.Barrier(2, timeout=10)
+    admitted: list[int] = []
+    finished: list[int] = []
+
+    def job(slot: int, cancelled: threading.Event, emit: Any) -> None:
+        admitted.append(slot)
+        both.wait()
+        broken.set()
+        time.sleep(0.6)  # Still running when the limit passes.
+        finished.append(slot)
+
+    with pytest.raises(run_lock.StopRequested, match="could not be read for 0.3 seconds"):
+        with control_store.execute(_owner(tmp_path, launch.launch_id)):
+            try:
+                parallel.run_jobs(range(6), jobs=2, operation=job)
+            finally:
+                broken.clear()
+    assert sorted(admitted) == sorted(finished) == [0, 1]

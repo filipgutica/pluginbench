@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, wait, FIRST_COMPLETED
 import sys
+import time
 from queue import Empty, SimpleQueue
 from threading import Event
 
@@ -79,34 +80,43 @@ def run_jobs[T](
     active: set[Future[None]] = set()
     with ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="pluginbench") as pool:
 
-        def replenish() -> None:
+        def replenish() -> bool:
+            """Admit jobs up to `jobs`. False while the recorded stop cannot be read: nothing
+            more is admitted until a later call reads it."""
             while len(active) < jobs and not cancelled.is_set():
                 # A stop recorded for this owner's launch admits no new job; admitted ones
                 # finish, as after a signal.
-                run_lock.check_stop()
+                if not run_lock.check_stop():
+                    return False
                 try:
                     item = next(iterator)
                 except StopIteration:
-                    return
+                    return True
                 if on_submit:
                     on_submit(item)
                 active.add(pool.submit(perform, item))
+            return True
 
+        waiting = False
         try:
-            replenish()
+            waiting = not replenish()
         except BaseException as exc:
             first_failure = exc
             cancelled.set()
-        while active:
+        while active or waiting:
             try:
                 drain_updates()
-                done, _ = wait(active, timeout=0.05, return_when=FIRST_COMPLETED)
-                active.difference_update(done)
+                if active:
+                    done, _ = wait(active, timeout=0.05, return_when=FIRST_COMPLETED)
+                    active.difference_update(done)
+                else:
+                    time.sleep(run_lock.STOP_READ_RETRY)
                 drain_updates()
-                replenish()
+                waiting = not replenish()
             except BaseException as exc:
                 first_failure = first_failure or exc
                 cancelled.set()
+                waiting = False
                 # Current native calls finish under their existing timeout. No new work is admitted.
                 if isinstance(exc, KeyboardInterrupt):
                     _report_stop(sum(not future.done() for future in active))

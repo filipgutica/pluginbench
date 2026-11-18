@@ -597,8 +597,13 @@ class ExecutionLock:
     # Set once a cleanup of something this owner started failed. Unlike `dirty`, a clean exit
     # never clears it, and the record names each failure (`note_leftover`).
     leftover: bool = False
-    # For a launched owner: whether a stop was requested for its launch (`check_stop`).
-    stop_requested: Callable[[], bool] | None = field(default=None, repr=False, compare=False)
+    # For a launched owner: whether a stop was requested for its launch (`check_stop`); None
+    # while that cannot be read.
+    stop_requested: Callable[[], bool | None] | None = field(
+        default=None, repr=False, compare=False
+    )
+    # Since when (time.monotonic()) the recorded stop has been unreadable, if it is now.
+    stop_unread_since: float | None = field(default=None, repr=False, compare=False)
     # Worker threads update the record too; each change reads and writes it under this lock.
     _updating: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
@@ -713,14 +718,41 @@ class StopRequested(KeyboardInterrupt):
     becomes, so it ends the run the same way."""
 
 
-def check_stop() -> None:
-    """Raise StopRequested if a stop was requested for the launch this process owns the host
-    for. `parallel.run_jobs` calls it before it admits each job, in every phase. So a stop
-    whose signal was lost still admits no new job, while jobs already admitted finish, with
-    their measurement after coding, as they do after `stop`'s signal."""
+# While the recorded stop cannot be read, admission waits and reads it again this often; once
+# it has been unreadable this long, the owner stops as if a stop were recorded.
+STOP_READ_RETRY = 0.25
+STOP_READ_LIMIT = 30.0
+
+
+def check_stop() -> bool:
+    """Whether the owner may admit a new job now. Raises StopRequested if a stop was requested
+    for the launch this process owns the host for.
+
+    `parallel.run_jobs` calls it before it admits each job, and source-only grading before each
+    stage it grades. So a stop whose signal was lost still admits no new job, while jobs
+    already admitted finish, with their measurement after coding, as they do after `stop`'s
+    signal. While the stop cannot be read, as when the control database is locked, it returns
+    False: nothing is admitted until a read succeeds. After STOP_READ_LIMIT seconds of failed
+    reads it raises StopRequested, so admitted jobs still finish.
+    """
     lock = _execution
-    if lock is not None and lock.stop_requested is not None and lock.stop_requested():
+    if lock is None or lock.stop_requested is None:
+        return True
+    requested = lock.stop_requested()
+    if requested is None:
+        now = time.monotonic()
+        if lock.stop_unread_since is None:
+            lock.stop_unread_since = now
+        if now - lock.stop_unread_since >= STOP_READ_LIMIT:
+            raise StopRequested(
+                f"stopped: whether a stop was requested could not be read for "
+                f"{STOP_READ_LIMIT:g} seconds"
+            )
+        return False
+    lock.stop_unread_since = None
+    if requested:
         raise StopRequested("stopped: a stop was requested for this launch")
+    return True
 
 
 def note_work() -> None:
