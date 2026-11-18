@@ -800,21 +800,23 @@ def _launched(lock: ExecutionLock, launch_id: str | None) -> Iterator[None]:
     main = threading.current_thread() is threading.main_thread()
     previous = signal.signal(signal.SIGTERM, run_lock.interrupt) if main else None
 
-    def requested() -> bool:
-        with ControlStore.open(lock.state) as store:
-            launch = store.launch(launch_id)
+    def requested() -> bool | None:
+        """Whether a stop was requested; None while the control database cannot be read."""
+        try:
+            with ControlStore.open(lock.state) as store:
+                launch = store.launch(launch_id)
+        except sqlite3.Error:
+            return None
         return launch is None or launch.desired == "stop"
 
     done = threading.Event()
 
     def wake() -> None:
         while not done.wait(STOP_POLL):
-            try:
-                if requested():
-                    os.kill(os.getpid(), signal.SIGTERM)
-                    return
-            except sqlite3.Error:
-                continue  # Checked again at the next poll, and before every job.
+            # Unreadable (None) is checked again at the next poll, and before every job.
+            if requested():
+                os.kill(os.getpid(), signal.SIGTERM)
+                return
 
     lock.stop_requested = requested
     watcher = threading.Thread(target=wake, name="pluginbench-stop", daemon=True)
