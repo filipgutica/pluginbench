@@ -467,6 +467,28 @@ def test_a_launched_call_whose_cleanup_then_fails_stays_spent(
     assert invocation_ledger.outcome(caught.value, spawned=False)[0] == "unresolved"
 
 
+def test_a_cleanup_that_fails_while_this_operation_launches_still_stops_its_handler(
+    fake_systemd: FakeSystemd, owned: run_lock.ExecutionLock, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Another slot's cleanup fails after `run_operation` checked, while this one starts its
+    scope. The gate checks again before the second permit, so the handler never runs."""
+    probe = invocation_runtime.require_user_manager
+
+    def other_slot_fails_now() -> str:
+        owned.note_leftover("cleanup of another invocation was not verified")
+        return probe()
+
+    monkeypatch.setattr(invocation_runtime, "require_user_manager", other_slot_fails_now)
+    marker = tmp_path / "ran"
+
+    with pytest.raises(CleanupBlocked, match="starts no more operations"):
+        invocation_runtime.run_operation(_request("echo", value=1, marker=str(marker)))
+
+    time.sleep(0.5)  # Long enough for a permitted handler to have written its marker.
+    assert not marker.exists()
+
+
 def test_an_owner_whose_cleanup_failed_launches_no_other_operation(
     fake_systemd: FakeSystemd, owned: run_lock.ExecutionLock, docker: _Docker, tmp_path: Path
 ) -> None:

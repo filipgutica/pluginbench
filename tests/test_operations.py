@@ -237,6 +237,24 @@ def test_every_handled_implementation_is_called_only_through_its_operation() -> 
     assert sorted(set(direct)) == []
 
 
+def test_the_image_budgets_match_harbor_backends_pull_and_build_timeouts() -> None:
+    """`operations` restates them so the hashed launcher file stays unchanged; a change to
+    either timeout there must change the preflight budget too."""
+    timeouts: dict[str, object] = {}
+    for node in ast.walk(ast.parse(Path(harbor_backend.__file__).read_text())):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_docker"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value in ("pull", "build")
+        ):
+            [timeout] = [item.value for item in node.keywords if item.arg == "timeout"]
+            timeouts[str(node.args[0].value)] = ast.literal_eval(timeout)
+    assert timeouts == {"pull": operations.IMAGE_PULL, "build": operations.IMAGE_BUILD}
+
+
 def test_each_operation_budget_outlasts_its_implementations_own_timeouts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

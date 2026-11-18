@@ -383,14 +383,7 @@ def run_operation(
     started carries `launched`: the call is spent (`ledger.outcome`).
     """
     lock = _lock()
-    if lock.leftover:
-        from pluginbench.control_store import CleanupBlocked
-
-        # A failed cleanup halts new admission for the whole owner, whichever slot hit it.
-        raise CleanupBlocked(
-            "an earlier operation's cleanup was not verified, so this command starts no more "
-            "operations; the next command checks what it left first"
-        )
+    _refuse_after_failed_cleanup(lock)
     launcher = require_user_manager()
     spec = request.spec
     directory = lock.state / "invocations" / spec.id
@@ -550,11 +543,24 @@ def _admit(
             started(pid)
             # The lock can be lost while the callback waits; check again before the permit.
             lock.assert_owned()
+        # Another slot's cleanup may have failed since `run_operation` checked.
+        _refuse_after_failed_cleanup(lock)
         _send(connection, {"permit": spec.id})
     except BaseException:
         connection.close()
         raise
     return connection
+
+
+def _refuse_after_failed_cleanup(lock: run_lock.ExecutionLock) -> None:
+    """A failed cleanup halts new admission for the whole owner, whichever slot hit it."""
+    if lock.leftover:
+        from pluginbench.control_store import CleanupBlocked
+
+        raise CleanupBlocked(
+            "an earlier operation's cleanup was not verified, so this command starts no more "
+            "operations; the next command checks what it left first"
+        )
 
 
 def _wait(
