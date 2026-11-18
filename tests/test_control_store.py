@@ -315,6 +315,44 @@ def _live_call(tmp_path: Path) -> tuple[Path, subprocess.Popen[bytes]]:
     return run, child
 
 
+# Killed mid-write: the writer dies once its transaction has synced the rollback journal and
+# changed the ledger file itself, as during a commit. A one-page cache makes the write spill to
+# the file at once. The journal is then hot, and only a writable connection can roll it back.
+_KILLED_MID_WRITE = """
+import os, signal, sqlite3, sys
+db = sqlite3.connect(sys.argv[1], isolation_level=None)
+db.execute("PRAGMA cache_size = 1")
+db.execute("BEGIN IMMEDIATE")
+db.execute("UPDATE attempts SET state = 'complete'")
+db.execute("CREATE TABLE spill (x)")
+db.executemany("INSERT INTO spill VALUES (?)", [("x" * 1000,) for _ in range(200)])
+os.kill(os.getpid(), signal.SIGKILL)
+"""
+
+
+def test_recovery_reads_a_ledger_whose_writer_was_killed_mid_write(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    run, child = _live_call(tmp_path)
+    child.kill()
+    child.wait(timeout=5)
+    before = _rows(run)
+    killed = subprocess.run(
+        [sys.executable, "-c", _KILLED_MID_WRITE, str(run / LEDGER_NAME)], check=False
+    )
+    assert killed.returncode == -signal.SIGKILL
+    assert (run / f"{LEDGER_NAME}-journal").is_file()
+    _crashed_owner(isolated_host_state, kind="review", root=run, runtimes=[])
+
+    with pytest.raises(CleanupBlocked, match=_UNRELEASED):
+        with control_store.execute(_owner(tmp_path / "next")):
+            pytest.fail("an unreleased owner was not verified")
+
+    # The killed write is undone, as SQLite does on the next writable open; no row changed.
+    assert _rows(run) == before
+    assert not (run / f"{LEDGER_NAME}-journal").exists()
+
+
 def test_repair_checks_containers_only_once_the_processes_are_gone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
 ) -> None:
