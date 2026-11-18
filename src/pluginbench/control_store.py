@@ -174,7 +174,18 @@ def _now() -> str:
 class ControlStore:
     """The host control database. Short transactions; never held across an external command."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, readonly: bool = False) -> None:
+        if readonly:
+            # Writes nothing, not even the file's mode; an older database is refused, not upgraded.
+            self._db = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=5)
+            version = self._db.execute("PRAGMA user_version").fetchone()[0]
+            if version != SCHEMA_VERSION:
+                self._db.close()
+                raise sqlite3.DatabaseError(
+                    f"{path} has schema {version}, not {SCHEMA_VERSION}; the next PluginBench "
+                    "command that executes upgrades it"
+                )
+            return
         self._db = sqlite3.connect(path, timeout=5)
         try:
             path.chmod(0o600)
@@ -193,8 +204,8 @@ class ControlStore:
 
     @classmethod
     @contextmanager
-    def open(cls, state: Path) -> Iterator[ControlStore]:
-        store = cls(state / CONTROL_NAME)
+    def open(cls, state: Path, *, readonly: bool = False) -> Iterator[ControlStore]:
+        store = cls(state / CONTROL_NAME, readonly=readonly)
         try:
             yield store
         finally:
@@ -304,14 +315,14 @@ class ControlStore:
         rows = self._db.execute(f"SELECT {', '.join(keys)} FROM confirmations ORDER BY check_id")
         return [dict(zip(keys, row, strict=True)) for row in rows]
 
-    def confirm(self, checks: Sequence[tuple[Check, str]], root: str) -> str:
+    def confirm(self, checks: Sequence[tuple[Check, str]]) -> str:
         """Record the operator's confirmation of each unknown check, with its reason; return
         the time recorded."""
         at = _now()
         with self._db:
             self._db.executemany(
                 "INSERT OR REPLACE INTO confirmations VALUES (?, ?, ?, ?)",
-                [(check["id"], root, reason, at) for check, reason in checks],
+                [(check["id"], check["root"], reason, at) for check, reason in checks],
             )
         return at
 
@@ -593,6 +604,22 @@ def _coverage(
     return None if directory.exists() else "its operation never started"
 
 
+def obligation_name(obligation: dict[str, Any]) -> str:
+    """The ID of a dead owner's obligation: its process and when it took the lock."""
+    return f"{obligation.get('pid')}-{obligation.get('acquired_at')}"
+
+
+def _legacy(check: Check) -> bool:
+    """Whether nothing recorded could ever prove `check`, so only an operator can clear it: its
+    owner record predates the P4b runtime (or could not be read), it is a failed cleanup with no
+    operation ticket, or its call recorded no process identity with a boot. A check of a
+    ticketed operation or of a booted process can be proven once what it needs (Docker,
+    systemd) answers again; an operator's word never clears it."""
+    if not check.get("contained") or check["kind"] == "unrecorded":
+        return True
+    return check["kind"] == "invocation" and "boot_id" not in (check.get("identity") or {})
+
+
 def _obligation_checks(obligation: dict[str, Any], state: Path) -> list[Check]:
     """What a dead owner may have left running, as checks.
 
@@ -602,7 +629,7 @@ def _obligation_checks(obligation: dict[str, Any], state: Path) -> list[Check]:
     recorded as failed is an unknown check either way.
     """
     root = str(obligation["root"])
-    name = f"{obligation.get('pid')}-{obligation.get('acquired_at')}"
+    name = obligation_name(obligation)
     unreleased: Check = {
         "id": f"{name}:unreleased",
         "root": root,
@@ -611,7 +638,7 @@ def _obligation_checks(obligation: dict[str, Any], state: Path) -> list[Check]:
             f"the host's owner record in {root} is unreadable or invalid "
             f"({obligation['problem']}), so nothing it says can be trusted and what earlier "
             "commands left is unknown. Check that no PluginBench command, process or container "
-            "still runs; repair takes this directory as the root"
+            "still runs; `pluginbench app cleanup --confirm-stopped` takes this directory as the root"
             if "problem" in obligation
             else f"`{obligation.get('kind')}` for {root} ended without a clean release, and the "
             "earlier PluginBench build that ran it cannot prove that everything it started has "
@@ -648,7 +675,7 @@ def _obligation_checks(obligation: dict[str, Any], state: Path) -> list[Check]:
 
 def _work_checks(obligation: dict[str, Any], state: Path) -> list[Check]:
     root = str(obligation["root"])
-    name = f"{obligation.get('pid')}-{obligation.get('acquired_at')}"
+    name = obligation_name(obligation)
     path = _ledger(Path(root))
     if obligation.get("kind") in UNRECORDED_KINDS or path is None:
         return []  # No ledger records its processes; the owner's own check covers them.
@@ -921,21 +948,31 @@ def verify_crashed(
 
 
 def confirm_stopped(
-    lock: ExecutionLock, root: Path
+    lock: ExecutionLock, root: str
 ) -> tuple[list[tuple[Check, str]], str, int]:
-    """Verify the obligations that name exactly `root` again, then record the operator's word
-    for each check that is still unknown. Refuses while any check finds a survivor.
+    """Verify the obligations `root` names again, then record the operator's word for each check
+    that is still unknown and that nothing recorded could ever prove (`_legacy`). Refuses while
+    any check finds a survivor, or while a check recorded under the P4b runtime is unknown.
 
-    Returns the confirmed checks, the time recorded, and how many obligations of other roots
-    remain.
+    `root` is a run root exactly as an obligation records it, that path resolved, or an
+    obligation's ID (`obligation_name`); the path need not exist, so a deleted run's
+    obligations can be cleared. Returns the confirmed checks, the time recorded, and how many
+    obligations remain.
     """
-    target = str(root.resolve())
+    names = {root, str(Path(root).expanduser().resolve())}
     pending: list[dict[str, Any]] = lock.record["pending"]
-    matching = [item for item in pending if item.get("root") == target]
+
+    def named(item: dict[str, Any]) -> bool:
+        return item.get("root") in names or obligation_name(item) == root
+
+    matching = [item for item in pending if named(item)]
     if not matching:
-        roots = sorted({str(item.get("root")) for item in pending}) or ["none"]
+        known = sorted(
+            f"{item.get('root')} (or {obligation_name(item)})" for item in pending
+        ) or ["none"]
         raise ValueError(
-            f"no open obligation names {target}; repair takes one of: {', '.join(roots)}"
+            f"no open obligation names {root}; `pluginbench app cleanup --confirm-stopped` "
+            f"takes one of: {', '.join(known)}"
         )
     checks = [check for item in matching for check in _obligation_checks(item, lock.state)]
     deadline = _deadline()  # Shared by both passes.
@@ -953,11 +990,17 @@ def confirm_stopped(
             unknown = [*processes, *containers]
         if blocked:
             raise CleanupBlocked(
-                f"{'; '.join(blocked)}. repair confirms only what cannot be checked, so nothing "
-                "was confirmed"
+                f"{'; '.join(blocked)}. `app cleanup --confirm-stopped` confirms only what "
+                "cannot be checked, so nothing was confirmed"
             )
-        at = store.confirm(unknown, target)
-    rest = [item for item in pending if item.get("root") != target]
+        if recorded := [reason for check, reason in unknown if not _legacy(check)]:
+            raise CleanupBlocked(
+                f"{'; '.join(reason.split('. Once')[0] for reason in recorded)}. PluginBench "
+                "recorded these itself and can check them once Docker and systemd answer: "
+                "restore the daemon and retry `pluginbench app cleanup`. Nothing was confirmed"
+            )
+        at = store.confirm(unknown)
+    rest = [item for item in pending if not named(item)]
     lock.settle(rest)
     return unknown, at, len(rest)
 

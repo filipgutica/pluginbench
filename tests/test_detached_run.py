@@ -8,7 +8,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 import pytest
 import yaml
@@ -18,24 +18,30 @@ import pluginbench
 from fake_systemd import FakeSystemd
 from fake_systemd import fake_systemd_fixture  # noqa: F401  (the fake_systemd fixture)
 from launch_support import launches, ticket, until
-from pluginbench import cli, coordinator, invocation_runtime, run_lock
+from pluginbench import cli, control_store, coordinator, invocation_runtime, run_lock
 from pluginbench.control_store import ControlStore
 from pluginbench.isolation import RuntimeDriftError
 
 _SOURCE = str(Path(pluginbench.__file__).parents[1])
 
 # Stands in for `pluginbench run RUN --launch ID`: claims its launch, records the PATH it got,
-# and owns the run until stopped.
+# and owns the run until stopped, checking for a recorded stop before each job it would admit.
+# It records what stopped it. PB_TEST_STOP_POLL slows its stop wake-up.
 _WORKER = """
 import os, sys, time
 from pathlib import Path
 from pluginbench import control_store, run_lock
+control_store.STOP_POLL = float(os.environ.get("PB_TEST_STOP_POLL", control_store.STOP_POLL))
 state, root, launch_id = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
 (root / "worker-path").write_text(os.environ["PATH"])
 owner = run_lock.ExecutionOwner(kind="run", eval=str(root), root=str(root), launch_id=launch_id)
-with control_store.execute(owner, state=state), run_lock.hold(root):
-    while not (root / "stop-at-once").exists():
-        time.sleep(0.02)
+try:
+    with control_store.execute(owner, state=state), run_lock.hold(root):
+        while not (root / "stop-at-once").exists():
+            run_lock.check_stop()
+            time.sleep(0.02)
+except KeyboardInterrupt as stopped:
+    (root / "stopped-by").write_text(type(stopped).__name__)
 """
 
 
@@ -92,10 +98,13 @@ def test_a_stop_whose_signal_is_lost_still_stops_the_background_worker(
     fake_systemd: FakeSystemd, isolated_host_state: Path, tmp_path: Path, planned: None,
     worker: None, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Neither `stop`'s SIGTERM nor the worker's own wake-up arrives: only the record can stop it.
     monkeypatch.setattr(run_lock, "stop", lambda root: None)
+    monkeypatch.setenv("PB_TEST_STOP_POLL", "3600")
     _start_and_stop(tmp_path, isolated_host_state)
     (launch,) = launches(isolated_host_state).values()
     assert launch.desired == "stop"
+    assert (tmp_path / "stopped-by").read_text() == "StopRequested"
 
 
 @pytest.mark.systemd
@@ -131,6 +140,40 @@ def test_a_host_without_systemd_refuses_the_run_before_anything_starts(
     assert not (isolated_host_state / "control.sqlite").exists() or not launches(
         isolated_host_state
     )
+
+
+@pytest.mark.real_operations
+def test_a_host_without_systemd_refuses_a_config_before_it_is_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
+) -> None:
+    (tmp_path / "empty").mkdir()
+    (tmp_path / "eval.yaml").write_text("{}")
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.setattr(cli, "load_evaluation", lambda path: pytest.fail("loaded without systemd"))
+    result = CliRunner().invoke(cli.app, ["run", str(tmp_path / "eval.yaml"), "--yes"])
+    assert result.exit_code == 2
+    assert "systemd-run or systemctl is not installed" in result.stderr
+
+
+@pytest.mark.real_operations
+def test_a_command_that_takes_the_host_as_run_releases_it_fences_the_background_run(
+    fake_systemd: FakeSystemd, isolated_host_state: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, planned: None, worker: None,
+) -> None:
+    detach = cli._detach
+
+    def another_command_first(*args: Any, **kwargs: Any) -> None:
+        other = run_lock.ExecutionOwner(kind="review", eval="/other", root="/other")
+        with control_store.execute(other):
+            pass
+        detach(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "_detach", another_command_first)
+    result = CliRunner().invoke(cli.app, ["run", str(tmp_path), "--yes"])
+    assert result.exit_code == 2
+    assert "another command took the host first" in result.stderr
+    assert not (tmp_path / "worker-path").exists()
+    assert [launch.status for launch in launches(isolated_host_state).values()] == ["finished"]
 
 
 @pytest.mark.real_operations

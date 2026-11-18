@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -107,6 +108,12 @@ def _error(exc: Exception, *, exit_code: int = 2) -> None:
         typer.echo(_readiness_table(exc.report), err=True)
     typer.echo(f"Error: {exc}", err=True)
     raise typer.Exit(exit_code)
+
+
+def _control_error(exc: sqlite3.Error) -> ValueError:
+    """A failure of the host control database, as an error the command reports."""
+    path = run_lock.state_root() / control_store.CONTROL_NAME
+    return ValueError(f"the host control database {path} could not be used: {exc}")
 
 
 def _readiness_table(report: dict[str, object]) -> str:
@@ -340,10 +347,12 @@ def _preflight(
         raise CheckFailed(report, report["findings"], root / "check.json") from None
 
 
-def _detach(root: Path, *, notify: bool) -> None:
-    """Start the run as a worker in its own systemd scope; return once it owns the host and
-    the run's run.lock."""
-    launched = coordinator.launch(coordinator.LaunchRequest("run", root, notify=notify))
+def _detach(
+    root: Path, request: coordinator.LaunchRequest, reserved: control_store.Launch
+) -> None:
+    """Start the run as a worker in its own systemd scope, under the launch reserved for it;
+    return once it owns the host and the run's run.lock."""
+    launched = coordinator.launch(request, reserved=reserved)
     process = launched.process or {}
     # The worker claims its launch as it takes the host, then takes run.lock.
     deadline = time.monotonic() + invocation_runtime.GATE_SECONDS
@@ -447,6 +456,9 @@ def run(
                 raise ValueError(
                     f"{target} does not exist; give an evaluation YAML or JSON, or a run directory"
                 )
+            if not dry_run:
+                # A host that cannot contain the run refuses before anything is planned.
+                invocation_runtime.require_user_manager()
             evaluation = None
             if target.is_dir():
                 if output is not None:
@@ -490,11 +502,17 @@ def run(
             if foreground:
                 _work(root, lock=lock, progress=progress, notify=notify)
             else:
-                # The background run takes the host execution lock itself.
+                # The background run takes the host execution lock itself. Its launch is
+                # recorded first, while this command still holds the host, so a command that
+                # takes the host once it is released fences the launch: the two never race.
+                request = coordinator.LaunchRequest("run", root, notify=notify)
+                reserved = coordinator.reserve(request)
                 owned.close()
-                _detach(root, notify=notify)
+                _detach(root, request, reserved)
     except _EXPECTED_RUN_ERRORS as exc:
         _error(exc)
+    except sqlite3.Error as exc:
+        _error(_control_error(exc))
 
 
 @app.command("resume")
@@ -612,22 +630,31 @@ def stop(
 ) -> None:
     """Stop a run: record the stop for its background launch, then SIGTERM only the process
     group its run.lock records; nothing else. The worker checks the recorded stop before it
-    records each new call, so a lost signal cannot let it start another."""
+    admits each new job, so a lost signal cannot let it start another."""
+    unrecorded: Exception | None = None
     try:
         requested = coordinator.request_stop(run)
+    except (OSError, sqlite3.Error) as exc:
+        requested, unrecorded = [], exc
+        typer.echo(f"Error: the stop could not be recorded ({exc}); signalling only.", err=True)
+    if requested:
+        typer.echo(f"Stop recorded for {run}: its background launch admits no further job.")
+    try:
         owner = run_lock.stop(run)
     except (OSError, ValueError) as exc:
-        _error(exc)
+        if not requested:
+            _error(exc)
+        typer.echo(f"Nothing signalled: {exc}")
         return
-    if owner is None and requested:
-        typer.echo(f"Stop recorded for {run}; its worker starts no further call.")
-    elif owner is None:
-        typer.echo(f"No active run owns {run}; nothing signalled.")
+    if owner is None:
+        typer.echo(f"No live process holds {run / run_lock.LOCK_NAME}; nothing signalled.")
     else:
         typer.echo(
             f"Sent SIGTERM to process group {owner['pgid']}. Attempts already coding finish "
             "and are kept; no new attempt starts."
         )
+    if unrecorded is not None:
+        raise typer.Exit(1)
 
 
 @app_commands.callback(invoke_without_command=True)
@@ -647,6 +674,9 @@ def app_start(
     except (OSError, ValueError) as exc:
         _error(exc)
         return
+    except sqlite3.Error as exc:
+        _error(_control_error(exc))
+        return
     typer.echo(
         f"Coordinator running: process {found['pid']}, launch {found['launch_id']}, "
         f"since {found['started_at']}."
@@ -664,6 +694,9 @@ def app_stop() -> None:
     except (OSError, ValueError) as exc:
         _error(exc)
         return
+    except sqlite3.Error as exc:
+        _error(_control_error(exc))
+        return
     if found is None:
         typer.echo("No coordinator runs on this host.")
     else:
@@ -679,6 +712,9 @@ def app_status(
         current = coordinator.status()
     except (OSError, ValueError) as exc:
         _error(exc)
+        return
+    except sqlite3.Error as exc:
+        _error(_control_error(exc))
         return
     if as_json:
         typer.echo(json.dumps(current, indent=2))
@@ -716,19 +752,25 @@ def app_status(
 
 @app_commands.command("cleanup")
 def app_cleanup(
-    confirm_stopped: Path | None = typer.Option(
+    confirm_stopped: str | None = typer.Option(
         None,
         "--confirm-stopped",
         metavar="ROOT",
-        help="Confirm you checked that nothing the crashed calls under ROOT started still runs.",
+        help=(
+            "Confirm you checked that nothing the crashed calls under ROOT started still runs. "
+            "ROOT is the run root a host block names (it need not exist any more), or its "
+            "obligation ID."
+        ),
     ),
 ) -> None:
     """Verify everything a crashed command may have left, so the host can execute again. No
     model call and no new work.
 
-    With --confirm-stopped ROOT, ROOT must be exactly the root a host block names. Every check
-    runs again first; only checks that still cannot tell are confirmed, never one that finds
-    something running. Each confirmation is recorded with its time.
+    With --confirm-stopped ROOT, ROOT must be exactly the root a host block names, or its
+    obligation ID. Every check runs again first. Only checks that still cannot tell, and that
+    were recorded before this PluginBench could prove them, are confirmed: never one that finds
+    something running, and never one this PluginBench recorded, which waits for Docker or
+    systemd to answer again. Each confirmation is recorded with its time.
     """
     try:
         if confirm_stopped is None:
@@ -738,7 +780,7 @@ def app_cleanup(
                 pass
             typer.echo("Every check passed; the host is clean.")
             return
-        target = str(confirm_stopped.resolve())
+        target = str(Path(confirm_stopped).expanduser().resolve())
         owner = run_lock.ExecutionOwner(kind="recovery", eval=target, root=target)
         with run_lock.hold_execution(owner) as lock:
             confirmed, at, remaining = control_store.confirm_stopped(lock, confirm_stopped)
@@ -748,7 +790,7 @@ def app_cleanup(
     for check, reason in confirmed:
         typer.echo(f"Confirmed stopped at {at}: {check['id']} ({reason.split('. Once')[0]})")
     if not confirmed:
-        typer.echo(f"Every check for {confirm_stopped.resolve()} passed; nothing needed confirming.")
+        typer.echo(f"Every check for {confirm_stopped} passed; nothing needed confirming.")
     typer.echo(
         f"{remaining} other run{'s' if remaining != 1 else ''} still wait for cleanup."
         if remaining

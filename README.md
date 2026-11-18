@@ -27,10 +27,12 @@ When a task ships a reference solution (`solution/solution.patch`), code measure
 
 ## Requirements
 
-PluginBench runs on Linux or macOS. Every run needs:
+PluginBench executes on Linux only: `run`, `check`, `review`, `measure` and `judge run` refuse on a host without a reachable systemd user manager, which includes macOS and most containers. Commands that only read saved results, such as `status`, `compare` and `dashboard`, do not need it. Every run needs:
 
 | Tool | Version | Why |
 | --- | --- | --- |
+| systemd | 255 or later, with a user manager for your account (`systemctl --user is-system-running` prints `running` or `degraded`) | Each run and each call runs in its own transient scope, so it outlives the terminal that started it and is stopped completely |
+| cgroup v2 | Mounted at `/sys/fs/cgroup` | Proves a scope's processes are gone before the next command starts |
 | Python | 3.12 or later | Runs PluginBench |
 | Git | Any recent | Task sources and patches |
 | Docker | Linux containers on a local Unix socket, with Compose and Buildx | Each attempt and its verifier run in containers |

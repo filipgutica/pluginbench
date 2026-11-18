@@ -1484,6 +1484,9 @@ def test_repair_never_confirms_a_known_survivor(
     try:
         result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)])
         assert result.exit_code == 2 and f"has processes {child.pid}" in result.stderr
+        assert "`app cleanup --confirm-stopped` confirms only what cannot be checked" in (
+            result.stderr
+        )
         with ControlStore.open(isolated_host_state) as store:
             assert store.confirmations() == []
         assert not _admitted(isolated_host_state, tmp_path)
@@ -1567,3 +1570,132 @@ def test_an_unverified_holder_turns_reconciling_after_30_seconds_and_is_never_to
         holder.kill()
         holder.wait(timeout=5)
     assert watch.poll() == "free" and _reconciling(state) is None
+
+
+# `app cleanup` without --confirm-stopped, and --confirm-stopped narrowed to legacy items.
+
+
+def test_plain_cleanup_refuses_while_a_call_of_a_dead_owner_still_runs(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    run, child = _live_call(tmp_path)
+    _crashed_owner(isolated_host_state, kind="review", root=run, runtimes=[])
+    try:
+        result = CliRunner().invoke(cli.app, ["app", "cleanup"])
+        assert result.exit_code == 2 and f"has processes {child.pid}" in result.stderr
+        assert "the host is clean" not in result.stdout
+        assert [item["root"] for item in _record(isolated_host_state)["pending"]] == [str(run)]
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+
+
+_HOLDER = """
+import sys, time
+from pathlib import Path
+from pluginbench import run_lock
+state, root = Path(sys.argv[1]), sys.argv[2]
+owner = run_lock.ExecutionOwner(kind="run", eval=root, root=root)
+with run_lock.hold_execution(owner, state=state):
+    (state / "ready").write_text("ready")
+    time.sleep(30)
+"""
+
+
+def test_plain_cleanup_refuses_while_another_command_executes(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _HOLDER, str(isolated_host_state), str(tmp_path / "busy")],
+        env={**os.environ, "PYTHONPATH": f"{_SOURCE}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"},
+    )
+    try:
+        while not (isolated_host_state / "ready").exists():
+            assert holder.poll() is None
+            time.sleep(0.02)
+        result = CliRunner().invoke(cli.app, ["app", "cleanup"])
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)
+    assert result.exit_code == 2
+    assert f"already executing on this host: run for {tmp_path / 'busy'}" in result.stderr
+
+
+def test_cleanup_hints_and_refusals_name_app_cleanup_not_repair(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    _crashed_owner(isolated_host_state, kind="judge", root=tmp_path / "one", runtimes=[])
+    result = CliRunner().invoke(
+        cli.app, ["app", "cleanup", "--confirm-stopped", str(tmp_path / "other")]
+    )
+    assert result.exit_code == 2
+    assert "`pluginbench app cleanup --confirm-stopped` takes one of" in result.stderr
+    (isolated_host_state / run_lock.EXECUTION_OWNER).write_text("{")
+    with pytest.raises(CleanupBlocked) as refused:
+        with control_store.execute(_owner(tmp_path / "next")):
+            pass
+    assert "`pluginbench app cleanup --confirm-stopped` takes this directory" in str(refused.value)
+    assert "repair" not in str(refused.value).replace("app cleanup", "")
+
+
+def test_cleanup_confirms_a_deleted_runs_legacy_obligation_by_its_root_or_its_id(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    gone = tmp_path / "deleted" / "run"  # Recorded, then deleted with its parent.
+    _crashed_owner(isolated_host_state, kind="judge", root=gone, runtimes=[], acquired_at="a")
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(gone)])
+    assert result.exit_code == 0, result.output
+    assert _record(isolated_host_state)["pending"] == []
+
+    _crashed_owner(isolated_host_state, kind="judge", root=gone, runtimes=[], acquired_at="b")
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", "7-b"])
+    assert result.exit_code == 0, result.output
+    assert "The host is unblocked." in result.stdout
+    assert _record(isolated_host_state)["pending"] == []
+
+
+def test_cleanup_never_confirms_an_unknown_the_runtime_recorded_itself(
+    tmp_path: Path, isolated_host_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A contained owner (schema 3) died with one recorded operation; systemd cannot answer.
+    op = "0" * 32
+    operation = {
+        "id": op, "scope": f"pb-inv-{op}.scope", "label": f"pluginbench.invocation={op}",
+        "docker": None, "dir": str(isolated_host_state / "invocations" / op),
+    }
+    record = {
+        "schema": run_lock.CONTAINED_SCHEMA, "pid": 7, "acquired_at": "earlier", "kind": "judge",
+        "root": str(tmp_path), "state": "active", "operations": [operation], "pending": [],
+    }
+    (isolated_host_state / run_lock.EXECUTION_OWNER).write_text(json.dumps(record))
+
+    def unknown(operation: Any, **kwargs: Any) -> None:
+        raise CleanupUnknown("systemd could not be asked about scope pb-op-1.scope")
+
+    monkeypatch.setattr(invocation_runtime, "verify_scope", unknown)
+    monkeypatch.setattr(invocation_runtime, "verify_labelled", lambda operation, **kwargs: None)
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(tmp_path)])
+    assert result.exit_code == 2
+    assert "restore the daemon and retry `pluginbench app cleanup`" in result.stderr
+    assert "Nothing was confirmed" in result.stderr
+    with ControlStore.open(isolated_host_state) as store:
+        assert store.confirmations() == []
+    assert not _admitted(isolated_host_state, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("check", "legacy"),
+    [
+        ({"kind": "scope"}, True),  # Its owner predates the P4b runtime.
+        ({"kind": "unrecorded", "contained": True}, True),  # A failed cleanup with no ticket.
+        ({"kind": "invocation", "contained": True, "identity": {"pid": 1}}, True),  # No boot.
+        ({"kind": "invocation", "contained": True, "identity": None}, True),
+        ({"kind": "invocation", "contained": True, "identity": {"pid": 1, "boot_id": "b"}}, False),
+        ({"kind": "scope", "contained": True}, False),
+        ({"kind": "labelled", "contained": True}, False),
+    ],
+)
+def test_only_a_check_nothing_recorded_can_prove_is_legacy(
+    check: dict[str, Any], legacy: bool
+) -> None:
+    assert control_store._legacy(check) is legacy
