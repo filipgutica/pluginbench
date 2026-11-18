@@ -504,9 +504,10 @@ def launch(
     The worker takes the host execution lock itself, so a command that takes it first wins:
     the launch is then fenced, the worker exits without work, and this raises LaunchFenced.
     The handshake is the worker holding the host for this launch within the startup gate; one
-    that misses it is stopped, never left. A worker that holds the host claims only once it has
-    recovered the last owner, so it gets CLAIM_SECONDS more; one that still has not claimed is
-    fenced, never stopped while it holds the lock, and exits without work once it checks.
+    that misses it is fenced, then stopped unless it is seen holding the host after the fence.
+    A worker that holds the host claims only once it has recovered the last owner, so it gets
+    CLAIM_SECONDS more; one that still has not claimed is fenced. A worker seen holding the
+    host after its fence is left to exit without work by itself once it checks.
     """
     state = state or run_lock.state_root()
     try:
@@ -544,10 +545,18 @@ def launch(
             if holding_until is None and _holds_host(state, launch_id):
                 holding_until = time.monotonic() + CLAIM_SECONDS
             if holding_until is None and current.expired:
+                # Fence before looking again, so a worker that takes the host after this look
+                # can no longer claim.
+                if not store.fence(launch_id):
+                    continue  # It claimed meanwhile, or another command fenced it.
                 if _holds_host(state, launch_id):
-                    # It took the host just as its gate passed: await its claim, never stop it.
-                    holding_until = time.monotonic() + CLAIM_SECONDS
-                    continue
+                    # It took the host just as its gate passed: never stop it while it holds
+                    # the host; it fails its claim and exits without work.
+                    raise LaunchFenced(
+                        f"the background {request.kind} for {target} took the host just as its "
+                        f"{invocation_runtime.GATE_SECONDS:g}-second startup gate passed, so its "
+                        "launch was fenced: it exits without work once it checks"
+                    )
                 failure = (
                     f"it did not start within {invocation_runtime.GATE_SECONDS:g} seconds; see "
                     f"{target / 'run.log'}"

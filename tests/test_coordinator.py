@@ -317,43 +317,68 @@ def test_a_worker_still_recovering_after_the_gate_is_awaited_not_killed(
     assert (run_lock.execution_owner(isolated_host_state).record or {}).get("state") == "released"
 
 
-def test_a_worker_that_takes_the_host_as_its_gate_passes_is_awaited_not_killed(
+# A worker that takes the host only once `go` exists, recovers until `landed` exists, and
+# records whether its launch was fenced.
+_LATE_TAKER = """
+import sys, time
+from pathlib import Path
+from pluginbench import control_store, run_lock
+state, root, launch_id = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+settle = control_store._settle_launches
+def slow(store, own):
+    while not (root / "landed").exists():
+        time.sleep(0.01)
+    settle(store, own)
+control_store._settle_launches = slow
+while not (root / "go").exists():
+    time.sleep(0.01)
+owner = run_lock.ExecutionOwner(kind="run", eval=str(root), root=str(root), launch_id=launch_id)
+try:
+    with control_store.execute(owner, state=state):
+        (root / "bodies").write_text("ran\\n")
+except control_store.LaunchFenced:
+    (root / "outcome").write_text("fenced")
+"""
+
+
+def test_a_worker_that_takes_the_host_as_its_gate_passes_exits_by_itself(
     fake_systemd: FakeSystemd,
     isolated_host_state: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(invocation_runtime, "GATE_SECONDS", 5.0)
+    monkeypatch.setattr(invocation_runtime, "GATE_SECONDS", 1.0)
     monkeypatch.setattr(
         coordinator,
         "_worker_argv",
         lambda request, launch_id: [
-            sys.executable, "-c", _SLOW_RECOVERY, str(isolated_host_state), str(request.target),
+            sys.executable, "-c", _LATE_TAKER, str(isolated_host_state), str(request.target),
             launch_id,
         ],
     )
     monkeypatch.setenv("PYTHONPATH", _env()["PYTHONPATH"])
-    holds = coordinator._holds_host
-    missed: list[bool] = []
+    fence = ControlStore.fence
 
-    def late(state: Path, launch_id: str) -> bool:
-        # The launcher's looks before the gate, and its first look after it, miss the worker,
-        # as when it takes the host between that look and the gate's end.
-        expired = launches(state)[launch_id].expired
-        if not expired or True not in missed:
-            missed.append(expired)
-            return False
-        return holds(state, launch_id)
+    def taken_first(store: ControlStore, launch_id: str) -> bool:
+        # The gate has passed and the launcher missed the worker; the worker takes the host
+        # now, and is still recovering when the launcher's fence lands.
+        (tmp_path / "go").touch()
+        until(lambda: (run_lock.execution_owner(isolated_host_state).record or {}).get(
+            "launch_id") == launch_id)
+        try:
+            return fence(store, launch_id)
+        finally:
+            (tmp_path / "landed").touch()
 
-    monkeypatch.setattr(coordinator, "_holds_host", late)
-    try:
-        launched = coordinator.launch(coordinator.LaunchRequest("run", tmp_path))
-        assert launched.status == "active"
-        until(lambda: len(_bodies(tmp_path)) == 1)
-    finally:
-        (tmp_path / "release").touch()
-    until(lambda: launches(isolated_host_state)[launched.launch_id].status == "finished")
-    assert (run_lock.execution_owner(isolated_host_state).record or {}).get("state") == "released"
+    monkeypatch.setattr(ControlStore, "fence", taken_first)
+    with pytest.raises(LaunchFenced, match="took the host just as its 1-second startup gate"):
+        coordinator.launch(coordinator.LaunchRequest("run", tmp_path))
+    # It was not stopped holding the host: it failed its claim and exited by itself, cleanly.
+    until(lambda: (tmp_path / "outcome").exists())
+    assert (tmp_path / "outcome").read_text() == "fenced"
+    assert _bodies(tmp_path) == []
+    until(lambda: (run_lock.execution_owner(isolated_host_state).record or {}).get("state")
+          == "released")
 
 
 def test_abandoning_a_launch_its_worker_claimed_first_leaves_it_running(
