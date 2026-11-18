@@ -860,8 +860,9 @@ def docker_cli_now(what: str) -> str:
 
 def _engine_answer(output: str) -> tuple[str | None, str | None, str]:
     """From `docker info --format '{{json .}}'`: the engine ID, the CLI version, and why there
-    is no ID. The CLI can exit 0 without a daemon: before 28.1 with nothing on stdout, and
-    later with the error in ServerErrors, so only an ID with no server error counts."""
+    is no ID. Some CLIs exit 0 without a working daemon: before 28.1 with nothing on stdout,
+    and from 28.1 with some server errors in ServerErrors (29.x exits 1 for a socket it cannot
+    reach). So only an ID with no server error counts."""
     try:
         info = json.loads(output)
     except ValueError:
@@ -901,7 +902,7 @@ def verify_labelled(operation: dict[str, Any], *, deadline: float) -> dict[str, 
     engine = runtime.get("docker_engine") or {}
     endpoint, recorded = str(engine.get("endpoint")), engine.get("id")
     label, phase = operation["label"], min(deadline, time.monotonic() + CONTAINER_SECONDS)
-    if not recorded:
+    if not isinstance(recorded, str) or not recorded:
         raise CleanupUnknown(
             f"no Docker engine ID was recorded for the containers labelled {label}, so the "
             f"engine at {endpoint} cannot be shown to be the one that ran them"
@@ -920,6 +921,11 @@ def verify_labelled(operation: dict[str, Any], *, deadline: float) -> dict[str, 
         try:
             actual, version, problem = _engine_answer(docker("info", "--format", "{{json .}}"))
         except CleanupUnknown as exc:
+            if exc.__cause__ is None:  # Out of time before Docker was asked: not an answer.
+                raise CleanupUnknown(
+                    f"cleanup ran out of time before Docker at {endpoint} was asked about the "
+                    f"containers labelled {label}"
+                ) from exc
             actual, version, problem = None, None, str(exc.__cause__)
         used["version"] = version or used["version"]
         if actual is None:
@@ -947,7 +953,8 @@ def verify_labelled(operation: dict[str, Any], *, deadline: float) -> dict[str, 
             )
         raise DaemonReplaced(
             f"{where}, and it holds none of them. Before you confirm, check that the recorded "
-            f"engine is not running at another socket (checked with {cli}, Docker CLI "
+            "engine is not running at another socket, and that none of its containers still "
+            f"run, as they can under live-restore (checked with {cli}, Docker CLI "
             f"{used['version'] or 'of unknown version'})"
         )
 

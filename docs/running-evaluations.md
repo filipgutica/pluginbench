@@ -574,7 +574,7 @@ If a check finds something still running, the command refuses to start and names
 - an obligation of an earlier PluginBench build, or of an owner record that could not be read;
 - a failed cleanup recorded without its operation;
 - a call recorded without a process identity and its boot;
-- containers whose recorded Docker engine no longer answers at its endpoint: another engine answers there, and it holds none of the operation's labelled containers. Before you confirm, check that the recorded engine is not running at another socket.
+- containers whose recorded Docker engine no longer answers at its endpoint: another engine answers there, and it holds none of the operation's labelled containers. Before you confirm, check that the recorded engine is not running at another socket, and that none of its containers still run, as they can under live-restore.
 
 It never confirms something it finds running. It also refuses an item this PluginBench recorded with its operation, scope and label, or with its boot, that cannot be checked now, for example because Docker does not answer: restore the daemon and retry `pluginbench app cleanup`.
 
