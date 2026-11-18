@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -1588,6 +1589,21 @@ def test_changed_line_coverage_and_redundant_added_tests(tmp_path: Path) -> None
     assert changed["redundant_added_tests"] == 1
     # A test that reaches no added line is reported separately, not as redundant.
     assert changed["added_tests_without_added_lines"] == 1
+
+
+@pytest.mark.parametrize("path", ["src/a:b.js", "src/a:b.py", "src/a.js:12"])
+def test_coverage_refuses_colon_measured_paths(path: str) -> None:
+    report: dict[str, object] = {"lines": {"total": [path + ":1"], "covered": []},
+                                "files_measured": ["src/a.js", path]}
+    with pytest.raises(ValueError, match="measured paths.*colons"):
+        assessment_metrics._coverage(report, {path, "src/a.js", "src/a"}, ["src/**"])
+
+
+def test_long_colon_function_name_has_bounded_runtime() -> None:
+    script = ("from pluginbench.assessment_metrics import _coverage\n"
+              "report={'functions':{'total':['src/a.js:1:'+':'*1_000_000],'covered':[]},'files_measured':['src/a.js']}\n"
+              "assert _coverage(report, {'src/a.js'}, ['src/**'])['function_total']==1\n")
+    subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, timeout=3)
 
 
 def test_changed_line_coverage_is_incomplete_when_an_added_source_file_is_unmeasured(

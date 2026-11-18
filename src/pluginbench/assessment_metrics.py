@@ -485,6 +485,12 @@ def _lcov_instrumented_scope(
 
 
 def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> dict[str, object]:
+    measured_value = report.get("files_measured")
+    measured = (
+        set(_strings(measured_value, "files_measured")) if measured_value is not None else set()
+    )
+    if any(":" in path for path in measured):
+        raise ValueError("coverage measured paths must not contain colons")
     test_scope = (
         [name.removeprefix("./") for name in _strings(report["test_scope"], "test scope")]
         if report.get("test_scope") is not None
@@ -502,10 +508,6 @@ def _coverage(report: dict[str, object], files: set[str], scope: list[str]) -> d
     if not populations:
         raise ValueError("coverage requires at least one explicit measured population")
     covered_branches = populations.get("branches", (set(), set()))[1]
-    measured_value = report.get("files_measured")
-    measured = (
-        set(_strings(measured_value, "files_measured")) if measured_value is not None else set()
-    )
     for path in measured:
         _source_path(path, files, scope)
     expected, go_build = _go_build_scope(report, coverage_sources(files, scope), measured)

@@ -20,6 +20,8 @@ VERSIONS: dict[str, int] = {
     # Version 2 adds Go line populations, so a profile version 1 froze reads differently.
     "coverage_observer": 2,
     "mutation_observer": 1,
+    # Version 9 applies name refusal only to supported tool-source suffixes.
+    "measurement_tools": 9,
     # Version 3 resolves Codex launches and grants its selected release and helper binaries.
     "local_sandbox": 3,
 }
@@ -50,6 +52,10 @@ FILES: dict[str, tuple[str, ...]] = {
         "observer_data/go-mutation-v1/main.go",
     ),
     "local_sandbox": ("isolation.py",),
+    "measurement_tools": (
+        "measurement_tools.py", "coverage_tools/launch-coverage.py", "coverage_tools/coverage-config.ini",
+        "coverage_tools/launch-c8.cjs", "coverage_tools/c8-config.json",
+    ),
 }
 
 # Every content each file had on main from 942f12c up to 34386c5, before versions were

@@ -465,9 +465,18 @@ def tsc_errors(stdout: str, site: Site | None = None) -> Counter[str]:
 # --- Collection ----------------------------------------------------------------------------
 
 
-def native_executor(identity: dict[str, object], report_path: str) -> Executor:
+def native_executor(
+    identity: dict[str, object], report_path: str, *, provisioned_tool: object = None,
+    provisioned_scope: list[str] | None = None
+) -> Executor:
     """Run commands with `run_native_command` in the frozen task image, timing each run."""
     from pluginbench.harbor_backend import run_native_command
+    from pluginbench.measurement_tools import ProvisionedCommandOptions, read_tool
+
+    tool = read_tool(provisioned_tool)
+    tool_options: ProvisionedCommandOptions = (
+        {"provisioned_tool": tool, "provisioned_scope": provisioned_scope} if tool is not None else {}
+    )
 
     def execute(tree: Path, command: list[str], timeout: int, destination: Path) -> Run:
         started = time.monotonic()
@@ -479,6 +488,8 @@ def native_executor(identity: dict[str, object], report_path: str) -> Executor:
                 command=command,
                 report_path=report_path,
                 timeout=timeout,
+                produce_report=False,
+                **tool_options,
             )
         except (OSError, subprocess.TimeoutExpired, ValueError) as error:
             # The launcher, a pinned file, raises ValueError for an integrity violation and for a
@@ -498,8 +509,7 @@ def native_executor(identity: dict[str, object], report_path: str) -> Executor:
             (destination / PRELAUNCH_FAILURE).write_text(json.dumps({"error": reason}))
             raise InfrastructureFailure(reason) from error
         finally:
-            # execution.json keeps the digests of both exports and of the coverage report,
-            # which mutation never reads; the copies themselves are not kept.
+            # Mutation keeps status/integrity receipts, never coverage reports or source copies.
             for name in ("before", "after"):
                 shutil.rmtree(destination / name, ignore_errors=True)
             for report in destination.glob("report.raw*"):
@@ -675,7 +685,10 @@ def _collect(
     identity = config["native_task_identity"]
     assert isinstance(coverage, dict) and isinstance(identity, dict)
     if execute is None:
-        execute = native_executor(identity, str(coverage["report_path"]))
+        execute = native_executor(
+            identity, str(coverage["report_path"]), provisioned_tool=coverage.get("provisioned_tool"),
+            provisioned_scope=_strings(coverage.get("source_scope") or ["*"])
+        )
     run = _Runner(execute, destination, _process_exit(config))
     change = compare_snapshots(before, root)
     generated = set(_strings(config["generated_files"]))

@@ -3,7 +3,7 @@
 These files give JavaScript tasks the per-test sidecar that
 [redundant added tests](../running-evaluations.md) need. A profile runs inside
 the task image without network access, so the profile command writes each
-helper script inline. The YAML files are `coverage_profiles` entries to copy
+helper script inline. Profiles can also request a [vendored coverage tool](#vendored-coverage-tools). The YAML files are `coverage_profiles` entries to copy
 into an evaluation config. A test checks that each embedded copy matches its
 script.
 
@@ -134,3 +134,137 @@ Limits beyond the Mocha ones:
 - Typecheck-only tests have no runtime sample and are not recorded.
 - Seeding changes `Math.random` for the whole suite, including tests that a
   submission adds.
+
+
+## Vendored coverage tools
+
+A coverage profile can supply a pinned tool when the task image lacks one.
+Declare `provisioned_tool` beside the existing command and version:
+
+```yaml
+measurement_settings:
+  coverage:
+    provisioned_tool: {name: coverage.py, version: 7.6.12}
+    tool_version: 7.6.12
+    format: coverage-py-json
+    report_path: coverage.json
+    command: [python, -I, -S, /opt/pluginbench-tools/coverage.py/launch-coverage.py, run-module, pytest]
+```
+
+Use the task image's Python executable. The portable wheel requires Python 3.9+
+and uses the Python tracer. Use `run <script> [arguments]` or
+`run-module <module> [arguments]`. The profile runs collection only; PluginBench
+runs `json` in a fresh reporting container and writes `coverage.json`.
+Other coverage.py options and operations refuse.
+PluginBench stages the profile's exact source-file list outside the task tree;
+reports include only those files, including unloaded files.
+
+For c8, use `provisioned_tool: {name: c8, version: 10.1.3}` and
+`tool_version: 10.1.3`. The image must supply Node 18+. Invoke
+`env -u NODE_OPTIONS -u NODE_PATH -u EXPERIMENTAL_MONOCART node
+/opt/pluginbench-tools/c8/launch-c8.cjs --all -- <test command>`.
+The backend also clears these environment variables before starting Node.
+The launcher accepts exactly that collection shape. PluginBench runs `report` in a
+fresh reporting container and writes `coverage/lcov.info`, including unloaded
+files and filtering output to the staged source-file list. Source-map remapping
+is unsupported: both converter discovery functions are disabled, and V8 map
+caches are ignored. Kysely changed-line
+coverage is deferred to later suite work.
+
+PluginBench verifies the vendored artifact before runtime checks. Unknown names,
+unsupported versions, missing files, changed hashes, and incompatible provisioner
+versions refuse. Frozen profiles record the name, version, artifact SHA-256, and
+provisioner component version, so each change produces a measurement revision.
+The same tool is supplied when mutation reuses the coverage command.
+
+The selected distribution is copied into `/opt/pluginbench-tools/<name>` in each
+fresh container. Provisioning leaves `/app`, task dependencies, and Git state
+untouched. It refuses a workdir overlapping the tool directory or a symlink at
+`/opt` or the tool root. Commands choose when and how to invoke the tool.
+The container still runs without network access. Existing profiles without
+`provisioned_tool` retain their serialized shape and behavior.
+
+Only the two releases above are supplied. This does not provision runtimes,
+install task dependencies, qualify Route B tasks, or configure per-test coverage.
+See [artifact provenance and licences](../../src/pluginbench/coverage_tools/README.md).
+
+
+The Python launcher starts with `-I -S`, places the staged distribution first,
+and checks `coverage.__file__` and package dependencies. A finder also refuses
+coverage submodules or a loaded optional `tomli` dependency outside that directory.
+Collection passes the staged `coverage-config.ini` with `--rcfile`; reporting
+passes that same absolute file through coverage.py's `config_file` API. Neither
+operation discovers task coverage configuration. The pinned config loads no
+plugins, disables parallel mode, and selects one absolute data file outside `/app`.
+Reporting reads only the single transferred database. Extra files and links
+refuse at the host transfer boundary. There is no append or combine operation.
+
+The measurement container stops before raw output is copied. PluginBench then
+creates another container from the same pinned image through the same labelled
+Docker path. It stages a new extraction from the verified artifact and copies in
+only raw collection data and frozen host source. It reuses no tool directory,
+interpreter, dependencies, or filesystem layer the measured process touched.
+Reports produced by the measurement container are discarded. Both container
+receipts and the transferred data hashes are recorded in `execution.json`.
+
+Collection enables image site packages and task imports because it executes the
+measured program. JSON reporting runs in its own `-I -S` process, clears the
+environment, and never calls `site.main()` or enables task import paths. It uses
+the reporting API because coverage.py's JSON CLI adds the working directory to
+`sys.path`. Standard-library code comes from the task interpreter; coverage code
+comes from the staged directory. Always invoke the launcher in a new process for
+reporting.
+
+The c8 launcher calls the pinned report implementation with the staged
+`c8-config.json`, built-in `lcovonly`, and fixed output paths. It never invokes
+c8's option parser or discovers `.c8rc*`, `.nycrc*`, or task `package.json` config.
+It passes `exclude: []` and explicit extensions derived from the frozen profile's
+plain JavaScript source files: `.js`, `.cjs`, and `.mjs` (case-insensitive).
+PluginBench's source classifier excludes test paths, and `coverage_sources` excludes
+declarations (`.d.ts`, `.d.mts`, `.d.cts`). Other languages are not c8 populations.
+Config-like names and `*-test.js` are not silently dropped. An empty source
+population or a supported source filename containing `:`, `\`, a control, or a Unicode line/paragraph separator refuses explicitly; other suffixes are ignored.
+Native parsers reject records outside the exact staged population. Python selects literal database filenames rather
+than treating the staged source list as glob patterns.
+The pinned Python INI sets `include_namespace_packages = True`, so never-imported
+files beneath directories without `__init__.py` also stay in the population.
+
+The reporting interpreter's absolute path and physical task root are resolved
+from the pinned image before snapshot copy. An interpreter inside that root or
+the tool tree refuses; reporting executes the resolved path without a PATH lookup.
+Signal-terminated collections retain their exit receipt without requiring raw
+data or starting reporting.
+Valid raw data from an ordinary nonzero test exit
+can still be reported. Mutation collects only status/output and source-integrity
+receipts; it does not export raw coverage or start a reporting container.
+
+Both tools use the same exclusion policy: source hints cannot exclude lines or
+credit unexecuted lines. The pinned INI clears `exclude_lines` and
+`partial_branches`. The pinned c8 converter has no public hint switch, so the
+reporting launcher disables its single `_parseIgnore` method. This disables c8,
+v8, and `node:coverage` hints, including block and line forms.
+
+Limitations:
+
+- Code inside the measured process can forge raw collection data.
+- coverage.py omits unloaded files whose base name contains `. # ~ ! $ @ % ^ & * ( ) + = ,`
+  (before the `.py` suffix), or whose suffix is upper/mixed-case `.PY`; downstream checks flag these as unmeasured.
+- Loading an upper- or mixed-case `.PY` source causes report parsing to refuse the measurement.
+- Load-time plain-JS transforms, for example Babel register, Jest, `Module._extensions`,
+  ESM loader hooks (`module.register` / `node --import`), or other mechanisms, can report
+  wrong lines. Without trusted maps this is undetectable: suite qualification
+  must verify that each JS profile's test runner does not transform plain JS.
+- TS and JSX (`.ts`, `.tsx`, `.jsx`, `.cts`, `.mts`) are unmeasured: transformed offsets
+  need trusted maps. Kysely loses provisioned coverage; cattrs, returns and direct-source Yjs remain supported. Existing sql-formatter LCOV profiles are unchanged.
+- Exit codes 129–255 are treated as signals, even if the program explicitly chose one.
+- FN/FNDA function names are not escaped; injection fails closed through consistency checks.
+
+Provisioning records resolved module, dependency, configuration, and staged
+source-file-list origins in `execution.json` under
+`provisioned_tool.runtime_origin`. Provisioner version 9 refuses older saved
+profiles. Prepare a new measurement revision with these launcher commands.
+Resume fingerprints bind only the distributions selected by the profile.
+
+The portable wheel omits optional `tomli`. The pinned INI configuration works on
+Python 3.9/3.10. The measured program can still import its own optional dependencies
+after tool verification.

@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from pluginbench import collectors, components, evaluation, harbor_backend, isolation
-from pluginbench import language_analysis, mutation
+from pluginbench import language_analysis, mutation, measurement_tools
 
 PINNED: dict[str, tuple[int, dict[str, str]]] = {
     "launcher": (
@@ -44,7 +44,8 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # exactly as before, so this stays v1.
             # Containers, builds and trials now start only inside an operation, on the daemon
             # it recorded; a launch inside one is unchanged, so this stays v1.
-            "harbor_backend.py": "a862f4d6d737c2873175ba50befb6260f291933db0001ea9f443acc7271a01da",
+            # Optional measurement provisioning leaves coding launches unchanged (v1).
+            "harbor_backend.py": "db5dec0f89afa0ed9367add3596b5ed4e0eb73b8276c6b640ee9fe3dc7db7b13",
             # The same spawn callback; launches are unchanged. A failed process-group cleanup
             # or output drain now also tells the host lock owner, which records it for the next
             # owner to check. Launches are unchanged.
@@ -97,6 +98,8 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
     "coverage_observer": (
         2,
         {
+            # Optional population validation is versioned by measurement_tools v9; exact c8
+            # empty-file normalization changes only formerly refused reports, retaining v2.
             # Optional Go `go list` and `go tool cover` sidecars narrow completeness to
             # compiled files with blocks, and a zero-width Go block with no statements parses
             # instead of aborting. An optional LCOV instrumented-counts sidecar likewise lets
@@ -111,7 +114,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # lines and any file a line directive is in or names. A profile v1 froze would now
             # report Go line coverage and compare executed lines across readiness repeats.
             "coverage_report.py": (
-                "7915e6742224d11a7994c3bac44042581085b44928a96ea0d95a937429796bf0"
+                "2bfc2c47b2b7b0fa8717b3134ca7cbb7624cc0bebae4cb9d52a2e58c85af541c"
             ),
         },
     ),
@@ -119,13 +122,25 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         1,
         {
             # Only report derivation changes; collection, sites, sampling and outcomes stay v1.
-            "mutation.py": "539472b97afb941b43adca1e86ea472477600cf9c8633cf971a5a36c7d7f5efb",
+            # Optional provisioning runs previously unsupported profiles; existing runs stay v1.
+            "mutation.py": "a2b592ba8298be5eb4042b4c66e70d812de2ab4a3843f08294324789aeb6fa64",
             "mutation_sites.mjs": (
                 "f7a602774f3e6f2415c1745127134862a9a6f42e8e9807b4c28368e7a3c27c88"
             ),
             "observer_data/go-mutation-v1/main.go": (
                 "ee3f96b8d281dc135ccfe706aadc250444ff686af0acfc10339510504c8e6eca"
             ),
+        },
+    ),
+    "measurement_tools": (
+        9,
+        {
+            # v9 applies name refusal only to supported tool-source suffixes.
+            "measurement_tools.py": "12f652ace96477d11e274478634bce9c0bba1f31178e40c0bc64c6750e721978",
+            "coverage_tools/launch-coverage.py": "afc80136c0f8f1e436935063615a2bd6bfe9857dbaec00f6f1f0ab3469faf06f",
+            "coverage_tools/launch-c8.cjs": "aac95a3301ee2e51e29ecd491ff25cf2efcdfa937609dcf8a3fcb363ec965950",
+            "coverage_tools/c8-config.json": "2ee2372e0af85263890e3e052453e08a091d47225ffa7678ca8a6c963fcbb177",
+            "coverage_tools/coverage-config.ini": "cbc139caa43cfefc8464c88db4af9c053a87a2c60cee43799b40c62c36c564dc",
         },
     ),
     "local_sandbox": (
@@ -156,6 +171,11 @@ def test_the_pinned_files_are_the_files_the_code_hashes() -> None:
         "coverage_observer": set(collectors.observer_identity()),
         "mutation_observer": set(mutation.observer_identity()),
         "local_sandbox": {Path(isolation.__file__).name},
+        "measurement_tools": {
+            Path(measurement_tools.__file__).name,
+            "coverage_tools/launch-coverage.py", "coverage_tools/launch-c8.cjs",
+            "coverage_tools/c8-config.json", "coverage_tools/coverage-config.ini",
+        },
     }
     assert {name: set(files) for name, files in components.FILES.items()} == hashed
     assert Path(harbor_backend.__file__).name in hashed["launcher"]

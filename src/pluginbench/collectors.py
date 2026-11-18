@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import fnmatch
 import json
 import os
 import shutil
@@ -385,6 +386,20 @@ def _native_coverage(
     for suffix, label in sidecars.items():
         if (root / (collector.report_path + suffix)).exists():
             raise ValueError(f"{label} must not exist in the frozen input snapshot")
+    from pluginbench.measurement_tools import ProvisionedCommandOptions, read_tool, source_population
+
+    coverage = config.get("coverage", {})
+    if not isinstance(coverage, dict):
+        raise ValueError("native coverage settings must be an object")
+    tool = read_tool(coverage.get("provisioned_tool"))
+    tool_options: ProvisionedCommandOptions = (
+        {"provisioned_tool": tool, "provisioned_scope": collector.scope} if tool is not None else {}
+    )
+    inventory = inspect_snapshot(root)["files"]
+    assert isinstance(inventory, dict)
+    expected_sources = source_population(tool.name, [
+        file for file in inventory if any(fnmatch.fnmatchcase(file, pattern) for pattern in collector.scope)
+    ]) if tool is not None else None
     execution = run_native_command(
         snapshot=root,
         task_identity=identity,
@@ -392,6 +407,7 @@ def _native_coverage(
         command=collector.command,
         report_path=collector.report_path,
         timeout=collector.timeout_seconds,
+        **tool_options,
     )
     if execution.get("timed_out"):
         raise CollectorUnavailable("coverage command failed or timed out; see execution.json")
@@ -424,6 +440,7 @@ def _native_coverage(
             source_scope=collector.scope,
             test_scope=test_scope,
             workdir=workdir,
+            expected_sources=expected_sources,
         )
     except CoveragePopulationUnavailable as exc:
         raise CollectorUnavailable(str(exc)) from exc

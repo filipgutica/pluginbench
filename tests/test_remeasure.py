@@ -1161,3 +1161,26 @@ def test_measurement_capacity_counts_each_inputs_largest_container(
     )
     with pytest.raises(isolation.RuntimeDriftError, match="need 2 CPUs and 24576 MB"):
         remeasure.propose_remeasurement(root, profiles=profiles, revision="mixed", jobs=2)
+
+
+def test_resume_does_not_require_the_tools_of_carried_collectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _native(tmp_path / "native")
+    prior = root / "observer-revisions/prior"
+    _write(prior / "revision.json", {"status": "complete"})
+    config = prior / "coverage.json"
+    _write(config, {"coverage": {"provisioned_tool": {"name": "unavailable-old-tool", "version": "1"}}})
+    carried = Collector(kind="coverage", config=config, command=["old-coverage"], tool_version="1",
+                        report_format="lcov", report_path="coverage.info")
+    mutation_config = root / "mutation.json"
+    _write(mutation_config, {"coverage": {}})
+    selected = {"task": [Collector(kind="mutation", config=mutation_config)]}
+    monkeypatch.setattr(remeasure, "_carried_collectors", lambda *args: {"task": [carried]})
+    # Exercise proposal and resume persistence without re-running either measurement.
+    monkeypatch.setattr(remeasure, "_collect_revision", lambda root, directory, *args, **kwargs: directory)
+    proposed = remeasure.propose_remeasurement(
+        root, profiles=selected, revision="next", carried_from="prior",
+        carried_kinds=frozenset({"coverage"}),
+    )
+    assert remeasure.resume_remeasurement(root, revision="next") == proposed

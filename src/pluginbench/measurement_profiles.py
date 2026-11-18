@@ -32,6 +32,7 @@ from pluginbench.assessment_metrics import (
 )
 from pluginbench.code_diff import TEST_PATH_PATTERNS, _is_source_path, _is_test_path
 from pluginbench import components
+from pluginbench.measurement_tools import ProvisionedTool
 from pluginbench.collectors import Collector, collect_measurements, observer_identity
 
 ROOT = Path(__file__).resolve().parent
@@ -85,6 +86,10 @@ class CoverageSettings(BaseModel):
         min_length=1,
         description="Records the nonempty coverage tool version in the measurement profile.",
     )
+    provisioned_tool: ProvisionedTool | None = Field(
+        default=None,
+        description="Supplies a vendored coverage.py or c8 release outside the task tree.",
+    )
     format: Literal["lcov", "coverage-py-json", "go-coverprofile"] = Field(
         default="lcov", description="Selects the parser for the coverage report."
     )
@@ -114,8 +119,17 @@ class CoverageSettings(BaseModel):
             raise ValueError(
                 "coverage requires a relative report path and nonempty command/version"
             )
+        if self.provisioned_tool and self.tool_version != self.provisioned_tool.version:
+            raise ValueError("coverage tool_version must match provisioned_tool.version")
         _validate_scopes([self.source_scope])
         return self
+
+    @model_serializer(mode="wrap")
+    def omit_unset_tool(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data: dict[str, object] = handler(self)
+        if self.provisioned_tool is None:
+            data.pop("provisioned_tool", None)
+        return data
 
 
 # Analysis and Fallow each run one command, at most this long.
@@ -373,9 +387,13 @@ def coverage_settings(task_dir: Path, settings: MeasurementSettings) -> Coverage
     metadata = tomllib.loads((task_dir / "task.toml").read_text()).get("metadata", {})
     repository = str(metadata.get("repository_url", ""))
     language = str(metadata.get("language", "")).lower()
-    return settings.coverage_profiles.get(
+    selected = settings.coverage_profiles.get(
         repository, settings.coverage_profiles.get(language, settings.coverage)
     )
+    if selected is not None and selected.provisioned_tool is not None and selected.source_scope is None:
+        # Mutation freezes this same profile, so resolve inheritance before either collector.
+        return selected.model_copy(update={"source_scope": settings.source_scope or ["*"]})
+    return selected
 
 
 def _fallow_capability(language: str) -> tuple[str | None, str | None]:
