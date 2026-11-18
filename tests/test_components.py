@@ -68,8 +68,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # identity binds by value, so the launcher stays v1 and Codex is untouched.
             # The unqualified-version warning names plugin-skill `paths`: text only.
             # The operator token may come from a secrets file when the environment has none;
-            # the launch receives the same token variable, so this stays v1.
-            "claude.py": "7a8914226bd93e8ce75110a003a70b47ae5d07a77db0bac95cce6508785a87ea",
+            # the launch receives the same token variable, so this stays v1. A token with
+            # whitespace inside, or a Keychain lookup off macOS, is refused before any launch.
+            "claude.py": "4b61257181073390c21a956b283fff92a21825eb0f89da4f4193cfeae9546e08",
             "claude_treatments.py": "0149a2dd1c0f0db6f2e29b030885bacbad2e0569e43cdf45c25764181bc9ea97",
             # Discovery proves plugin agents exactly; an agent-free receipt is unchanged and
             # verifies as before unless an agent loads, so the launcher stays v1.
