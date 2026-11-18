@@ -28,6 +28,7 @@ from native_support import execution as native_execution, runtime_identity, synt
 from pluginbench import harbor_backend, processes, provider_stops, source_only, study, study_review
 from pluginbench import codex, invocation_runtime, submissions, trial_containers
 from pluginbench import ledger as invocation_ledger
+from pluginbench import run_lock
 from pluginbench.control_store import CleanupBlocked
 from pluginbench.ledger import (
     LEDGER_NAME,
@@ -209,6 +210,25 @@ def test_grading_spends_at_most_three_replays_per_slot(
     pending = study._bound_document(root, index)["pending"]
     reason = "twice with the same error" if replayed == 2 else "used its 3 grading invocations"
     assert all(reason in stages["handoff"] for stages in pending.values()) and len(pending) == 2
+
+
+def test_a_recorded_stop_grades_no_further_source_only_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unverified(area: Path, execution: dict[str, Any]) -> None:
+        execution["native_verifier_result"] = None
+
+    root, _ = _coded(tmp_path, monkeypatch, unverified)
+    replays: list[str] = []
+    monkeypatch.setattr(harbor_backend, "regrade_native", _regrade(replays, exception=None))
+    monkeypatch.setattr(harbor_backend, "_assert_native_image", lambda image, expected: None)
+    lock = run_lock.held_execution()
+    assert lock is not None
+    # A stop is recorded for this owner's launch, and its signal never arrives.
+    monkeypatch.setattr(lock, "stop_requested", lambda: True)
+    with pytest.raises(run_lock.StopRequested):
+        source_only.record_source_only_grades(root, requalify=HEALTHY)
+    assert replays == []
 
 
 def test_the_one_regrade_of_a_filtered_patch_is_its_second_grading_invocation(

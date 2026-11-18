@@ -26,6 +26,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from functools import partial
@@ -442,6 +443,9 @@ def record_source_only_grades(
         ledger.resolve_crashed("grading", cleaned=cleaned)
         slots = {row["id"]: row["slot"] for row in ledger.attempts()}
         for attempt_id, stage_id, run, task in _stages(evidence):
+            # A stop recorded for this owner's launch grades no further stage.
+            while not run_lock.check_stop():
+                time.sleep(run_lock.STOP_READ_RETRY)
             target = directory / attempt_id / stage_id
             path = target / "grade.json"
             if not path.is_file():
