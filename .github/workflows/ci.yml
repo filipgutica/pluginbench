@@ -51,8 +51,9 @@ jobs:
         run: pytest
 
       - name: Start a systemd user manager
-        # The systemd tests need a real user manager and bus. A CI step is not a login session,
-        # so start the runner user's manager explicitly; lingering is fine on a disposable runner.
+        # The runner already has a user manager, so the Test step runs the systemd tests too.
+        # Start it explicitly anyway, as the P4 plan asks, rather than rely on the runner image;
+        # lingering is fine on a disposable runner.
         run: |
           sudo apt-get install -y dbus-user-session
           uid=$(id -u)
@@ -71,10 +72,10 @@ jobs:
           exit 1
 
       - name: Test with real systemd
-        # Fails, rather than skips, when the user manager is missing.
+        # A systemd test that skips, such as on a runner without a user manager, fails the job.
         env:
           PLUGINBENCH_REQUIRE_SYSTEMD_TESTS: "1"
-        run: pytest -m systemd -rs
+        run: pytest -m systemd
 
       - name: Build the package
         run: python -m build
