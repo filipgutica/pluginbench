@@ -277,12 +277,16 @@ def test_a_worker_of_another_version_never_claims_its_launch(
 
 # The launcher's handshake.
 
-# A worker whose recovery of the last owner outlasts the startup gate: it holds the host, then
-# claims its launch seconds later.
+# A worker whose recovery of the last owner outlasts the startup gate: it holds the host, and
+# claims its launch only once the launch's gate has passed (the monotonic clock is shared).
 _SLOW_RECOVERY = _WORKER.replace(
     "owner = run_lock.ExecutionOwner(",
     "import time as _t\n_settle = control_store._settle_launches\n"
-    "control_store._settle_launches = lambda store, own: (_t.sleep(5), _settle(store, own))\n"
+    "def _slow(store, own):\n"
+    "    while _t.monotonic() < store.launch(own).expires + 1:\n"
+    "        _t.sleep(0.05)\n"
+    "    _settle(store, own)\n"
+    "control_store._settle_launches = _slow\n"
     "owner = run_lock.ExecutionOwner(",
 )
 
@@ -293,7 +297,7 @@ def test_a_worker_still_recovering_after_the_gate_is_awaited_not_killed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(invocation_runtime, "GATE_SECONDS", 2.0)
+    monkeypatch.setattr(invocation_runtime, "GATE_SECONDS", 5.0)
     monkeypatch.setattr(
         coordinator,
         "_worker_argv",
