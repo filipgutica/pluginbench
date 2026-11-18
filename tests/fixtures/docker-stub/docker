@@ -1,0 +1,3 @@
+#!/bin/sh
+# Stands in for the Docker CLI on PATH; tests that run Docker commands fake them.
+exit 1

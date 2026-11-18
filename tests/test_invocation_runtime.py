@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -25,7 +26,7 @@ from fake_systemd import HANDLERS, FakeSystemd
 from fake_systemd import fake_systemd_fixture  # noqa: F401  (the fake_systemd fixture)
 from pluginbench import control_store, harbor_backend, invocation_runtime, run_lock
 from pluginbench import ledger as invocation_ledger
-from pluginbench.control_store import CleanupBlocked, CleanupUnknown
+from pluginbench.control_store import CleanupBlocked, CleanupUnknown, DaemonReplaced
 from pluginbench.invocation_runtime import (
     HostUnavailable,
     InvocationSpec,
@@ -93,9 +94,12 @@ class _Docker:
         self.calls: list[tuple[str, ...]] = []
         self.removes = True
         self.on_ps: Callable[[int], None] | None = None
+        self.engine = "daemon"
 
     def __call__(self, *arguments: str, **_: Any) -> str:
         self.calls.append(arguments)
+        if arguments[0] == "info":
+            return json.dumps({"ID": self.engine, "ServerErrors": None}) + "\n"
         if arguments[0] == "ps":
             if self.on_ps is not None:
                 self.on_ps(sum(call[0] == "ps" for call in self.calls))
@@ -114,10 +118,17 @@ class _Docker:
 
 
 @pytest.fixture
-def docker(monkeypatch: pytest.MonkeyPatch) -> _Docker:
+def docker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _Docker:
     fake = _Docker()
+    # The CLI `verify_labelled` resolves on PATH; `_recovery_docker` stands in for running it.
+    binaries = tmp_path / "docker-stub"
+    binaries.mkdir()
+    (binaries / "docker").write_text("#!/bin/sh\nexit 1\n")
+    (binaries / "docker").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{binaries}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setattr(harbor_backend, "_docker", fake)
     monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime, timeout: None)
+    monkeypatch.setattr(invocation_runtime, "_recovery_docker", fake)
     return fake
 
 
@@ -659,14 +670,15 @@ def test_a_reused_bootstrap_pid_is_never_signalled(fake_systemd: FakeSystemd) ->
     ("break_docker", "error"),
     [
         (lambda fake, mp: mp.setattr(fake, "removes", False), CleanupBlocked),
+        (lambda fake, mp: (mp.setattr(fake, "engine", "other"), fake.containers.clear()),
+         DaemonReplaced),
         (
-            lambda fake, mp: mp.setattr(harbor_backend, "_assert_daemon", _changed_daemon),
+            lambda fake, mp: mp.setattr(invocation_runtime, "_recovery_docker", _unreachable),
             CleanupUnknown,
         ),
-        (lambda fake, mp: mp.setattr(harbor_backend, "_docker", _unreachable), CleanupUnknown),
         (lambda fake, mp: mp.setattr(fake, "on_ps", _late_create(fake)), CleanupBlocked),
     ],
-    ids=["survives removal", "changed daemon", "docker fails", "created late"],
+    ids=["survives removal", "replaced daemon", "docker fails", "created late"],
 )
 def test_labelled_containers_are_clean_only_after_two_empty_inventories_of_the_recorded_daemon(
     docker: _Docker,
@@ -687,10 +699,6 @@ def test_labelled_containers_are_clean_only_after_two_empty_inventories_of_the_r
         invocation_runtime.verify_labelled(_operation(spec), deadline=_deadline())
 
 
-def _changed_daemon(runtime: object, timeout: int) -> None:
-    raise ValueError("Docker daemon changed; cannot accept export or cleanup proof")
-
-
 def _unreachable(*arguments: str, **_: Any) -> str:
     raise ValueError("docker ps failed: Cannot connect to the Docker daemon")
 
@@ -701,6 +709,195 @@ def _late_create(fake: _Docker) -> Callable[[int], None]:
             fake.containers["late"] = "a" * 32
 
     return create
+
+
+# The Docker CLI on PATH during recovery: it logs each call with the variables that could
+# redirect it. `info` fails while FAKE_DOCKER_DOWN is set, prints FAKE_DOCKER_INFO verbatim
+# when set, and otherwise answers as CLI 29.0.0 with engine FAKE_DOCKER_ID. `ps` lists
+# FAKE_DOCKER_PS.
+_FAKE_DOCKER = """#!{python}
+import json, os, sys
+redirects = {{key: os.environ.get(key) for key in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG")}}
+with open(os.environ["FAKE_DOCKER_LOG"], "a") as log:
+    log.write(json.dumps({{"argv": sys.argv[1:], "env": redirects}}) + "\\n")
+if sys.argv[3] == "info":
+    if os.environ.get("FAKE_DOCKER_DOWN"):
+        sys.exit("Cannot connect to the Docker daemon at " + sys.argv[2])
+    if "FAKE_DOCKER_INFO" in os.environ:
+        print(os.environ["FAKE_DOCKER_INFO"], end="")
+    else:
+        print(json.dumps({{
+            "ID": os.environ.get("FAKE_DOCKER_ID", "daemon"), "ServerErrors": None,
+            "ClientInfo": {{"Version": "29.0.0"}},
+        }}))
+elif sys.argv[3] == "ps":
+    print(os.environ.get("FAKE_DOCKER_PS", ""))
+"""
+
+# Recorded at preparation by a Docker CLI that has since been replaced.
+_RECORDED: dict[str, object] = {
+    "docker_engine": {"id": "daemon", "endpoint": "unix:///recorded.sock"},
+    "docker_cli": {"path": "/usr/bin/docker", "resolved_path": "/usr/bin/docker", "sha256": "0" * 64},
+}
+
+
+@pytest.fixture
+def current_docker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A Docker CLI on PATH other than the one recorded; returns its call log."""
+    binaries = tmp_path / "docker-bin"
+    binaries.mkdir()
+    docker = binaries / "docker"
+    docker.write_text(_FAKE_DOCKER.format(python=sys.executable))
+    docker.chmod(0o755)
+    log = tmp_path / "docker-calls.jsonl"
+    monkeypatch.setenv("PATH", f"{binaries}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_DOCKER_LOG", str(log))
+    return log
+
+
+def _calls(log: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in log.read_text().splitlines()]
+
+
+def test_a_changed_docker_cli_with_the_recorded_engine_is_verified_automatically(
+    current_docker: Path,
+) -> None:
+    operation = _operation(InvocationSpec("c" * 32, _RECORDED))
+    proof = invocation_runtime.verify_labelled(operation, deadline=_deadline())
+    assert proof["removed"] == [] and proof["inventories"] == 2
+    assert [call["argv"][2] for call in _calls(current_docker)] == ["info", "ps"] * 3
+    # The proof names the CLI that gave it.
+    cli = str(current_docker.parent / "docker-bin" / "docker")
+    assert proof["docker_cli"] == {"path": cli, "version": "29.0.0"}
+
+
+def test_an_unreachable_recorded_endpoint_is_refused_by_name(
+    current_docker: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_DOCKER_DOWN", "1")
+    operation = _operation(InvocationSpec("c" * 32, _RECORDED))
+    with pytest.raises(CleanupUnknown) as refused:
+        invocation_runtime.verify_labelled(operation, deadline=_deadline())
+    assert not isinstance(refused.value, DaemonReplaced)
+    assert "start Docker at unix:///recorded.sock and retry" in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "",  # Before CLI 28.1: exit 0, nothing on stdout, the error on stderr.
+        json.dumps({"ClientInfo": {"Version": "28.1.0"}, "ServerErrors": ["Cannot connect"]}),
+        json.dumps({"ID": "", "ServerErrors": ["permission denied"]}),
+        json.dumps({"ID": "", "ServerErrors": None}),
+        "not json",
+    ],
+    ids=["silent exit 0", "server errors", "errors and empty ID", "empty ID", "unreadable"],
+)
+def test_an_engine_that_gives_no_id_did_not_answer_even_when_the_cli_exits_0(
+    current_docker: Path, monkeypatch: pytest.MonkeyPatch, answer: str
+) -> None:
+    monkeypatch.setenv("FAKE_DOCKER_INFO", answer)
+    operation = _operation(InvocationSpec("c" * 32, _RECORDED))
+    with pytest.raises(CleanupUnknown) as refused:
+        invocation_runtime.verify_labelled(operation, deadline=_deadline())
+    assert not isinstance(refused.value, DaemonReplaced)
+    assert "did not answer" in str(refused.value)
+    assert [call["argv"][2:5] for call in _calls(current_docker)] == [
+        ["info", "--format", "{{json .}}"]
+    ]
+
+
+def test_another_engine_at_the_recorded_endpoint_without_our_containers_means_replaced(
+    current_docker: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_DOCKER_ID", "another-engine")
+    operation = _operation(InvocationSpec("c" * 32, _RECORDED))
+    with pytest.raises(DaemonReplaced) as replaced:
+        invocation_runtime.verify_labelled(operation, deadline=_deadline())
+    message = str(replaced.value)
+    assert "another Docker engine, another-engine, answers at unix:///recorded.sock" in message
+    assert "check that the recorded engine is not running at another socket" in message
+    assert f"checked with {current_docker.parent / 'docker-bin' / 'docker'}, Docker CLI 29.0.0" in (
+        message
+    )
+    # It still listed the label there before deciding, and removed nothing.
+    assert [call["argv"][2] for call in _calls(current_docker)] == ["info", "ps"]
+
+
+def test_another_engine_holding_our_labelled_containers_blocks(
+    current_docker: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_DOCKER_ID", "another-engine")
+    monkeypatch.setenv("FAKE_DOCKER_PS", "survivor")
+    operation = _operation(InvocationSpec("c" * 32, _RECORDED))
+    with pytest.raises(CleanupBlocked) as blocked:
+        invocation_runtime.verify_labelled(operation, deadline=_deadline())
+    assert not isinstance(blocked.value, CleanupUnknown)  # No operator can confirm it.
+    assert "it holds containers with that label: survivor" in str(blocked.value)
+
+
+def test_an_operation_without_a_recorded_engine_id_is_unknown_not_replaced(
+    current_docker: Path,
+) -> None:
+    runtime = {**_RECORDED, "docker_engine": {"endpoint": "unix:///recorded.sock"}}
+    operation = _operation(InvocationSpec("c" * 32, runtime))
+    with pytest.raises(CleanupUnknown) as refused:
+        invocation_runtime.verify_labelled(operation, deadline=_deadline())
+    assert not isinstance(refused.value, DaemonReplaced)
+    assert "no Docker engine ID was recorded" in str(refused.value)
+    assert not current_docker.exists()  # Docker was never asked.
+
+
+def test_a_missing_docker_cli_is_named_as_such(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    operation = _operation(InvocationSpec("c" * 32, _RECORDED))
+    with pytest.raises(CleanupUnknown) as refused:
+        invocation_runtime.verify_labelled(operation, deadline=_deadline())
+    assert "the Docker CLI is not on PATH" in str(refused.value)
+    assert "did not answer" not in str(refused.value)
+
+
+def test_a_docker_cli_found_through_a_relative_path_entry_is_not_run(
+    current_docker: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", f"docker-bin{os.pathsep}{os.environ['PATH']}")
+    operation = _operation(InvocationSpec("c" * 32, _RECORDED))
+    with pytest.raises(CleanupUnknown, match="docker-bin/docker, is not an absolute path"):
+        invocation_runtime.verify_labelled(operation, deadline=_deadline())
+    assert not current_docker.exists()
+
+
+def test_the_docker_cli_is_resolved_once_per_check(
+    current_docker: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lookups: list[str] = []
+    which = shutil.which
+
+    def counted(name: str) -> str | None:
+        lookups.append(name)
+        return which(name)
+
+    monkeypatch.setattr(shutil, "which", counted)
+    invocation_runtime.verify_labelled(
+        _operation(InvocationSpec("c" * 32, _RECORDED)), deadline=_deadline()
+    )
+    assert lookups == ["docker"] and len(_calls(current_docker)) == 6
+
+
+def test_the_environment_cannot_redirect_the_recovery_check(
+    current_docker: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DOCKER_HOST", "unix:///elsewhere.sock")
+    monkeypatch.setenv("DOCKER_CONTEXT", "elsewhere")
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path / "elsewhere"))
+    operation = _operation(InvocationSpec("c" * 32, _RECORDED))
+    invocation_runtime.verify_labelled(operation, deadline=_deadline())
+    calls = _calls(current_docker)
+    assert calls and all(call["argv"][:2] == ["--host", "unix:///recorded.sock"] for call in calls)
+    assert all(set(call["env"].values()) == {None} for call in calls)
 
 
 def test_an_operation_without_docker_needs_no_daemon(monkeypatch: pytest.MonkeyPatch) -> None:

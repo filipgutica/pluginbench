@@ -200,7 +200,13 @@ def test_a_background_run_that_ends_before_run_sees_it_is_reported_by_how_it_end
 ) -> None:
     # The worker takes run.lock, then ends at once.
     (tmp_path / "stop-at-once").touch()
-    monkeypatch.setattr(cli, "run_status", lambda root: {"phase": phase})
+    asked: list[dict[str, object]] = []
+
+    def status(root: Path, **kwargs: object) -> dict[str, object]:
+        asked.append(kwargs)
+        return {"phase": phase}
+
+    monkeypatch.setattr(cli, "run_status", status)
     start = invocation_runtime.start_gated
 
     def descheduled(*args: object, **kwargs: object) -> object:
@@ -219,6 +225,7 @@ def test_a_background_run_that_ends_before_run_sees_it_is_reported_by_how_it_end
         assert result.exit_code == 2
         assert f"the background run for {tmp_path} has already ended (failed)" in result.stderr
     assert "before it took" not in result.output
+    assert asked == [{"containers": False}]  # Only its phase is read: no Docker inventory.
 
 
 def test_foreground_run_owns_the_lock_and_writes_events(

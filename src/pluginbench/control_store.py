@@ -130,6 +130,12 @@ class CleanupUnknown(CleanupBlocked):
     """PluginBench cannot tell whether something still runs; only the operator can confirm."""
 
 
+class DaemonReplaced(CleanupUnknown):
+    """Another engine answers at the recorded Docker endpoint and holds none of the operation's
+    labelled containers. PluginBench cannot reach the recorded engine to check it, so
+    `app cleanup --confirm-stopped` may confirm it, as it does a legacy item."""
+
+
 class LaunchFenced(ValueError):
     """A launch is no longer current: fenced, stopped, finished, or of another version. Its
     process exits without starting any work."""
@@ -418,7 +424,8 @@ def verify_containers(
 ) -> dict[str, Any]:
     """Stop the trial containers the run left running, and prove none still runs.
 
-    Each inventory first proves the daemon is the one the runtime recorded. After the stop, two
+    It uses the Docker CLI on PATH now (`invocation_runtime.docker_cli_now`), as a resume does,
+    and each inventory first proves the daemon is the one the runtime recorded. After the stop, two
     inventories at least INVENTORY_INTERVAL apart must both be empty, which catches a container
     created late, such as a sidecar. Every Docker command is capped by what is left before
     `deadline`, a `time.monotonic()` value; once it passes, the containers are unknown.
@@ -435,6 +442,21 @@ def verify_containers(
         raise CleanupUnknown(
             f"the frozen suite that names {where} is missing. {_repair(check['root'])}"
         )
+
+    from pluginbench import invocation_runtime
+
+    # Pinned to the CLI on PATH now, not the one frozen at preparation, so a Docker upgrade
+    # since then cannot block forever; the engine ID and endpoint stay the recorded ones.
+    try:
+        cli = Path(invocation_runtime.docker_cli_now(where))
+        runtime = {**runtime, "docker_cli": harbor_backend._executable_identity(cli)}
+    except CleanupUnknown as exc:
+        raise CleanupUnknown(f"{exc}. {_repair(check['root'])}") from exc
+    except (OSError, ValueError) as exc:
+        raise CleanupUnknown(
+            f"the Docker CLI at {cli} could not be read for {where}: {exc}. "
+            f"{_repair(check['root'])}"
+        ) from exc
 
     def inventory() -> list[dict[str, str]]:
         if time.monotonic() >= deadline:
@@ -511,9 +533,12 @@ def _verify(
                     f"still be created. {_repair(check['root'])}"
                 )
             if check["kind"] == "labelled":
-                invocation_runtime.verify_labelled(check["operation"], deadline=deadline)
+                proof = invocation_runtime.verify_labelled(check["operation"], deadline=deadline)
+                check["docker_cli"] = proof.get("docker_cli")  # For its `cleanup.json`.
             else:
                 verify_containers(check, progress, deadline=deadline)
+        except DaemonReplaced as exc:
+            unknown.append(({**check, "replaced": True}, f"{exc}. {_repair(check['root'])}"))
         except CleanupUnknown as exc:
             unknown.append((check, str(exc)))
         except CleanupBlocked as exc:
@@ -619,8 +644,8 @@ def _legacy(check: Check) -> bool:
     operation ticket, or its call recorded no process identity with a boot. A check of a
     ticketed operation or of a booted process can be proven once what it needs (Docker,
     systemd) answers again; an operator's word never clears it."""
-    if not check.get("contained") or check["kind"] == "unrecorded":
-        return True
+    if not check.get("contained") or check["kind"] == "unrecorded" or check.get("replaced"):
+        return True  # Another engine answers at its recorded endpoint (DaemonReplaced).
     return check["kind"] == "invocation" and "boot_id" not in (check.get("identity") or {})
 
 
@@ -887,13 +912,20 @@ def _prove(state: Path, checks: Sequence[Check], confirmed: Collection[tuple[str
         if proven(check)
         and (check["kind"] == "scope" or (check["kind"] == "invocation" and check.get("covered")))
     }
+    # The Docker CLI that checked each operation's labelled containers, when Docker was used.
+    clis = {
+        str(check["operation"]["id"]): check["docker_cli"]
+        for check in checks
+        if check["kind"] == "labelled" and check.get("docker_cli")
+    }
     for invocation, proof in proofs.items():
         directory = state / "invocations" / invocation
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         if not (directory / "cleanup.json").exists():
-            (directory / "cleanup.json").write_text(
-                json.dumps({"id": invocation, "recovered": proof, "at": _now()}, indent=2) + "\n"
-            )
+            record: dict[str, object] = {"id": invocation, "recovered": proof, "at": _now()}
+            if invocation in clis:
+                record["docker_cli"] = clis[invocation]
+            (directory / "cleanup.json").write_text(json.dumps(record, indent=2) + "\n")
 
 
 def _held() -> ExecutionLock:
@@ -1003,7 +1035,9 @@ def confirm_stopped(
             raise CleanupBlocked(
                 f"{'; '.join(reason.split('. Once')[0] for reason in recorded)}. PluginBench "
                 "recorded these itself and can check them once Docker and systemd answer: "
-                "restore the daemon and retry `pluginbench app cleanup`. Nothing was confirmed"
+                "restore the daemon and retry `pluginbench app cleanup`. Only labelled "
+                "containers whose recorded Docker endpoint another engine now answers can be "
+                "confirmed instead. Nothing was confirmed"
             )
         at = store.confirm(unknown)
     rest = [item for item in pending if not named(item)]
