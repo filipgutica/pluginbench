@@ -8,6 +8,8 @@ import sys
 from queue import Empty, SimpleQueue
 from threading import Event
 
+from pluginbench import run_lock
+
 
 # Task jobs one host runs at once: Docker keeps about two task jobs' containers going. A task
 # job's own containers, such as its Harbor sidecars, count as one.
@@ -79,6 +81,9 @@ def run_jobs[T](
 
         def replenish() -> None:
             while len(active) < jobs and not cancelled.is_set():
+                # A stop recorded for this owner's launch admits no new job; admitted ones
+                # finish, as after a signal.
+                run_lock.check_stop()
                 try:
                     item = next(iterator)
                 except StopIteration:

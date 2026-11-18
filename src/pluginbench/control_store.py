@@ -179,11 +179,14 @@ class ControlStore:
         try:
             path.chmod(0o600)
             self._db.execute("PRAGMA synchronous = FULL")
-            self._db.executescript(f"PRAGMA user_version = {SCHEMA_VERSION};" + _SCHEMA)
-            with self._db:
-                self._db.execute(
-                    "INSERT OR IGNORE INTO host_state (id, updated_at) VALUES (1, ?)", (_now(),)
-                )
+            # Only a new or older database is written to, so opening one to read writes nothing.
+            if self._db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                self._db.executescript(f"PRAGMA user_version = {SCHEMA_VERSION};" + _SCHEMA)
+                with self._db:
+                    self._db.execute(
+                        "INSERT OR IGNORE INTO host_state (id, updated_at) VALUES (1, ?)",
+                        (_now(),),
+                    )
         except BaseException:
             self._db.close()
             raise
@@ -766,11 +769,13 @@ def _settle_launches(store: ControlStore, own: str | None) -> None:
     owner starts nothing. The coordinator is no executor and keeps running."""
     from pluginbench import invocation_runtime
 
-    for launch in store.launches("launching", "fenced", "active"):
-        if launch.kind == "coordinator" or launch.launch_id == own:
+    for listed in store.launches("launching", "fenced", "active"):
+        if listed.kind == "coordinator" or listed.launch_id == own:
             continue
-        if launch.status == "launching":
-            store.fence(launch.launch_id)
+        store.fence(listed.launch_id)
+        # Read again after the fence: its launcher may have recorded a bootstrap since the list.
+        launch = store.launch(listed.launch_id)
+        assert launch is not None
         invocation_runtime.verify_scope(launch.operation(), deadline=_deadline())
         store.finish(launch.launch_id)
 
@@ -781,12 +786,17 @@ STOP_POLL = 0.25
 
 @contextmanager
 def _launched(lock: ExecutionLock, launch_id: str | None) -> Iterator[None]:
-    """For a launched owner: refuse each new ledger intent once a stop is requested for its
-    launch (`run_lock.check_stop`), and wake it with SIGTERM, as `stop` does. The signal is
-    only a wake-up; a lost one cannot erase the request. The launch finishes with the block."""
+    """For a launched owner: once a stop is requested for its launch, admit no new job
+    (`run_lock.check_stop`, which `parallel.run_jobs` calls before each), and wake it with
+    SIGTERM, as `stop` does. The signal is only a wake-up; a lost one cannot erase the
+    request. In the main thread, SIGTERM raises KeyboardInterrupt for the whole block, as under
+    `run_lock.hold`, so the wake-up never kills the owner with its launch still active.
+    Elsewhere no signal is sent. The launch finishes with the block."""
     if launch_id is None:
         yield
         return
+    main = threading.current_thread() is threading.main_thread()
+    previous = signal.signal(signal.SIGTERM, run_lock.interrupt) if main else None
 
     def requested() -> bool:
         with ControlStore.open(lock.state) as store:
@@ -802,19 +812,25 @@ def _launched(lock: ExecutionLock, launch_id: str | None) -> Iterator[None]:
                     os.kill(os.getpid(), signal.SIGTERM)
                     return
             except sqlite3.Error:
-                continue  # Checked again at the next poll, and before every intent.
+                continue  # Checked again at the next poll, and before every job.
 
     lock.stop_requested = requested
     watcher = threading.Thread(target=wake, name="pluginbench-stop", daemon=True)
-    watcher.start()
+    if main:
+        watcher.start()
     try:
         yield
     finally:
         done.set()
-        watcher.join()
+        if main:
+            watcher.join()
         lock.stop_requested = None
-        with ControlStore.open(lock.state) as store:
-            store.finish(launch_id)
+        try:
+            with ControlStore.open(lock.state) as store:
+                store.finish(launch_id)
+        finally:
+            if previous is not None:
+                signal.signal(signal.SIGTERM, previous)
 
 
 def _prove(state: Path, checks: Sequence[Check], confirmed: Collection[tuple[str, str]]) -> None:

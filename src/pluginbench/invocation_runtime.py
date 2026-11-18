@@ -391,6 +391,10 @@ def start_gated(
         if admit(process_identity(proc.pid)):
             os.write(write_end, b"1")
             permitted = True
+    except BaseException as exc:
+        # Its bootstrap started, so whatever ended it, the call is spent.
+        setattr(exc, "launched", True)
+        raise
     finally:
         os.close(write_end)
         if not permitted:
@@ -497,12 +501,7 @@ def _launch(
         listener.listen(1)
 
         def admit(identity: dict[str, object]) -> bool:
-            try:
-                lock.update_operation(spec.id, bootstrap=identity)
-            except BaseException as exc:
-                # Its bootstrap started, so whatever ended it, the call is spent.
-                setattr(exc, "launched", True)
-                raise
+            lock.update_operation(spec.id, bootstrap=identity)
             return True
 
         proc = start_gated(command, output=directory / "output.log", admit=admit, cwd=directory)

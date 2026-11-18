@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from pluginbench.run_lock import boot_id, check_stop, note_work, pid_namespace, process_start
+from pluginbench.run_lock import boot_id, note_work, pid_namespace, process_start
 
 # Version 2 adds `invocations` and `budget`; a writable open migrates version 1 in place.
 SCHEMA_VERSION = 2
@@ -462,10 +462,8 @@ class Ledger:
     ) -> str:
         """Commit a new invocation before anything external starts; return its ID.
 
-        The cap, short-circuit and ceiling checks share the insert's transaction. A stop
-        requested for this owner's launch refuses it first (`run_lock.check_stop`).
+        The cap, short-circuit and ceiling checks share the insert's transaction.
         """
-        check_stop()
         with self._db:
             self._db.execute("BEGIN IMMEDIATE")
             if (reason := self.refusal(slot, stage, inputs)) is not None:
