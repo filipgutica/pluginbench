@@ -38,6 +38,16 @@ def isolated_host_state(
 
 
 @pytest.fixture(autouse=True)
+def docker_cli_on_path(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Recovery checks containers with the Docker CLI on PATH now, so tests put a stub there
+    rather than depend on the host's. It exits 1, like a CLI whose daemon is down; tests that
+    run Docker commands fake them. Tests marked `systemd` keep the host's PATH."""
+    if not request.node.get_closest_marker("systemd"):
+        stub = Path(__file__).parent / "fixtures" / "docker-stub"
+        monkeypatch.setenv("PATH", f"{stub}{os.pathsep}{os.environ['PATH']}")
+
+
+@pytest.fixture(autouse=True)
 def guidance_outside_tests_is_ignored(
     request: pytest.FixtureRequest,
     tmp_path_factory: pytest.TempPathFactory,
