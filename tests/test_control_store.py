@@ -192,7 +192,7 @@ def test_a_recorded_process_group_is_clean_only_once_every_member_is_gone(
             time.sleep(0.02)
     # What cannot be checked is unknown: no record, or a PID from another namespace.
     for unknown in (None, {**identity, "pid_namespace": "pid:[1]"}):
-        with pytest.raises(CleanupUnknown, match=f"repair --confirm-stopped {tmp_path}"):
+        with pytest.raises(CleanupUnknown, match=f"app cleanup --confirm-stopped {tmp_path}"):
             control_store.verify_invocation(_check(unknown, tmp_path))
     # A process recorded before a reboot ended with it.
     rebooted = {**identity, "boot_id": "an-earlier-boot"}
@@ -290,7 +290,7 @@ def test_an_unreleased_owner_blocks_every_execution_command_whatever_run_it_targ
     result = CliRunner().invoke(cli.app, argv)
     assert result.exit_code == 2, result.output
     assert "cleanup after a crash is not verified" in result.stderr
-    assert f"repair --confirm-stopped {tmp_path / 'judged'}" in result.stderr
+    assert f"app cleanup --confirm-stopped {tmp_path / 'judged'}" in result.stderr
     assert work == []
     assert not run_lock.execution_owner(isolated_host_state).held
     assert _record(isolated_host_state)["pending"][0]["kind"] == "judge"
@@ -373,13 +373,13 @@ def test_repair_checks_containers_only_once_the_processes_are_gone(
         with pytest.raises(CleanupBlocked, match="a container may still be created"):
             with control_store.execute(_owner(tmp_path / "unrelated")):
                 pass
-        result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+        result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)])
         assert result.exit_code == 2 and f"has processes {child.pid}" in result.stderr
         assert inventories == []
     finally:
         child.kill()
         child.wait(timeout=5)
-    result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)])
     assert result.exit_code == 0, result.output
     assert len(inventories) == 3 and _record(isolated_host_state)["pending"] == []
     assert _admitted(isolated_host_state, tmp_path)
@@ -416,7 +416,7 @@ def test_containers_that_cannot_be_checked_during_a_resume_fence_the_host(
         assert calls == [] and _rows(root) == [crashed]
         # Its process is gone, but the run's containers are unknown: an unrelated run stays out.
         assert not _admitted(isolated_host_state, tmp_path)
-    assert CliRunner().invoke(cli.app, ["repair", str(root), "--confirm-stopped"]).exit_code == 0
+    assert CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(root)]).exit_code == 0
     assert _admitted(isolated_host_state, tmp_path)
 
 
@@ -508,7 +508,7 @@ def test_an_owner_whose_call_cleanup_failed_stays_unreleased_after_a_normal_exit
         os.waitpid(child, 0)
     # Its group is gone now, but only the operator can clear the recorded cleanup failure.
     assert not _admitted(isolated_host_state, tmp_path)
-    result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)])
     assert result.exit_code == 0 and "could not be stopped" in result.stdout, result.output
     assert _admitted(isolated_host_state, tmp_path)
 
@@ -617,7 +617,7 @@ def test_a_failed_measurement_cleanup_leaves_a_normally_exiting_owner_unreleased
     with pytest.raises(CleanupBlocked, match=_UNRELEASED):
         with control_store.execute(_owner(tmp_path / "unrelated")):
             pass
-    result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)])
     assert result.exit_code == 0, result.output
     assert _admitted(isolated_host_state, tmp_path)
 
@@ -727,7 +727,7 @@ def test_an_earlier_builds_owner_killed_with_a_container_running_needs_repair(
     with pytest.raises(CleanupBlocked, match=_UNRELEASED):
         with control_store.execute(_owner(tmp_path / "unrelated")):
             pass
-    result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)])
     assert result.exit_code == 0 and _UNRELEASED in result.stdout, result.output
     assert _admitted(isolated_host_state, tmp_path)
 
@@ -971,7 +971,7 @@ def test_a_failed_save_after_an_escaped_drain_still_needs_repair(
         ledger.close()
         if escaped.exists() and escaped.read_text():
             _gone(int(escaped.read_text()))
-    assert CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"]).exit_code == 0
+    assert CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)]).exit_code == 0
     assert _admitted(isolated_host_state, tmp_path)
 
 
@@ -1041,7 +1041,7 @@ def test_an_owner_killed_during_a_call_needs_repair_even_once_its_group_is_gone(
             owner.wait(timeout=10)
         if escaped.exists() and escaped.read_text():
             _gone(int(escaped.read_text()))
-    result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)])
     assert result.exit_code == 0 and _UNRELEASED in result.stdout
     assert _admitted(isolated_host_state, tmp_path)
 
@@ -1056,7 +1056,7 @@ def test_an_owner_killed_between_calls_needs_repair_too(
     with pytest.raises(CleanupBlocked, match=_UNRELEASED):
         with control_store.execute(_owner(tmp_path / "unrelated")):
             pass
-    assert CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"]).exit_code == 0
+    assert CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)]).exit_code == 0
     assert _admitted(isolated_host_state, tmp_path)
 
 
@@ -1106,12 +1106,12 @@ def test_an_escaped_process_holding_a_calls_output_blocks_until_repair_confirms_
         with pytest.raises(CleanupBlocked, match="held open by an escaped process") as refused:
             with control_store.execute(_owner(tmp_path / "unrelated")):
                 pass
-        assert f"repair --confirm-stopped {run}" in str(refused.value)
+        assert f"app cleanup --confirm-stopped {run}" in str(refused.value)
     finally:
         ledger.close()
         if escaped.exists():
             _gone(int(escaped.read_text()))
-    result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)])
     assert result.exit_code == 0 and "held open by an escaped process" in result.stdout
     assert _admitted(isolated_host_state, tmp_path)
 
@@ -1164,7 +1164,7 @@ def test_a_run_root_without_a_ledger_is_unknown(
     destination = tmp_path / "preparing"
     destination.mkdir()
     _crashed_owner(isolated_host_state, kind="run", root=destination, runtimes=[])
-    with pytest.raises(CleanupBlocked, match=f"repair --confirm-stopped {destination}"):
+    with pytest.raises(CleanupBlocked, match=f"app cleanup --confirm-stopped {destination}"):
         with control_store.execute(_owner(tmp_path / "unrelated")):
             pass
 
@@ -1176,7 +1176,7 @@ def test_confirming_an_unreadable_record_never_covers_a_later_one(
     owner_record.write_text("{not json")
     assert not _admitted(isolated_host_state, tmp_path)
     runner = CliRunner()
-    result = runner.invoke(cli.app, ["repair", str(isolated_host_state), "--confirm-stopped"])
+    result = runner.invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(isolated_host_state)])
     assert result.exit_code == 0 and "The host is unblocked." in result.stdout
     assert _admitted(isolated_host_state, tmp_path)
     owner_record.write_text("{not json either")
@@ -1214,18 +1214,18 @@ def test_a_corrupt_owner_record_is_unknown_until_repair(
     state = re.escape(str(isolated_host_state))
     with pytest.raises(
         CleanupBlocked,
-        match=rf"owner record in {state} is unreadable or invalid .*repair --confirm-stopped {state}`",
+        match=rf"owner record in {state} is unreadable or invalid .*app cleanup --confirm-stopped {state}`",
     ):
         with control_store.execute(_owner(tmp_path / "unrelated")):
             pass
-    result = CliRunner().invoke(cli.app, ["repair", str(isolated_host_state), "--confirm-stopped"])
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(isolated_host_state)])
     assert result.exit_code == 0, result.output
     if corrupt not in ("only released", "truncated"):
         # The owner itself still validates, so it stays an obligation under its own root;
         # repairing the fence never clears it.
         assert "1 other run still wait" in result.stdout
         assert not _admitted(isolated_host_state, tmp_path)
-        result = CliRunner().invoke(cli.app, ["repair", str(earlier), "--confirm-stopped"])
+        result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(earlier)])
         assert result.exit_code == 0, result.output
     assert "The host is unblocked." in result.stdout
     assert _admitted(isolated_host_state, tmp_path)
@@ -1239,7 +1239,7 @@ def test_an_owner_record_that_is_not_an_object_is_unknown_until_repair(
     with pytest.raises(CleanupBlocked, match="it is not a JSON object"):
         with control_store.execute(_owner(tmp_path / "unrelated")):
             pass
-    result = CliRunner().invoke(cli.app, ["repair", str(isolated_host_state), "--confirm-stopped"])
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(isolated_host_state)])
     assert result.exit_code == 0 and "The host is unblocked." in result.stdout, result.output
     assert _admitted(isolated_host_state, tmp_path)
 
@@ -1258,7 +1258,7 @@ def test_a_confirmation_covers_only_its_own_root_and_identity(
         **same, "pid": 8, "root": str(tmp_path / "released"), "state": "released",
         "pending": [{**same, "root": str(first)}, {**same, "root": str(second)}],
     }))
-    result = CliRunner().invoke(cli.app, ["repair", str(first), "--confirm-stopped"])
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(first)])
     assert result.exit_code == 0 and "1 other run still wait" in result.stdout, result.output
     # The first root's confirmation never covers the second.
     assert not _admitted(isolated_host_state, tmp_path)
@@ -1270,13 +1270,13 @@ def test_a_confirmation_covers_only_its_own_root_and_identity(
     with pytest.raises(CleanupBlocked, match="pending obligation 0 has pid None, not an int"):
         with control_store.execute(_owner(tmp_path / "unrelated")):
             pass
-    assert CliRunner().invoke(cli.app, ["repair", str(second), "--confirm-stopped"]).exit_code == 2
-    result = CliRunner().invoke(cli.app, ["repair", str(isolated_host_state), "--confirm-stopped"])
+    assert CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(second)]).exit_code == 2
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(isolated_host_state)])
     assert result.exit_code == 0, result.output
     # The release of the owner whose record held the bad entry is not trusted either, so it
     # waits for repair under its own root.
     assert "1 other run still wait" in result.stdout
-    result = CliRunner().invoke(cli.app, ["repair", record["root"], "--confirm-stopped"])
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", record["root"]])
     assert result.exit_code == 0, result.output
     assert _admitted(isolated_host_state, tmp_path)
 
@@ -1291,19 +1291,19 @@ def test_a_malformed_entry_never_hides_a_valid_obligation_or_its_survivor(
     (isolated_host_state / run_lock.EXECUTION_OWNER).write_text(json.dumps(record))
     try:
         result = CliRunner().invoke(
-            cli.app, ["repair", str(isolated_host_state), "--confirm-stopped"]
+            cli.app, ["app", "cleanup", "--confirm-stopped", str(isolated_host_state)]
         )
         # Repairing the fence leaves the valid owner, whose call's child still runs.
         assert result.exit_code == 0 and "1 other run still wait" in result.stdout, result.output
         with pytest.raises(CleanupBlocked, match=f"has processes {child.pid}"):
             with control_store.execute(_owner(tmp_path / "unrelated")):
                 pass
-        result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+        result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)])
         assert result.exit_code == 2 and f"has processes {child.pid}" in result.stderr
     finally:
         child.kill()
         child.wait(timeout=5)
-    assert CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"]).exit_code == 0
+    assert CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)]).exit_code == 0
     assert _admitted(isolated_host_state, tmp_path)
 
 
@@ -1323,12 +1323,12 @@ def test_a_call_that_ended_while_its_process_lived_is_checked_after_its_owner_di
     )
     try:
         # Repair refuses while the call's child lives: the check names it.
-        result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+        result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)])
         assert result.exit_code == 2 and f"has processes {child.pid}" in result.stderr
     finally:
         child.kill()
         child.wait(timeout=5)
-    assert CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"]).exit_code == 0
+    assert CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)]).exit_code == 0
     assert _admitted(isolated_host_state, tmp_path)
 
 
@@ -1364,7 +1364,7 @@ def test_calls_that_ended_before_the_dead_owner_started_are_not_its_obligation(
     _crashed_owner(isolated_host_state, kind="review", root=run, runtimes=[], acquired_at=later)
     try:
         # Repair does not count it as a survivor of this owner.
-        result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+        result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)])
         assert result.exit_code == 0, result.output
         assert _admitted(isolated_host_state, tmp_path)
     finally:
@@ -1391,7 +1391,7 @@ def test_each_recorded_runtime_is_checked_even_when_another_is_unknown(
     monkeypatch.setattr(harbor_backend, "_assert_daemon", daemon)
     monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: survivor)
     monkeypatch.setattr(trial_containers, "stop_left_running", lambda evidence, **kwargs: None)
-    result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)])
     # The live daemon still runs a container, so nothing is confirmed, not even the offline one.
     assert result.exit_code == 2 and "survivor" in result.stderr, result.output
     assert "live" in daemons
@@ -1411,7 +1411,7 @@ def test_a_recorded_runtime_is_checked_even_when_the_frozen_suite_is_gone(
     )
     monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime, **kwargs: None)
     monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
-    result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)])
     # Repair checks the recorded runtime, finds its containers cannot be listed, and says so.
     assert result.exit_code == 0 and "frozen suite" in result.stdout, result.output
 
@@ -1508,7 +1508,7 @@ def test_repair_takes_only_the_exact_root_an_obligation_names(
 ) -> None:
     _crashed_owner(isolated_host_state, kind="judge", root=tmp_path / "runs/one", runtimes=[])
     path = tmp_path / "runs" if target == "parent" else Path("/")
-    result = CliRunner().invoke(cli.app, ["repair", str(path), "--confirm-stopped"])
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(path)])
     assert result.exit_code == 2 and "no open obligation names" in result.stderr
     [obligation] = _record(isolated_host_state)["pending"]
     assert obligation["kind"] == "judge" and obligation["root"] == str(tmp_path / "runs/one")
@@ -1520,8 +1520,11 @@ def test_repair_never_confirms_a_known_survivor(
     run, child = _live_call(tmp_path)
     _crashed_owner(isolated_host_state, kind="review", root=run, runtimes=[])
     try:
-        result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
+        result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(run)])
         assert result.exit_code == 2 and f"has processes {child.pid}" in result.stderr
+        assert "`app cleanup --confirm-stopped` confirms only what cannot be checked" in (
+            result.stderr
+        )
         with ControlStore.open(isolated_host_state) as store:
             assert store.confirmations() == []
         assert not _admitted(isolated_host_state, tmp_path)
@@ -1605,3 +1608,132 @@ def test_an_unverified_holder_turns_reconciling_after_30_seconds_and_is_never_to
         holder.kill()
         holder.wait(timeout=5)
     assert watch.poll() == "free" and _reconciling(state) is None
+
+
+# `app cleanup` without --confirm-stopped, and --confirm-stopped narrowed to legacy items.
+
+
+def test_plain_cleanup_refuses_while_a_call_of_a_dead_owner_still_runs(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    run, child = _live_call(tmp_path)
+    _crashed_owner(isolated_host_state, kind="review", root=run, runtimes=[])
+    try:
+        result = CliRunner().invoke(cli.app, ["app", "cleanup"])
+        assert result.exit_code == 2 and f"has processes {child.pid}" in result.stderr
+        assert "the host is clean" not in result.stdout
+        assert [item["root"] for item in _record(isolated_host_state)["pending"]] == [str(run)]
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+
+
+_HOLDER = """
+import sys, time
+from pathlib import Path
+from pluginbench import run_lock
+state, root = Path(sys.argv[1]), sys.argv[2]
+owner = run_lock.ExecutionOwner(kind="run", eval=root, root=root)
+with run_lock.hold_execution(owner, state=state):
+    (state / "ready").write_text("ready")
+    time.sleep(30)
+"""
+
+
+def test_plain_cleanup_refuses_while_another_command_executes(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _HOLDER, str(isolated_host_state), str(tmp_path / "busy")],
+        env={**os.environ, "PYTHONPATH": f"{_SOURCE}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"},
+    )
+    try:
+        while not (isolated_host_state / "ready").exists():
+            assert holder.poll() is None
+            time.sleep(0.02)
+        result = CliRunner().invoke(cli.app, ["app", "cleanup"])
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)
+    assert result.exit_code == 2
+    assert f"already executing on this host: run for {tmp_path / 'busy'}" in result.stderr
+
+
+def test_cleanup_hints_and_refusals_name_app_cleanup_not_repair(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    _crashed_owner(isolated_host_state, kind="judge", root=tmp_path / "one", runtimes=[])
+    result = CliRunner().invoke(
+        cli.app, ["app", "cleanup", "--confirm-stopped", str(tmp_path / "other")]
+    )
+    assert result.exit_code == 2
+    assert "`pluginbench app cleanup --confirm-stopped` takes one of" in result.stderr
+    (isolated_host_state / run_lock.EXECUTION_OWNER).write_text("{")
+    with pytest.raises(CleanupBlocked) as refused:
+        with control_store.execute(_owner(tmp_path / "next")):
+            pass
+    assert "`pluginbench app cleanup --confirm-stopped` takes this directory" in str(refused.value)
+    assert "repair" not in str(refused.value).replace("app cleanup", "")
+
+
+def test_cleanup_confirms_a_deleted_runs_legacy_obligation_by_its_root_or_its_id(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    gone = tmp_path / "deleted" / "run"  # Recorded, then deleted with its parent.
+    _crashed_owner(isolated_host_state, kind="judge", root=gone, runtimes=[], acquired_at="a")
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(gone)])
+    assert result.exit_code == 0, result.output
+    assert _record(isolated_host_state)["pending"] == []
+
+    _crashed_owner(isolated_host_state, kind="judge", root=gone, runtimes=[], acquired_at="b")
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", "7-b"])
+    assert result.exit_code == 0, result.output
+    assert "The host is unblocked." in result.stdout
+    assert _record(isolated_host_state)["pending"] == []
+
+
+def test_cleanup_never_confirms_an_unknown_the_runtime_recorded_itself(
+    tmp_path: Path, isolated_host_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A contained owner (schema 3) died with one recorded operation; systemd cannot answer.
+    op = "0" * 32
+    operation = {
+        "id": op, "scope": f"pb-inv-{op}.scope", "label": f"pluginbench.invocation={op}",
+        "docker": None, "dir": str(isolated_host_state / "invocations" / op),
+    }
+    record = {
+        "schema": run_lock.CONTAINED_SCHEMA, "pid": 7, "acquired_at": "earlier", "kind": "judge",
+        "root": str(tmp_path), "state": "active", "operations": [operation], "pending": [],
+    }
+    (isolated_host_state / run_lock.EXECUTION_OWNER).write_text(json.dumps(record))
+
+    def unknown(operation: Any, **kwargs: Any) -> None:
+        raise CleanupUnknown("systemd could not be asked about scope pb-op-1.scope")
+
+    monkeypatch.setattr(invocation_runtime, "verify_scope", unknown)
+    monkeypatch.setattr(invocation_runtime, "verify_labelled", lambda operation, **kwargs: None)
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(tmp_path)])
+    assert result.exit_code == 2
+    assert "restore the daemon and retry `pluginbench app cleanup`" in result.stderr
+    assert "Nothing was confirmed" in result.stderr
+    with ControlStore.open(isolated_host_state) as store:
+        assert store.confirmations() == []
+    assert not _admitted(isolated_host_state, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("check", "legacy"),
+    [
+        ({"kind": "scope"}, True),  # Its owner predates the P4b runtime.
+        ({"kind": "unrecorded", "contained": True}, True),  # A failed cleanup with no ticket.
+        ({"kind": "invocation", "contained": True, "identity": {"pid": 1}}, True),  # No boot.
+        ({"kind": "invocation", "contained": True, "identity": None}, True),
+        ({"kind": "invocation", "contained": True, "identity": {"pid": 1, "boot_id": "b"}}, False),
+        ({"kind": "scope", "contained": True}, False),
+        ({"kind": "labelled", "contained": True}, False),
+    ],
+)
+def test_only_a_check_nothing_recorded_can_prove_is_legacy(
+    check: dict[str, Any], legacy: bool
+) -> None:
+    assert control_store._legacy(check) is legacy

@@ -280,7 +280,7 @@ def child_resume() -> None:
     repairer = ExecutionOwner(kind="recovery", eval=target, root=target)
     with run_lock.hold_execution(repairer, state=state) as lock:
         if any(item.get("root") == target for item in lock.record["pending"]):
-            control_store.confirm_stopped(lock, Path(root))
+            control_store.confirm_stopped(lock, str(root))
     owner = ExecutionOwner(kind="run", eval=root, root=root)
     with control_store.execute(owner, state=state):
         study.resume_study(Path(root))

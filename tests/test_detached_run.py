@@ -1,4 +1,4 @@
-"""`run` returns once a background process owns the run; that process keeps running."""
+"""`run` returns once a background worker owns the host for its launch; the worker keeps running."""
 
 from __future__ import annotations
 
@@ -6,137 +6,219 @@ import json
 import os
 import subprocess
 import sys
-import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 import pytest
 import yaml
 from typer.testing import CliRunner
 
 import pluginbench
-from pluginbench import cli, run_lock
+from fake_systemd import FakeSystemd
+from fake_systemd import fake_systemd_fixture  # noqa: F401  (the fake_systemd fixture)
+from launch_support import launches, ticket, until
+from pluginbench import cli, control_store, coordinator, invocation_runtime, run_lock
+from pluginbench.control_store import ControlStore
 from pluginbench.isolation import RuntimeDriftError
 
 _SOURCE = str(Path(pluginbench.__file__).parents[1])
 
-# Stands in for the background run: owns the lock until `stop` interrupts it.
+# Stands in for `pluginbench run RUN --launch ID`: claims its launch, records the PATH it got,
+# and owns the run until stopped, checking for a recorded stop before each job it would admit.
+# It records what stopped it. PB_TEST_STOP_POLL slows its stop wake-up.
 _WORKER = """
-import sys, time
+import os, sys, time
 from pathlib import Path
-from pluginbench import run_lock
-root = Path(sys.argv[1])
-with run_lock.hold(root):
-    while True:
-        time.sleep(0.02)
+from pluginbench import control_store, run_lock
+control_store.STOP_POLL = float(os.environ.get("PB_TEST_STOP_POLL", control_store.STOP_POLL))
+state, root, launch_id = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+(root / "worker-path").write_text(os.environ["PATH"])
+owner = run_lock.ExecutionOwner(kind="run", eval=str(root), root=str(root), launch_id=launch_id)
+try:
+    with control_store.execute(owner, state=state), run_lock.hold(root):
+        while not (root / "stop-at-once").exists():
+            run_lock.check_stop()
+            time.sleep(0.02)
+except KeyboardInterrupt as stopped:
+    (root / "stopped-by").write_text(type(stopped).__name__)
 """
 
 
 @pytest.fixture
 def planned(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "plan_resume", lambda root: {"coding_calls": 3, "review_calls": 0})
-    monkeypatch.setenv("PYTHONPATH", _SOURCE)
 
 
-def _until(condition: Callable[[], bool]) -> None:
-    deadline = time.monotonic() + 10
-    while not condition():
-        assert time.monotonic() < deadline
-        time.sleep(0.02)
-
-
-def test_run_returns_while_the_background_run_continues(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planned: None
-) -> None:
+@pytest.fixture
+def worker(monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path) -> None:
     monkeypatch.setattr(
-        cli, "_worker_argv", lambda root, *, notify: [sys.executable, "-c", _WORKER, str(root)]
+        coordinator,
+        "_worker_argv",
+        lambda request, launch_id: [
+            sys.executable, "-c", _WORKER, str(isolated_host_state), str(request.target), launch_id
+        ],
     )
-    result = CliRunner().invoke(cli.app, ["run", str(tmp_path), "--yes"])
-    owner = run_lock.owner(tmp_path)
-    try:
-        assert result.exit_code == 0, result.output
-        assert f"pluginbench stop {tmp_path.absolute()}" in result.stdout
-        assert f"pluginbench status {tmp_path.absolute()} --watch" in result.stdout
-        assert owner and owner["pid"] == owner["pgid"] != os.getpgrp()
-        time.sleep(0.2)
-        assert run_lock.owner(tmp_path) == owner
-    finally:
-        # Only ever signal the detached child's own group, never this test's.
-        if owner and owner.get("pgid") != os.getpgrp():
-            run_lock.stop(tmp_path)
-    _until(lambda: run_lock.owner(tmp_path) is None)
-    # The lock is released before the child prints its traceback, so wait for the log too.
-    _until(lambda: "KeyboardInterrupt: stopped by SIGTERM" in (tmp_path / "run.log").read_text())
+    monkeypatch.setenv("PYTHONPATH", f"{_SOURCE}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
 
 
-# Records the environment it started with, then owns the lock like _WORKER.
-_ENV_WORKER = """
-import os, sys, time
-from pathlib import Path
-from pluginbench import run_lock
-root = Path(sys.argv[1])
-(root / "worker-path").write_text(os.environ["PATH"])
-with run_lock.hold(root):
-    while True:
-        time.sleep(0.02)
-"""
-
-
-def _start_and_stop(root: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[str, str]:
-    """Start _ENV_WORKER in the background, then stop it; return the output and its cgroup."""
-    monkeypatch.setattr(
-        cli, "_worker_argv", lambda root, *, notify: [sys.executable, "-c", _ENV_WORKER, str(root)]
-    )
+def _start_and_stop(root: Path, state: Path, *, signal: bool = True) -> tuple[str, str]:
+    """Start the worker with `run`, then stop it with `stop`; return the start's output and the
+    worker's cgroup. Without `signal`, the stop's SIGTERM is lost: only its record remains."""
     result = CliRunner().invoke(cli.app, ["run", str(root), "--yes"])
+    assert result.exit_code == 0, result.output
     owner = run_lock.owner(root)
-    try:
-        assert result.exit_code == 0, result.output
-        assert owner and owner["pid"] == owner["pgid"] != os.getpgrp()
-        cgroup = Path(f"/proc/{owner['pid']}/cgroup")
-        cgroups = cgroup.read_text() if cgroup.is_file() else ""
-        _until(lambda: (root / "worker-path").is_file())
-    finally:
-        if owner and owner.get("pgid") != os.getpgrp():
-            run_lock.stop(root)
-    _until(lambda: run_lock.owner(root) is None)
-    return result.stdout, cgroups
+    assert owner and owner["pid"] != os.getpid()
+    cgroup = invocation_runtime.cgroup_of(int(str(owner["pid"]))) or ""
+    until(lambda: (root / "worker-path").is_file())
+    stopped = CliRunner().invoke(cli.app, ["stop", str(root)])
+    assert stopped.exit_code == 0, stopped.output
+    until(lambda: run_lock.owner(root) is None)
+    until(lambda: {launch.status for launch in launches(state).values()} == {"finished"})
+    return result.stdout, cgroup
 
 
-@pytest.mark.skipif(not cli._systemd_scope(), reason="needs a systemd user manager")
+@pytest.mark.real_operations
+def test_run_returns_while_the_background_worker_continues_until_stopped(
+    fake_systemd: FakeSystemd, isolated_host_state: Path, tmp_path: Path, planned: None,
+    worker: None,
+) -> None:
+    output, cgroup = _start_and_stop(tmp_path, isolated_host_state)
+    (launch,) = launches(isolated_host_state).values()
+    assert f"in scope {launch.scope}" in output
+    assert cgroup.endswith(f"/{launch.scope}")
+    assert f"pluginbench stop {tmp_path}" in output
+    assert f"pluginbench status {tmp_path} --watch" in output
+    assert f"pluginbench resume {tmp_path}" in output
+    assert launch.desired == "stop"
+
+
+@pytest.mark.real_operations
+def test_a_stop_whose_signal_is_lost_still_stops_the_background_worker(
+    fake_systemd: FakeSystemd, isolated_host_state: Path, tmp_path: Path, planned: None,
+    worker: None, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Neither `stop`'s SIGTERM nor the worker's own wake-up arrives: only the record can stop it.
+    monkeypatch.setattr(run_lock, "stop", lambda root: None)
+    monkeypatch.setenv("PB_TEST_STOP_POLL", "3600")
+    _start_and_stop(tmp_path, isolated_host_state)
+    (launch,) = launches(isolated_host_state).values()
+    assert launch.desired == "stop"
+    assert (tmp_path / "stopped-by").read_text() == "StopRequested"
+
+
+@pytest.mark.systemd
 def test_background_run_leaves_the_launcher_cgroup_and_keeps_its_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planned: None
+    user_manager: None, isolated_host_state: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, planned: None, worker: None,
 ) -> None:
     # Ending the launcher's cgroup, as an agent session restart does, must not end the run.
     path = f"{tmp_path / 'launcher-bin'}{os.pathsep}{os.environ['PATH']}"
     monkeypatch.setenv("PATH", path)
-    output, cgroup = _start_and_stop(tmp_path, monkeypatch)
-    assert "in a systemd user scope" in output
-    assert cgroup.strip().endswith(".scope")
-    assert cgroup != Path("/proc/self/cgroup").read_text()
-    assert (tmp_path / "worker-path").read_text() == path
+    run = tmp_path / "run"
+    run.mkdir()
+    output, cgroup = _start_and_stop(run, isolated_host_state)
+    (launch,) = launches(isolated_host_state).values()
+    assert cgroup.endswith(f"/{launch.scope}")
+    assert cgroup != invocation_runtime.cgroup_of(os.getpid())
+    assert (run / "worker-path").read_text() == path
 
 
-def test_background_run_without_systemd_starts_in_a_new_session(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planned: None
+@pytest.mark.real_operations
+def test_a_host_without_systemd_refuses_the_run_before_anything_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path, worker: None
 ) -> None:
     (tmp_path / "empty").mkdir()
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.setattr(cli, "plan_resume", lambda root: pytest.fail("planned without systemd"))
     run = tmp_path / "run"
     run.mkdir()
-    output, _ = _start_and_stop(run, monkeypatch)
-    assert "in a new session" in output
+    result = CliRunner().invoke(cli.app, ["run", str(run), "--yes"])
+    assert result.exit_code == 2
+    assert "systemd-run or systemctl is not installed" in result.stderr
+    assert not (run / "worker-path").exists()
+    assert not (isolated_host_state / "control.sqlite").exists() or not launches(
+        isolated_host_state
+    )
 
 
+@pytest.mark.real_operations
+def test_a_host_without_systemd_refuses_a_config_before_it_is_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
+) -> None:
+    (tmp_path / "empty").mkdir()
+    (tmp_path / "eval.yaml").write_text("{}")
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.setattr(cli, "load_evaluation", lambda path: pytest.fail("loaded without systemd"))
+    result = CliRunner().invoke(cli.app, ["run", str(tmp_path / "eval.yaml"), "--yes"])
+    assert result.exit_code == 2
+    assert "systemd-run or systemctl is not installed" in result.stderr
+
+
+@pytest.mark.real_operations
+def test_a_command_that_takes_the_host_as_run_releases_it_fences_the_background_run(
+    fake_systemd: FakeSystemd, isolated_host_state: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, planned: None, worker: None,
+) -> None:
+    detach = cli._detach
+
+    def another_command_first(*args: Any, **kwargs: Any) -> None:
+        other = run_lock.ExecutionOwner(kind="review", eval="/other", root="/other")
+        with control_store.execute(other):
+            pass
+        detach(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "_detach", another_command_first)
+    result = CliRunner().invoke(cli.app, ["run", str(tmp_path), "--yes"])
+    assert result.exit_code == 2
+    assert "another command took the host first" in result.stderr
+    assert not (tmp_path / "worker-path").exists()
+    assert [launch.status for launch in launches(isolated_host_state).values()] == ["finished"]
+
+
+@pytest.mark.real_operations
 def test_background_run_that_exits_before_it_starts_fails_the_command(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planned: None
+    fake_systemd: FakeSystemd, isolated_host_state: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, planned: None,
 ) -> None:
     monkeypatch.setattr(
-        cli, "_worker_argv", lambda root, *, notify: [sys.executable, "-c", "raise SystemExit(5)"]
+        coordinator,
+        "_worker_argv",
+        lambda request, launch_id: [sys.executable, "-c", "raise SystemExit(5)"],
     )
     result = CliRunner().invoke(cli.app, ["run", str(tmp_path), "--yes"])
     assert result.exit_code == 2
     assert "exited with code 5 before it started" in result.stderr
+    assert [launch.status for launch in launches(isolated_host_state).values()] == ["finished"]
+
+
+@pytest.mark.real_operations
+@pytest.mark.parametrize("phase", ["failed", "complete"])
+def test_a_background_run_that_ends_before_run_sees_it_is_reported_by_how_it_ended(
+    fake_systemd: FakeSystemd, isolated_host_state: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, planned: None, worker: None, phase: str,
+) -> None:
+    # The worker takes run.lock, then ends at once.
+    (tmp_path / "stop-at-once").touch()
+    monkeypatch.setattr(cli, "run_status", lambda root: {"phase": phase})
+    start = invocation_runtime.start_gated
+
+    def descheduled(*args: object, **kwargs: object) -> object:
+        proc = start(*args, **kwargs)  # type: ignore[arg-type]
+        until(lambda: [launch.status for launch in launches(isolated_host_state).values()]
+              == ["finished"])
+        return proc
+
+    monkeypatch.setattr(invocation_runtime, "start_gated", descheduled)
+    result = CliRunner().invoke(cli.app, ["run", str(tmp_path), "--yes"])
+    assert (tmp_path / "worker-path").exists()
+    if phase == "complete":
+        assert result.exit_code == 0, result.output
+        assert f"The background run for {tmp_path} already finished." in result.stdout
+    else:
+        assert result.exit_code == 2
+        assert f"the background run for {tmp_path} has already ended (failed)" in result.stderr
+    assert "before it took" not in result.output
 
 
 def test_foreground_run_owns_the_lock_and_writes_events(
@@ -167,9 +249,10 @@ def test_foreground_run_owns_the_lock_and_writes_events(
 
 
 def test_the_background_command_runs_this_package() -> None:
-    argv = cli._worker_argv(Path("/run"), notify=False)
+    request = coordinator.LaunchRequest("run", Path("/run"), notify=True)
+    argv = coordinator._worker_argv(request, "launch-1")
     assert argv[:4] == [sys.executable, "-m", "pluginbench", "run"]
-    assert argv[4:] == ["/run", "--yes", "--foreground"]
+    assert argv[4:] == ["/run", "--yes", "--foreground", "--notify", "--launch", "launch-1"]
     version = subprocess.run(
         [sys.executable, "-m", "pluginbench", "--version"],
         env={**os.environ, "PYTHONPATH": _SOURCE},
@@ -263,3 +346,31 @@ def test_worker_tracebacks_keep_chain_locations_without_messages_or_notes(
     assert "line " in frames
     assert "worker failed" not in frames
     assert "raise failure" not in frames
+
+
+@pytest.mark.parametrize("fenced", [False, True])
+def test_a_worker_run_claims_its_launch_and_a_fenced_one_starts_nothing(
+    isolated_host_state: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    planned: None, fenced: bool,
+) -> None:
+    with ControlStore.open(isolated_host_state) as store:
+        launch = ticket(store, status="fenced" if fenced else "launching")
+    statuses: list[str] = []
+
+    def work(root: Path, *, progress: Callable[[str], None], guard: Callable[[], None]) -> Path:
+        statuses.append(launches(isolated_host_state)[launch.launch_id].status)
+        return root
+
+    monkeypatch.setattr(cli, "resume_evaluation", work)
+    result = CliRunner().invoke(
+        cli.app, ["run", str(tmp_path), "--yes", "--foreground", "--launch", launch.launch_id]
+    )
+    if fenced:
+        assert result.exit_code == 2
+        assert "is fenced" in result.stderr
+        assert statuses == []
+    else:
+        assert result.exit_code == 0, result.output
+        assert statuses == ["active"]
+    expected = "fenced" if fenced else "finished"
+    assert launches(isolated_host_state)[launch.launch_id].status == expected
