@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import os
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,8 @@ import pytest
 
 import operation_support
 import resume_support
-from pluginbench import control_store, run_lock
+from fake_systemd import HANDLERS, register_handlers
+from pluginbench import control_store, invocation_runtime, run_lock
 from pluginbench.run_lock import ExecutionLock
 
 
@@ -78,6 +80,42 @@ def nothing_left_running(check: dict[str, Any]) -> dict[str, Any]:
 @pytest.fixture(autouse=True)
 def operations_in_place(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     """Operations run in the test's own process (`operation_support.in_place`) on a host that
-    can contain them. Tests marked `real_operations` run them in real or fake systemd scopes."""
-    if not request.node.get_closest_marker("real_operations"):
+    can contain them. Tests marked `real_operations` run them in real or fake systemd scopes, and
+    so do tests marked `systemd`, which need the real runtime."""
+    node = request.node
+    if not (node.get_closest_marker("real_operations") or node.get_closest_marker("systemd")):
         operation_support.in_place(monkeypatch)
+
+
+@pytest.fixture
+def user_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A real systemd user manager, for tests marked `systemd`. Without one the test skips,
+    which REQUIRE_SYSTEMD makes a failure (`pytest_runtest_makereport`). Scope children load
+    the test handlers from this checkout."""
+    try:
+        invocation_runtime.require_user_manager()
+    except invocation_runtime.HostUnavailable as exc:
+        pytest.skip(f"no systemd user manager: {exc.reason}")
+    source = str(Path(invocation_runtime.__file__).parents[1])
+    monkeypatch.setenv("PYTHONPATH", f"{HANDLERS}{os.pathsep}{source}")
+    register_handlers(monkeypatch)
+
+
+# Set in CI: a `systemd` test that skips, for whatever reason, fails instead.
+REQUIRE_SYSTEMD = "PLUGINBENCH_REQUIRE_SYSTEMD_TESTS"
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[None]
+) -> Generator[None, pytest.TestReport, pytest.TestReport]:
+    report = yield
+    if (
+        report.skipped
+        and not hasattr(report, "wasxfail")
+        and item.get_closest_marker("systemd")
+        and os.environ.get(REQUIRE_SYSTEMD) == "1"
+    ):
+        report.outcome = "failed"
+        report.longrepr = f"a systemd test skipped although {REQUIRE_SYSTEMD}=1: {report.longrepr}"
+    return report

@@ -50,6 +50,33 @@ jobs:
       - name: Test
         run: pytest
 
+      - name: Start a systemd user manager
+        # The runner already has a user manager, so the Test step runs the systemd tests too.
+        # Start it explicitly anyway, as the P4 plan asks, rather than rely on the runner image;
+        # lingering is fine on a disposable runner.
+        run: |
+          sudo apt-get install -y dbus-user-session
+          uid=$(id -u)
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@${uid}.service"
+          export XDG_RUNTIME_DIR="/run/user/${uid}"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+          for _ in $(seq 30); do
+            state=$(systemctl --user is-system-running || true)
+            case "$state" in running|degraded) exit 0 ;; esac
+            sleep 1
+          done
+          echo "The user manager did not start: ${state:-no answer}"
+          exit 1
+
+      - name: Test with real systemd
+        # A systemd test that skips, such as on a runner without a user manager, fails the job.
+        env:
+          PLUGINBENCH_REQUIRE_SYSTEMD_TESTS: "1"
+        run: pytest -m systemd
+
       - name: Build the package
         run: python -m build
 
