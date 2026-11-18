@@ -223,7 +223,7 @@ plain JavaScript source files: `.js`, `.cjs`, and `.mjs` (case-insensitive).
 PluginBench's source classifier excludes test paths, and `coverage_sources` excludes
 declarations (`.d.ts`, `.d.mts`, `.d.cts`). Other languages are not c8 populations.
 Config-like names and `*-test.js` are not silently dropped. An empty source
-population or a name containing `:`, `\`, a control, or a Unicode line/paragraph separator refuses explicitly.
+population or a supported source filename containing `:`, `\`, a control, or a Unicode line/paragraph separator refuses explicitly; other suffixes are ignored.
 Native parsers reject records outside the exact staged population. Python selects literal database filenames rather
 than treating the staged source list as glob patterns.
 The pinned Python INI sets `include_namespace_packages = True`, so never-imported
@@ -249,8 +249,10 @@ Limitations:
 - Code inside the measured process can forge raw collection data.
 - coverage.py omits unloaded files whose base name contains `. # ~ ! $ @ % ^ & * ( ) + = ,`
   (before the `.py` suffix), or whose suffix is upper/mixed-case `.PY`; downstream checks flag these as unmeasured.
-- Plain JS transformed by Babel register, Jest transforms, or `Module._extensions` hooks
-  can report wrong lines. Without trusted maps this is undetectable: suite qualification
+- Loading an upper- or mixed-case `.PY` source causes report parsing to refuse the measurement.
+- Load-time plain-JS transforms, for example Babel register, Jest, `Module._extensions`,
+  ESM loader hooks (`module.register` / `node --import`), or other mechanisms, can report
+  wrong lines. Without trusted maps this is undetectable: suite qualification
   must verify that each JS profile's test runner does not transform plain JS.
 - TS and JSX (`.ts`, `.tsx`, `.jsx`, `.cts`, `.mts`) are unmeasured: transformed offsets
   need trusted maps. Kysely loses provisioned coverage; cattrs, returns and direct-source Yjs remain supported. Existing sql-formatter LCOV profiles are unchanged.
@@ -259,7 +261,7 @@ Limitations:
 
 Provisioning records resolved module, dependency, configuration, and staged
 source-file-list origins in `execution.json` under
-`provisioned_tool.runtime_origin`. Provisioner version 8 refuses older saved
+`provisioned_tool.runtime_origin`. Provisioner version 9 refuses older saved
 profiles. Prepare a new measurement revision with these launcher commands.
 Resume fingerprints bind only the distributions selected by the profile.
 

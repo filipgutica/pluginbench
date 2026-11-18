@@ -20,8 +20,8 @@ VERSIONS: dict[str, int] = {
     # Version 2 adds Go line populations, so a profile version 1 froze reads differently.
     "coverage_observer": 2,
     "mutation_observer": 1,
-    # Version 8 also refuses colon/backslash population names.
-    "measurement_tools": 8,
+    # Version 9 applies name refusal only to supported tool-source suffixes.
+    "measurement_tools": 9,
     # Version 3 resolves Codex launches and grants its selected release and helper binaries.
     "local_sandbox": 3,
 }

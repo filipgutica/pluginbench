@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -1590,18 +1591,19 @@ def test_changed_line_coverage_and_redundant_added_tests(tmp_path: Path) -> None
     assert changed["added_tests_without_added_lines"] == 1
 
 
-@pytest.mark.parametrize("suffix", ["js", "py"])
-@pytest.mark.parametrize("decoy", [False, True])
-def test_colon_filename_keeps_changed_line_denominator(suffix: str, decoy: bool) -> None:
-    path = f"src/a:b.{suffix}"
-    report: dict[str, object] = {"lines": {
-        "total": [f"{path}:{n}" for n in range(1, 31)] + ["src/ok.js:1"], "covered": ["src/ok.js:1"],
-    }, "files_measured": [path, "src/ok.js"]}
-    files = {path, "src/ok.js"} | ({"src/a"} if decoy else set())
-    measured = assessment_metrics._coverage(report, files, ["src/**"])
-    change: dict[str, object] = {"changed_line_ranges": {path: {"after": [[1, 30]]}, "src/ok.js": {"after": [[1, 1]]}}}
-    changed = assessment_metrics._changed_line_coverage({}, measured, change)
-    assert changed["added_executable_lines"] == 31 and changed["added_lines_covered"] == 1
+@pytest.mark.parametrize("path", ["src/a:b.js", "src/a:b.py", "src/a.js:12"])
+def test_coverage_refuses_colon_measured_paths(path: str) -> None:
+    report: dict[str, object] = {"lines": {"total": [path + ":1"], "covered": []},
+                                "files_measured": ["src/a.js", path]}
+    with pytest.raises(ValueError, match="measured paths.*colons"):
+        assessment_metrics._coverage(report, {path, "src/a.js", "src/a"}, ["src/**"])
+
+
+def test_long_colon_function_name_has_bounded_runtime() -> None:
+    script = ("from pluginbench.assessment_metrics import _coverage\n"
+              "report={'functions':{'total':['src/a.js:1:'+':'*1_000_000],'covered':[]},'files_measured':['src/a.js']}\n"
+              "assert _coverage(report, {'src/a.js'}, ['src/**'])['function_total']==1\n")
+    subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, timeout=3)
 
 
 def test_changed_line_coverage_is_incomplete_when_an_added_source_file_is_unmeasured(

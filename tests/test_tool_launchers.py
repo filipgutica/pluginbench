@@ -337,7 +337,7 @@ def test_c8_source_population_has_no_filename_or_extension_exclusions(tmp_path: 
     names = ["src/empty.js", "src/rollup.config.js", "src/logic-test.js", "src/upper.JS", *[
         f"src/impl{suffix}" for suffix in [".cjs", ".mjs"]
     ]]
-    excluded = [f"src/transformed{suffix}" for suffix in [".ts", ".tsx", ".jsx", ".cts", ".mts"]] + ["src/types.d.ts", "src/types.d.mts", "src/types.d.cts", "src/tool.py", "src/x.vue",
+    excluded = [f"src/transformed{suffix}" for suffix in [".ts", ".tsx", ".jsx", ".cts", ".mts"]] + ["src/types.d.ts", "src/types.d.mts", "src/types.d.cts", "src/tool.py", "src/x.vue", "src/__snapshots__/2024-01-01T10:00:00.json",
                 "src/core.test.js", "src/view.test.tsx", "src/__tests__/a.ts"]
     (tmp_path / "src").mkdir()
     for name in [*names, *excluded]:

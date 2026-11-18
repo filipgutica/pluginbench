@@ -98,7 +98,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
     "coverage_observer": (
         2,
         {
-            # Optional population validation is versioned by measurement_tools v8; exact c8
+            # Optional population validation is versioned by measurement_tools v9; exact c8
             # empty-file normalization changes only formerly refused reports, retaining v2.
             # Optional Go `go list` and `go tool cover` sidecars narrow completeness to
             # compiled files with blocks, and a zero-width Go block with no statements parses
@@ -133,10 +133,10 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         },
     ),
     "measurement_tools": (
-        8,
+        9,
         {
-            # v8 also refuses colon/backslash population names.
-            "measurement_tools.py": "22b118e78452369230d11d0680bd6cad6d741d0ef710f6375cfc3d80cf075946",
+            # v9 applies name refusal only to supported tool-source suffixes.
+            "measurement_tools.py": "12f652ace96477d11e274478634bce9c0bba1f31178e40c0bc64c6750e721978",
             "coverage_tools/launch-coverage.py": "afc80136c0f8f1e436935063615a2bd6bfe9857dbaec00f6f1f0ab3469faf06f",
             "coverage_tools/launch-c8.cjs": "aac95a3301ee2e51e29ecd491ff25cf2efcdfa937609dcf8a3fcb363ec965950",
             "coverage_tools/c8-config.json": "2ee2372e0af85263890e3e052453e08a091d47225ffa7678ca8a6c963fcbb177",

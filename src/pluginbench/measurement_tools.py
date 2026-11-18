@@ -110,10 +110,10 @@ def collection_files(directory: Path, tool: ProvisionedTool) -> list[Path]:
 
 
 def source_population(name: str, filenames: list[str]) -> set[str]:
-    if any(char in ":\\" or unicodedata.category(char) in {"Cc", "Zl", "Zp"} for file in filenames for char in file):
+    sources = {file for file in filenames if Path(file).suffix.lower() in _TOOL_SUFFIXES[name]}
+    if any(char in ":\\" or unicodedata.category(char) in {"Cc", "Zl", "Zp"} for file in sources for char in file):
         raise ValueError("coverage population paths must not contain controls or line separators, colons or backslashes")
-    return {file for file in coverage_sources(set(filenames), ["*"])
-            if Path(file).suffix.lower() in _TOOL_SUFFIXES[name]}
+    return coverage_sources(sources, ["*"])
 
 
 @contextmanager
