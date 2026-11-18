@@ -279,3 +279,77 @@ def test_opening_a_current_control_store_writes_nothing(isolated_host_state: Pat
         assert observer.execute("PRAGMA data_version").fetchone()[0] == before
     finally:
         observer.close()
+
+
+def test_concurrent_first_opens_each_see_the_whole_schema(tmp_path: Path) -> None:
+    # Many commands open a host's control database for the first time at once: none may read it
+    # before its tables exist.
+    for attempt in range(20):
+        state = tmp_path / str(attempt)
+        state.mkdir()
+        together = threading.Barrier(8, timeout=10)
+        errors: list[BaseException] = []
+
+        def open_and_read() -> None:
+            together.wait()
+            try:
+                with ControlStore.open(state) as store:
+                    store.reconciling()
+                    store.launches("active")
+                    store.confirmed()
+            except BaseException as exc:
+                errors.append(exc)
+
+        openers = [threading.Thread(target=open_and_read) for _ in range(8)]
+        for opener in openers:
+            opener.start()
+        for opener in openers:
+            opener.join(timeout=30)
+        assert errors == [], f"attempt {attempt}: {errors[:3]}"
+        with ControlStore.open(state) as store:
+            assert store._db.execute("PRAGMA user_version").fetchone()[0] == (
+                control_store.SCHEMA_VERSION
+            )
+
+
+def test_a_reader_never_sees_the_schema_version_before_the_tables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The first opener pauses as it creates its first table; a second opener meanwhile must not
+    # find the current version without the tables.
+    creating, release = threading.Event(), threading.Event()
+    connect = sqlite3.connect
+
+    def first(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        monkeypatch.setattr(sqlite3, "connect", connect)
+        db: sqlite3.Connection = connect(*args, **kwargs)
+
+        def authorize(action: int, name: str | None, *rest: object) -> int:
+            if action == sqlite3.SQLITE_CREATE_TABLE and name == "host_state":
+                creating.set()
+                release.wait(timeout=10)
+            return sqlite3.SQLITE_OK
+
+        db.set_authorizer(authorize)
+        return db
+
+    monkeypatch.setattr(sqlite3, "connect", first)
+    errors: list[BaseException] = []
+
+    def open_and_read() -> None:
+        try:
+            with ControlStore.open(tmp_path) as store:
+                store.reconciling()
+        except BaseException as exc:
+            errors.append(exc)
+
+    creator = threading.Thread(target=open_and_read)
+    creator.start()
+    assert creating.wait(timeout=10)
+    reader = threading.Thread(target=open_and_read)
+    reader.start()
+    reader.join(timeout=1)  # Waits for the creator now, rather than reading a partial schema.
+    release.set()
+    creator.join(timeout=10)
+    reader.join(timeout=10)
+    assert errors == []
