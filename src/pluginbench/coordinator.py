@@ -72,6 +72,7 @@ class LaunchRequest:
     kind: str
     target: Path
     initiator: str = "cli"
+    notify: bool = False
 
     def __post_init__(self) -> None:
         if self.kind not in WORKER_KINDS:
@@ -416,13 +417,13 @@ def _signal(found: dict[str, Any], signum: signal.Signals) -> None:
 
 
 def status(state: Path | None = None) -> dict[str, Any]:
-    """What an observer sees of the coordinator and the host execution lock. It changes no
-    record; opening the control database writes only to bring an older one up to date."""
+    """What an observer sees of the coordinator and the host execution lock. It writes nothing
+    but the rollback of a transaction a killed writer left unfinished."""
     state = state or run_lock.state_root()
     snapshot = run_lock.execution_owner(state)
     reconciling, launches = None, []
     if (state / control_store.CONTROL_NAME).exists():
-        with ControlStore.open(state) as store:
+        with ControlStore.open(state, readonly=True) as store:
             reconciling = store.reconciling()
             launches = [asdict(launch) for launch in store.launches("launching", "active", "fenced")]
     return {
@@ -436,7 +437,32 @@ def status(state: Path | None = None) -> dict[str, Any]:
 
 def _worker_argv(request: LaunchRequest, launch_id: str) -> list[str]:
     return [sys.executable, "-m", "pluginbench", request.kind, str(request.target.resolve()),
-            "--yes", "--foreground", "--launch", launch_id]
+            "--yes", "--foreground", *(["--notify"] if request.notify else []),
+            "--launch", launch_id]
+
+
+def running(launch_id: str, state: Path | None = None) -> bool:
+    """Whether `launch_id` is still claimed by its process."""
+    with ControlStore.open(state or run_lock.state_root()) as store:
+        launch = store.launch(launch_id)
+    return launch is not None and launch.status == "active"
+
+
+def request_stop(target: Path, state: Path | None = None) -> list[str]:
+    """Record a stop for every unfinished worker launch for `target`; return their IDs. Each
+    worker checks it before it admits each new job, so it holds even if no signal reaches the
+    worker."""
+    state = state or run_lock.state_root()
+    if not (state / control_store.CONTROL_NAME).exists():
+        return []
+    root = str(target.resolve())
+    with ControlStore.open(state) as store:
+        return [
+            launch.launch_id
+            for launch in store.launches("launching", "active")
+            if launch.kind != "coordinator" and launch.target == root
+            and store.request_stop(launch.launch_id)
+        ]
 
 
 def _holds_host(state: Path, launch_id: str) -> bool:
@@ -451,8 +477,29 @@ def _holds_host(state: Path, launch_id: str) -> bool:
 CLAIM_SECONDS = control_store.RECOVERY_SECONDS + invocation_runtime.CLEANUP_SECONDS
 
 
-def launch(request: LaunchRequest, state: Path | None = None) -> Launch:
-    """Start a worker for `request` in its own scope; return its launch once it claimed it.
+def reserve(request: LaunchRequest, state: Path | None = None) -> Launch:
+    """Record the launch for `request` before anything spawns. A caller that holds the host
+    reserves it before it releases the host, so a command that takes the host in between
+    fences it, and `launch` then reports that the command took the host first."""
+    state = state or run_lock.state_root()
+    launch_id = uuid4().hex
+    target = request.target.resolve()
+    ticket = _ticket(
+        launch_id, request.kind, request.initiator, target, f"pb-worker-{launch_id}.scope"
+    )
+    with ControlStore.open(state) as store:
+        try:
+            store.create_launch(ticket)
+        except sqlite3.IntegrityError as exc:
+            raise run_lock.ExecutionBusy("the app is already starting a worker") from exc
+    return ticket
+
+
+def launch(
+    request: LaunchRequest, state: Path | None = None, *, reserved: Launch | None = None
+) -> Launch:
+    """Start a worker for `request` in its own scope, under the launch `reserved` for it or a
+    new one; return its launch once it claimed it.
 
     The worker takes the host execution lock itself, so a command that takes it first wins:
     the launch is then fenced, the worker exits without work, and this raises LaunchFenced.
@@ -462,16 +509,16 @@ def launch(request: LaunchRequest, state: Path | None = None) -> Launch:
     fenced, never stopped while it holds the lock, and exits without work once it checks.
     """
     state = state or run_lock.state_root()
-    launcher = invocation_runtime.require_user_manager()
+    try:
+        launcher = invocation_runtime.require_user_manager()
+    except BaseException:
+        if reserved is not None:
+            _abandon(state, reserved.launch_id)
+        raise
     target = request.target.resolve()
-    launch_id = uuid4().hex
+    launch_id = (reserved or reserve(request, state)).launch_id
     scope = f"pb-worker-{launch_id}.scope"
-    ticket = _ticket(launch_id, request.kind, request.initiator, target, scope)
     with ControlStore.open(state) as store:
-        try:
-            store.create_launch(ticket)
-        except sqlite3.IntegrityError as exc:
-            raise run_lock.ExecutionBusy("the app is already starting a worker") from exc
         try:
             proc = invocation_runtime.start_gated(
                 _scope_command(launcher, scope, _worker_argv(request, launch_id)),

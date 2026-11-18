@@ -202,6 +202,24 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def roll_back_unfinished_write(path: Path) -> None:
+    """Undo a transaction that a killed writer left half done in the SQLite database at `path`,
+    so a read-only connection can read it.
+
+    A writer killed mid-transaction can leave a hot rollback journal, which a read-only
+    connection cannot roll back ("attempt to write a readonly database"). A writable open
+    rolls it back, as SQLite does for the next writer: the database returns to its last commit
+    and no committed row changes. SQLite rolls back only a journal no live writer holds, so a
+    live writer's transaction is never touched. Without a journal file nothing is opened.
+    """
+    if path.with_name(f"{path.name}-journal").exists():
+        connection = sqlite3.connect(path, timeout=2)
+        try:
+            connection.execute("PRAGMA user_version").fetchone()
+        finally:
+            connection.close()
+
+
 class Ledger:
     def __init__(self, connection: sqlite3.Connection, version: int = SCHEMA_VERSION) -> None:
         self._db = connection
@@ -312,6 +330,12 @@ class Ledger:
             connection.close()
             raise ValueError(f"unsupported ledger schema version {version}")
         return cls(connection)
+
+    @classmethod
+    def recover(cls, path: Path) -> Ledger:
+        """Open read-only, after undoing a write its killed writer left half done."""
+        roll_back_unfinished_write(path)
+        return cls.read(path)
 
     @classmethod
     def read(cls, path: Path) -> Ledger:

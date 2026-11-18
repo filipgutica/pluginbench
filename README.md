@@ -27,10 +27,12 @@ When a task ships a reference solution (`solution/solution.patch`), code measure
 
 ## Requirements
 
-PluginBench runs on Linux or macOS. Every run needs:
+PluginBench executes on Linux only: `run`, `check`, `review`, `measure` and `judge run` refuse on a host without a reachable systemd user manager, which includes macOS and most containers. Commands that only read saved results, such as `status`, `compare` and `dashboard`, do not need it. Every run needs:
 
 | Tool | Version | Why |
 | --- | --- | --- |
+| systemd | 255 or later, with a user manager for your account (`systemctl --user is-system-running` prints `running` or `degraded`) | Each run and each call runs in its own transient scope, so it outlives the terminal that started it and is stopped completely |
+| cgroup v2 | Mounted at `/sys/fs/cgroup` | Proves a scope's processes are gone before the next command starts |
 | Python | 3.12 or later | Runs PluginBench |
 | Git | Any recent | Task sources and patches |
 | Docker | Linux containers on a local Unix socket, with Compose and Buildx | Each attempt and its verifier run in containers |
@@ -240,7 +242,7 @@ Every setting lives in the config. Flags only control how a command runs.
 ## Stop, resume, and reuse
 
 - `pluginbench stop runs/<run>` stops new attempts. Attempts already coding finish and are kept, including with `jobs: 1`. Resume never codes complete attempts again.
-- `pluginbench run runs/<run>` resumes. A run that was killed, for example by a host shutdown, shows `interrupted`, and `status` prints this command. Complete attempts are kept and never coded again. An attempt cut off mid-call is recorded as `discarded-interrupted` and a new attempt takes its slot. Containers the killed attempt left running are stopped before coding resumes, and `status` names them until then. Resume cannot repair a failing solution.
+- `pluginbench resume runs/<run>`, or `pluginbench run runs/<run>`, resumes. A run that was killed, for example by a host shutdown, shows `interrupted`, and `status` prints this command. Complete attempts are kept and never coded again. An attempt cut off mid-call is recorded as `discarded-interrupted` and a new attempt takes its slot. Containers the killed attempt left running are stopped before coding resumes, and `status` names them until then. Resume cannot repair a failing solution.
 - If Codex or Claude Code fails before its first model turn, for example during a network outage, a CLI startup error, or a timeout with no model turn, the run stops instead of scoring the attempt. Resume when the CLI can reach its model.
 - A run coded before grade contract 1 is legacy: `status` and `report` read it, but `pluginbench run` refuses to code more of it. Start a new run; its vanilla cache entries are still reused.
 - If a Claude Code or Codex session stops at a usage or rate limit, an authentication failure, or a provider error that retries did not recover, the run also stops instead of scoring the attempt. Resume after the limit resets. [Concurrency and resume](docs/running-evaluations.md#concurrency-and-resume).
