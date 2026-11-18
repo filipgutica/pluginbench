@@ -24,7 +24,7 @@ from uuid import uuid4
 import pytest
 import yaml
 
-from pluginbench import control_store, harbor_backend, harbor_labels, invocation_runtime
+from pluginbench import control_store, harbor_backend, harbor_labels, invocation_runtime, processes
 from pluginbench.assessment_metrics import inspect_snapshot
 from test_native_harbor import native_task
 
@@ -351,6 +351,8 @@ class _Daemon:
             output = key + "\n"
         elif arguments[0] == "exec":
             status = 1  # The measurement fails, and its process dies before its cleanup.
+        elif arguments[0] == "info":
+            output = "daemon\n"  # The engine ID the runtime recorded.
         elif arguments[0] == "ps":
             name, value = arguments[-1].removeprefix("label=").split("=", 1)
             output = "".join(
@@ -403,8 +405,14 @@ def test_recovery_removes_a_crashed_measurements_container_by_its_label_alone(
     assert inspect_snapshot(source)  # The frozen input is intact; only the container remains.
     left = [key for key, labels in daemon.containers.items() if labels.get(LABEL) == invocation]
     assert len(left) == 1
-    # Recovery runs in the next owner, outside any operation.
+    # Recovery runs in the next owner, outside any operation, with the Docker CLI on PATH now.
     monkeypatch.setattr(invocation_runtime, "_current", None)
+    monkeypatch.setattr(processes, "run_command", daemon)
+    binaries = tmp_path / "docker-bin"
+    binaries.mkdir()
+    (binaries / "docker").write_text("#!/bin/sh\nexit 1\n")
+    (binaries / "docker").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{binaries}{os.pathsep}{os.environ['PATH']}")
     spec = invocation_runtime.InvocationSpec(invocation, runtime)
     proof = invocation_runtime.verify_labelled(
         {"id": invocation, "label": spec.label, "docker": runtime},
