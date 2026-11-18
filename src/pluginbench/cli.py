@@ -341,9 +341,19 @@ def _preflight(
 
 
 def _detach(root: Path, *, notify: bool) -> None:
-    """Start the run as a worker in its own systemd scope; return once it owns the host."""
+    """Start the run as a worker in its own systemd scope; return once it owns the host and
+    the run's run.lock."""
     launched = coordinator.launch(coordinator.LaunchRequest("run", root, notify=notify))
     process = launched.process or {}
+    # The worker claims its launch as it takes the host, then takes run.lock.
+    deadline = time.monotonic() + invocation_runtime.GATE_SECONDS
+    while (run_lock.owner(root) or {}).get("pid") != process.get("pid"):
+        if time.monotonic() > deadline or not coordinator.running(launched.launch_id):
+            raise ValueError(
+                f"the background run did not take {root / run_lock.LOCK_NAME}; see "
+                f"{root / 'run.log'}"
+            )
+        time.sleep(0.05)
     typer.echo(
         f"Started run {root} in the background (process {process.get('pid')}, in scope "
         f"{launched.scope})."

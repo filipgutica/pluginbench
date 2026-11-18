@@ -400,6 +400,13 @@ def _worker_argv(request: LaunchRequest, launch_id: str) -> list[str]:
             "--launch", launch_id]
 
 
+def running(launch_id: str, state: Path | None = None) -> bool:
+    """Whether `launch_id` is still claimed by its process."""
+    with ControlStore.open(state or run_lock.state_root()) as store:
+        launch = store.launch(launch_id)
+    return launch is not None and launch.status == "active"
+
+
 def request_stop(target: Path, state: Path | None = None) -> list[str]:
     """Record a stop for every unfinished worker launch for `target`; return their IDs. Each
     worker checks it before every call, so it holds even if no signal reaches the worker."""
