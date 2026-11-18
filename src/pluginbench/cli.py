@@ -471,6 +471,11 @@ def run(
         with ExitStack() as owned:
             if as_json and not dry_run:
                 raise ValueError("--json prints the dry-run plan; add --dry-run")
+            if launch is not None and not (target.is_dir() and foreground and not dry_run):
+                raise ValueError(
+                    "--launch names a background worker's launch: it takes a run directory "
+                    "and --foreground"
+                )
             if not target.exists():
                 raise ValueError(
                     f"{target} does not exist; give an evaluation YAML or JSON, or a run directory"
