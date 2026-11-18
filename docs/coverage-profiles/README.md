@@ -223,7 +223,7 @@ plain JavaScript source files: `.js`, `.cjs`, and `.mjs` (case-insensitive).
 PluginBench's source classifier excludes test paths, and `coverage_sources` excludes
 declarations (`.d.ts`, `.d.mts`, `.d.cts`). Other languages are not c8 populations.
 Config-like names and `*-test.js` are not silently dropped. An empty source
-population or a name containing a control or Unicode line/paragraph separator refuses explicitly.
+population or a name containing `:`, `\`, a control, or a Unicode line/paragraph separator refuses explicitly.
 Native parsers reject records outside the exact staged population. Python selects literal database filenames rather
 than treating the staged source list as glob patterns.
 The pinned Python INI sets `include_namespace_packages = True`, so never-imported
@@ -233,7 +233,7 @@ The reporting interpreter's absolute path and physical task root are resolved
 from the pinned image before snapshot copy. An interpreter inside that root or
 the tool tree refuses; reporting executes the resolved path without a PATH lookup.
 Signal-terminated collections retain their exit receipt without requiring raw
-data or starting reporting. Node-ignored signals retain a nonzero fallback code.
+data or starting reporting.
 Valid raw data from an ordinary nonzero test exit
 can still be reported. Mutation collects only status/output and source-integrity
 receipts; it does not export raw coverage or start a reporting container.
@@ -248,14 +248,18 @@ Limitations:
 
 - Code inside the measured process can forge raw collection data.
 - coverage.py omits unloaded files whose base name contains `. # ~ ! $ @ % ^ & * ( ) + = ,`
-  (before the `.py` suffix); downstream checks flag these as unmeasured.
+  (before the `.py` suffix), or whose suffix is upper/mixed-case `.PY`; downstream checks flag these as unmeasured.
+- Plain JS transformed by Babel register, Jest transforms, or `Module._extensions` hooks
+  can report wrong lines. Without trusted maps this is undetectable: suite qualification
+  must verify that each JS profile's test runner does not transform plain JS.
 - TS and JSX (`.ts`, `.tsx`, `.jsx`, `.cts`, `.mts`) are unmeasured: transformed offsets
   need trusted maps. Kysely loses provisioned coverage; cattrs, returns and direct-source Yjs remain supported. Existing sql-formatter LCOV profiles are unchanged.
 - Exit codes 129–255 are treated as signals, even if the program explicitly chose one.
+- FN/FNDA function names are not escaped; injection fails closed through consistency checks.
 
 Provisioning records resolved module, dependency, configuration, and staged
 source-file-list origins in `execution.json` under
-`provisioned_tool.runtime_origin`. Provisioner version 7 refuses older saved
+`provisioned_tool.runtime_origin`. Provisioner version 8 refuses older saved
 profiles. Prepare a new measurement revision with these launcher commands.
 Resume fingerprints bind only the distributions selected by the profile.
 

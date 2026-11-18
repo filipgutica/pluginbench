@@ -1590,6 +1590,20 @@ def test_changed_line_coverage_and_redundant_added_tests(tmp_path: Path) -> None
     assert changed["added_tests_without_added_lines"] == 1
 
 
+@pytest.mark.parametrize("suffix", ["js", "py"])
+@pytest.mark.parametrize("decoy", [False, True])
+def test_colon_filename_keeps_changed_line_denominator(suffix: str, decoy: bool) -> None:
+    path = f"src/a:b.{suffix}"
+    report: dict[str, object] = {"lines": {
+        "total": [f"{path}:{n}" for n in range(1, 31)] + ["src/ok.js:1"], "covered": ["src/ok.js:1"],
+    }, "files_measured": [path, "src/ok.js"]}
+    files = {path, "src/ok.js"} | ({"src/a"} if decoy else set())
+    measured = assessment_metrics._coverage(report, files, ["src/**"])
+    change: dict[str, object] = {"changed_line_ranges": {path: {"after": [[1, 30]]}, "src/ok.js": {"after": [[1, 1]]}}}
+    changed = assessment_metrics._changed_line_coverage({}, measured, change)
+    assert changed["added_executable_lines"] == 31 and changed["added_lines_covered"] == 1
+
+
 def test_changed_line_coverage_is_incomplete_when_an_added_source_file_is_unmeasured(
     tmp_path: Path,
 ) -> None:

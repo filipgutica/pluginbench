@@ -373,7 +373,10 @@ def _coordinates(
     for coordinate in total:
         if ":" not in coordinate:
             raise ValueError("coverage coordinates require relative-path:coordinate")
-        _source_path(coordinate.split(":", 1)[0], files, scope)
+        path = coordinate.rsplit(":", 1)[0]
+        while label != "lines" and path not in files and ":" in path:
+            path = path.rsplit(":", 1)[0]
+        _source_path(path, files, scope)
     if not covered <= total:
         raise ValueError(f"{label} covered coordinates escape the fixed denominator")
     return total, covered
@@ -2055,6 +2058,7 @@ def _changed_line_coverage(
         return {"status": "unavailable", "reason": "bound source diff or line coordinates missing"}
     added = _added_source_lines(change)
     added_files = {line.rsplit(":", 1)[0] for line in added}
+    measured_files = set(_strings(right.get("files_measured", []), "measured files"))
     unmeasured = sorted(
         set(_strings(right.get("unmeasured_source_files", []), "unmeasured source files"))
         & added_files
@@ -2088,7 +2092,10 @@ def _changed_line_coverage(
             continue
 
         def on_added_line(coordinate: str) -> bool:
-            path, _, rest = coordinate.partition(":")
+            path, _, rest = coordinate.rpartition(":")
+            while unit == "branch" and path not in measured_files and ":" in path:
+                path, _, suffix = path.rpartition(":")
+                rest = suffix + ":" + rest
             return f"{path}:{rest.split(':')[0]}" in added
 
         total = {item for item in _strings(population["total"], unit) if on_added_line(item)}

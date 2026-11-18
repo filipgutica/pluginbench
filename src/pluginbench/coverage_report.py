@@ -134,6 +134,12 @@ def _record(
         raise ValueError("LCOV record must begin with a source path")
     path = _source_path(rows[0][3:], files, scope, workdir)
     result = _Record(path, len((snapshot / path).read_text().splitlines()))
+    # c8's unexecuted empty-file placeholder has no real coordinates of any kind.
+    if result.line_count == 0 and rows[1:] == [
+        "FN:1,(empty-report)", "FNF:1", "FNH:0", "FNDA:0,(empty-report)",
+        "DA:1,0", "LF:1", "LH:0", "BRDA:1,0,0,0", "BRF:1", "BRH:0",
+    ]:
+        return _Record(path, 0, summaries=dict.fromkeys(("FNF", "FNH", "LF", "LH", "BRF", "BRH"), 0))
     for raw in rows[1:]:
         key, separator, value = raw.partition(":")
         if not separator:

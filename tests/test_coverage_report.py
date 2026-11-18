@@ -301,6 +301,16 @@ def test_explicit_empty_population_is_distinct_from_missing(tmp_path: Path, sour
     assert "lines" not in report
 
 
+@pytest.mark.parametrize(("old", "new"), [("DA:1,0", "DA:1,1"), ("DA:1,0", "DA:2,0"),
+    ("FN:1,", "FN:2,"), ("BRDA:1,", "BRDA:2,"), ("LF:1", "LF:2"), ("FNF:1", "FNF:0")])
+def test_empty_c8_placeholder_rejects_other_rows(tmp_path: Path, source: Path, old: str, new: str) -> None:
+    (source / "src/empty.js").write_text("")
+    raw = ("SF:src/empty.js\nFN:1,(empty-report)\nFNF:1\nFNH:0\nFNDA:0,(empty-report)\n"
+           "DA:1,0\nLF:1\nLH:0\nBRDA:1,0,0,0\nBRF:1\nBRH:0\nend_of_record\n")
+    with pytest.raises(ValueError):
+        read_report(tmp_path, source, raw.replace(old, new))
+
+
 def test_duplicate_source_records_are_rejected(tmp_path: Path, source: Path) -> None:
     with pytest.raises(ValueError, match="duplicated"):
         read_report(tmp_path, source, REPORT + REPORT)

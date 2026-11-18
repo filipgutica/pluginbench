@@ -334,7 +334,7 @@ def test_provisioned_c8_refuses_remapping_opt_in() -> None:
 def test_c8_source_population_has_no_filename_or_extension_exclusions(tmp_path: Path) -> None:
     from pluginbench.coverage_report import parse_lcov
 
-    names = ["src/rollup.config.js", "src/logic-test.js", "src/upper.JS", *[
+    names = ["src/empty.js", "src/rollup.config.js", "src/logic-test.js", "src/upper.JS", *[
         f"src/impl{suffix}" for suffix in [".cjs", ".mjs"]
     ]]
     excluded = [f"src/transformed{suffix}" for suffix in [".ts", ".tsx", ".jsx", ".cts", ".mts"]] + ["src/types.d.ts", "src/types.d.mts", "src/types.d.cts", "src/tool.py", "src/x.vue",
@@ -342,7 +342,7 @@ def test_c8_source_population_has_no_filename_or_extension_exclusions(tmp_path: 
     (tmp_path / "src").mkdir()
     for name in [*names, *excluded]:
         (tmp_path / name).parent.mkdir(exist_ok=True)
-        (tmp_path / name).write_text("export const value = 1;\n")
+        (tmp_path / name).write_text("" if name == "src/empty.js" else "export const value = 1;\n")
     (tmp_path / "main.cjs").write_text("console.log(1)\n")
     with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3"), source_files=names + excluded) as stage:
         result = subprocess.run(c8_command(stage / "c8", "--all", "--", "node", "main.cjs"),
@@ -352,7 +352,9 @@ def test_c8_source_population_has_no_filename_or_extension_exclusions(tmp_path: 
                         test_scope=["tests/**"], workdir=str(tmp_path))
     lines = report["lines"]
     assert isinstance(lines, dict)
-    assert set(lines["total"]) == {f"{name}:1" for name in names}
+    assert set(lines["total"]) == {f"{name}:1" for name in names if name != "src/empty.js"}
+    measured = report["files_measured"]
+    assert isinstance(measured, list) and "src/empty.js" in measured
     assert lines["covered"] == []
     from pluginbench.assessment_metrics import _coverage, inspect_snapshot
     inventory = inspect_snapshot(tmp_path)["files"]
@@ -362,10 +364,10 @@ def test_c8_source_population_has_no_filename_or_extension_exclusions(tmp_path: 
     assert isinstance(unmeasured, list) and set(unmeasured) >= set(excluded[:5] + ["src/tool.py"])
 
 
-@pytest.mark.parametrize("char", ["\n", "\x0c", "\x7f", "\x85", "\u2028", "\u2029"])
+@pytest.mark.parametrize("char", ["\n", "\x0c", "\x7f", "\x85", "\u2028", "\u2029", ":", "\\"])
 def test_population_refuses_control_and_separator_names(char: str) -> None:
     with pytest.raises(ValueError, match="controls or line separators"):
-        with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3"), source_files=[f"src/a{char}DA:1,1.js"]):
+        with tools.staged_tool(tools.ProvisionedTool(name="c8", version="10.1.3"), source_files=[f"src/a{char}b.js"]):
             pytest.fail("unsafe population entered staging")
 
 

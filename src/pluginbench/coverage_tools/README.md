@@ -35,7 +35,7 @@ component version in `components.py`. Coding launch identity stays unchanged.
 `launch-coverage.py`, `coverage-config.ini`, `launch-c8.cjs`, and `c8-config.json` are PluginBench code
 bound by the `measurement_tools` component version. They are staged beside the
 selected distribution. Use the documented launchers, rather than the distributions'
-raw entry points. Provisioner version 7 reports in a fresh container with a fresh artifact extraction,
+raw entry points. Provisioner version 8 reports in a fresh container with a fresh artifact extraction,
 pins the reporting interpreter/configuration/data paths, filters c8 to plain JavaScript
 without declarations or tests, disables source-map discovery, and disables exclusion hints. The staged
 `source-files.json` comes from the frozen snapshot and profile scope, not task
