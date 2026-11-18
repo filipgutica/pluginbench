@@ -682,7 +682,7 @@ def _work_checks(obligation: dict[str, Any], state: Path) -> list[Check]:
     if obligation.get("kind") in UNRECORDED_KINDS or path is None:
         return []  # No ledger records its processes; the owner's own check covers them.
     since = _since(obligation.get("acquired_at"))
-    ledger = Ledger.read(path)
+    ledger = Ledger.recover(path)  # Its writer is dead: undo a write it left half done.
     try:
         rows = _owned(ledger, since)
     finally:
