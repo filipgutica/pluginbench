@@ -7,11 +7,14 @@ starts a container or a model.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
@@ -23,9 +26,9 @@ import pytest
 import pluginbench
 from fake_systemd import FakeSystemd, members
 from fake_systemd import fake_systemd_fixture  # noqa: F401  (the fake_systemd fixture)
-from launch_support import SLEEP, launches, until
-from pluginbench import coordinator, invocation_runtime, run_lock
-from pluginbench.control_store import LaunchFenced
+from launch_support import SLEEP, in_scope, launches, ticket, until
+from pluginbench import control_store, coordinator, invocation_runtime, run_lock
+from pluginbench.control_store import ControlStore, LaunchFenced
 
 pytestmark = pytest.mark.real_operations
 
@@ -270,6 +273,329 @@ def test_a_worker_of_another_version_never_claims_its_launch(
         coordinator.launch(coordinator.LaunchRequest("run", tmp_path))
     assert _bodies(tmp_path) == []
     assert [launch.status for launch in launches(isolated_host_state).values()] == ["finished"]
+
+
+# The launcher's handshake.
+
+# A worker whose recovery of the last owner outlasts the startup gate: it holds the host, then
+# claims its launch seconds later.
+_SLOW_RECOVERY = _WORKER.replace(
+    "owner = run_lock.ExecutionOwner(",
+    "import time as _t\n_settle = control_store._settle_launches\n"
+    "control_store._settle_launches = lambda store, own: (_t.sleep(5), _settle(store, own))\n"
+    "owner = run_lock.ExecutionOwner(",
+)
+
+
+def test_a_worker_still_recovering_after_the_gate_is_awaited_not_killed(
+    fake_systemd: FakeSystemd,
+    isolated_host_state: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(invocation_runtime, "GATE_SECONDS", 2.0)
+    monkeypatch.setattr(
+        coordinator,
+        "_worker_argv",
+        lambda request, launch_id: [
+            sys.executable, "-c", _SLOW_RECOVERY, str(isolated_host_state), str(request.target),
+            launch_id,
+        ],
+    )
+    monkeypatch.setenv("PYTHONPATH", _env()["PYTHONPATH"])
+    try:
+        launched = coordinator.launch(coordinator.LaunchRequest("run", tmp_path))
+        assert launched.status == "active"
+        until(lambda: len(_bodies(tmp_path)) == 1)
+    finally:
+        (tmp_path / "release").touch()
+    until(lambda: launches(isolated_host_state)[launched.launch_id].status == "finished")
+    assert (run_lock.execution_owner(isolated_host_state).record or {}).get("state") == "released"
+
+
+def test_abandoning_a_launch_its_worker_claimed_first_leaves_it_running(
+    fake_systemd: FakeSystemd, isolated_host_state: Path
+) -> None:
+    with ControlStore.open(isolated_host_state) as store:
+        launch = ticket(store)
+    worker = in_scope(launch.scope)
+    try:
+        with ControlStore.open(isolated_host_state) as store:
+            assert store.claim(launch.launch_id, {"pid": worker.pid})
+        started = coordinator._abandon(isolated_host_state, launch.launch_id)
+        assert started is not None and started.status == "active"
+        assert members(launch.scope)
+    finally:
+        worker.kill()
+        worker.wait()
+
+
+def test_a_launch_being_abandoned_can_no_longer_be_claimed(
+    fake_systemd: FakeSystemd, isolated_host_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with ControlStore.open(isolated_host_state) as store:
+        launch = ticket(store)
+    worker = in_scope(launch.scope)
+    claimed: list[bool] = []
+    verify = invocation_runtime.verify_scope
+
+    def claim_first(operation: Any, **kwargs: Any) -> Any:
+        # The worker reaches its claim while its scope is being stopped.
+        with ControlStore.open(isolated_host_state) as store:
+            claimed.append(store.claim(launch.launch_id, {"pid": worker.pid}))
+        return verify(operation, **kwargs)
+
+    monkeypatch.setattr(invocation_runtime, "verify_scope", claim_first)
+    try:
+        assert coordinator._abandon(isolated_host_state, launch.launch_id) is None
+        assert claimed == [False]
+        assert members(launch.scope) == []
+        assert launches(isolated_host_state)[launch.launch_id].status == "finished"
+    finally:
+        worker.kill()
+        worker.wait()
+
+
+def test_a_launch_whose_start_fails_is_ended_not_left_launching(
+    fake_systemd: FakeSystemd,
+    isolated_host_state: Path,
+    worker: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(*args: Any, **kwargs: Any) -> None:
+        raise OSError("systemd-run could not be started")
+
+    monkeypatch.setattr(invocation_runtime, "start_gated", broken)
+    with pytest.raises(OSError, match="systemd-run"):
+        coordinator.launch(coordinator.LaunchRequest("run", tmp_path))
+    assert [launch.status for launch in launches(isolated_host_state).values()] == ["finished"]
+
+
+def test_a_worker_that_claims_and_finishes_before_the_launcher_looks_counts_as_started(
+    fake_systemd: FakeSystemd,
+    isolated_host_state: Path,
+    worker: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "release").touch()  # Its body ends at once.
+    start = invocation_runtime.start_gated
+
+    def descheduled(*args: Any, **kwargs: Any) -> Any:
+        proc = start(*args, **kwargs)
+        until(lambda: [launch.status for launch in launches(isolated_host_state).values()]
+              == ["finished"])
+        return proc
+
+    monkeypatch.setattr(invocation_runtime, "start_gated", descheduled)
+    launched = coordinator.launch(coordinator.LaunchRequest("run", tmp_path))
+    assert launched.status == "finished" and launched.process is not None
+    assert len(_bodies(tmp_path)) == 1
+
+
+def test_a_launch_fenced_before_its_late_systemd_run_never_starts_its_worker(
+    fake_systemd: FakeSystemd,
+    isolated_host_state: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "ran"
+    monkeypatch.setattr(
+        coordinator,
+        "_worker_argv",
+        lambda request, launch_id: [sys.executable, "-c", f"open({str(marker)!r}, 'w')"],
+    )
+    start = invocation_runtime.start_gated
+
+    def late(*args: Any, **kwargs: Any) -> Any:
+        # A command takes the host before this launcher's systemd-run runs.
+        with ControlStore.open(isolated_host_state) as store:
+            (pending,) = store.launches("launching")
+            assert store.fence(pending.launch_id)
+        return start(*args, **kwargs)
+
+    monkeypatch.setattr(invocation_runtime, "start_gated", late)
+    with pytest.raises(LaunchFenced, match="fenced before it started"):
+        coordinator.launch(coordinator.LaunchRequest("run", tmp_path))
+    assert not marker.exists()
+    (launch,) = launches(isolated_host_state).values()
+    assert launch.status == "finished" and launch.bootstrap is None
+    assert members(launch.scope) == []
+
+
+# Adoption of a worker of another version.
+
+
+def test_a_live_worker_of_another_version_is_neither_adopted_nor_signalled(
+    fake_systemd: FakeSystemd, isolated_host_state: Path, tmp_path: Path
+) -> None:
+    other = "0.0.0+other"
+    launch_id = uuid4().hex
+    launch = coordinator._ticket(
+        launch_id, "run", "app", tmp_path, f"pb-worker-{launch_id}.scope"
+    )
+    launch = dataclasses.replace(launch, version=other)
+    with ControlStore.open(isolated_host_state) as store:
+        store.create_launch(launch)
+    # Started by a coordinator of that version; it claims and holds the host.
+    older = subprocess.Popen(
+        [sys.executable, "-c", _WORKER, str(isolated_host_state), str(tmp_path),
+         launch.launch_id],
+        env=_env(PB_TEST_VERSION=other),
+    )
+    try:
+        until(lambda: len(_bodies(tmp_path)) == 1)
+        with _coordinator(isolated_host_state):
+            time.sleep(8 * coordinator.POLL)
+            assert (coordinator.identity(isolated_host_state) or {}).get("adopted") is None
+            assert older.poll() is None
+            assert launches(isolated_host_state)[launch.launch_id].status == "active"
+    finally:
+        (tmp_path / "release").touch()
+        older.wait(timeout=30)
+    assert older.returncode == 0
+
+
+# The coordinator process itself.
+
+
+@pytest.fixture
+def served(isolated_host_state: Path, monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Run `serve` without its loop; records whether its lock descriptor was inheritable."""
+    isolated_host_state.mkdir(parents=True, exist_ok=True)
+    looped: list[bool] = []
+
+    def run(self: Any, stopping: Any) -> None:
+        looped.append(os.get_inheritable(self.record["lock_fd"]))
+
+    monkeypatch.setattr(coordinator._Coordinator, "run", run)
+    return looped
+
+
+def _coordinator_ticket(state: Path) -> str:
+    launch_id = uuid4().hex
+    with ControlStore.open(state) as store:
+        coordinator._new_launch(
+            store, coordinator._ticket(launch_id, "coordinator", "app", state, scope="")
+        )
+    return launch_id
+
+
+def test_serve_exits_unless_it_holds_the_coordinator_lock(
+    isolated_host_state: Path, served: list[bool]
+) -> None:
+    launch_id = _coordinator_ticket(isolated_host_state)
+    fd = os.open(isolated_host_state / coordinator.COORDINATOR_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        assert coordinator.serve(isolated_host_state, launch_id, fd) == 1
+    finally:
+        os.close(fd)
+    assert served == []
+    assert launches(isolated_host_state)[launch_id].status == "launching"
+    assert coordinator.identity(isolated_host_state) is None
+
+
+def test_serve_exits_when_its_launch_is_no_longer_current(
+    isolated_host_state: Path, served: list[bool]
+) -> None:
+    launch_id = _coordinator_ticket(isolated_host_state)
+    with ControlStore.open(isolated_host_state) as store:
+        assert store.fence(launch_id)
+    fd = run_lock.named_flock(isolated_host_state / coordinator.COORDINATOR_LOCK, RuntimeError)
+    try:
+        assert coordinator.serve(isolated_host_state, launch_id, fd) == 75
+    finally:
+        os.close(fd)
+    assert served == []
+    assert not (isolated_host_state / coordinator.COORDINATOR_OWNER).exists()
+
+
+def test_serve_never_hands_its_lock_descriptor_on(
+    isolated_host_state: Path, served: list[bool]
+) -> None:
+    launch_id = _coordinator_ticket(isolated_host_state)
+    fd = run_lock.named_flock(isolated_host_state / coordinator.COORDINATOR_LOCK, RuntimeError)
+    os.set_inheritable(fd, True)  # As passed through pass_fds.
+    try:
+        assert coordinator.serve(isolated_host_state, launch_id, fd) == 0
+    finally:
+        os.close(fd)
+    assert served == [False]
+
+
+def test_a_failing_check_is_logged_and_retried_and_never_ends_the_coordinator(
+    isolated_host_state: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    checks: list[int] = []
+
+    def tick(self: Any) -> None:
+        checks.append(1)
+        if len(checks) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        with ControlStore.open(self.state) as store:
+            store.request_stop(self.launch_id)
+
+    monkeypatch.setattr(coordinator._Coordinator, "tick", tick)
+    assert coordinator.run_foreground(isolated_host_state) == 0
+    assert len(checks) == 2
+    assert "database is locked" in capsys.readouterr().out
+
+
+def _recovering(
+    state: Path, monkeypatch: pytest.MonkeyPatch, failure: BaseException
+) -> tuple[Any, list[str], list[dict[str, object]]]:
+    """A coordinator facing a free host with an unreleased owner record, whose every recovery
+    fails with `failure`. Returns it, the recoveries tried, and the owner records seen."""
+    state.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, object]] = [{"state": "active", "pid": 1}]
+    monkeypatch.setattr(
+        run_lock,
+        "execution_owner",
+        lambda state=None: run_lock.LockSnapshot(
+            Path("/unused"), held=False, record=records[-1], verified=False
+        ),
+    )
+    tried: list[str] = []
+
+    @contextmanager
+    def refused(owner: run_lock.ExecutionOwner, *, state: Path | None = None) -> Iterator[None]:
+        tried.append(owner.kind)
+        raise failure
+        yield
+
+    monkeypatch.setattr(control_store, "execute", refused)
+    found = coordinator._Coordinator(state, uuid4().hex, {"adopted": None})
+    monkeypatch.setattr(found.watch, "poll", lambda: None)
+    return found, tried, records
+
+
+def test_a_recovery_that_cannot_finish_is_retried_ever_more_slowly(
+    isolated_host_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocked = control_store.CleanupBlocked("a container is still running")
+    found, tried, _ = _recovering(isolated_host_state, monkeypatch, blocked)
+    waits = []
+    for _ in range(3):
+        found.retry_at = 0.0
+        found.tick()
+        waits.append(round(found.retry_at - time.monotonic()))
+    assert waits == [30, 60, 120]
+    assert len(tried) == 3
+
+
+def test_a_recovery_only_the_operator_can_clear_is_not_retried_until_they_act(
+    isolated_host_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    unknown = control_store.CleanupUnknown("no verifiable process record")
+    found, tried, records = _recovering(isolated_host_state, monkeypatch, unknown)
+    for _ in range(3):
+        found.retry_at = 0.0
+        found.tick()
+    assert tried == ["recovery"]
+    records.append({"state": "released", "pending": [{"root": "/run"}]})  # The operator acted.
+    found.tick()
+    assert tried == ["recovery", "recovery"]
 
 
 # Real systemd: the coordinator's own scope, and the descriptor it inherits.
