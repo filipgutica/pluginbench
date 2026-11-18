@@ -35,10 +35,14 @@ REQUIRED_FLAGS = (
     "--permission-prompts",
     "--json-schema",
 )
+# The operator's subscription token, raw, when the environment has none. It resolves from
+# the HOME of the process that runs pluginbench, so a service finds it without an export.
+TOKEN_FILE = Path("~/.config/secrets/claude-oauth-token")
 _NO_CREDENTIAL = (
     "Claude authentication unavailable: CLAUDE_CODE_OAUTH_TOKEN is not set in the environment "
-    "of this process. A service, such as a systemd unit, does not inherit a variable that a "
-    "shell profile exports; set it in the service's environment"
+    f"of this process and {TOKEN_FILE} is missing or empty. A service, such as a systemd unit, "
+    "does not inherit a variable that a shell profile exports; write the token to the file, or "
+    "set it in the service's environment"
 )
 READ_TOOLS = "Read,Glob,Grep"
 
@@ -291,6 +295,12 @@ def runtime_environment(
             raise ValueError(f"Claude auth file must contain only {TOKEN_ENV}")
     else:
         selected = {TOKEN_ENV: os.environ[TOKEN_ENV]} if os.environ.get(TOKEN_ENV) else {}
+        if not selected:
+            try:
+                token = TOKEN_FILE.expanduser().read_text().strip()
+            except FileNotFoundError:
+                token = ""
+            selected = {TOKEN_ENV: token} if token else {}
         if not selected:
             # Retain the existing native macOS subscription-auth path, not its settings.
             try:

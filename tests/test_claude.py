@@ -281,6 +281,57 @@ def test_oauth_environment_needs_no_keychain_reads(
     assert secrets == ("explicit-token",)
 
 
+def test_token_file_is_used_before_keychain_when_the_environment_has_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(claude.TOKEN_ENV, raising=False)
+    token_file = tmp_path / "claude-oauth-token"
+    token_file.write_text("file-token\n")
+    monkeypatch.setattr(claude, "TOKEN_FILE", token_file)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("A token file must not read Keychain"),
+    )
+    env, secrets = claude.runtime_environment(tmp_path / "private")
+    assert env[claude.TOKEN_ENV] == "file-token"
+    assert secrets == ("file-token",)
+
+
+def test_environment_token_wins_over_the_token_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(claude.TOKEN_ENV, "env-token")
+    token_file = tmp_path / "claude-oauth-token"
+    token_file.write_text("file-token")
+    monkeypatch.setattr(claude, "TOKEN_FILE", token_file)
+    env, secrets = claude.runtime_environment(tmp_path / "private")
+    assert env[claude.TOKEN_ENV] == "env-token"
+    assert secrets == ("env-token",)
+
+
+def test_empty_token_file_falls_through_to_keychain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(claude.TOKEN_ENV, raising=False)
+    token_file = tmp_path / "claude-oauth-token"
+    token_file.write_text(" \n")
+    monkeypatch.setattr(claude, "TOKEN_FILE", token_file)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps({"claudeAiOauth": {"accessToken": "keychain-token"}})
+        ),
+    )
+    env, secrets = claude.runtime_environment(tmp_path / "private")
+    assert env[claude.TOKEN_ENV] == "keychain-token"
+    assert secrets == ("keychain-token",)
+
+
 def test_existing_keychain_auth_copies_only_access_token(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -512,8 +563,9 @@ def test_keychain_unavailable_does_not_create_private_runtime(
     monkeypatch.setattr(subprocess, "run", missing)
     with pytest.raises(ValueError) as refused:
         claude.runtime_environment(tmp_path / "private")
-    # The message names the variable and the case that hides it: a service's environment.
+    # The message names both sources and the case that hides one: a service's environment.
     assert claude.TOKEN_ENV in str(refused.value)
+    assert "~/.config/secrets/claude-oauth-token" in str(refused.value)
     assert "systemd unit" in str(refused.value)
     assert not (tmp_path / "private").exists()
 
