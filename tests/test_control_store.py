@@ -1496,6 +1496,43 @@ def test_a_container_still_running_after_its_stop_or_created_late_blocks(
         control_store.verify_containers(_containers(run))
 
 
+def test_trial_containers_are_checked_with_the_docker_cli_installed_now(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The run was prepared with a Docker CLI that has since been upgraded, and then crashed.
+    run, container = _stuck_run(tmp_path)
+    binaries = tmp_path / "docker-bin"
+    binaries.mkdir()
+    (binaries / "docker").write_text("#!/bin/sh\nexit 1\n")
+    (binaries / "docker").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{binaries}{os.pathsep}{os.environ['PATH']}")
+    prepared = {
+        "docker_engine": {"id": "daemon", "endpoint": "unix:///recorded.sock"},
+        "docker_cli": {"path": "/usr/bin/docker", "resolved_path": "/usr/bin/docker",
+                       "sha256": "0" * 64},
+    }
+    docker = _Docker([container])
+    commands: list[list[str]] = []
+
+    def daemon(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        arguments = command[3:]
+        if arguments[0] == "info":
+            output = json.dumps({"ID": "daemon"})
+        else:
+            output = docker(*arguments)
+        return subprocess.CompletedProcess(command, 0, output, "")
+
+    monkeypatch.setattr(trial_containers, "running", _REAL_RUNNING)
+    monkeypatch.setattr(harbor_backend, "run_command", daemon)
+    check = {**_containers(run), "runtime": prepared}
+    proof = control_store.verify_containers(check, deadline=time.monotonic() + 30)
+    assert proof["checked"] == "trial containers" and not docker.containers[0]["running"]
+    assert {tuple(command[:3]) for command in commands} == {
+        (str(binaries / "docker"), "--host", "unix:///recorded.sock")
+    }
+
+
 @pytest.mark.parametrize(
     "error",
     [

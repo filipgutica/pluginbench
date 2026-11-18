@@ -424,7 +424,8 @@ def verify_containers(
 ) -> dict[str, Any]:
     """Stop the trial containers the run left running, and prove none still runs.
 
-    Each inventory first proves the daemon is the one the runtime recorded. After the stop, two
+    It uses the Docker CLI on PATH now (`invocation_runtime.docker_cli_now`), as a resume does,
+    and each inventory first proves the daemon is the one the runtime recorded. After the stop, two
     inventories at least INVENTORY_INTERVAL apart must both be empty, which catches a container
     created late, such as a sidecar. Every Docker command is capped by what is left before
     `deadline`, a `time.monotonic()` value; once it passes, the containers are unknown.
@@ -441,6 +442,21 @@ def verify_containers(
         raise CleanupUnknown(
             f"the frozen suite that names {where} is missing. {_repair(check['root'])}"
         )
+
+    from pluginbench import invocation_runtime
+
+    # Pinned to the CLI on PATH now, not the one frozen at preparation, so a Docker upgrade
+    # since then cannot block forever; the engine ID and endpoint stay the recorded ones.
+    try:
+        cli = Path(invocation_runtime.docker_cli_now(where))
+        runtime = {**runtime, "docker_cli": harbor_backend._executable_identity(cli)}
+    except CleanupUnknown as exc:
+        raise CleanupUnknown(f"{exc}. {_repair(check['root'])}") from exc
+    except (OSError, ValueError) as exc:
+        raise CleanupUnknown(
+            f"the Docker CLI at {cli} could not be read for {where}: {exc}. "
+            f"{_repair(check['root'])}"
+        ) from exc
 
     def inventory() -> list[dict[str, str]]:
         if time.monotonic() >= deadline:

@@ -839,6 +839,25 @@ def _recovery_docker(*arguments: str, cli: str, endpoint: str, timeout: int) -> 
     return result.stdout
 
 
+def docker_cli_now(what: str) -> str:
+    """The Docker CLI on PATH now, as an absolute path, to check `what` after a crash or at the
+    end of an operation: a CLI upgraded since preparation must not block the host for good.
+    Raises control_store.CleanupUnknown when there is none, or only through a relative path."""
+    from pluginbench.control_store import CleanupUnknown
+
+    cli = shutil.which("docker")
+    if cli is None:
+        raise CleanupUnknown(
+            f"the Docker CLI is not on PATH, so {what} cannot be checked: install it and retry"
+        )
+    if not os.path.isabs(cli):
+        raise CleanupUnknown(
+            f"the Docker CLI on PATH, {cli}, is not an absolute path, so {what} are not checked "
+            "with it: put only absolute directories on PATH and retry"
+        )
+    return cli
+
+
 def _engine_answer(output: str) -> tuple[str | None, str | None, str]:
     """From `docker info --format '{{json .}}'`: the engine ID, the CLI version, and why there
     is no ID. The CLI can exit 0 without a daemon: before 28.1 with nothing on stdout, and
@@ -887,18 +906,7 @@ def verify_labelled(operation: dict[str, Any], *, deadline: float) -> dict[str, 
             f"no Docker engine ID was recorded for the containers labelled {label}, so the "
             f"engine at {endpoint} cannot be shown to be the one that ran them"
         )
-    cli = shutil.which("docker")
-    if cli is None:
-        raise CleanupUnknown(
-            f"the Docker CLI is not on PATH, so the containers labelled {label} cannot be "
-            "checked: install it and retry"
-        )
-    if not os.path.isabs(cli):
-        raise CleanupUnknown(
-            f"the Docker CLI on PATH, {cli}, is not an absolute path, so the containers "
-            f"labelled {label} are not checked with it: put only absolute directories on PATH "
-            "and retry"
-        )
+    cli = docker_cli_now(f"the containers labelled {label}")
     used: dict[str, str | None] = {"path": cli, "version": None}
 
     def docker(*arguments: str, cap: float = QUERY_SECONDS) -> str:
