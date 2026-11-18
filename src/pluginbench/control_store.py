@@ -180,13 +180,15 @@ class ControlStore:
             path.chmod(0o600)
             self._db.execute("PRAGMA synchronous = FULL")
             # Only a new or older database is written to, so opening one to read writes nothing.
+            # The tables and the version are one transaction: an opener that reads the current
+            # version always finds the tables. Concurrent creators wait for each other, and a
+            # second run of the script changes nothing.
             if self._db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
-                self._db.executescript(f"PRAGMA user_version = {SCHEMA_VERSION};" + _SCHEMA)
-                with self._db:
-                    self._db.execute(
-                        "INSERT OR IGNORE INTO host_state (id, updated_at) VALUES (1, ?)",
-                        (_now(),),
-                    )
+                self._db.executescript(
+                    f"BEGIN IMMEDIATE;{_SCHEMA}"
+                    f"INSERT OR IGNORE INTO host_state (id, updated_at) VALUES (1, '{_now()}');"
+                    f"PRAGMA user_version = {SCHEMA_VERSION};COMMIT;"
+                )
         except BaseException:
             self._db.close()
             raise
