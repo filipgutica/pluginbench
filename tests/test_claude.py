@@ -317,6 +317,7 @@ def test_empty_token_file_falls_through_to_keychain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv(claude.TOKEN_ENV, raising=False)
+    monkeypatch.setattr(sys, "platform", "darwin")
     token_file = tmp_path / "claude-oauth-token"
     token_file.write_text(" \n")
     monkeypatch.setattr(claude, "TOKEN_FILE", token_file)
@@ -332,11 +333,44 @@ def test_empty_token_file_falls_through_to_keychain(
     assert secrets == ("keychain-token",)
 
 
+def test_linux_never_runs_a_keychain_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(claude.TOKEN_ENV, raising=False)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("Linux has no Keychain to read"),
+    )
+    with pytest.raises(ValueError, match="claude-oauth-token is missing or empty"):
+        claude.runtime_environment(tmp_path / "private")
+    assert not (tmp_path / "private").exists()
+
+
+def test_a_token_with_whitespace_inside_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(claude.TOKEN_ENV, raising=False)
+    token_file = tmp_path / "claude-oauth-token"
+    # An old and a new token left together after a rotation.
+    token_file.write_text("old-token\nnew-token\n")
+    monkeypatch.setattr(claude, "TOKEN_FILE", token_file)
+    with pytest.raises(ValueError) as refused:
+        claude.runtime_environment(tmp_path / "private")
+    assert "contains whitespace" in str(refused.value)
+    assert "old-token" not in str(refused.value) and "new-token" not in str(refused.value)
+    assert not (tmp_path / "private").exists()
+
+
 def test_existing_keychain_auth_copies_only_access_token(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv(claude.TOKEN_ENV, raising=False)
+    monkeypatch.setattr(sys, "platform", "darwin")
     calls = []
 
     def keychain(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -556,6 +590,7 @@ def test_keychain_unavailable_does_not_create_private_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv(claude.TOKEN_ENV, raising=False)
+    monkeypatch.setattr(sys, "platform", "darwin")
 
     def missing(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         raise FileNotFoundError("security unavailable")

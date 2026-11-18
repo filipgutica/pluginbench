@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -302,6 +303,9 @@ def runtime_environment(
                 token = ""
             selected = {TOKEN_ENV: token} if token else {}
         if not selected:
+            # Only macOS has a Keychain; elsewhere a `security` on PATH is some other program.
+            if sys.platform != "darwin":
+                raise ValueError(_NO_CREDENTIAL)
             # Retain the existing native macOS subscription-auth path, not its settings.
             try:
                 credentials = subprocess.run(
@@ -324,6 +328,10 @@ def runtime_environment(
         isinstance(value, str) and value.strip() for value in selected.values()
     ):
         raise ValueError("Select exactly one nonempty Claude OAuth token")
+    # Two tokens joined by a newline, as after a careless rotation, would pass as one, and the
+    # JSON-escaped newline would hide both from the artifact scan.
+    if any(re.search(r"\s", value.strip()) for value in selected.values()):
+        raise ValueError("The Claude OAuth token contains whitespace; keep exactly one token")
     private.mkdir(mode=0o700)
     home, temporary, config = (private / name for name in ("home", "tmp", "claude"))
     for directory in (home, temporary, config):
