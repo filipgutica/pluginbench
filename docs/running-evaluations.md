@@ -574,11 +574,11 @@ If a check finds something still running, the command refuses to start and names
 - an obligation of an earlier PluginBench build, or of an owner record that could not be read;
 - a failed cleanup recorded without its operation;
 - a call recorded without a process identity and its boot;
-- containers whose recorded Docker daemon was replaced: the recorded endpoint answers with another engine ID, so that daemon and its containers are gone.
+- containers whose recorded Docker engine no longer answers at its endpoint: another engine answers there, and it holds none of the operation's labelled containers. Before you confirm, check that the recorded engine is not running at another socket.
 
 It never confirms something it finds running. It also refuses an item this PluginBench recorded with its operation, scope and label, or with its boot, that cannot be checked now, for example because Docker does not answer: restore the daemon and retry `pluginbench app cleanup`.
 
-Recovery checks labelled containers with the Docker CLI installed now, not the one frozen at preparation, so a Docker upgrade after a crash does not block the host. It always passes the recorded endpoint with `--host`, ignores `DOCKER_HOST`, `DOCKER_CONTEXT` and `DOCKER_CONFIG`, and first requires `docker info` to report the recorded engine ID. When the recorded endpoint does not answer, the error names it: start Docker there and retry. Trial execution still uses the frozen CLI. It prints and records each confirmation with its time.
+Recovery checks labelled containers with the Docker CLI installed now, not the one frozen at preparation, so a Docker upgrade after a crash does not block the host. It resolves `docker` on `PATH` once per check and requires an absolute path. It always passes the recorded endpoint with `--host`, ignores `DOCKER_HOST`, `DOCKER_CONTEXT` and `DOCKER_CONFIG`, and first requires `docker info` to report an engine ID with no server error. When the recorded endpoint does not answer, or answers with no engine ID, the error names it: start Docker there and retry. When another engine answers, recovery still lists the operation's label there: any container found blocks the host until you remove it; none makes the check confirmable as above. A missing recorded engine ID is never confirmable. Each proof and each confirmation names the CLI path and version that checked it. Trial execution still uses the frozen CLI. It prints and records each confirmation with its time.
 
 ROOT is the root exactly as the error names it, or the obligation ID the error lists beside it. The directory need not exist, so a deleted run's obligation can still be cleared.
 

@@ -131,9 +131,9 @@ class CleanupUnknown(CleanupBlocked):
 
 
 class DaemonReplaced(CleanupUnknown):
-    """The recorded Docker endpoint answers with another engine: the daemon that ran the
-    containers is gone. Nothing can check it again, so `app cleanup --confirm-stopped` may
-    confirm it, as it does a legacy item."""
+    """Another engine answers at the recorded Docker endpoint and holds none of the operation's
+    labelled containers. PluginBench cannot reach the recorded engine to check it, so
+    `app cleanup --confirm-stopped` may confirm it, as it does a legacy item."""
 
 
 class LaunchFenced(ValueError):
@@ -517,12 +517,14 @@ def _verify(
                     f"still be created. {_repair(check['root'])}"
                 )
             if check["kind"] == "labelled":
-                invocation_runtime.verify_labelled(check["operation"], deadline=deadline)
+                proof = invocation_runtime.verify_labelled(check["operation"], deadline=deadline)
+                check["docker_cli"] = proof.get("docker_cli")  # For its `cleanup.json`.
             else:
                 verify_containers(check, progress, deadline=deadline)
+        except DaemonReplaced as exc:
+            unknown.append(({**check, "replaced": True}, f"{exc}. {_repair(check['root'])}"))
         except CleanupUnknown as exc:
-            replaced = isinstance(exc, DaemonReplaced)
-            unknown.append(({**check, "replaced": True} if replaced else check, str(exc)))
+            unknown.append((check, str(exc)))
         except CleanupBlocked as exc:
             blocked.append(str(exc))
     return blocked, unknown
@@ -627,7 +629,7 @@ def _legacy(check: Check) -> bool:
     ticketed operation or of a booted process can be proven once what it needs (Docker,
     systemd) answers again; an operator's word never clears it."""
     if not check.get("contained") or check["kind"] == "unrecorded" or check.get("replaced"):
-        return True  # Replaced: its recorded Docker daemon is gone (DaemonReplaced).
+        return True  # Another engine answers at its recorded endpoint (DaemonReplaced).
     return check["kind"] == "invocation" and "boot_id" not in (check.get("identity") or {})
 
 
@@ -894,13 +896,20 @@ def _prove(state: Path, checks: Sequence[Check], confirmed: Collection[tuple[str
         if proven(check)
         and (check["kind"] == "scope" or (check["kind"] == "invocation" and check.get("covered")))
     }
+    # The Docker CLI that checked each operation's labelled containers, when Docker was used.
+    clis = {
+        str(check["operation"]["id"]): check["docker_cli"]
+        for check in checks
+        if check["kind"] == "labelled" and check.get("docker_cli")
+    }
     for invocation, proof in proofs.items():
         directory = state / "invocations" / invocation
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         if not (directory / "cleanup.json").exists():
-            (directory / "cleanup.json").write_text(
-                json.dumps({"id": invocation, "recovered": proof, "at": _now()}, indent=2) + "\n"
-            )
+            record: dict[str, object] = {"id": invocation, "recovered": proof, "at": _now()}
+            if invocation in clis:
+                record["docker_cli"] = clis[invocation]
+            (directory / "cleanup.json").write_text(json.dumps(record, indent=2) + "\n")
 
 
 def _held() -> ExecutionLock:
@@ -1010,9 +1019,9 @@ def confirm_stopped(
             raise CleanupBlocked(
                 f"{'; '.join(reason.split('. Once')[0] for reason in recorded)}. PluginBench "
                 "recorded these itself and can check them once Docker and systemd answer: "
-                "restore the daemon and retry `pluginbench app cleanup`. Only a recorded Docker "
-                "daemon that another engine replaced can be confirmed instead. Nothing was "
-                "confirmed"
+                "restore the daemon and retry `pluginbench app cleanup`. Only labelled "
+                "containers whose recorded Docker endpoint another engine now answers can be "
+                "confirmed instead. Nothing was confirmed"
             )
         at = store.confirm(unknown)
     rest = [item for item in pending if not named(item)]

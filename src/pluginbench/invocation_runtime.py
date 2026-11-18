@@ -817,28 +817,48 @@ def verify_scope(operation: dict[str, Any], *, deadline: float) -> dict[str, Any
 _DOCKER_REDIRECTS = ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG")
 
 
-def _recovery_docker(*arguments: str, endpoint: str, timeout: int) -> str:
-    """Run the Docker CLI on PATH now against the recorded `endpoint`, for recovery only.
+def _recovery_docker(*arguments: str, cli: str, endpoint: str, timeout: int) -> str:
+    """Run `cli`, the Docker CLI on PATH now, against the recorded `endpoint`.
 
-    A CLI upgraded since the crash must not block the host for good, so this is not the frozen
-    CLI that trial execution and the create guard keep using. The endpoint is always passed
-    with `--host`, and DOCKER_HOST, DOCKER_CONTEXT and DOCKER_CONFIG are removed, so the
-    environment cannot redirect it. The caller checks the engine ID first.
+    `verify_labelled` uses it at the end of every operation (`verify_cleanup`) and in recovery
+    after a crash. A CLI upgraded since preparation must not block the host for good, so this
+    is not the frozen CLI that trial execution and the create guard keep using. The endpoint is
+    always passed with `--host`, and DOCKER_HOST, DOCKER_CONTEXT and DOCKER_CONFIG are removed,
+    so the environment cannot redirect it. The caller checks the engine ID.
     """
     from pluginbench.processes import run_command
 
     if not endpoint.startswith("unix://"):
         raise ValueError(f"the recorded Docker endpoint {endpoint!r} is not a local Unix socket")
-    docker = shutil.which("docker")
-    if docker is None:
-        raise ValueError("docker is not on PATH")
     env = {key: value for key, value in os.environ.items() if key not in _DOCKER_REDIRECTS}
     result = run_command(
-        [docker, "--host", endpoint, *arguments], cwd=Path.cwd(), env=env, timeout=timeout
+        [cli, "--host", endpoint, *arguments], cwd=Path.cwd(), env=env, timeout=timeout
     )
     if result.returncode:
         raise ValueError(f"docker {arguments[0]} failed: {result.stderr.strip()}")
     return result.stdout
+
+
+def _engine_answer(output: str) -> tuple[str | None, str | None, str]:
+    """From `docker info --format '{{json .}}'`: the engine ID, the CLI version, and why there
+    is no ID. The CLI can exit 0 without a daemon: before 28.1 with nothing on stdout, and
+    later with the error in ServerErrors, so only an ID with no server error counts."""
+    try:
+        info = json.loads(output)
+    except ValueError:
+        info = None
+    if not isinstance(info, dict):
+        return None, None, "an unreadable answer" if output.strip() else "no answer"
+    client = info.get("ClientInfo")
+    version = client.get("Version") if isinstance(client, dict) else None
+    version = version if isinstance(version, str) else None
+    errors, engine = info.get("ServerErrors"), info.get("ID")
+    if errors:
+        problem = "; ".join(map(str, errors)) if isinstance(errors, list) else str(errors)
+        return None, version, problem
+    if not isinstance(engine, str) or not engine:
+        return None, version, "no engine ID"
+    return engine, version, ""
 
 
 def verify_labelled(operation: dict[str, Any], *, deadline: float) -> dict[str, Any]:
@@ -846,10 +866,11 @@ def verify_labelled(operation: dict[str, Any], *, deadline: float) -> dict[str, 
     then require two empty inventories INVENTORY_INTERVAL apart. Only run once the scope is
     gone, so nothing of the operation can still create one.
 
-    It uses the Docker CLI installed now (`_recovery_docker`), and each inventory first requires
-    the recorded endpoint to report the recorded engine ID. An endpoint that does not answer is
-    unknown; one that answers with another engine raises DaemonReplaced: the daemon that ran the
-    containers is gone.
+    It uses the Docker CLI on PATH now (`_recovery_docker`), resolved once to an absolute path,
+    and each inventory first requires the recorded endpoint to answer with an engine ID. An
+    endpoint that does not answer, or a missing recorded ID, is unknown. When another engine
+    answers, its containers with the label are still listed: any found blocks; none raises
+    DaemonReplaced, since the recorded daemon no longer answers there.
     """
     from pluginbench.control_store import (
         INVENTORY_INTERVAL, CleanupBlocked, CleanupUnknown, DaemonReplaced,
@@ -861,34 +882,66 @@ def verify_labelled(operation: dict[str, Any], *, deadline: float) -> dict[str, 
     engine = runtime.get("docker_engine") or {}
     endpoint, recorded = str(engine.get("endpoint")), engine.get("id")
     label, phase = operation["label"], min(deadline, time.monotonic() + CONTAINER_SECONDS)
+    if not recorded:
+        raise CleanupUnknown(
+            f"no Docker engine ID was recorded for the containers labelled {label}, so the "
+            f"engine at {endpoint} cannot be shown to be the one that ran them"
+        )
+    cli = shutil.which("docker")
+    if cli is None:
+        raise CleanupUnknown(
+            f"the Docker CLI is not on PATH, so the containers labelled {label} cannot be "
+            "checked: install it and retry"
+        )
+    if not os.path.isabs(cli):
+        raise CleanupUnknown(
+            f"the Docker CLI on PATH, {cli}, is not an absolute path, so the containers "
+            f"labelled {label} are not checked with it: put only absolute directories on PATH "
+            "and retry"
+        )
+    used: dict[str, str | None] = {"path": cli, "version": None}
 
     def docker(*arguments: str, cap: float = QUERY_SECONDS) -> str:
         timeout = math.ceil(_left(phase, cap, f"the containers labelled {label}"))
         try:
-            return _recovery_docker(*arguments, endpoint=endpoint, timeout=timeout)
+            return _recovery_docker(*arguments, cli=cli, endpoint=endpoint, timeout=timeout)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             raise CleanupUnknown(f"Docker could not be checked for {label}: {exc}") from exc
 
-    def recorded_daemon() -> None:
+    def answering_engine() -> str:
         try:
-            actual = docker("info", "--format", "{{.ID}}").strip()
+            actual, version, problem = _engine_answer(docker("info", "--format", "{{json .}}"))
         except CleanupUnknown as exc:
+            actual, version, problem = None, None, str(exc.__cause__)
+        used["version"] = version or used["version"]
+        if actual is None:
             raise CleanupUnknown(
                 f"Docker at {endpoint}, which ran the containers labelled {label}, did not "
-                f"answer ({exc.__cause__}): start Docker at {endpoint} and retry"
-            ) from exc
-        if not recorded or actual != recorded:
-            raise DaemonReplaced(
-                f"the Docker engine at {endpoint} is {actual or 'unnamed'}, not {recorded}, "
-                f"which ran the containers labelled {label}: that daemon and its containers "
-                "are gone"
+                f"answer ({problem}): start Docker at {endpoint} and retry"
             )
+        return actual
 
     def inventory() -> list[str]:
-        recorded_daemon()
-        return docker(
+        actual = answering_engine()
+        found = docker(
             "ps", "--all", "--quiet", "--no-trunc", "--filter", f"label={label}"
         ).split()
+        if actual == recorded:
+            return found
+        where = (
+            f"another Docker engine, {actual}, answers at {endpoint} instead of {recorded}, "
+            f"which ran the containers labelled {label}"
+        )
+        if found:
+            raise CleanupBlocked(
+                f"{where}, and it holds containers with that label: {', '.join(found)}. "
+                "Remove them, then run the command again"
+            )
+        raise DaemonReplaced(
+            f"{where}, and it holds none of them. Before you confirm, check that the recorded "
+            f"engine is not running at another socket (checked with {cli}, Docker CLI "
+            f"{used['version'] or 'of unknown version'})"
+        )
 
     removed: list[str] = []
     if found := inventory():
@@ -907,7 +960,7 @@ def verify_labelled(operation: dict[str, Any], *, deadline: float) -> dict[str, 
         time.sleep(INVENTORY_INTERVAL)
         if left := inventory():
             raise CleanupBlocked(f"containers labelled {label} remain: {', '.join(left)}")
-    return {"removed": removed, "inventories": 2, "at": _now()}
+    return {"removed": removed, "inventories": 2, "docker_cli": used, "at": _now()}
 
 
 def handler(operation: str) -> Callable[[dict[str, Any]], Any]:

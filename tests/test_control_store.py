@@ -765,7 +765,10 @@ class _FileDaemon:
             self.path.write_text(json.dumps(containers))
             self.on_start()
         elif arguments[0] == "info":
-            output = str(_RUNTIME["docker_engine"]["id"])  # type: ignore[index]
+            engine = _RUNTIME["docker_engine"]["id"]  # type: ignore[index]
+            output = json.dumps(
+                {"ID": engine, "ServerErrors": None, "ClientInfo": {"Version": "fake-cli"}}
+            )
         elif arguments[0] == "ps":
             output = "\n".join(self.labelled(arguments[-1].removeprefix("label=")))
         elif arguments[0] == "inspect":
@@ -902,8 +905,11 @@ def test_an_owner_killed_with_a_labelled_container_recovers_only_once_it_is_remo
     with control_store.execute(_owner(tmp_path / "unrelated")) as lock:
         assert lock.record["pending"] == []  # No repair: the checks alone cleared it.
     assert fake.load() == {}
-    proof = isolated_host_state / "invocations" / operation["id"] / "cleanup.json"
-    assert json.loads(proof.read_text())["id"] == operation["id"]
+    proof = json.loads(
+        (isolated_host_state / "invocations" / operation["id"] / "cleanup.json").read_text()
+    )
+    assert proof["id"] == operation["id"]
+    assert proof["docker_cli"] == {"path": str(binaries / "docker"), "version": "fake-cli"}
 
 
 # Leads a call whose descendant leaves its process group with setsid() and keeps the call's
@@ -1719,11 +1725,13 @@ def test_cleanup_never_confirms_an_unknown_the_runtime_recorded_itself(
         raise CleanupUnknown("systemd could not be asked about scope pb-op-1.scope")
 
     monkeypatch.setattr(invocation_runtime, "verify_scope", unknown)
-    monkeypatch.setattr(invocation_runtime, "verify_labelled", lambda operation, **kwargs: None)
+    monkeypatch.setattr(invocation_runtime, "verify_labelled", lambda operation, **kwargs: {})
     result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(tmp_path)])
     assert result.exit_code == 2
     assert "restore the daemon and retry `pluginbench app cleanup`" in result.stderr
-    assert "Only a recorded Docker daemon that another engine replaced" in result.stderr
+    assert "Only labelled containers whose recorded Docker endpoint another engine now answers" in (
+        result.stderr
+    )
     assert "Nothing was confirmed" in result.stderr
     with ControlStore.open(isolated_host_state) as store:
         assert store.confirmations() == []
@@ -1747,22 +1755,35 @@ def test_a_replaced_docker_daemon_is_refused_automatically_but_can_be_confirmed(
     }
     (isolated_host_state / run_lock.EXECUTION_OWNER).write_text(json.dumps(record))
     monkeypatch.setattr(invocation_runtime, "verify_scope", lambda operation, **kwargs: {})
+    binaries = tmp_path / "docker-bin"
+    binaries.mkdir()
+    (binaries / "docker").write_text("#!/bin/sh\nexit 1\n")
+    (binaries / "docker").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{binaries}{os.pathsep}{os.environ['PATH']}")
 
     def another_engine(*arguments: str, **kwargs: Any) -> str:
-        assert arguments[0] == "info"
-        return "replacement-engine\n"
+        if arguments[0] == "info":
+            info = {"ID": "replacement-engine", "ClientInfo": {"Version": "29.0.0"}}
+            return json.dumps({**info, "ServerErrors": None})
+        assert arguments[0] == "ps"  # It holds none of the operation's containers.
+        return ""
 
     monkeypatch.setattr(invocation_runtime, "_recovery_docker", another_engine)
     plain = CliRunner().invoke(cli.app, ["app", "cleanup"])
     assert plain.exit_code == 2
-    assert "is replacement-engine, not recorded-engine" in plain.stderr
+    assert "another Docker engine, replacement-engine, answers at" in plain.stderr
+    # The refusal names the way out.
+    assert f"pluginbench app cleanup --confirm-stopped {tmp_path}" in plain.stderr
     assert not _admitted(isolated_host_state, tmp_path)
 
     result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(tmp_path)])
     assert result.exit_code == 0, result.output
     assert "Confirmed stopped at" in result.stdout and op in result.stdout
     with ControlStore.open(isolated_host_state) as store:
-        assert [item["check_id"] for item in store.confirmations()] == [f"7-earlier:labelled:{op}"]
+        [confirmation] = store.confirmations()
+    assert confirmation["check_id"] == f"7-earlier:labelled:{op}"
+    # It records which CLI found the other engine.
+    assert f"checked with {binaries / 'docker'}, Docker CLI 29.0.0" in confirmation["reason"]
     assert _admitted(isolated_host_state, tmp_path)
 
 

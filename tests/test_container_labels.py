@@ -352,7 +352,7 @@ class _Daemon:
         elif arguments[0] == "exec":
             status = 1  # The measurement fails, and its process dies before its cleanup.
         elif arguments[0] == "info":
-            output = "daemon\n"  # The engine ID the runtime recorded.
+            output = json.dumps({"ID": "daemon", "ServerErrors": None})  # The recorded engine.
         elif arguments[0] == "ps":
             name, value = arguments[-1].removeprefix("label=").split("=", 1)
             output = "".join(
