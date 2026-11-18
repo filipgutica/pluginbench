@@ -599,8 +599,8 @@ def stop(
     run: Path = typer.Argument(..., help="A run directory started by `pluginbench run`."),
 ) -> None:
     """Stop a run: record the stop for its background launch, then SIGTERM only the process
-    group its run.lock records; nothing else. The worker checks the recorded stop before each
-    call, so a lost signal cannot let it start another."""
+    group its run.lock records; nothing else. The worker checks the recorded stop before it
+    records each new call, so a lost signal cannot let it start another."""
     try:
         requested = coordinator.request_stop(run)
         owner = run_lock.stop(run)
