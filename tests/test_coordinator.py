@@ -168,7 +168,7 @@ def test_a_stop_whose_signal_is_lost_still_ends_the_coordinator_and_no_worker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    coordinator.ensure_started(isolated_host_state)
+    started = coordinator.ensure_started(isolated_host_state)
     launched = coordinator.launch(coordinator.LaunchRequest("run", tmp_path), isolated_host_state)
     pid = int(launched.process["pid"]) if launched.process else 0
     # The coordinator records the worker it monitors in its identity at its next poll. Stop it
@@ -176,7 +176,7 @@ def test_a_stop_whose_signal_is_lost_still_ends_the_coordinator_and_no_worker(
     until(lambda: (coordinator.identity(isolated_host_state) or {}).get("adopted")
           == launched.launch_id)
     found = coordinator.identity(isolated_host_state)
-    assert found is not None
+    assert found is not None and found["pid"] == started["pid"]
     monkeypatch.setattr(coordinator, "_signal", lambda found, signum: None)
     try:
         assert coordinator.stop(isolated_host_state) == found

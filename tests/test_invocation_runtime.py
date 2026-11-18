@@ -817,6 +817,7 @@ def test_another_engine_at_the_recorded_endpoint_without_our_containers_means_re
     message = str(replaced.value)
     assert "another Docker engine, another-engine, answers at unix:///recorded.sock" in message
     assert "check that the recorded engine is not running at another socket" in message
+    assert "none of its containers still run, as they can under live-restore" in message
     assert f"checked with {current_docker.parent / 'docker-bin' / 'docker'}, Docker CLI 29.0.0" in (
         message
     )
@@ -836,15 +837,30 @@ def test_another_engine_holding_our_labelled_containers_blocks(
     assert "it holds containers with that label: survivor" in str(blocked.value)
 
 
+@pytest.mark.parametrize("recorded", [None, 7, ["daemon"]], ids=["missing", "number", "list"])
 def test_an_operation_without_a_recorded_engine_id_is_unknown_not_replaced(
-    current_docker: Path,
+    current_docker: Path, recorded: object
 ) -> None:
-    runtime = {**_RECORDED, "docker_engine": {"endpoint": "unix:///recorded.sock"}}
+    engine = {"endpoint": "unix:///recorded.sock"} | ({} if recorded is None else {"id": recorded})
+    runtime = {**_RECORDED, "docker_engine": engine}
     operation = _operation(InvocationSpec("c" * 32, runtime))
     with pytest.raises(CleanupUnknown) as refused:
         invocation_runtime.verify_labelled(operation, deadline=_deadline())
     assert not isinstance(refused.value, DaemonReplaced)
     assert "no Docker engine ID was recorded" in str(refused.value)
+    assert not current_docker.exists()  # Docker was never asked.
+
+
+def test_running_out_of_time_is_not_reported_as_an_engine_that_did_not_answer(
+    current_docker: Path,
+) -> None:
+    operation = _operation(InvocationSpec("c" * 32, _RECORDED))
+    with pytest.raises(CleanupUnknown) as refused:
+        invocation_runtime.verify_labelled(operation, deadline=time.monotonic() - 1)
+    assert "ran out of time before Docker at unix:///recorded.sock was asked" in str(
+        refused.value
+    )
+    assert "did not answer" not in str(refused.value)
     assert not current_docker.exists()  # Docker was never asked.
 
 
