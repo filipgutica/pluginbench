@@ -699,6 +699,19 @@ def test_resume_that_fails_before_coding_starts_closes_its_ledger(
     assert len(closed) == 1
 
 
+def test_a_run_saved_with_more_jobs_than_a_host_runs_does_not_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _killed_run(tmp_path, boundary="after-ledger", at=12, cache=tmp_path / "cache")
+    ledger_bytes = (root / ledger.LEDGER_NAME).read_bytes()
+    # A saved run keeps its jobs; one above the host ceiling (here lowered below the run's one)
+    # is refused before anything opens or starts.
+    monkeypatch.setattr(parallel, "HOST_JOBS", 0)
+    with pytest.raises(ValueError, match="jobs=1 is more than the 0 task jobs"):
+        study.resume_study(root)
+    assert (root / ledger.LEDGER_NAME).read_bytes() == ledger_bytes
+
+
 def test_vanilla_attempt_killed_before_it_was_cached_is_cached_on_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

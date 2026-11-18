@@ -420,7 +420,9 @@ def run_operation(
         except Exception as exc:
             from pluginbench.control_store import CleanupBlocked
 
-            lock.note_leftover(f"cleanup of invocation {spec.id} was not verified: {exc}")
+            lock.note_leftover(
+                f"cleanup of invocation {spec.id} was not verified: {exc}", operation=spec.id
+            )
             # It replaces the operation's own outcome (chained as its context): while anything
             # of it may run, its slot stays taken and no more work starts.
             blocked = (

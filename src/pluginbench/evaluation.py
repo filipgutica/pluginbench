@@ -40,6 +40,7 @@ from pluginbench import (
     run_lock,
     submissions,
 )
+from pluginbench.parallel import require_host_jobs
 from pluginbench.treatments import Treatment, resolve_treatment, treatment_inventory
 from pluginbench.saved_usage import AuditedHook
 from pluginbench.native_treatments import NativeCapabilities, admit
@@ -205,7 +206,7 @@ class Evaluation(BaseModel):
         strict=True,
         ge=1,
         le=4,
-        description="Sets concurrent jobs from one to four, subject to Docker capacity.",
+        description="Sets concurrent jobs from one to two, subject to Docker capacity.",
     )
     container_cpus: int | None = Field(
         default=None,
@@ -371,6 +372,7 @@ def plan_evaluation(config: Evaluation) -> dict[str, object]:
                 "contract": contract,
                 "reason": "grader baseline and frozen fixture must be qualified before coding",
             }
+    require_host_jobs(config.jobs)
     limits = _container_limits(config, declared)
     capacity = harbor_backend.capacity_jobs(**limits)
     if config.jobs > capacity:
@@ -1789,6 +1791,8 @@ def plan_measure(
     """Check that a finished run can gain `measurements` as measurement revision `revision`."""
     root = root.expanduser().resolve()
     selection = _load_selection(root)
+    # Refused here, before `measure` asks to start, as `measure_evaluation` refuses it.
+    require_host_jobs(_saved_evaluation(selection).jobs)
     _, resumed = _measure_inputs(root, selection, measurements, revision, coverage_profiles, tasks)
     collected, carried = (
         _measure_split(selection, measurements)
@@ -1832,6 +1836,8 @@ def measure_evaluation(
     """
     root = root.expanduser().resolve()
     selection = _load_selection(root)
+    # Before any preparation or readiness probe: a saved run keeps its jobs.
+    require_host_jobs(_saved_evaluation(selection).jobs)
     settings, plan = _measure_inputs(
         root, selection, measurements, revision, coverage_profiles, tasks
     )

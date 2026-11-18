@@ -39,6 +39,12 @@ EXECUTION_KINDS = ("run", "review", "measure", "preflight", "judge", "recovery")
 # The flock authorizes work. The owner record is also the fence recovery reads: until its owner
 # records `released`, a dead owner may have left something running at its root.
 OWNER_STATES = ("acquiring", "active", "reconciling", "blocked", "released")
+# From schema 3 the owner runs every coding, grading, review, collect and preflight call inside
+# an operation it records first (`invocation_runtime.run_operation`), and starts every
+# container, build and trial only inside one, labelled with it. Its operations and its ledger's
+# calls then cover all those may have left (`control_store`).
+CONTAINED_SCHEMA = 3
+OWNER_SCHEMA = CONTAINED_SCHEMA  # The owner records this build writes.
 
 
 class RunMoved(ValueError):
@@ -415,9 +421,9 @@ def _obligations(value: object) -> tuple[list[dict[str, Any]], list[str]]:
         return [], ["it is not a JSON object"]
     problems: list[str] = []
     schema = value.get("schema")
-    if type(schema) is not int or schema not in (1, 2):
-        problems.append(f"its schema {schema!r} is not 1 or 2")
-    elif schema == 2 and value.get("state") not in OWNER_STATES:
+    if type(schema) is not int or schema not in (1, 2, CONTAINED_SCHEMA):
+        problems.append(f"its schema {schema!r} is not 1, 2 or {CONTAINED_SCHEMA}")
+    elif schema != 1 and value.get("state") not in OWNER_STATES:
         problems.append(f"its state {value.get('state')!r} is not one of {', '.join(OWNER_STATES)}")
     kept: list[dict[str, Any]] = []
     pending = value.get("pending", [] if schema == 1 else None)
@@ -464,6 +470,11 @@ def _obligation_problem(value: object) -> str | None:
         for item in value.get("leftovers") or []
     ):
         return "has a failed cleanup without a reason"
+    if not all(
+        "operation" not in item or is_invocation_id(item["operation"])
+        for item in value.get("leftovers") or []
+    ):
+        return "has a failed cleanup of an operation without a valid ID"
     for item in value.get("operations") or []:
         if problem := _operation_problem(item):
             return f"has an operation that {problem}"
@@ -627,11 +638,15 @@ class ExecutionLock:
             else {**record, "runtimes": [*record["runtimes"], docker]}
         )
 
-    def note_leftover(self, reason: str) -> None:
+    def note_leftover(self, reason: str, *, operation: str | None = None) -> None:
         """Keep this owner unreleased, and record why a cleanup failed so the next owner's error
-        can say so. The record is best-effort: an unreleased owner needs repair anyway."""
+        can say so. With `operation`, the failed cleanup is that recorded operation's, which its
+        own checks prove later (`control_store`). The record is best-effort: the in-memory flag
+        alone keeps the release unrecorded."""
         self.leftover = True
-        failure = {"reason": reason, "at": datetime.now(UTC).isoformat()}
+        failure: dict[str, str] = {"reason": reason, "at": datetime.now(UTC).isoformat()}
+        if operation is not None:
+            failure["operation"] = operation
         try:
             self._update(
                 lambda record: {**record, "leftovers": [*record.get("leftovers", []), failure]}
@@ -776,7 +791,7 @@ def hold_execution(owner: ExecutionOwner, *, state: Path | None = None) -> Itera
             state,
             fd,
             {
-                "schema": 2,
+                "schema": OWNER_SCHEMA,
                 "pid": os.getpid(),
                 "start_time": process_start(os.getpid()),
                 "boot_id": boot_id(),

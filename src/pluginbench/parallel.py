@@ -9,9 +9,25 @@ from queue import Empty, SimpleQueue
 from threading import Event
 
 
+# Task jobs one host runs at once: Docker keeps about two task jobs' containers going. A task
+# job's own containers, such as its Harbor sidecars, count as one.
+HOST_JOBS = 2
+
+
 def validate_jobs(jobs: object) -> None:
     if type(jobs) is not int or not 1 <= jobs <= 16:
         raise ValueError("jobs must be an integer from 1 to 16")
+
+
+def require_host_jobs(jobs: int) -> None:
+    """Refuse more concurrent task jobs than one host runs, before anything is prepared or
+    started. jobs is part of a run's comparison identity, so it is never lowered here."""
+    if jobs > HOST_JOBS:
+        raise ValueError(
+            f"jobs={jobs} is more than the {HOST_JOBS} task jobs PluginBench runs at once on one "
+            f"host. A saved run keeps its jobs; start a new run, or a new measurement revision, "
+            f"with jobs: {HOST_JOBS} or fewer"
+        )
 
 
 def run_jobs[T](

@@ -47,7 +47,7 @@ from pluginbench import control_store, ledger as invocation_ledger
 from pluginbench.ledger import LEDGER_NAME, Ledger
 from pluginbench import run_lock
 from pluginbench.run_lock import RunMoved
-from pluginbench.parallel import run_jobs, validate_jobs
+from pluginbench.parallel import require_host_jobs, run_jobs, validate_jobs
 from pluginbench.assessment import build_assessment, write_assessment
 from pluginbench.assessment_metrics import EXCLUDED_NAMES, inspect_snapshot
 from pluginbench.assessment_models import (
@@ -1092,6 +1092,7 @@ def run_study(
     """Code a new study. `paid_call_ceiling` bounds its model calls (by default every coding
     slot's cap); an evaluation passes its coding plus review slots' caps."""
     validate_jobs(study.recipe.jobs)
+    require_host_jobs(study.recipe.jobs)
     for treatment in study.treatments.values():
         admit(treatment, study.recipe.harness)
     if baseline_cache is not None and not baseline_identity:
@@ -1300,6 +1301,7 @@ def resume_study(
         )
     frozen = _frozen_study(root)
     validate_jobs(frozen.recipe.jobs)
+    require_host_jobs(frozen.recipe.jobs)
     for treatment in frozen.treatments.values():
         admit(treatment, frozen.recipe.harness)
     path = root / LEDGER_NAME

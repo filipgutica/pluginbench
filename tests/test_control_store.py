@@ -23,7 +23,10 @@ from typer.testing import CliRunner
 
 import pluginbench
 import resume_support
-from pluginbench import cli, control_store, harbor_backend, isolation, judge, processes
+from fake_systemd import FakeSystemd
+from fake_systemd import fake_systemd_fixture  # noqa: F401  (the fake_systemd fixture)
+from pluginbench import cli, control_store, harbor_backend, invocation_runtime, isolation, judge
+from pluginbench import processes
 from pluginbench import run_lock, study
 from pluginbench import trial_containers
 from pluginbench.control_store import CleanupBlocked, CleanupUnknown, ControlStore, OwnerWatch
@@ -53,6 +56,13 @@ def _crashed_owner(
         "state": "active", "runtimes": runtimes, "pending": [],
     }
     (state / run_lock.EXECUTION_OWNER).write_text(json.dumps(record))
+
+
+@pytest.fixture
+def earlier_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Owners write records as a build before P4b-3 did (schema 2), whose calls and containers
+    did not all run as recorded operations, so each of their crashes needs repair."""
+    monkeypatch.setattr(run_lock, "OWNER_SCHEMA", 2)
 
 
 def _still_running(check: Mapping[str, Any]) -> dict[str, Any]:
@@ -118,9 +128,9 @@ def test_unverified_cleanup_keeps_crashed_rows_open_and_fences_the_host(
     monkeypatch.setattr(control_store, "verify_invocation", verified)
     monkeypatch.setattr(study, "_reconcile", reconciled)
     monkeypatch.setattr(Ledger, "resolve_crashed", resolved)
-    # The failed resume's owner is unreleased: nothing clears it but the operator's repair.
-    assert not _admitted(isolated_host_state, tmp_path)
-    assert CliRunner().invoke(cli.app, ["repair", str(root), "--confirm-stopped"]).exit_code == 0
+    # The failed resume's owner ran every call as an operation, so the next owner clears it by
+    # itself once its checks pass, with no repair.
+    assert _admitted(isolated_host_state, tmp_path)
     trace.clear()
     with control_store.execute(_owner(root)) as lock:
         assert lock.record["pending"] == []
@@ -337,10 +347,13 @@ def test_repair_checks_containers_only_once_the_processes_are_gone(
     assert _admitted(isolated_host_state, tmp_path)
 
 
+@pytest.mark.usefixtures("earlier_build")
 @pytest.mark.parametrize("unknown", ["daemon unreachable", "runtime unreadable"])
 def test_containers_that_cannot_be_checked_during_a_resume_fence_the_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path, unknown: str
 ) -> None:
+    """For a resume by an earlier build. A contained owner's containers all carry a recorded
+    operation's label, so its own operations' checks prove them, never the run's inventory."""
     root = _crashed(tmp_path, "after-identity")
     [crashed] = _rows(root)
     calls: list[str] = []
@@ -408,12 +421,13 @@ def test_a_command_left_by_an_exception_stays_unreleased_until_the_next_owner_ve
     finally:
         child.kill()
         child.wait(timeout=5)
-    # The child is gone, but the call recorded just before Ctrl-C has no process to check.
-    assert not _admitted(isolated_host_state, tmp_path)
-    result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
-    assert result.exit_code == 0 and "The host is unblocked." in result.stdout
+    # The child is gone. The call recorded just before Ctrl-C has no process to check, but its
+    # operation never made its runtime directory, so it never started: no repair is needed.
     assert _admitted(isolated_host_state, tmp_path)
     assert _record(isolated_host_state)["pending"] == []
+    [_, intent] = _rows(run)
+    proof = isolated_host_state / "invocations" / intent["id"] / "cleanup.json"
+    assert json.loads(proof.read_text())["recovered"] == "its operation never started"
 
 
 def test_an_owner_whose_call_cleanup_failed_stays_unreleased_after_a_normal_exit(
@@ -517,6 +531,7 @@ def _measure(snapshot: Path, destination: Path) -> None:
     )
 
 
+@pytest.mark.usefixtures("earlier_build")
 def test_a_failed_measurement_cleanup_leaves_a_normally_exiting_owner_unreleased(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
 ) -> None:
@@ -579,6 +594,7 @@ from pathlib import Path
 from unittest.mock import patch
 from pluginbench import control_store, harbor_backend, invocation_runtime, processes, run_lock
 from pluginbench.ledger import LEDGER_NAME, Ledger
+run_lock.OWNER_SCHEMA = 2  # As a build before P4b-3.
 state, run, mode, container = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
 runtime = json.loads(sys.argv[5])
 owner = run_lock.ExecutionOwner(kind="run", eval=str(run), root=str(run))
@@ -647,7 +663,8 @@ raise AssertionError("the owner must be killed with its container running")
 
 
 @pytest.mark.parametrize("mode", ["measurement", "regrade"])
-def test_an_owner_killed_with_a_container_running_needs_repair(
+@pytest.mark.usefixtures("earlier_build")
+def test_an_earlier_builds_owner_killed_with_a_container_running_needs_repair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path, mode: str
 ) -> None:
     run = tmp_path / "run"
@@ -665,8 +682,8 @@ def test_an_owner_killed_with_a_container_running_needs_repair(
     )
     assert owner.returncode == -signal.SIGKILL
     assert json.loads(container.read_text())["running"]
-    # No inventory can find this container until P4b labels it, and every call the owner
-    # recorded ended clean: nothing but the unreleased owner says it may still run.
+    # No inventory finds this unlabelled container, and every call the owner recorded ended
+    # clean: nothing but the unreleased owner says it may still run.
     monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime, **kwargs: None)
     monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
     with pytest.raises(CleanupBlocked, match=_UNRELEASED):
@@ -675,6 +692,172 @@ def test_an_owner_killed_with_a_container_running_needs_repair(
     result = CliRunner().invoke(cli.app, ["repair", str(run), "--confirm-stopped"])
     assert result.exit_code == 0 and _UNRELEASED in result.stdout, result.output
     assert _admitted(isolated_host_state, tmp_path)
+
+
+class _FileDaemon:
+    """A fake Docker daemon behind the frozen CLI whose containers live in a JSON file, so a
+    killed owner and the next one share them. `start` calls `on_start`; with `removable`
+    False, `rm` removes nothing, as when a container survives its removal."""
+
+    def __init__(
+        self, path: Path, *, on_start: Callable[[], None] = lambda: None, removable: bool = True
+    ) -> None:
+        self.path, self.on_start, self.removable = path, on_start, removable
+
+    def load(self) -> dict[str, dict[str, Any]]:
+        value: dict[str, dict[str, Any]] = (
+            json.loads(self.path.read_text()) if self.path.exists() else {}
+        )
+        return value
+
+    def labelled(self, label: str) -> list[str]:
+        key, value = label.split("=", 1)
+        return [item for item, row in self.load().items() if row["labels"].get(key) == value]
+
+    def __call__(self, command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        arguments = command[3:] if command[1:2] == ["--host"] else command[1:]
+        containers, output = self.load(), ""
+        if arguments[0] == "create":
+            output = f"{len(containers):064x}"
+            pairs = [arguments[index + 1] for index, item in enumerate(arguments) if item == "--label"]
+            labels = dict(pair.split("=", 1) for pair in pairs)
+            containers[output] = {"labels": labels, "running": False}
+        elif arguments[0] == "start":
+            containers[arguments[1]]["running"] = True
+            self.path.write_text(json.dumps(containers))
+            self.on_start()
+        elif arguments[0] == "ps":
+            output = "\n".join(self.labelled(arguments[-1].removeprefix("label=")))
+        elif arguments[0] == "inspect":
+            key = invocation_runtime.LABEL_KEY
+            output = "\n".join(containers[item]["labels"].get(key, "") for item in arguments[3:])
+        elif arguments[0] == "rm" and self.removable:
+            for item in arguments[3:]:
+                containers.pop(item, None)
+        self.path.write_text(json.dumps(containers))
+        return subprocess.CompletedProcess(command, 0, output, "")
+
+
+# Owns the host lock for a run, records an operation as `run_operation` does before anything of
+# it spawns, then runs it in this process, which stands in for its scope's entry point.
+# "measurement" kills itself when its measurement container starts; "regrade" kills itself after
+# its regrade worker timed out, before the regrade's own container cleanup. The fake daemon's
+# containers are saved to `daemon`.
+_CONTAINED_KILLED = """
+import json, os, signal, subprocess, sys
+from pathlib import Path
+from unittest.mock import patch
+from uuid import uuid4
+from pluginbench import control_store, harbor_backend, invocation_runtime, processes, run_lock
+from pluginbench.ledger import LEDGER_NAME, Ledger
+from test_control_store import _FileDaemon
+state, run, mode, daemon = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
+runtime = json.loads(sys.argv[5])
+owner = run_lock.ExecutionOwner(kind="run", eval=str(run), root=str(run))
+with control_store.execute(owner, state=state) as lock:
+    run_lock.note_runtime(runtime)
+    ledger = Ledger.open(run / LEDGER_NAME)
+    invocation = (
+        ledger.intent(slot=0, stage="grading", attempt_id="a") if mode == "regrade" else uuid4().hex
+    )
+    directory = state / "invocations" / invocation
+    directory.mkdir(parents=True)
+    lock.note_operation({
+        "id": invocation, "scope": f"pb-inv-{invocation}.scope",
+        "label": f"pluginbench.invocation={invocation}", "docker": runtime,
+        "dir": str(directory), "bootstrap": None, "payload": None,
+    })
+    if mode == "regrade":
+        ledger.invocation_started(invocation, os.getpid())
+    invocation_runtime._current, invocation_runtime._runtime = invocation, runtime
+    die = lambda: os.kill(os.getpid(), signal.SIGKILL)
+    fake = _FileDaemon(daemon, on_start=die)
+    with patch.object(harbor_backend, "_frozen_executable", lambda *a: {"resolved_path": "docker"}):
+        if mode == "measurement":
+            snapshot = run.parent / "snapshot"
+            snapshot.mkdir()
+            (snapshot / "index.ts").write_text("original\\n")
+            with patch.object(harbor_backend, "assert_runtime", lambda *a, **k: runtime), \\
+                    patch.object(harbor_backend, "run_command", fake):
+                harbor_backend.run_native_command(
+                    snapshot=snapshot,
+                    task_identity={"isolation": runtime, "image_identity": {"image_id": "fake"},
+                                   "workdir": "/app"},
+                    destination=run.parent / "measurement", command=["coverage"],
+                    report_path="coverage/lcov.info", timeout=10,
+                )
+        area = run.parent / "regrade"
+        (area / "artifacts").mkdir(parents=True)
+
+        def worker(argv, **kwargs):
+            # The Harbor worker's verifier container, labelled as `harbor_labels` labels it.
+            config = json.loads(Path(argv[3]).read_text())
+            fake(["docker", "create", "--label",
+                  f"pluginbench.invocation={config['pluginbench_invocation']}", "grader"])
+            kwargs["timeout"] = 0.2
+            return processes.run_command([sys.executable, "-c", "import time; time.sleep(30)"],
+                                         **kwargs)
+
+        with patch.object(harbor_backend, "_private_docker_config", lambda **k: {}), \\
+                patch.object(harbor_backend, "run_command", worker):
+            try:
+                harbor_backend._native_process(
+                    area=area, config={}, expected=runtime, harness="codex", timeout=5,
+                    install_only=True,
+                )
+            except subprocess.TimeoutExpired:
+                die()
+raise AssertionError("the owner must be killed with its container left")
+"""
+
+
+@pytest.mark.parametrize("removed", [True, False], ids=["removed", "survives"])
+@pytest.mark.parametrize("mode", ["measurement", "regrade"])
+def test_an_owner_killed_with_a_labelled_container_recovers_only_once_it_is_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_host_state: Path,
+    fake_systemd: FakeSystemd,
+    mode: str,
+    removed: bool,
+) -> None:
+    """The #130 Critic's two reproductions: a measurement container under `run`, then SIGKILL;
+    a regrade timeout, then SIGKILL before its container cleanup. Neither container is in the
+    frozen suite's inventory; each carries its operation's label, so recovery removes it and
+    clears the owner by itself, and only once both inventories are empty."""
+    run = tmp_path / "run"
+    (run / "frozen/suite").mkdir(parents=True)
+    _review_ledger(run).close()
+    daemon = tmp_path / "daemon.json"
+    tests = str(Path(__file__).parent)
+    owner = subprocess.run(
+        [sys.executable, "-c", _CONTAINED_KILLED, str(isolated_host_state), str(run), mode,
+         str(daemon), json.dumps({**_RUNTIME, "docker_cli": {}})],
+        env={**os.environ, "PYTHONPATH": os.pathsep.join([_SOURCE, tests])}, timeout=60,
+    )
+    assert owner.returncode == -signal.SIGKILL
+    [operation] = _record(isolated_host_state)["operations"]
+    label = f"{invocation_runtime.LABEL_KEY}={operation['id']}"
+    fake = _FileDaemon(daemon, removable=removed)
+    assert len(fake.labelled(label)) == 1
+    monkeypatch.setattr(harbor_backend, "run_command", fake)
+    monkeypatch.setattr(
+        harbor_backend, "_frozen_executable", lambda identity, label: {"resolved_path": "docker"}
+    )
+    monkeypatch.setattr(harbor_backend, "_assert_daemon", lambda runtime, **kwargs: None)
+    monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
+    if not removed:
+        for _ in range(2):  # Every later command is refused, not only the first.
+            with pytest.raises(CleanupBlocked, match=f"containers labelled {label} remain"):
+                with control_store.execute(_owner(tmp_path / "unrelated")):
+                    pass
+        assert fake.labelled(label) and _record(isolated_host_state)["pending"]
+        return
+    with control_store.execute(_owner(tmp_path / "unrelated")) as lock:
+        assert lock.record["pending"] == []  # No repair: the checks alone cleared it.
+    assert fake.load() == {}
+    proof = isolated_host_state / "invocations" / operation["id"] / "cleanup.json"
+    assert json.loads(proof.read_text())["id"] == operation["id"]
 
 
 # Leads a call whose descendant leaves its process group with setsid() and keeps the call's
@@ -715,6 +898,7 @@ def _review_ledger(run: Path) -> Ledger:
     )
 
 
+@pytest.mark.usefixtures("earlier_build")
 def test_a_failed_save_after_an_escaped_drain_still_needs_repair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_host_state: Path
 ) -> None:
@@ -761,6 +945,7 @@ import os, signal, subprocess, sys
 from pathlib import Path
 from pluginbench import control_store, processes, run_lock
 from pluginbench.ledger import LEDGER_NAME, Ledger
+run_lock.OWNER_SCHEMA = 2  # As a build before P4b-3.
 state, run, mode, escaped = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
 owner = run_lock.ExecutionOwner(kind="review", eval=str(run), root=str(run))
 with control_store.execute(owner, state=state):
@@ -792,6 +977,7 @@ def _killed_owner(tmp_path: Path, state: Path, mode: str) -> tuple[Path, Path, s
     return run, escaped, owner
 
 
+@pytest.mark.usefixtures("earlier_build")
 def test_an_owner_killed_during_a_call_needs_repair_even_once_its_group_is_gone(
     tmp_path: Path, isolated_host_state: Path
 ) -> None:
@@ -822,6 +1008,7 @@ def test_an_owner_killed_during_a_call_needs_repair_even_once_its_group_is_gone(
     assert _admitted(isolated_host_state, tmp_path)
 
 
+@pytest.mark.usefixtures("earlier_build")
 def test_an_owner_killed_between_calls_needs_repair_too(
     tmp_path: Path, isolated_host_state: Path
 ) -> None:

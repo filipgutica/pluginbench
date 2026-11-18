@@ -187,7 +187,7 @@ def test_the_entry_point_creates_containers_only_on_the_daemon_its_operation_rec
     )
 
 
-def test_a_container_that_survives_removal_keeps_the_owner_unreleased_though_the_error_is_caught(
+def test_a_container_that_survives_removal_fences_the_host_until_a_later_check_removes_it(
     fake_systemd: FakeSystemd, docker: _Docker, tmp_path: Path, isolated_host_state: Path
 ) -> None:
     request = _request("echo", _RUNTIME, value=1)
@@ -203,10 +203,38 @@ def test_a_container_that_survives_removal_keeps_the_owner_unreleased_though_the
     record = _record(isolated_host_state)
     assert record["state"] != "released"
     assert [item["id"] for item in record["operations"]] == [request.spec.id]
+    assert [item["operation"] for item in record["leftovers"]] == [request.spec.id]
     # The next owner carries the operation forward and verifies it before anything starts.
     with pytest.raises(CleanupBlocked, match="remain: mine"):
         with control_store.execute(_owner(tmp_path / "unrelated")):
             pass
+    # Once its container can be removed, that same check clears the fence, with no repair.
+    docker.removes = True
+    with control_store.execute(_owner(tmp_path / "unrelated")) as recovered:
+        assert recovered.record["pending"] == []
+    assert docker.containers == {}
+    assert (isolated_host_state / "invocations" / request.spec.id / "cleanup.json").is_file()
+
+
+def test_a_contained_owner_needs_only_its_operations_proof_not_its_runs_frozen_suite(
+    fake_systemd: FakeSystemd, docker: _Docker, tmp_path: Path, isolated_host_state: Path
+) -> None:
+    """Every container a contained owner started carries a recorded operation's label, so its
+    label inventory alone proves them gone, even with the run's frozen suite missing."""
+    from pluginbench.ledger import LEDGER_NAME, Ledger
+
+    run = tmp_path / "run"
+    run.mkdir()
+    Ledger.create(run / LEDGER_NAME, [], {}).close()
+    with pytest.raises(RuntimeError, match="killed"):
+        with run_lock.hold_execution(_owner(run)) as lock:
+            lock.note_runtime(_RUNTIME)
+            invocation_runtime.run_operation(_request("echo", _RUNTIME, value=1))
+            raise RuntimeError("killed")  # Its owner never records a clean release.
+    assert _record(isolated_host_state)["state"] != "released"
+
+    with control_store.execute(_owner(tmp_path / "unrelated")) as lock:
+        assert lock.record["pending"] == []
 
 
 def test_an_interrupted_cleanup_keeps_the_owner_unreleased_though_the_interrupt_is_caught(
@@ -747,12 +775,13 @@ def _killed_owner(
     return invocation, owner
 
 
-def _recover(state: Path, tmp_path: Path) -> str:
-    """Try the next execution, as any command does; return why it was refused."""
-    with pytest.raises(CleanupBlocked) as refused:
-        with control_store.execute(_owner(tmp_path / "unrelated"), state=state):
-            pass
-    return str(refused.value)
+def _recover(state: Path, tmp_path: Path, invocation: str) -> None:
+    """Run the next execution, as any command does: the killed owner's checks alone clear it,
+    and its operation's cleanup is proven on disk."""
+    with control_store.execute(_owner(tmp_path / "unrelated"), state=state) as lock:
+        assert lock.record["pending"] == []
+    proof = json.loads((state / "invocations" / invocation / "cleanup.json").read_text())
+    assert proof["id"] == invocation
 
 
 @pytest.mark.parametrize("boundary", ["bootstrap", "started"])
@@ -766,11 +795,8 @@ def test_an_owner_killed_inside_a_startup_gate_never_runs_the_handler(
     [recorded] = _record(isolated_host_state)["operations"]
     assert recorded["id"] == invocation
 
-    refusal = _recover(isolated_host_state, tmp_path)
+    _recover(isolated_host_state, tmp_path, invocation)
 
-    # The scope check passed; until P4b-2 the owner's own release still needs repair.
-    assert "ended without a clean release" in refusal
-    assert f"pb-inv-{invocation}.scope" not in refusal
     assert fake_systemd.units() == []
     time.sleep(1)
     assert not (tmp_path / "ran").exists()
@@ -789,16 +815,11 @@ def test_an_owner_killed_during_a_call_has_its_scope_and_escaped_children_stoppe
         owner.wait()
         assert _alive(escaped)  # Its owner's death left it running.
 
-        _recover(isolated_host_state, tmp_path)
+        _recover(isolated_host_state, tmp_path, invocation)
 
         assert _gone(escaped)
         assert fake_systemd.units() == []
         assert sibling.poll() is None  # Not in the scope, so never signalled.
-        with run_lock.hold_execution(_owner(tmp_path)) as lock:
-            confirmed, _, _ = control_store.confirm_stopped(lock, tmp_path)
-        assert [check["kind"] for check, _ in confirmed] == ["unrecorded"]
-        with control_store.execute(_owner(tmp_path / "unrelated")):
-            pass
     finally:
         sibling.kill()
         sibling.wait()
@@ -849,7 +870,7 @@ def test_a_real_scope_left_by_a_killed_owner_is_stopped_by_recovery(
         owner.wait()
         assert _alive(escaped)
 
-        _recover(isolated_host_state, tmp_path)
+        _recover(isolated_host_state, tmp_path, invocation)
 
         assert _gone(escaped)
         assert sibling.poll() is None
