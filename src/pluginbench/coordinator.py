@@ -417,7 +417,8 @@ def _signal(found: dict[str, Any], signum: signal.Signals) -> None:
 
 
 def status(state: Path | None = None) -> dict[str, Any]:
-    """What an observer sees of the coordinator and the host execution lock; writes nothing."""
+    """What an observer sees of the coordinator and the host execution lock. It writes nothing
+    but the rollback of a transaction a killed writer left unfinished."""
     state = state or run_lock.state_root()
     snapshot = run_lock.execution_owner(state)
     reconciling, launches = None, []
@@ -449,7 +450,8 @@ def running(launch_id: str, state: Path | None = None) -> bool:
 
 def request_stop(target: Path, state: Path | None = None) -> list[str]:
     """Record a stop for every unfinished worker launch for `target`; return their IDs. Each
-    worker checks it before every call, so it holds even if no signal reaches the worker."""
+    worker checks it before it admits each new job, so it holds even if no signal reaches the
+    worker."""
     state = state or run_lock.state_root()
     if not (state / control_store.CONTROL_NAME).exists():
         return []

@@ -21,6 +21,7 @@ from typing import Any, Literal
 
 import typer
 import yaml
+from typer.core import TyperGroup
 
 from pluginbench import __version__, control_store, coordinator, invocation_runtime, run_lock
 from pluginbench.isolation import RuntimeDriftError
@@ -50,7 +51,25 @@ _EXPECTED_RUN_ERRORS = (
     RuntimeDriftError,
 )
 
+
+class _Commands(TyperGroup):
+    """Every command. A PluginBench database that cannot be used, such as a corrupt, full or
+    locked host control database, ends the command with an error rather than a traceback.
+    `stop` handles its own, so that it still signals."""
+
+    def invoke(self, ctx: Any) -> Any:  # Typer vendors click; its Context has no public name.
+        try:
+            return super().invoke(ctx)
+        except sqlite3.Error as exc:
+            path = run_lock.state_root() / control_store.CONTROL_NAME
+            _error(ValueError(
+                f"a PluginBench database could not be used: {exc}. The host control database "
+                f"is {path}"
+            ))
+
+
 app = typer.Typer(
+    cls=_Commands,
     help="Compare native instructions, skills, and plugins with vanilla coding agents.",
     no_args_is_help=True,
     invoke_without_command=True,
@@ -108,12 +127,6 @@ def _error(exc: Exception, *, exit_code: int = 2) -> None:
         typer.echo(_readiness_table(exc.report), err=True)
     typer.echo(f"Error: {exc}", err=True)
     raise typer.Exit(exit_code)
-
-
-def _control_error(exc: sqlite3.Error) -> ValueError:
-    """A failure of the host control database, as an error the command reports."""
-    path = run_lock.state_root() / control_store.CONTROL_NAME
-    return ValueError(f"the host control database {path} could not be used: {exc}")
 
 
 def _readiness_table(report: dict[str, object]) -> str:
@@ -358,11 +371,16 @@ def _detach(
     deadline = time.monotonic() + invocation_runtime.GATE_SECONDS
     while (run_lock.owner(root) or {}).get("pid") != process.get("pid"):
         if not coordinator.running(launched.launch_id):
-            # It claimed its launch, then ended before it took run.lock: nothing runs now.
+            # It claimed its launch and ended before this command saw it own run.lock, with or
+            # without taking it: its status says how it ended.
+            phase = run_status(root)["phase"]
+            if phase == "complete":
+                typer.echo(f"The background run for {root} already finished.")
+                typer.echo(f"Report: {root / 'report/report.html'}")
+                return
             raise ValueError(
-                f"the background run for {root} ended before it took "
-                f"{root / run_lock.LOCK_NAME}; see `pluginbench status {root}` and "
-                f"{root / 'run.log'}"
+                f"the background run for {root} has already ended ({phase}); see "
+                f"`pluginbench status {root}` and {root / 'run.log'}"
             )
         if time.monotonic() > deadline:
             raise ValueError(
@@ -511,8 +529,6 @@ def run(
                 _detach(root, request, reserved)
     except _EXPECTED_RUN_ERRORS as exc:
         _error(exc)
-    except sqlite3.Error as exc:
-        _error(_control_error(exc))
 
 
 @app.command("resume")
@@ -674,9 +690,6 @@ def app_start(
     except (OSError, ValueError) as exc:
         _error(exc)
         return
-    except sqlite3.Error as exc:
-        _error(_control_error(exc))
-        return
     typer.echo(
         f"Coordinator running: process {found['pid']}, launch {found['launch_id']}, "
         f"since {found['started_at']}."
@@ -694,9 +707,6 @@ def app_stop() -> None:
     except (OSError, ValueError) as exc:
         _error(exc)
         return
-    except sqlite3.Error as exc:
-        _error(_control_error(exc))
-        return
     if found is None:
         typer.echo("No coordinator runs on this host.")
     else:
@@ -707,14 +717,11 @@ def app_stop() -> None:
 def app_status(
     as_json: bool = typer.Option(False, "--json", help="Print one JSON object."),
 ) -> None:
-    """Show the coordinator, who executes on this host, and background launches; never writes."""
+    """Show the coordinator, who executes on this host, and background launches; changes no record."""
     try:
         current = coordinator.status()
     except (OSError, ValueError) as exc:
         _error(exc)
-        return
-    except sqlite3.Error as exc:
-        _error(_control_error(exc))
         return
     if as_json:
         typer.echo(json.dumps(current, indent=2))

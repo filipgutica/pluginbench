@@ -53,7 +53,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from pluginbench import harbor_backend, isolation, run_lock, trial_containers
-from pluginbench.ledger import LEDGER_NAME, OPEN_STATES, Ledger
+from pluginbench.ledger import LEDGER_NAME, OPEN_STATES, Ledger, roll_back_unfinished_write
 from pluginbench.run_lock import ExecutionLock, ExecutionOwner
 
 CONTROL_NAME = "control.sqlite"
@@ -176,7 +176,9 @@ class ControlStore:
 
     def __init__(self, path: Path, *, readonly: bool = False) -> None:
         if readonly:
-            # Writes nothing, not even the file's mode; an older database is refused, not upgraded.
+            # Writes nothing, not even the file's mode, except to roll back a transaction a
+            # killed writer left unfinished; an older database is refused, not upgraded.
+            roll_back_unfinished_write(path)
             self._db = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=5)
             version = self._db.execute("PRAGMA user_version").fetchone()[0]
             if version != SCHEMA_VERSION:

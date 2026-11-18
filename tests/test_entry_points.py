@@ -252,7 +252,12 @@ def test_a_stop_that_cannot_be_recorded_still_signals_and_says_so(
 
 
 @pytest.mark.parametrize(
-    "argv", [["run", "{run}", "--yes"], ["app"], ["app", "stop"], ["app", "status"]]
+    "argv",
+    [
+        ["run", "{run}", "--yes"], ["app"], ["app", "stop"], ["app", "status"],
+        ["app", "cleanup"],
+        *(_COMMANDS[name][0] for name in ("check", "review", "measure", "judge run")),
+    ],
 )
 def test_a_broken_control_database_is_a_clean_error(
     fake_systemd: FakeSystemd, broken_control: None, tmp_path: Path,
@@ -260,11 +265,14 @@ def test_a_broken_control_database_is_a_clean_error(
 ) -> None:
     monkeypatch.setattr(cli, "plan_resume", lambda root: {"coding_calls": 1, "review_calls": 0})
     monkeypatch.setattr(coordinator, "identity", lambda state=None: {"launch_id": "c", "pid": 1})
-    result = CliRunner().invoke(cli.app, [part.format(run=tmp_path) for part in argv])
+    (tmp_path / "eval.yaml").write_text("{}")
+    command = [part.format(run=tmp_path, target=tmp_path) for part in argv]
+    result = CliRunner().invoke(cli.app, command)
     assert result.exit_code == 2, result.output
     assert isinstance(result.exception, SystemExit)
-    assert "the host control database" in result.stderr
-    assert "database disk image is malformed" in result.stderr
+    assert "a PluginBench database could not be used: database disk image is malformed" in (
+        result.stderr
+    )
 
 
 # `app status` and `app --foreground`.
@@ -291,6 +299,33 @@ def test_app_status_writes_nothing_and_never_upgrades_an_older_database(
         assert observer.execute("PRAGMA user_version").fetchone()[0] == 1
     finally:
         observer.close()
+
+
+# A command killed while it wrote the control database: a one-page cache makes its write spill
+# into the file at once, so its rollback journal is hot.
+_KILLED_MID_WRITE = """
+import os, signal, sqlite3, sys
+db = sqlite3.connect(sys.argv[1], isolation_level=None)
+db.execute("PRAGMA cache_size = 1")
+db.execute("BEGIN IMMEDIATE")
+db.execute("UPDATE host_state SET reconciling = 'half-written'")
+db.execute("CREATE TABLE spill (x)")
+db.executemany("INSERT INTO spill VALUES (?)", [("x" * 1000,) for _ in range(200)])
+os.kill(os.getpid(), signal.SIGKILL)
+"""
+
+
+def test_app_status_reads_a_control_database_whose_writer_was_killed_mid_write(
+    isolated_host_state: Path,
+) -> None:
+    path = isolated_host_state / control_store.CONTROL_NAME
+    with ControlStore.open(isolated_host_state):
+        pass
+    killed = subprocess.run([sys.executable, "-c", _KILLED_MID_WRITE, str(path)], check=False)
+    assert killed.returncode == -9 and path.with_name(path.name + "-journal").is_file()
+    result = CliRunner().invoke(cli.app, ["app", "status", "--json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["reconciling"] is None  # The killed write is undone.
 
 
 def test_app_in_the_foreground_is_the_one_coordinator_until_its_stop_is_recorded(

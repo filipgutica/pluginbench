@@ -193,11 +193,14 @@ def test_background_run_that_exits_before_it_starts_fails_the_command(
 
 
 @pytest.mark.real_operations
-def test_a_background_run_that_ends_before_its_run_lock_is_reported_ended_and_fails(
+@pytest.mark.parametrize("phase", ["failed", "complete"])
+def test_a_background_run_that_ends_before_run_sees_it_is_reported_by_how_it_ended(
     fake_systemd: FakeSystemd, isolated_host_state: Path, tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch, planned: None, worker: None,
+    monkeypatch: pytest.MonkeyPatch, planned: None, worker: None, phase: str,
 ) -> None:
+    # The worker takes run.lock, then ends at once.
     (tmp_path / "stop-at-once").touch()
+    monkeypatch.setattr(cli, "run_status", lambda root: {"phase": phase})
     start = invocation_runtime.start_gated
 
     def descheduled(*args: object, **kwargs: object) -> object:
@@ -208,8 +211,14 @@ def test_a_background_run_that_ends_before_its_run_lock_is_reported_ended_and_fa
 
     monkeypatch.setattr(invocation_runtime, "start_gated", descheduled)
     result = CliRunner().invoke(cli.app, ["run", str(tmp_path), "--yes"])
-    assert result.exit_code == 2
-    assert f"the background run for {tmp_path} ended before it took" in result.stderr
+    assert (tmp_path / "worker-path").exists()
+    if phase == "complete":
+        assert result.exit_code == 0, result.output
+        assert f"The background run for {tmp_path} already finished." in result.stdout
+    else:
+        assert result.exit_code == 2
+        assert f"the background run for {tmp_path} has already ended (failed)" in result.stderr
+    assert "before it took" not in result.output
 
 
 def test_foreground_run_owns_the_lock_and_writes_events(
