@@ -599,7 +599,11 @@ class ExecutionLock:
             current = None
         if current is None or (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
             raise ExecutionLost(f"the host execution lock in {self.state} was replaced")
-        if _read_record(self.state / EXECUTION_OWNER)[0] != self.record:
+        # Not while another thread's update has renamed its record into place but not yet
+        # adopted it (`_update`): the file would differ from `self.record` for that moment.
+        with self._updating:
+            replaced = _read_record(self.state / EXECUTION_OWNER)[0] != self.record
+        if replaced:
             raise ExecutionLost(f"another owner record replaced this process's in {self.state}")
 
     def publish(self, state: str) -> None:

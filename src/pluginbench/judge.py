@@ -732,14 +732,21 @@ def _judge_task(
             break
         else:
             raise _cap_reached(judge.label, task)
-        execution = codex.invoke(
-            area=area,
-            artifacts=attempt,
-            entry={"host": judge.harness},
-            protocol={"models": {judge.harness: judge.model}, "reasoning": judge.effort},
-            prompt=prompt,
-            timeout=timeout,
-            output_schema=workspace / SCHEMA,
+        from pluginbench import operations
+
+        execution = operations.run(
+            "review",
+            operations.Review(
+                area=area,
+                artifacts=attempt.resolve(),
+                entry={"host": judge.harness},
+                protocol={"models": {judge.harness: judge.model}, "reasoning": judge.effort},
+                prompt=prompt,
+                timeout=timeout,
+                output_schema=workspace / SCHEMA,
+            ),
+            timeout=operations.review_budget(timeout),
+            docker=None,
         )
     final = verified_final(execution, model=judge.model, effort=judge.effort, harness=judge.harness)
     check_read_only_trace(

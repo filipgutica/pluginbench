@@ -465,3 +465,34 @@ def test_a_failed_record_write_is_never_adopted(
             run_lock.note_runtime({"docker_engine": {"id": "d"}})
         assert lock.record["runtimes"] == [] and lock.record == _owner_record(state)
         monkeypatch.setattr(run_lock, "_write_atomic", write)
+
+
+def test_the_owner_check_never_sees_a_record_another_thread_is_still_adopting(
+    tmp_path: Path,
+) -> None:
+    """Two task jobs share one owner: one updates the record while the other checks it. The
+    update renames its file into place before adopting it; a check in that moment must not
+    read it as another owner's record."""
+    import threading
+
+    lost: list[str] = []
+    stop = threading.Event()
+    owner = run_lock.ExecutionOwner(kind="run", eval=str(tmp_path), root=str(tmp_path))
+    with run_lock.hold_execution(owner, state=tmp_path / "state") as lock:
+
+        def check() -> None:
+            while not stop.is_set():
+                try:
+                    lock.assert_owned()
+                except run_lock.ExecutionLost as exc:
+                    lost.append(str(exc))
+
+        checker = threading.Thread(target=check)
+        checker.start()
+        try:
+            for index in range(2000):
+                lock.note_runtime({"docker_engine": {"id": str(index), "endpoint": "unix:///x"}})
+        finally:
+            stop.set()
+            checker.join()
+    assert lost == []

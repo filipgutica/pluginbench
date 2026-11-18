@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import TypedDict, Unpack
 
@@ -102,9 +101,6 @@ def _judge(
         **kwargs: object,
     ) -> dict[str, object]:
         calls.append(area)
-        on_spawn = kwargs.get("on_spawn")
-        if callable(on_spawn):
-            on_spawn(os.getpid())  # As the real judge reports itself once it runs.
         workspace = area / "workspace"
         assert output_schema == workspace / "response-schema.json"
         assert protocol.get("models") == {"codex": "gpt-6-astra"}

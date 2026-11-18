@@ -1232,7 +1232,11 @@ import os
 from pathlib import Path
 import signal
 import sys
+import pytest
+import operation_support
 from pluginbench import codex, judge
+
+operation_support.in_place(pytest.MonkeyPatch())
 
 def killed(*, area, artifacts=None, **kwargs):
     destination = artifacts if artifacts is not None else area / "artifacts"
@@ -1245,7 +1249,11 @@ judge.run(Path(sys.argv[1]), judges=["codex:m1:high"], timeout=60, jobs=1, progr
 """
     child = subprocess.run(
         [sys.executable, "-c", script, str(directory)],
-        env={**os.environ, "TMPDIR": str(tmp_path)},
+        env={
+            **os.environ,
+            "TMPDIR": str(tmp_path),
+            "PYTHONPATH": os.pathsep.join([str(Path(__file__).parent), os.environ.get("PYTHONPATH", "")]),
+        },
         capture_output=True,
         timeout=30,
     )

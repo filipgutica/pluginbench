@@ -16,23 +16,23 @@ from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, Literal
 
 import typer
 import yaml
 
-from pluginbench import __version__, control_store, run_lock
+from pluginbench import __version__, control_store, invocation_runtime, run_lock
 from pluginbench.isolation import RuntimeDriftError
 from pluginbench.evaluation import (
     CheckFailed,
     Runner,
-    check_evaluation,
+    Evaluation,
     load_evaluation,
     measure_evaluation,
     plan_evaluation,
     plan_measure,
     plan_resume,
     plan_review,
-    prepare_evaluation,
     regenerate_report,
     resume_evaluation,
     review_evaluation,
@@ -43,6 +43,7 @@ from pluginbench.run_status import format_status, run_status
 _EXPECTED_RUN_ERRORS = (
     OSError,
     ValueError,
+    control_store.CleanupBlocked,
     yaml.YAMLError,
     subprocess.SubprocessError,
     RuntimeDriftError,
@@ -295,10 +296,40 @@ def _execution(
     Every command that runs containers or models takes it, before any run lock. It fails at once
     while another command runs, whatever run that targets, or while cleanup is unverified.
     """
+    # A host that cannot contain an operation refuses here, before any call is committed.
+    invocation_runtime.require_user_manager()
     owner = run_lock.ExecutionOwner(
         kind=kind, eval=str(target.resolve()), root=str((root or target).resolve())
     )
     return control_store.execute(owner)
+
+
+def _preflight(
+    mode: Literal["check", "prepare"],
+    evaluation: Evaluation,
+    output: Path,
+    progress: Callable[[str], None],
+) -> Any:
+    """Check or prepare `evaluation` into `output` as one preflight operation, whose containers
+    start on the Docker daemon commands reach now. A blocking finding raises CheckFailed with the
+    report the check saved."""
+    from pluginbench import harbor_backend, operations
+
+    root = output.expanduser().resolve()
+    try:
+        return operations.run(
+            "preflight",
+            operations.Preflight(mode=mode, config=evaluation, output=root),
+            timeout=operations.preflight_budget(evaluation),
+            # Read-only: the daemon the preparation's own runtime identity names.
+            docker=harbor_backend.runtime_identity(harness=evaluation.runner.harness),
+            progress=progress,
+        )
+    except invocation_runtime.OperationFailed as failed:
+        if failed.type != "pluginbench.evaluation.CheckFailed":
+            raise
+        report = json.loads((root / "check.json").read_text())
+        raise CheckFailed(report, report["findings"], root / "check.json") from None
 
 
 def _worker_argv(root: Path, *, notify: bool) -> list[str]:
@@ -473,7 +504,7 @@ def run(
                 destination = output or _new_run_directory()
                 owned.enter_context(_execution("run", target, destination))
                 try:
-                    root = prepare_evaluation(evaluation, destination, progress=typer.echo)
+                    root = Path(str(_preflight("prepare", evaluation, destination, typer.echo)))
                 except BaseException as exc:
                     if notify:
                         _notify(f"Run failed: {str(exc) or type(exc).__name__}")
@@ -501,7 +532,7 @@ def check(
     try:
         destination = output or _new_run_directory("check-")
         with _execution("preflight", config, destination):
-            report = check_evaluation(load_evaluation(config), destination, progress=typer.echo)
+            report = _preflight("check", load_evaluation(config), destination, typer.echo)
         typer.echo("\n".join(_vanilla_cache_lines(report)))
         typer.echo(_readiness_table(report))
         typer.echo(f"Ready. Check: {destination / 'check.json'}")
@@ -511,6 +542,7 @@ def check(
         yaml.YAMLError,
         subprocess.SubprocessError,
         RuntimeDriftError,
+        control_store.CleanupBlocked,
     ) as exc:
         _error(exc)
 
@@ -622,7 +654,7 @@ def repair(
         owner = run_lock.ExecutionOwner(kind="recovery", eval=target, root=target)
         with run_lock.hold_execution(owner) as lock:
             confirmed, at, remaining = control_store.confirm_stopped(lock, run)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, control_store.CleanupBlocked) as exc:
         _error(exc)
         return
     for check, reason in confirmed:
@@ -722,7 +754,7 @@ def review(
             if not yes and not _confirm("Start review?"):
                 raise typer.Exit()
             _review(run, revision, reviewer=reviewer, select=select)
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError, control_store.CleanupBlocked) as exc:
         _error(exc)
 
 
@@ -807,7 +839,13 @@ def measure(
             if not yes and not _confirm("Start measurement?"):
                 raise typer.Exit()
             _measure(run, names, revision, coverage_profiles, tasks=task_ids)
-    except (OSError, ValueError, yaml.YAMLError, subprocess.SubprocessError) as exc:
+    except (
+        OSError,
+        ValueError,
+        yaml.YAMLError,
+        subprocess.SubprocessError,
+        control_store.CleanupBlocked,
+    ) as exc:
         _error(exc)
 
 
@@ -898,7 +936,7 @@ def judge_run(
             failed = run_judges(
                 directory, judges=judges, timeout=timeout, jobs=jobs, progress=typer.echo
             )
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError, control_store.CleanupBlocked) as exc:
         _error(exc)
         return
     if failed:

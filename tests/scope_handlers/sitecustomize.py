@@ -42,8 +42,36 @@ def hang(arguments: dict[str, Any]) -> Any:
         time.sleep(1)
 
 
+class Unexpected(Exception):
+    """An exception no caller handles by type."""
+
+
 def fail(arguments: dict[str, Any]) -> Any:
-    raise ValueError(arguments["message"])
+    message, kind = arguments["message"], arguments.get("kind", "ValueError")
+    if kind == "TimeoutExpired":
+        raise subprocess.TimeoutExpired(["worker", message], 7)
+    raise Unexpected(message) if kind == "Unexpected" else ValueError(message)
+
+
+def chatty(arguments: dict[str, Any]) -> Any:
+    for text in arguments["lines"]:
+        invocation_runtime.report(text)
+    return len(arguments["lines"])
+
+
+def nested_collect(arguments: dict[str, Any]) -> Any:
+    """A collect inside this operation, as a preflight's readiness probe runs one, with the
+    collector's own command stubbed."""
+    from pluginbench import collectors
+
+    setattr(collectors, "_run_collector", lambda *args: ({"collected": True}, "test", "true"))
+    collector = collectors.Collector(
+        kind="coverage", config=Path(arguments["config"]), command=["true"], tool_version="test"
+    )
+    report, _, _ = collectors._contained(
+        Path(arguments["root"]), collector, Path(arguments["destination"]), None
+    )
+    return report
 
 
 def descriptors(arguments: dict[str, Any]) -> Any:
@@ -57,5 +85,5 @@ def descriptors(arguments: dict[str, Any]) -> Any:
 
 
 invocation_runtime.HANDLERS.update(
-    {name: f"sitecustomize:{name}" for name in ("echo", "escape", "hang", "fail", "descriptors")}
+    {name: f"sitecustomize:{name}" for name in ("echo", "escape", "hang", "fail", "chatty", "nested_collect", "descriptors")}
 )

@@ -252,9 +252,7 @@ def _entry_points(
     monkeypatch.setattr(cli, "load_evaluation", lambda path: object())
     monkeypatch.setattr(cli, "plan_evaluation", lambda evaluation: {"coding_calls": 1})
     monkeypatch.setattr(cli, "_plan_summary", lambda plan: "plan")
-    for name in (
-        "prepare_evaluation", "plan_resume", "check_evaluation", "plan_review", "plan_measure"
-    ):
+    for name in ("_preflight", "plan_resume", "plan_review", "plan_measure"):
         monkeypatch.setattr(cli, name, record(name))
     monkeypatch.setattr(judge, "run", record("judge"))
     return {

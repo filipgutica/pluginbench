@@ -13,18 +13,22 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import operation_support
 import resume_support
 import test_baselines
 import test_study_review
 from native_support import execution as native_execution, runtime_identity, synthetic_contract
 from pluginbench import harbor_backend, processes, provider_stops, source_only, study, study_review
-from pluginbench import codex, submissions, trial_containers
+from pluginbench import codex, invocation_runtime, submissions, trial_containers
+from pluginbench import ledger as invocation_ledger
+from pluginbench.control_store import CleanupBlocked
 from pluginbench.ledger import (
     LEDGER_NAME,
     SCHEMA_VERSION,
@@ -143,7 +147,6 @@ def test_the_same_infrastructure_error_twice_ends_the_slot_without_a_third_try(
 
     def undelivered(**kwargs: Any) -> dict[str, Any]:
         calls.append(str(kwargs["entry"]["id"]))
-        kwargs["on_spawn"](os.getpid())
         area = kwargs["area"]
         execution = native_execution(area, kwargs["protocol"]["native_task_identity"], reward=1)
         cause = "missing skill" if same else f"missing skill {len(calls)}"
@@ -174,7 +177,6 @@ def _regrade(
     replays: list[str], *, exception: str | None, reward: int | None = None
 ) -> Any:
     def regrade(**kwargs: Any) -> dict[str, object]:
-        kwargs["on_spawn"](os.getpid())
         replays.append(str(kwargs["directory"]))
         if exception is None:
             rewards = {} if reward is None else {"reward": reward}
@@ -368,7 +370,6 @@ def test_a_migrated_ledger_counts_the_calls_its_receipts_record(
 
     def undelivered(**kwargs: Any) -> dict[str, Any]:
         calls.append(str(kwargs["entry"]["id"]))
-        kwargs["on_spawn"](os.getpid())
         execution = native_execution(
             kwargs["area"], kwargs["protocol"]["native_task_identity"], reward=1
         )
@@ -418,7 +419,6 @@ def test_cached_vanilla_regrades_spend_the_slot_s_grading_invocations(
     monkeypatch.setattr(trial_containers, "running", lambda evidence, **kwargs: [])
 
     def invoke(**kwargs: Any) -> dict[str, Any]:
-        kwargs["on_spawn"](os.getpid())
         area = kwargs["area"]
         (area / "workspace/answer.py").write_text("answer = 1\n")
         return native_execution(
@@ -432,8 +432,6 @@ def test_cached_vanilla_regrades_spend_the_slot_s_grading_invocations(
     regrades: list[str] = []
 
     def regrade(**kwargs: Any) -> dict[str, object]:
-        if "on_spawn" in kwargs:  # The worker reports itself when the caller asks.
-            kwargs["on_spawn"](os.getpid())
         regrades.append(str(kwargs["directory"]))
         raise OSError(f"docker went away {len(regrades)}")
 
@@ -545,6 +543,7 @@ def test_a_run_without_a_ledger_is_not_reviewed(
 def _review_child() -> None:
     """argv: run. Reviews it with a judge call that SIGKILLs this process as it starts."""
     patch = pytest.MonkeyPatch()
+    operation_support.in_place(patch)
     patch.setattr(submissions, "reviewed_contract", synthetic_contract)
     patch.setattr(codex, "invoke", lambda **kwargs: os.kill(os.getpid(), signal.SIGKILL))
     study_review.review_study(Path(sys.argv[1]))
@@ -584,7 +583,6 @@ def test_coding_resumed_after_a_review_counts_the_review_s_calls(
 
     def vanilla_fails(**kwargs: Any) -> dict[str, Any]:
         calls.append(str(kwargs["entry"]["id"]))
-        kwargs["on_spawn"](os.getpid())
         area = kwargs["area"]
         (area / "workspace/src/answer.py").write_text("answer = 1\n")
         execution = native_execution(area, kwargs["protocol"]["native_task_identity"], reward=1)
@@ -719,3 +717,185 @@ def test_a_reviewed_row_without_an_observation_is_rejected(
     path.write_text(json.dumps(state))
     with pytest.raises(ValueError, match="reviewed row has no bound observation"):
         study_review.validate_review_revision(root, "review")
+
+
+def test_an_operation_whose_scope_was_launched_counts_as_spent_though_never_admitted() -> None:
+    """Its bootstrap ran, so a scope that failed its startup gate is no refundable abort; a
+    call refused before anything spawned still is."""
+    launched = invocation_runtime.OperationFailed("the operation's scope did not start")
+    assert invocation_ledger.outcome(launched, spawned=False)[0] == "failed_transient"
+    assert invocation_ledger.outcome(ValueError("refused"), spawned=False) == (
+        "aborted_prespawn", None
+    )
+
+
+# The owner's real `run_operation`, which the autouse fixture replaces with `run_in_place`.
+_RUN_OPERATION = invocation_runtime.run_operation
+
+
+def _through_run_operation(
+    monkeypatch: pytest.MonkeyPatch, *, launch: Any, cleanup: Any
+) -> None:
+    """Run the study's operations through the owner's real `run_operation`: it records each
+    operation and verifies its cleanup. `launch` stands in for the scope, `cleanup` for the
+    verification."""
+    monkeypatch.setattr(invocation_runtime, "run_operation", _RUN_OPERATION)
+    monkeypatch.setattr(invocation_runtime, "_launch", launch)
+    monkeypatch.setattr(invocation_runtime, "verify_cleanup", cleanup)
+
+
+def test_an_unverified_cleanup_holds_its_slot_and_starts_no_other_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_execution: Any
+) -> None:
+    """The call ran, then a container of it survived its removal. A retryable error would free
+    its slot for the next task; this stops the run with the call spent, and the host fenced."""
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+
+    def launch(lock: Any, request: Any, command: Any, directory: Any, started: Any, progress: Any) -> Any:
+        return operation_support.run_in_place(request, started=started, progress=progress)
+
+    def survived(operation: dict[str, Any], *, lock: Any) -> None:
+        raise CleanupBlocked(f"a container of invocation {operation['id']} survived its removal")
+
+    _through_run_operation(monkeypatch, launch=launch, cleanup=survived)
+    resolved = study.load_study(
+        resume_support.recipe(tmp_path / "config", tasks=3, treatments=0, repeats=1, jobs=1)
+    )
+
+    with pytest.raises(CleanupBlocked, match="survived its removal"):
+        study.run_study(resolved, tmp_path / "run")
+
+    assert len(calls) == 1
+    assert _states(tmp_path / "run") == ["unresolved"]  # Spent, never refunded.
+    assert host_execution.leftover
+
+
+def test_a_coding_call_whose_scope_never_admitted_it_is_spent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its bootstrap ran, so it is no refundable abort, though coding saves the failure as an
+    infrastructure error."""
+    resume_support.install(monkeypatch, [])
+
+    def never_admitted(*args: Any) -> Any:
+        raise invocation_runtime.OperationFailed("the operation's scope did not start")
+
+    _through_run_operation(monkeypatch, launch=never_admitted, cleanup=lambda operation, *, lock: None)
+
+    with pytest.raises(study.CodingInfrastructure, match="scope did not start"):
+        study.run_study(_one_slot(tmp_path), tmp_path / "run")
+
+    assert _states(tmp_path / "run") == ["failed_transient"]
+
+
+def test_an_unverified_review_cleanup_ends_the_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A review pass records a failed call and goes on; a call whose cleanup was not verified
+    stops it, with the call spent."""
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    calls = test_study_review._judge(monkeypatch, root, behavior="clean")
+
+    def launch(lock: Any, request: Any, command: Any, directory: Any, started: Any, progress: Any) -> Any:
+        return operation_support.run_in_place(request, started=started, progress=progress)
+
+    def survived(operation: dict[str, Any], *, lock: Any) -> None:
+        raise CleanupBlocked(f"a process of invocation {operation['id']} survived its scope")
+
+    _through_run_operation(monkeypatch, launch=launch, cleanup=survived)
+
+    with pytest.raises(CleanupBlocked, match="survived its scope"):
+        study_review.review_study(root)
+
+    assert len(calls) == 1
+    assert _states(root, "review") == ["unresolved"]
+
+
+def _in_scope(lock: Any, request: Any, command: Any, directory: Any, started: Any, progress: Any) -> Any:
+    return operation_support.run_in_place(request, started=started, progress=progress)
+
+
+def test_two_jobs_share_one_owner_through_the_real_run_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both slots record, admit and drop operations on one owner record at once. Run several
+    studies, since one slot's check races the other's write."""
+    _through_run_operation(
+        monkeypatch,
+        launch=_in_scope,
+        cleanup=lambda operation, *, lock: lock.drop_operation(operation["id"]),
+    )
+    for run in range(4):
+        calls: list[str] = []
+        resume_support.install(monkeypatch, calls)
+        monkeypatch.setattr(invocation_runtime, "run_operation", _RUN_OPERATION)
+        resolved = study.load_study(
+            resume_support.recipe(tmp_path / f"config-{run}", tasks=6, treatments=0, repeats=1, jobs=2)
+        )
+        study.run_study(resolved, tmp_path / f"run-{run}")
+        assert len(calls) == 6
+
+
+def _halting(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Run operations through the real `run_operation`, two at once: the first call's cleanup
+    fails, and the second reaches its `run_operation` only after that. Return what launched."""
+    failed = threading.Event()
+    first: list[str] = []
+    launched: list[str] = []
+    guard = threading.Lock()
+
+    def run_operation(request: Any, **kwargs: Any) -> Any:
+        with guard:
+            mine = not first
+            if mine:
+                first.append(request.spec.id)
+        if not mine:
+            assert failed.wait(10)  # In flight, about to make its call, as the first fails.
+        return _RUN_OPERATION(request, **kwargs)
+
+    def launch(lock: Any, request: Any, command: Any, directory: Any, started: Any, progress: Any) -> Any:
+        launched.append(request.spec.id)
+        return _in_scope(lock, request, command, directory, started, progress)
+
+    def cleanup(operation: dict[str, Any], *, lock: Any) -> None:
+        if operation["id"] in first:
+            failed.set()
+            raise CleanupBlocked("a container of it survived its removal")
+        lock.drop_operation(operation["id"])
+
+    _through_run_operation(monkeypatch, launch=launch, cleanup=cleanup)
+    monkeypatch.setattr(invocation_runtime, "run_operation", run_operation)
+    return launched
+
+
+def test_after_one_slots_cleanup_fails_the_other_slot_launches_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    resume_support.install(monkeypatch, calls)
+    launched = _halting(monkeypatch)
+    resolved = study.load_study(
+        resume_support.recipe(tmp_path / "config", tasks=4, treatments=0, repeats=1, jobs=2)
+    )
+
+    with pytest.raises(CleanupBlocked):
+        study.run_study(resolved, tmp_path / "run")
+
+    assert len(launched) == len(calls) == 1
+    # The other slot's call never launched, so it is given back to its slot.
+    assert sorted(_states(tmp_path / "run")) == ["aborted_prespawn", "unresolved"]
+
+
+def test_after_one_review_cleanup_fails_an_in_flight_review_makes_no_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    calls = test_study_review._judge(monkeypatch, root, behavior="clean")
+    launched = _halting(monkeypatch)
+
+    with pytest.raises(CleanupBlocked):
+        study_review.review_study(root, jobs=2)
+
+    assert len(launched) == len(calls) == 1
+    assert sorted(_states(root, "review")) == ["aborted_prespawn", "unresolved"]

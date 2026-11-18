@@ -24,6 +24,7 @@ import pluginbench
 from fake_systemd import HANDLERS, FakeSystemd, register_handlers
 from fake_systemd import fake_systemd_fixture  # noqa: F401  (the fake_systemd fixture)
 from pluginbench import control_store, harbor_backend, invocation_runtime, run_lock
+from pluginbench import ledger as invocation_ledger
 from pluginbench.control_store import CleanupBlocked, CleanupUnknown
 from pluginbench.invocation_runtime import (
     HostUnavailable,
@@ -32,6 +33,8 @@ from pluginbench.invocation_runtime import (
     OperationFailed,
     OperationRequest,
 )
+
+pytestmark = pytest.mark.real_operations
 
 _SOURCE = str(Path(pluginbench.__file__).parents[1])
 _RUNTIME: dict[str, object] = {"docker_engine": {"id": "daemon", "endpoint": "unix:///fake.sock"}}
@@ -212,15 +215,80 @@ def test_an_interrupted_cleanup_keeps_the_owner_unreleased_though_the_interrupt_
     assert [item["id"] for item in record["operations"]] == [request.spec.id]
 
 
-def test_a_handler_error_becomes_operation_failed_after_cleanup(
-    fake_systemd: FakeSystemd, owned: run_lock.ExecutionLock
+def test_an_unverified_cleanup_replaces_the_handlers_retryable_error(
+    fake_systemd: FakeSystemd, owned: run_lock.ExecutionLock, docker: _Docker
 ) -> None:
-    request = _request("fail", message="boom")
+    """A caller retries a ValueError and frees its slot; while a container of the operation
+    remains, it gets CleanupBlocked, with the handler's error as its context."""
+    request = _request("fail", _RUNTIME, message="boom")
+    docker.containers = {"mine": request.spec.id}
+    docker.removes = False
 
-    with pytest.raises(OperationFailed, match="ValueError: boom") as caught:
+    with pytest.raises(CleanupBlocked, match="remain: mine") as caught:
         invocation_runtime.run_operation(request)
 
-    assert caught.value.type == "builtins.ValueError"
+    assert isinstance(caught.value.__context__, ValueError)
+    assert owned.leftover
+
+
+def test_a_collect_inside_an_operation_runs_in_that_operations_scope(
+    fake_systemd: FakeSystemd, owned: run_lock.ExecutionLock, tmp_path: Path
+) -> None:
+    """A preflight's readiness probe collects inside the preflight's scope, whose fresh entry
+    point holds no execution lock, so the collect cannot start an operation of its own."""
+    config = tmp_path / "coverage.yaml"
+    config.write_text("{}\n")
+    request = _request(
+        "nested_collect",
+        config=str(config),
+        root=str(tmp_path),
+        destination=str(tmp_path / "collected"),
+    )
+
+    assert invocation_runtime.run_operation(request) == {"collected": True}
+
+
+def test_the_handlers_progress_reaches_the_caller_and_a_long_line_never_ends_it(
+    fake_systemd: FakeSystemd, owned: run_lock.ExecutionLock
+) -> None:
+    """A preflight's progress is what `check` and `run` print while they prepare."""
+    long = "é" * 5000  # Longer than one message, even before JSON escapes it.
+    lines: list[str] = []
+
+    value = invocation_runtime.run_operation(
+        _request("chatty", lines=["one", long, "two"]), progress=lines.append
+    )
+
+    assert value == 3
+    assert lines[0] == "one" and lines[2] == "two"
+    assert lines[1] and long.startswith(lines[1])
+
+
+@pytest.mark.parametrize(
+    ("kind", "raised", "text"),
+    [
+        ("ValueError", ValueError, "boom"),
+        ("TimeoutExpired", subprocess.TimeoutExpired, "timed out after 7.0 seconds"),
+        ("Unexpected", OperationFailed, "sitecustomize.Unexpected: boom"),
+    ],
+)
+def test_a_handler_error_comes_back_as_its_callers_handle_it_after_cleanup(
+    fake_systemd: FakeSystemd,
+    owned: run_lock.ExecutionLock,
+    kind: str,
+    raised: type[Exception],
+    text: str,
+) -> None:
+    """Callers handle a timeout, a ValueError or a collector's error by type, so these come
+    back as themselves; any other is an infrastructure failure."""
+    request = _request("fail", message="boom", kind=kind)
+
+    with pytest.raises(raised, match=text) as caught:
+        invocation_runtime.run_operation(request)
+
+    assert type(caught.value) is raised
+    if isinstance(caught.value, subprocess.TimeoutExpired):
+        assert caught.value.cmd == ["worker", "boom"]
     assert (owned.state / "invocations" / request.spec.id / "traceback.txt").is_file()
     assert _record(owned.state)["operations"] == []
 
@@ -308,6 +376,72 @@ def test_a_scope_that_fails_to_start_fails_the_operation_within_the_gate(
         invocation_runtime.run_operation(_request("echo"))
 
     assert _record(owned.state)["operations"] == []
+
+
+@pytest.mark.parametrize(
+    "error", [TimeoutError("timed out"), run_lock.ExecutionLost("replaced")], ids=type
+)
+def test_an_error_after_the_scope_launched_leaves_the_call_spent(
+    fake_systemd: FakeSystemd,
+    owned: run_lock.ExecutionLock,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    """The gate's own failures, raised once the bootstrap started: no refund, whatever type."""
+
+    def failing(*args: Any) -> Any:
+        raise error
+
+    monkeypatch.setattr(invocation_runtime, "_admit", failing)
+
+    with pytest.raises(type(error)) as caught:
+        invocation_runtime.run_operation(_request("echo"))
+
+    assert invocation_ledger.outcome(caught.value, spawned=False)[0] == "failed_transient"
+
+
+def test_a_launched_call_whose_cleanup_then_fails_stays_spent(
+    fake_systemd: FakeSystemd,
+    owned: run_lock.ExecutionLock,
+    monkeypatch: pytest.MonkeyPatch,
+    docker: _Docker,
+) -> None:
+    """Never admitted, so no spawn was reported, but its bootstrap ran: the cleanup failure
+    that replaces the gate's error keeps the call spent, and unresolved."""
+    request = _request("echo", _RUNTIME, value=1)
+    docker.containers = {"mine": request.spec.id}
+    docker.removes = False
+
+    def stalled(*args: Any) -> Any:
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(invocation_runtime, "_admit", stalled)
+
+    with pytest.raises(CleanupBlocked, match="remain: mine") as caught:
+        invocation_runtime.run_operation(request)
+
+    assert invocation_ledger.outcome(caught.value, spawned=False)[0] == "unresolved"
+
+
+def test_an_owner_whose_cleanup_failed_launches_no_other_operation(
+    fake_systemd: FakeSystemd, owned: run_lock.ExecutionLock, docker: _Docker, tmp_path: Path
+) -> None:
+    """A failed cleanup halts admission for the whole owner, so another slot's next
+    operation, or an in-flight review's call, is refused before it launches."""
+    failed = _request("echo", _RUNTIME, value=1)
+    docker.containers = {"mine": failed.spec.id}
+    docker.removes = False
+    with pytest.raises(CleanupBlocked, match="remain: mine"):
+        invocation_runtime.run_operation(failed)
+    marker = tmp_path / "ran"
+
+    with pytest.raises(CleanupBlocked, match="starts no more operations") as refused:
+        invocation_runtime.run_operation(_request("echo", marker=str(marker)))
+
+    assert not marker.exists()
+    assert [item["id"] for item in _record(owned.state)["operations"]] == [failed.spec.id]
+    # Nothing launched, so the refused call is given back to its slot.
+    assert invocation_ledger.outcome(refused.value, spawned=False)[0] == "aborted_prespawn"
 
 
 def test_lock_descriptors_never_reach_the_operation(

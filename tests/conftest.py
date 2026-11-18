@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+import operation_support
 import resume_support
 from pluginbench import control_store, run_lock
 from pluginbench.run_lock import ExecutionLock
@@ -72,3 +73,11 @@ def host_execution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[
 def nothing_left_running(check: dict[str, Any]) -> dict[str, Any]:
     """A cleanup check for a test whose crashed calls left no process."""
     return {"id": check["id"], "checked": "test"}
+
+
+@pytest.fixture(autouse=True)
+def operations_in_place(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Operations run in the test's own process (`operation_support.in_place`) on a host that
+    can contain them. Tests marked `real_operations` run them in real or fake systemd scopes."""
+    if not request.node.get_closest_marker("real_operations"):
+        operation_support.in_place(monkeypatch)

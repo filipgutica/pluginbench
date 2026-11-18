@@ -599,9 +599,17 @@ def _requalify(evidence: Path, task: TaskSpec) -> str | None:
     A grade may only stand as a fail when the task is healthy now, so an admission pass is
     not enough.
     """
+    from pluginbench import operations
+
     destination = evidence / source_only.DIRECTORY / "requalify" / task.task_id / uuid4().hex
+    identity = native_identity(task)
     rows = _reference_agent_rows(
-        harbor_backend.run_reference_agents(native_identity(task), destination)
+        operations.run(
+            "preflight",
+            operations.Requalify(identity=identity, destination=destination.resolve()),
+            timeout=operations.requalify_budget(task.native_task),
+            docker=harbor_backend._native_object(identity["isolation"], "reference runtime"),
+        )
     )
     broken = [
         f"{agent} {row['state']}: {row['reason']}"

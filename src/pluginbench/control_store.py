@@ -75,8 +75,15 @@ Check = dict[str, Any]
 CONTAINER_KINDS = ("containers", "labelled")
 
 
-class CleanupBlocked(ValueError):
-    """Something a crashed owner or call started still runs, so no work starts on this host."""
+class CleanupBlocked(Exception):
+    """Something a crashed owner or call started still runs, so no work starts on this host.
+
+    Not a ValueError: no caller's error handling may turn it into a result or an
+    infrastructure error and start more work. The CLI reports it as the command's error.
+    """
+
+    # Whether the call it ended had launched its scope, so the call is spent (`ledger.outcome`).
+    launched = False
 
 
 class CleanupUnknown(CleanupBlocked):

@@ -511,8 +511,11 @@ class CodingInfrastructure(_Reasoned, ValueError):
     """A coding attempt that ended without gradable evidence: an infrastructure error.
 
     It is never complete, graded or cached; the next resume codes its slot again while the slot
-    has invocations left.
+    has invocations left. `launched` keeps a launched scope's spend (`ledger.outcome`) when its
+    operation failed before the call was admitted.
     """
+
+    launched = False
 
 
 def _call_error(error: BaseException) -> str:
@@ -537,7 +540,7 @@ def _execute_stage(
     study: ResolvedStudy,
     stage_id: str,
     prompt: str,
-    on_native_start: Callable[[], None],
+    on_native_start: Callable[[], str],
     expected_runtime: dict[str, object],
     guard: Callable[[], None] = lambda: None,
     on_spawn: Callable[[int], None] | None = None,
@@ -555,16 +558,19 @@ def _execute_stage(
     nothing more to its old path; that call's evidence is lost with its temporary work area,
     and resume discards the attempt by its invocation receipt.
 
-    `on_native_start` commits the invocation's intent and may refuse it; `on_spawn` records the
-    spawned worker.
+    `on_native_start` commits the invocation's intent and returns its ID, or refuses it; the
+    call runs as that invocation's coding operation, and `on_spawn` records it once admitted.
     """
     _assert_frozen(root)
     interrupted: KeyboardInterrupt | None = None
     worker_error: str | None = None
+    launched = False  # The call's scope was launched, so it is spent even if never admitted.
     try:
         codex.reject_guidance(area / "workspace", include_ancestors=True, reject_git=False)
-        on_native_start()
-        execution = harbor_backend.invoke_native(
+        from pluginbench import operations
+
+        invocation = on_native_start()
+        arguments = operations.Coding(
             area=area,
             task_dir=task.native_task,
             entry={**entry, "host": study.recipe.harness},
@@ -588,7 +594,14 @@ def _execute_stage(
             },
             prompt=prompt,
             timeout=study.recipe.timeout_seconds,
-            on_spawn=on_spawn,
+        )
+        execution = operations.run(
+            "coding",
+            arguments,
+            timeout=operations.coding_budget(task.native_task, study.recipe.timeout_seconds),
+            docker=expected_runtime,
+            invocation=invocation,
+            started=on_spawn,
         )
     except invocation_ledger.InvocationRefused:
         raise  # Nothing started, so there is no evidence to save.
@@ -624,6 +637,7 @@ def _execute_stage(
             interrupted = exc
         else:
             worker_error = _call_error(exc)
+            launched = getattr(exc, "launched", False)
     mixed = None
     if reused_vanilla:
         receipt = _discovery_receipt(execution, area / "artifacts")
@@ -765,7 +779,9 @@ def _execute_stage(
             except ValueError as error:
                 execution["error"] = str(error)
                 _write(target / "execution.json", execution)
-        raise _infrastructure(target, entry, infrastructure)
+        failed = _infrastructure(target, entry, infrastructure)
+        failed.launched = launched
+        raise failed
     try:
         exported = inspect_snapshot(area / "workspace")
         if exported["digest"] != execution.get("submission_export_digest"):
@@ -1813,7 +1829,7 @@ def _run_attempts(
                 if guard:
                     guard()
 
-            def started() -> None:
+            def started() -> str:
                 nonlocal invocation
                 if cancelled.is_set():
                     raise CancelledError("attempt cancelled before its next native invocation")
@@ -1834,6 +1850,7 @@ def _run_attempts(
                     },
                 )
                 emit(partial(invoked, index, copy.deepcopy(record), stage_id))
+                return invocation
 
             def spawn(pid: int) -> None:
                 nonlocal spawned
@@ -1855,8 +1872,18 @@ def _run_attempts(
                     replay_spawned = True
                     _on_coordinator(emit, partial(ledger.invocation_started, replay, pid))
 
+                from pluginbench import operations
+
                 try:
-                    return harbor_backend.regrade_native(**arguments, on_spawn=replay_spawn)
+                    regraded: dict[str, object] = operations.run(
+                        "grading",
+                        operations.Grading(**arguments),
+                        timeout=operations.grading_budget(arguments["task_dir"]),
+                        docker=arguments["identity"]["isolation"],
+                        invocation=replay,
+                        started=replay_spawn,
+                    )
+                    return regraded
                 except BaseException as failure:
                     if not isinstance(failure, RunMoved):
                         ended = invocation_ledger.outcome(failure, spawned=replay_spawned)
