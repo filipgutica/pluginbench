@@ -339,6 +339,11 @@ def _cgroup(pid: int) -> str | None:
     return next((line[3:] for line in lines if line.startswith("0::")), None)
 
 
+def cgroup_of(pid: int) -> str | None:
+    """The cgroup v2 path of `pid`, or None once it has exited; its last part is the unit."""
+    return _cgroup(pid)
+
+
 def _populated(cgroup: str) -> bool:
     """Whether any process remains in `cgroup`, descendants included. A removed cgroup has none."""
     try:
@@ -348,7 +353,56 @@ def _populated(cgroup: str) -> bool:
     return "populated 0" not in events.splitlines()
 
 
-def _identity(pid: int) -> dict[str, object]:
+def start_gated(
+    command: list[str],
+    *,
+    output: Path,
+    admit: Callable[[dict[str, object]], bool],
+    cwd: Path | None = None,
+    pass_fds: tuple[int, ...] = (),
+) -> subprocess.Popen[bytes] | None:
+    """Start `command` behind a bootstrap in a new session that runs it only once permitted.
+
+    `admit` gets the bootstrap's identity and records it; the permit is sent only if it returns
+    True. Without a permit, as when `admit` refuses or this process dies first, the bootstrap
+    exits and runs nothing. Returns the bootstrap, or None when `admit` refused it. `pass_fds`
+    are handed to the command too. Output is appended to `output`.
+    """
+    read_end, write_end = os.pipe()
+    try:
+        with output.open("ab") as log:
+            proc = subprocess.Popen(
+                [sys.executable, "-I", "-c", _BOOTSTRAP, str(read_end), str(GATE_SECONDS),
+                 *command],
+                pass_fds=(read_end, *pass_fds),
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except BaseException:
+        os.close(write_end)
+        raise
+    finally:
+        os.close(read_end)
+    permitted = False
+    try:
+        if admit(process_identity(proc.pid)):
+            os.write(write_end, b"1")
+            permitted = True
+    except BaseException as exc:
+        # Its bootstrap started, so whatever ended it, the call is spent.
+        setattr(exc, "launched", True)
+        raise
+    finally:
+        os.close(write_end)
+        if not permitted:
+            proc.wait()  # Without its permit the bootstrap exits at once.
+    return proc if permitted else None
+
+
+def process_identity(pid: int) -> dict[str, object]:
     return {
         "pid": pid,
         "start_time": run_lock.started_at(pid),
@@ -445,31 +499,15 @@ def _launch(
         finally:
             os.close(gate)
         listener.listen(1)
-        read_end, write_end = os.pipe()
-        try:
-            with (directory / "output.log").open("wb") as log:
-                proc = subprocess.Popen(
-                    [sys.executable, "-I", "-c", _BOOTSTRAP, str(read_end), str(GATE_SECONDS),
-                     *command],
-                    pass_fds=(read_end,),
-                    cwd=directory,
-                    stdin=subprocess.DEVNULL,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-        except BaseException:
-            os.close(write_end)
-            raise
-        finally:
-            os.close(read_end)
+
+        def admit(identity: dict[str, object]) -> bool:
+            lock.update_operation(spec.id, bootstrap=identity)
+            return True
+
+        proc = start_gated(command, output=directory / "output.log", admit=admit, cwd=directory)
+        assert proc is not None  # `admit` never refuses.
         try:
             try:
-                try:
-                    lock.update_operation(spec.id, bootstrap=_identity(proc.pid))
-                    os.write(write_end, b"1")
-                finally:
-                    os.close(write_end)
                 with _admit(listener, lock, spec, started) as connection:
                     outcome = _wait(connection, spec, request.timeout, progress)
             finally:
@@ -537,7 +575,7 @@ def _admit(
         cgroup = _cgroup(pid)
         if cgroup is None or cgroup.rsplit("/", 1)[-1] != spec.scope:
             raise OperationFailed(f"process {pid} does not run in scope {spec.scope}")
-        lock.update_operation(spec.id, payload={**_identity(pid), "cgroup": cgroup})
+        lock.update_operation(spec.id, payload={**process_identity(pid), "cgroup": cgroup})
         lock.assert_owned()
         if started is not None:
             started(pid)

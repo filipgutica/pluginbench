@@ -289,7 +289,7 @@ def _work(
 
 
 def _execution(
-    kind: str, target: Path, root: Path | None = None
+    kind: str, target: Path, root: Path | None = None, *, launch_id: str | None = None
 ) -> AbstractContextManager[run_lock.ExecutionLock]:
     """Own this host's execution lock for `kind` work on `target`, whose evidence is in `root`.
 
@@ -299,7 +299,10 @@ def _execution(
     # A host that cannot contain an operation refuses here, before any call is committed.
     invocation_runtime.require_user_manager()
     owner = run_lock.ExecutionOwner(
-        kind=kind, eval=str(target.resolve()), root=str((root or target).resolve())
+        kind=kind,
+        eval=str(target.resolve()),
+        root=str((root or target).resolve()),
+        launch_id=launch_id,
     )
     return control_store.execute(owner)
 
@@ -453,6 +456,9 @@ def run(
         "--foreground",
         help="Run in this process instead of in the background.",
     ),
+    launch: str | None = typer.Option(
+        None, "--launch", hidden=True, help="The launch a background worker claims."
+    ),
 ) -> None:
     """Start a run from a config, or resume a run directory.
 
@@ -465,6 +471,11 @@ def run(
         with ExitStack() as owned:
             if as_json and not dry_run:
                 raise ValueError("--json prints the dry-run plan; add --dry-run")
+            if launch is not None and not (target.is_dir() and foreground and not dry_run):
+                raise ValueError(
+                    "--launch names a background worker's launch: it takes a run directory "
+                    "and --foreground"
+                )
             if not target.exists():
                 raise ValueError(
                     f"{target} does not exist; give an evaluation YAML or JSON, or a run directory"
@@ -477,7 +488,7 @@ def run(
                         "--output names the directory for a new run from a config"
                     )
                 if not dry_run:
-                    owned.enter_context(_execution("run", target))
+                    owned.enter_context(_execution("run", target, launch_id=launch))
                 if foreground and not dry_run:
                     # Own the run before planning, so a background start never races its parent.
                     lock = owned.enter_context(run_lock.hold(target))

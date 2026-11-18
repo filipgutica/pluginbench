@@ -629,7 +629,7 @@ def test_a_recorded_bootstrap_is_killed_by_identity_before_the_scope_is_checked(
     fake_systemd: FakeSystemd,
 ) -> None:
     bootstrap = subprocess.Popen(["sleep", "60"])
-    identity = invocation_runtime._identity(bootstrap.pid)
+    identity = invocation_runtime.process_identity(bootstrap.pid)
     try:
         proof = invocation_runtime.verify_scope(
             _operation(InvocationSpec(uuid4().hex), bootstrap=identity), deadline=_deadline()
@@ -644,7 +644,7 @@ def test_a_recorded_bootstrap_is_killed_by_identity_before_the_scope_is_checked(
 def test_a_reused_bootstrap_pid_is_never_signalled(fake_systemd: FakeSystemd) -> None:
     unrelated = subprocess.Popen(["sleep", "60"])
     try:
-        identity = {**invocation_runtime._identity(unrelated.pid), "start_time": "1"}
+        identity = {**invocation_runtime.process_identity(unrelated.pid), "start_time": "1"}
         proof = invocation_runtime.verify_scope(
             _operation(InvocationSpec(uuid4().hex), bootstrap=identity), deadline=_deadline()
         )

@@ -105,7 +105,7 @@ def _owner(fd: int) -> dict[str, object] | None:
     return value
 
 
-def _interrupt(signum: int, frame: FrameType | None) -> None:
+def interrupt(signum: int, frame: FrameType | None) -> None:
     # Reuse the interrupt path: no new attempts start and saved work is checkpointed.
     raise KeyboardInterrupt("stopped by SIGTERM")
 
@@ -217,7 +217,7 @@ def hold(root: Path) -> Iterator[RunLock]:
         os.ftruncate(fd, 0)
         os.pwrite(fd, (json.dumps(owner, indent=2) + "\n").encode(), 0)
         os.fsync(fd)
-        previous_handler = signal.signal(signal.SIGTERM, _interrupt)
+        previous_handler = signal.signal(signal.SIGTERM, interrupt)
         try:
             _held.add(root)
             yield RunLock(root, fd)
@@ -516,7 +516,7 @@ def _operation_problem(value: object) -> str | None:
     return None
 
 
-def _holds(record: dict[str, object], lock: os.stat_result) -> bool:
+def holds(record: dict[str, object], lock: os.stat_result) -> bool:
     """Whether the recorded process holds the exclusive flock on `lock` through its recorded
     descriptor. A live PID alone is not enough: it may be reused, or have handed the lock on."""
     pid, fd = record.get("pid"), record.get("lock_fd")
@@ -556,11 +556,11 @@ def execution_owner(state: Path | None = None) -> LockSnapshot:
         lock = os.fstat(fd)
     finally:
         os.close(fd)
-    verified = held and record is not None and _holds(record, lock)
+    verified = held and record is not None and holds(record, lock)
     return LockSnapshot(path, held=held, record=record, verified=verified)
 
 
-def _write_atomic(path: Path, value: dict[str, object]) -> None:
+def write_atomic(path: Path, value: dict[str, object]) -> None:
     """Replace `path` with `value` so a reader sees the old record or the new, never a mix.
 
     Each write has its own temporary file, so writes that overlap never share one.
@@ -597,6 +597,13 @@ class ExecutionLock:
     # Set once a cleanup of something this owner started failed. Unlike `dirty`, a clean exit
     # never clears it, and the record names each failure (`note_leftover`).
     leftover: bool = False
+    # For a launched owner: whether a stop was requested for its launch (`check_stop`); None
+    # while that cannot be read.
+    stop_requested: Callable[[], bool | None] | None = field(
+        default=None, repr=False, compare=False
+    )
+    # Since when (time.monotonic()) the recorded stop has been unreadable, if it is now.
+    stop_unread_since: float | None = field(default=None, repr=False, compare=False)
     # Worker threads update the record too; each change reads and writes it under this lock.
     _updating: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
@@ -693,7 +700,7 @@ class ExecutionLock:
         # Adopt the record only once it is on disk, so a failed write never reaches it later.
         with self._updating:
             record = change(self.record)
-            _write_atomic(self.state / EXECUTION_OWNER, record)
+            write_atomic(self.state / EXECUTION_OWNER, record)
             self.record = record
 
 
@@ -704,6 +711,48 @@ _execution: ExecutionLock | None = None
 def held_execution() -> ExecutionLock | None:
     """The host execution lock this process holds right now, if any."""
     return _execution
+
+
+class StopRequested(KeyboardInterrupt):
+    """A stop was requested for this owner's launch. A KeyboardInterrupt, as `stop`'s SIGTERM
+    becomes, so it ends the run the same way."""
+
+
+# While the recorded stop cannot be read, admission waits and reads it again this often; once
+# it has been unreadable this long, the owner stops as if a stop were recorded.
+STOP_READ_RETRY = 0.25
+STOP_READ_LIMIT = 30.0
+
+
+def check_stop() -> bool:
+    """Whether the owner may admit a new job now. Raises StopRequested if a stop was requested
+    for the launch this process owns the host for.
+
+    `parallel.run_jobs` calls it before it admits each job, and source-only grading before each
+    stage it grades. So a stop whose signal was lost still admits no new job, while jobs
+    already admitted finish, with their measurement after coding, as they do after `stop`'s
+    signal. While the stop cannot be read, as when the control database is locked, it returns
+    False: nothing is admitted until a read succeeds. After STOP_READ_LIMIT seconds of failed
+    reads it raises StopRequested, so admitted jobs still finish.
+    """
+    lock = _execution
+    if lock is None or lock.stop_requested is None:
+        return True
+    requested = lock.stop_requested()
+    if requested is None:
+        now = time.monotonic()
+        if lock.stop_unread_since is None:
+            lock.stop_unread_since = now
+        if now - lock.stop_unread_since >= STOP_READ_LIMIT:
+            raise StopRequested(
+                f"stopped: whether a stop was requested could not be read for "
+                f"{STOP_READ_LIMIT:g} seconds"
+            )
+        return False
+    lock.stop_unread_since = None
+    if requested:
+        raise StopRequested("stopped: a stop was requested for this launch")
+    return True
 
 
 def note_work() -> None:

@@ -38,11 +38,15 @@ crashed calls before it accepts saved output or marks a call unresolved (`verify
 from __future__ import annotations
 
 import json
+import os
+import signal
 import sqlite3
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import astuple, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -53,7 +57,7 @@ from pluginbench.ledger import LEDGER_NAME, OPEN_STATES, Ledger
 from pluginbench.run_lock import ExecutionLock, ExecutionOwner
 
 CONTROL_NAME = "control.sqlite"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 # How long a held lock may name no verifiable owner before observers report `reconciling`.
 UNKNOWN_OWNER_GRACE = 30.0
 # Seconds between the two container inventories that must both find nothing.
@@ -70,6 +74,31 @@ CREATE TABLE IF NOT EXISTS host_state (
     reconciling TEXT,
     updated_at TEXT NOT NULL
 );
+-- A process started in the background in its own scope: the coordinator (kind "coordinator"),
+-- or a worker that takes the host execution lock for one execution kind. Status moves only
+-- forward: launching, then active (claimed by the process itself) or fenced, then finished.
+CREATE TABLE IF NOT EXISTS launches (
+    launch_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    initiator TEXT NOT NULL CHECK (initiator IN ('cli', 'app')),
+    target TEXT NOT NULL,
+    version TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    desired TEXT NOT NULL CHECK (desired IN ('run', 'stop')),
+    status TEXT NOT NULL CHECK (status IN ('launching', 'active', 'fenced', 'finished')),
+    bootstrap TEXT,
+    process TEXT,
+    boot_id TEXT NOT NULL,
+    expires REAL NOT NULL,
+    updated_at TEXT NOT NULL
+);
+-- At most one active coordinator and one active worker.
+CREATE UNIQUE INDEX IF NOT EXISTS one_active
+    ON launches ((kind = 'coordinator')) WHERE status = 'active';
+-- At most one worker the app is still launching.
+CREATE UNIQUE INDEX IF NOT EXISTS one_app_launch
+    ON launches (initiator) WHERE initiator = 'app' AND kind != 'coordinator'
+    AND status = 'launching';
 -- The operator's word that an unknown check left nothing running. Each covers one check.
 CREATE TABLE IF NOT EXISTS confirmations (
     check_id TEXT PRIMARY KEY,
@@ -101,6 +130,43 @@ class CleanupUnknown(CleanupBlocked):
     """PluginBench cannot tell whether something still runs; only the operator can confirm."""
 
 
+class LaunchFenced(ValueError):
+    """A launch is no longer current: fenced, stopped, finished, or of another version. Its
+    process exits without starting any work."""
+
+
+@dataclass(frozen=True)
+class Launch:
+    """One row of `launches`. `expires` is the handshake deadline on the monotonic clock of the
+    boot `boot_id` names; on any other boot it has passed."""
+
+    launch_id: str
+    kind: str
+    initiator: str
+    target: str
+    version: str
+    scope: str
+    desired: str = "run"
+    status: str = "launching"
+    bootstrap: dict[str, Any] | None = None
+    process: dict[str, Any] | None = None
+    boot_id: str = ""
+    expires: float = 0.0
+
+    @property
+    def expired(self) -> bool:
+        return self.boot_id != run_lock.boot_id() or time.monotonic() >= self.expires
+
+    def operation(self) -> dict[str, Any]:
+        """This launch as `invocation_runtime.verify_scope` takes an operation."""
+        payload = None if self.process is None else {"cgroup": self.process.get("cgroup")}
+        return {"id": self.launch_id, "scope": self.scope, "bootstrap": self.bootstrap,
+                "payload": payload}
+
+
+_LAUNCH_COLUMNS = tuple(Launch.__dataclass_fields__)
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -113,10 +179,15 @@ class ControlStore:
         try:
             path.chmod(0o600)
             self._db.execute("PRAGMA synchronous = FULL")
-            self._db.executescript(f"PRAGMA user_version = {SCHEMA_VERSION};" + _SCHEMA)
-            with self._db:
-                self._db.execute(
-                    "INSERT OR IGNORE INTO host_state (id, updated_at) VALUES (1, ?)", (_now(),)
+            # Only a new or older database is written to, so opening one to read writes nothing.
+            # The tables and the version are one transaction: an opener that reads the current
+            # version always finds the tables. Concurrent creators wait for each other, and a
+            # second run of the script changes nothing.
+            if self._db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                self._db.executescript(
+                    f"BEGIN IMMEDIATE;{_SCHEMA}"
+                    f"INSERT OR IGNORE INTO host_state (id, updated_at) VALUES (1, '{_now()}');"
+                    f"PRAGMA user_version = {SCHEMA_VERSION};COMMIT;"
                 )
         except BaseException:
             self._db.close()
@@ -141,6 +212,89 @@ class ControlStore:
                 "UPDATE host_state SET reconciling = ?, updated_at = ? WHERE reconciling IS NOT ?",
                 (reason, _now(), reason),
             )
+
+    def create_launch(self, launch: Launch) -> None:
+        """Record a new launch before anything spawns. Raises sqlite3.IntegrityError while the
+        app already launches another worker."""
+        values = [
+            json.dumps(value) if column in ("bootstrap", "process") and value is not None
+            else value
+            for column, value in zip(_LAUNCH_COLUMNS, astuple(launch), strict=True)
+        ]
+        with self._db:
+            self._db.execute(
+                f"INSERT INTO launches ({', '.join(_LAUNCH_COLUMNS)}, updated_at) "
+                f"VALUES ({', '.join('?' * len(_LAUNCH_COLUMNS))}, ?)",
+                (*values, _now()),
+            )
+
+    def launch(self, launch_id: str) -> Launch | None:
+        rows = self._launches("launch_id = ?", (launch_id,))
+        return rows[0] if rows else None
+
+    def launches(self, *statuses: str) -> list[Launch]:
+        """Launches in any of `statuses`, coordinators included, oldest first."""
+        marks = ", ".join("?" * len(statuses))
+        return self._launches(f"status IN ({marks})", statuses)
+
+    def _launches(self, where: str, parameters: Sequence[object]) -> list[Launch]:
+        rows = self._db.execute(
+            f"SELECT {', '.join(_LAUNCH_COLUMNS)} FROM launches WHERE {where} ORDER BY rowid",
+            parameters,
+        )
+        return [
+            Launch(**{
+                column: json.loads(value) if column in ("bootstrap", "process") and value
+                else value
+                for column, value in zip(_LAUNCH_COLUMNS, row, strict=True)
+            })
+            for row in rows
+        ]
+
+    def _move(
+        self,
+        launch_id: str,
+        sets: str,
+        where: str,
+        values: Sequence[object] = (),
+        conditions: Sequence[object] = (),
+    ) -> bool:
+        """Update one launch only where `where` holds; True if it did."""
+        with self._db:
+            cursor = self._db.execute(
+                f"UPDATE launches SET {sets}, updated_at = ? WHERE launch_id = ? AND {where}",
+                (*values, _now(), launch_id, *conditions),
+            )
+        return cursor.rowcount == 1
+
+    def record_bootstrap(self, launch_id: str, identity: dict[str, object]) -> bool:
+        """Record a launch's bootstrap before its permit. False once the launch is no longer
+        launching: then no permit may be sent."""
+        return self._move(
+            launch_id, "bootstrap = ?", "status = 'launching'", values=(json.dumps(identity),)
+        )
+
+    def claim(self, launch_id: str, process: dict[str, object]) -> bool:
+        """The launched process marks its launch active. Only a launch still launching, still
+        wanted, and of this process's version can be claimed."""
+        return self._move(
+            launch_id,
+            "status = 'active', process = ?",
+            "status = 'launching' AND desired = 'run' AND version = ?",
+            values=(json.dumps(process),),
+            conditions=(run_lock.execution_version(),),
+        )
+
+    def fence(self, launch_id: str) -> bool:
+        """Make a launch that was never claimed impossible to claim."""
+        return self._move(launch_id, "status = 'fenced'", "status = 'launching'")
+
+    def finish(self, launch_id: str) -> bool:
+        return self._move(launch_id, "status = 'finished'", "status != 'finished'")
+
+    def request_stop(self, launch_id: str) -> bool:
+        """Persist a stop for a launch that is not finished; its process polls for it."""
+        return self._move(launch_id, "desired = 'stop'", "status IN ('launching', 'active')")
 
     def confirmed(self) -> set[tuple[str, str]]:
         """Each confirmed check as (check id, root): a confirmation covers only the check with
@@ -548,9 +702,16 @@ def execute(owner: ExecutionOwner, *, state: Path | None = None) -> Iterator[Exe
     Every execution entry point enters here, before any run lock. While an obligation fails,
     nothing runs, whatever this command targets. A contained owner's obligation clears once its
     checks pass; any other only once a repair confirmed it.
+
+    An owner with a `launch_id` was started in the background (`coordinator.launch`). It raises
+    LaunchFenced, before anything else, unless its launch is still current, and claims it only
+    after recovery. Every owner then ends each other worker launch (`_settle_launches`).
     """
     with run_lock.hold_execution(owner, state=state) as lock:
         with ControlStore.open(lock.state) as store:
+            # A stale launch exits before it touches anyone else's launch or obligations.
+            if owner.launch_id is not None:
+                _require_current(store, owner.launch_id)
             if pending := lock.record["pending"]:
                 checks = [
                     check for item in pending for check in _obligation_checks(item, lock.state)
@@ -562,11 +723,118 @@ def execute(owner: ExecutionOwner, *, state: Path | None = None) -> Iterator[Exe
                 lock.settle([])
             # Holding the lock proves any holder an observer could not verify is gone.
             store.set_reconciling(None)
+            _settle_launches(store, owner.launch_id)
+            if owner.launch_id is not None:
+                launch = store.launch(owner.launch_id)
+                process = launched_process(launch.scope if launch else "")
+                if not store.claim(owner.launch_id, process):
+                    _require_current(store, owner.launch_id)
+                    raise LaunchFenced(f"launch {owner.launch_id} could not be claimed")
         lock.publish("active")
-        yield lock
+        with _launched(lock, owner.launch_id):
+            yield lock
         # Returning is a clean exit. Left by an exception after it recorded work (see
         # ExecutionLock.dirty), the owner stays unreleased, so the next one verifies this root.
         lock.dirty = False
+
+
+def launched_process(scope: str) -> dict[str, object]:
+    """This process's identity for its launch, with its cgroup only when that is `scope`: the
+    cgroup recovery may check for survivors is the launch's own, never another."""
+    from pluginbench import invocation_runtime
+
+    pid = os.getpid()
+    cgroup = invocation_runtime.cgroup_of(pid)
+    in_scope = bool(scope) and cgroup is not None and cgroup.rsplit("/", 1)[-1] == scope
+    return {**invocation_runtime.process_identity(pid), "cgroup": cgroup if in_scope else None}
+
+
+def _require_current(store: ControlStore, launch_id: str) -> None:
+    launch = store.launch(launch_id)
+    if launch is None:
+        raise LaunchFenced(f"launch {launch_id} is not recorded, so this process starts nothing")
+    if launch.version != run_lock.execution_version():
+        raise LaunchFenced(
+            f"launch {launch_id} is for PluginBench {launch.version}, not "
+            f"{run_lock.execution_version()}, so this process starts nothing"
+        )
+    if launch.status != "launching" or launch.desired != "run":
+        raise LaunchFenced(
+            f"launch {launch_id} is {launch.status} with desired {launch.desired}, so this "
+            "process starts nothing"
+        )
+
+
+def _settle_launches(store: ControlStore, own: str | None) -> None:
+    """End every other worker launch: holding the lock, this owner is the only executor. One
+    never claimed is fenced so it never can be; then its scope must be proven gone, or this
+    owner starts nothing. The coordinator is no executor and keeps running."""
+    from pluginbench import invocation_runtime
+
+    for listed in store.launches("launching", "fenced", "active"):
+        if listed.kind == "coordinator" or listed.launch_id == own:
+            continue
+        store.fence(listed.launch_id)
+        # Read again after the fence: its launcher may have recorded a bootstrap since the list.
+        launch = store.launch(listed.launch_id)
+        assert launch is not None
+        invocation_runtime.verify_scope(launch.operation(), deadline=_deadline())
+        store.finish(launch.launch_id)
+
+
+# How often a launched owner reads whether a stop was requested for its launch.
+STOP_POLL = 0.25
+
+
+@contextmanager
+def _launched(lock: ExecutionLock, launch_id: str | None) -> Iterator[None]:
+    """For a launched owner: once a stop is requested for its launch, admit no new job
+    (`run_lock.check_stop`, which `parallel.run_jobs` calls before each), and wake it with
+    SIGTERM, as `stop` does. The signal is only a wake-up; a lost one cannot erase the
+    request. In the main thread, SIGTERM raises KeyboardInterrupt for the whole block, as under
+    `run_lock.hold`, so the wake-up never kills the owner with its launch still active.
+    Elsewhere no signal is sent. The launch finishes with the block."""
+    if launch_id is None:
+        yield
+        return
+    main = threading.current_thread() is threading.main_thread()
+    previous = signal.signal(signal.SIGTERM, run_lock.interrupt) if main else None
+
+    def requested() -> bool | None:
+        """Whether a stop was requested; None while the control database cannot be read."""
+        try:
+            with ControlStore.open(lock.state) as store:
+                launch = store.launch(launch_id)
+        except sqlite3.Error:
+            return None
+        return launch is None or launch.desired == "stop"
+
+    done = threading.Event()
+
+    def wake() -> None:
+        while not done.wait(STOP_POLL):
+            # Unreadable (None) is checked again at the next poll, and before every job.
+            if requested():
+                os.kill(os.getpid(), signal.SIGTERM)
+                return
+
+    lock.stop_requested = requested
+    watcher = threading.Thread(target=wake, name="pluginbench-stop", daemon=True)
+    if main:
+        watcher.start()
+    try:
+        yield
+    finally:
+        done.set()
+        if main:
+            watcher.join()
+        lock.stop_requested = None
+        try:
+            with ControlStore.open(lock.state) as store:
+                store.finish(launch_id)
+        finally:
+            if previous is not None:
+                signal.signal(signal.SIGTERM, previous)
 
 
 def _prove(state: Path, checks: Sequence[Check], confirmed: Collection[tuple[str, str]]) -> None:
