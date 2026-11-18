@@ -182,8 +182,8 @@ def outcome(error: BaseException, *, spawned: bool) -> tuple[str, str | None]:
     scope was launched (`launched`, set by `invocation_runtime.run_operation`), so that is the
     one refund besides an operator interrupt. A spent call whose cleanup was not verified
     (`control_store.CleanupBlocked`) is `unresolved`: its usage is unknown, and the host stays
-    fenced until recovery verifies it. The signature is what the short-circuit compares: the error's stable
-    `reason` when it has one, which holds no attempt ID or temporary path.
+    fenced until recovery verifies it. The signature is what the short-circuit compares: the
+    error's stable `reason` when it has one, which holds no attempt ID or temporary path.
     """
     from pluginbench.control_store import CleanupBlocked
 
