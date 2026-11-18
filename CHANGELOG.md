@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.10.0](https://github.com/filipgutica/pluginbench/compare/v0.9.0...v0.10.0) (2026-11-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* the overlap, unknown and native-completion outcomes are removed. Runs coded before grade contract 1 can be read but not resumed for coding. Judge keys without a grade contract keep their votes but correctness decides none of their pairs.
+
+### Features
+
+* add the coordinator singleton, the CLI entry-point matrix and app commands ([#141](https://github.com/filipgutica/pluginbench/issues/141), [#142](https://github.com/filipgutica/pluginbench/issues/142)) ([d8d530a](https://github.com/filipgutica/pluginbench/commit/d8d530aac84dbbfdc430df4d6f9df2017e5ecd34))
+* cap a host at two task jobs, and clear a contained owner's fence once its checks pass ([#136](https://github.com/filipgutica/pluginbench/issues/136)) ([6ca109e](https://github.com/filipgutica/pluginbench/commit/6ca109e1a36af8cc11a3a9ef29fc6d3bdfc5212c))
+* count every paid call in an invocation ledger with per-slot caps ([#128](https://github.com/filipgutica/pluginbench/issues/128)) ([be92b03](https://github.com/filipgutica/pluginbench/commit/be92b03a5bc3793528b34380a349c2dd4c73a017))
+* grade each attempt pass or fail, and retry what cannot be graded ([#126](https://github.com/filipgutica/pluginbench/issues/126)) ([05864f7](https://github.com/filipgutica/pluginbench/commit/05864f77e5e916750676eb95fdb4dbf18cf0ced2))
+* label every container an operation creates, and register the five scoped operations ([#132](https://github.com/filipgutica/pluginbench/issues/132)) ([e86cdf6](https://github.com/filipgutica/pluginbench/commit/e86cdf657ff5c1adc3f2847175b8a86b650febb0))
+* launch tickets that only a current worker can claim, and a persisted stop that refuses new calls ([#140](https://github.com/filipgutica/pluginbench/issues/140)) ([cb9f137](https://github.com/filipgutica/pluginbench/commit/cb9f13726170165931df941f117c16683c47e77e))
+* one host execution lock for every execution command ([#129](https://github.com/filipgutica/pluginbench/issues/129)) ([c30faae](https://github.com/filipgutica/pluginbench/commit/c30faae51c060a4435252841b151e02f4fbd18f9))
+* provision pinned offline coverage tools ([#133](https://github.com/filipgutica/pluginbench/issues/133)) ([48f34a2](https://github.com/filipgutica/pluginbench/commit/48f34a28ff115dafbec87f19c312ac6cfa2b7080))
+* recover labelled containers with the current Docker CLI against the recorded engine ([#144](https://github.com/filipgutica/pluginbench/issues/144)) ([9b8fab7](https://github.com/filipgutica/pluginbench/commit/9b8fab75ec8d7cbce6e084b701bbab550685f43e))
+* run coding, grading, review, collect and preflight in scoped operations ([#134](https://github.com/filipgutica/pluginbench/issues/134)) ([e19ef85](https://github.com/filipgutica/pluginbench/commit/e19ef8555e0d515cae1f6bbfc581242dd6b96920))
+* run operations in gated systemd scopes and verify their cleanup ([#131](https://github.com/filipgutica/pluginbench/issues/131)) ([8b1a3ae](https://github.com/filipgutica/pluginbench/commit/8b1a3aed66f9a4274e14ef4dfa4be61069d9227f))
+* start containers, builds and trials only inside an operation ([#135](https://github.com/filipgutica/pluginbench/issues/135)) ([5f05362](https://github.com/filipgutica/pluginbench/commit/5f05362aef04056e53c1e31f09c4ad659390ff8a))
+* verify crashed-call cleanup before marking calls unresolved, and block the host until it passes ([#130](https://github.com/filipgutica/pluginbench/issues/130)) ([b5c58c4](https://github.com/filipgutica/pluginbench/commit/b5c58c43822eb5726ddad8c32914fd1efe7d2534))
+
+
+### Bug Fixes
+
+* check the admission halt again before an operation's second permit ([#138](https://github.com/filipgutica/pluginbench/issues/138)) ([ec8b38b](https://github.com/filipgutica/pluginbench/commit/ec8b38bedfd1e7319d074c1ce18ae90463328104))
+* let recovery read a ledger whose writer was killed mid-write ([#143](https://github.com/filipgutica/pluginbench/issues/143)) ([7cdc7d1](https://github.com/filipgutica/pluginbench/commit/7cdc7d1f06e831b000d57fc7f213f6755c427b1e))
+* normalize native artifacts before Harbor validation ([#125](https://github.com/filipgutica/pluginbench/issues/125)) ([8f50e34](https://github.com/filipgutica/pluginbench/commit/8f50e34f45771442a6f849033a2e4eea005d027f))
+* tighten the labelled-container recovery messages and the recorded engine ID check ([#145](https://github.com/filipgutica/pluginbench/issues/145)) ([31ac518](https://github.com/filipgutica/pluginbench/commit/31ac518d48456fd35b6189fce7b97eb6befd969f))
+
 ## [0.9.0](https://github.com/filipgutica/pluginbench/compare/v0.8.0...v0.9.0) (2026-11-16)
 
 
