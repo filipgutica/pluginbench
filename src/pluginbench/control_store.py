@@ -781,8 +781,8 @@ STOP_POLL = 0.25
 
 @contextmanager
 def _launched(lock: ExecutionLock, launch_id: str | None) -> Iterator[None]:
-    """For a launched owner: refuse each new intent and operation once a stop is requested for
-    its launch (`run_lock.check_stop`), and wake it with SIGTERM, as `stop` does. The signal is
+    """For a launched owner: refuse each new ledger intent once a stop is requested for its
+    launch (`run_lock.check_stop`), and wake it with SIGTERM, as `stop` does. The signal is
     only a wake-up; a lost one cannot erase the request. The launch finishes with the block."""
     if launch_id is None:
         yield

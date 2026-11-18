@@ -115,13 +115,17 @@ def test_a_stop_whose_signal_is_lost_admits_no_further_intent_while_two_jobs_run
     assert launches(isolated_host_state)[launch.launch_id].status == "finished"
 
 
-def test_a_stop_whose_signal_is_lost_starts_no_further_operation(
+def test_after_a_stop_an_admitted_attempt_s_operations_finish_but_no_new_call_starts(
     fake_systemd: FakeSystemd, isolated_host_state: Path, tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # As after `stop`'s signal: an attempt past its intent finishes, such as its measurement
+    # after coding, so its paid call is kept and never made again on resume.
     monkeypatch.setattr(control_store, "STOP_POLL", 3600.0)
     with ControlStore.open(isolated_host_state) as store:
         launch = ticket(store, scope="pb-worker-test.scope")
+    entries: list[dict[str, Any]] = [{"id": "a0", "task_id": "t", "arm": "baseline", "attempt": 1}]
+    ledger = Ledger.create(tmp_path / LEDGER_NAME, entries, {"a0": "pending"})
     marker = tmp_path / "ran"
     request = invocation_runtime.OperationRequest(
         operation="echo",
@@ -132,10 +136,14 @@ def test_a_stop_whose_signal_is_lost_starts_no_further_operation(
     owner = run_lock.ExecutionOwner(
         "run", str(tmp_path), str(tmp_path), launch_id=launch.launch_id
     )
-    with pytest.raises(run_lock.StopRequested):
+    try:
         with control_store.execute(owner):
             with ControlStore.open(isolated_host_state) as store:
                 store.request_stop(launch.launch_id)
-            invocation_runtime.run_operation(request)
-    assert not marker.exists()
-    assert fake_systemd.units() == []
+            assert invocation_runtime.run_operation(request) == 1
+            with pytest.raises(run_lock.StopRequested):
+                ledger.intent(slot=0, stage="coding", attempt_id="a0")
+        assert ledger.invocations() == []
+    finally:
+        ledger.close()
+    assert marker.exists()

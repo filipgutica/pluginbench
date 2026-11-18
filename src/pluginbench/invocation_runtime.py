@@ -434,7 +434,6 @@ def run_operation(
     """
     lock = _lock()
     _refuse_after_failed_cleanup(lock)
-    run_lock.check_stop()
     launcher = require_user_manager()
     spec = request.spec
     directory = lock.state / "invocations" / spec.id
