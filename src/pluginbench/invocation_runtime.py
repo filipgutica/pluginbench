@@ -813,31 +813,79 @@ def verify_scope(operation: dict[str, Any], *, deadline: float) -> dict[str, Any
     return {"unit": "not-found", "bootstrap": bootstrap, "escalated": escalated, "at": _now()}
 
 
+# Variables that could point the Docker CLI at another daemon or configuration.
+_DOCKER_REDIRECTS = ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG")
+
+
+def _recovery_docker(*arguments: str, endpoint: str, timeout: int) -> str:
+    """Run the Docker CLI on PATH now against the recorded `endpoint`, for recovery only.
+
+    A CLI upgraded since the crash must not block the host for good, so this is not the frozen
+    CLI that trial execution and the create guard keep using. The endpoint is always passed
+    with `--host`, and DOCKER_HOST, DOCKER_CONTEXT and DOCKER_CONFIG are removed, so the
+    environment cannot redirect it. The caller checks the engine ID first.
+    """
+    from pluginbench.processes import run_command
+
+    if not endpoint.startswith("unix://"):
+        raise ValueError(f"the recorded Docker endpoint {endpoint!r} is not a local Unix socket")
+    docker = shutil.which("docker")
+    if docker is None:
+        raise ValueError("docker is not on PATH")
+    env = {key: value for key, value in os.environ.items() if key not in _DOCKER_REDIRECTS}
+    result = run_command(
+        [docker, "--host", endpoint, *arguments], cwd=Path.cwd(), env=env, timeout=timeout
+    )
+    if result.returncode:
+        raise ValueError(f"docker {arguments[0]} failed: {result.stderr.strip()}")
+    return result.stdout
+
+
 def verify_labelled(operation: dict[str, Any], *, deadline: float) -> dict[str, Any]:
-    """Remove every container carrying the operation's exact label from the frozen daemon, then
-    require two empty inventories INVENTORY_INTERVAL apart. Only run once the scope is gone, so
-    nothing of the operation can still create one. A daemon that cannot be checked, or is not
-    the recorded one, is unknown."""
-    from pluginbench import harbor_backend, isolation
-    from pluginbench.control_store import INVENTORY_INTERVAL, CleanupBlocked, CleanupUnknown
+    """Remove every container carrying the operation's exact label from the recorded daemon,
+    then require two empty inventories INVENTORY_INTERVAL apart. Only run once the scope is
+    gone, so nothing of the operation can still create one.
+
+    It uses the Docker CLI installed now (`_recovery_docker`), and each inventory first requires
+    the recorded endpoint to report the recorded engine ID. An endpoint that does not answer is
+    unknown; one that answers with another engine raises DaemonReplaced: the daemon that ran the
+    containers is gone.
+    """
+    from pluginbench.control_store import (
+        INVENTORY_INTERVAL, CleanupBlocked, CleanupUnknown, DaemonReplaced,
+    )
 
     runtime = operation.get("docker")
     if runtime is None:
         return {"docker": "not used"}
+    engine = runtime.get("docker_engine") or {}
+    endpoint, recorded = str(engine.get("endpoint")), engine.get("id")
     label, phase = operation["label"], min(deadline, time.monotonic() + CONTAINER_SECONDS)
 
     def docker(*arguments: str, cap: float = QUERY_SECONDS) -> str:
         timeout = math.ceil(_left(phase, cap, f"the containers labelled {label}"))
         try:
-            if arguments[0] == "ps":
-                harbor_backend._assert_daemon(runtime, timeout=timeout)
-            return harbor_backend._docker(*arguments, expected_runtime=runtime, timeout=timeout)
-        except (
-            OSError, ValueError, subprocess.SubprocessError, isolation.RuntimeDriftError
-        ) as exc:
+            return _recovery_docker(*arguments, endpoint=endpoint, timeout=timeout)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
             raise CleanupUnknown(f"Docker could not be checked for {label}: {exc}") from exc
 
+    def recorded_daemon() -> None:
+        try:
+            actual = docker("info", "--format", "{{.ID}}").strip()
+        except CleanupUnknown as exc:
+            raise CleanupUnknown(
+                f"Docker at {endpoint}, which ran the containers labelled {label}, did not "
+                f"answer ({exc.__cause__}): start Docker at {endpoint} and retry"
+            ) from exc
+        if not recorded or actual != recorded:
+            raise DaemonReplaced(
+                f"the Docker engine at {endpoint} is {actual or 'unnamed'}, not {recorded}, "
+                f"which ran the containers labelled {label}: that daemon and its containers "
+                "are gone"
+            )
+
     def inventory() -> list[str]:
+        recorded_daemon()
         return docker(
             "ps", "--all", "--quiet", "--no-trunc", "--filter", f"label={label}"
         ).split()

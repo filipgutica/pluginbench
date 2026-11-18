@@ -130,6 +130,12 @@ class CleanupUnknown(CleanupBlocked):
     """PluginBench cannot tell whether something still runs; only the operator can confirm."""
 
 
+class DaemonReplaced(CleanupUnknown):
+    """The recorded Docker endpoint answers with another engine: the daemon that ran the
+    containers is gone. Nothing can check it again, so `app cleanup --confirm-stopped` may
+    confirm it, as it does a legacy item."""
+
+
 class LaunchFenced(ValueError):
     """A launch is no longer current: fenced, stopped, finished, or of another version. Its
     process exits without starting any work."""
@@ -515,7 +521,8 @@ def _verify(
             else:
                 verify_containers(check, progress, deadline=deadline)
         except CleanupUnknown as exc:
-            unknown.append((check, str(exc)))
+            replaced = isinstance(exc, DaemonReplaced)
+            unknown.append(({**check, "replaced": True} if replaced else check, str(exc)))
         except CleanupBlocked as exc:
             blocked.append(str(exc))
     return blocked, unknown
@@ -619,8 +626,8 @@ def _legacy(check: Check) -> bool:
     operation ticket, or its call recorded no process identity with a boot. A check of a
     ticketed operation or of a booted process can be proven once what it needs (Docker,
     systemd) answers again; an operator's word never clears it."""
-    if not check.get("contained") or check["kind"] == "unrecorded":
-        return True
+    if not check.get("contained") or check["kind"] == "unrecorded" or check.get("replaced"):
+        return True  # Replaced: its recorded Docker daemon is gone (DaemonReplaced).
     return check["kind"] == "invocation" and "boot_id" not in (check.get("identity") or {})
 
 
@@ -1003,7 +1010,9 @@ def confirm_stopped(
             raise CleanupBlocked(
                 f"{'; '.join(reason.split('. Once')[0] for reason in recorded)}. PluginBench "
                 "recorded these itself and can check them once Docker and systemd answer: "
-                "restore the daemon and retry `pluginbench app cleanup`. Nothing was confirmed"
+                "restore the daemon and retry `pluginbench app cleanup`. Only a recorded Docker "
+                "daemon that another engine replaced can be confirmed instead. Nothing was "
+                "confirmed"
             )
         at = store.confirm(unknown)
     rest = [item for item in pending if not named(item)]

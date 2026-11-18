@@ -764,6 +764,8 @@ class _FileDaemon:
             containers[arguments[1]]["running"] = True
             self.path.write_text(json.dumps(containers))
             self.on_start()
+        elif arguments[0] == "info":
+            output = str(_RUNTIME["docker_engine"]["id"])  # type: ignore[index]
         elif arguments[0] == "ps":
             output = "\n".join(self.labelled(arguments[-1].removeprefix("label=")))
         elif arguments[0] == "inspect":
@@ -879,6 +881,12 @@ def test_an_owner_killed_with_a_labelled_container_recovers_only_once_it_is_remo
     fake = _FileDaemon(daemon, removable=removed)
     assert len(fake.labelled(label)) == 1
     monkeypatch.setattr(harbor_backend, "run_command", fake)
+    monkeypatch.setattr(processes, "run_command", fake)  # Recovery's current Docker CLI.
+    binaries = tmp_path / "docker-bin"
+    binaries.mkdir()
+    (binaries / "docker").write_text("#!/bin/sh\nexit 1\n")
+    (binaries / "docker").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{binaries}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setattr(
         harbor_backend, "_frozen_executable", lambda identity, label: {"resolved_path": "docker"}
     )
@@ -1715,10 +1723,47 @@ def test_cleanup_never_confirms_an_unknown_the_runtime_recorded_itself(
     result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(tmp_path)])
     assert result.exit_code == 2
     assert "restore the daemon and retry `pluginbench app cleanup`" in result.stderr
+    assert "Only a recorded Docker daemon that another engine replaced" in result.stderr
     assert "Nothing was confirmed" in result.stderr
     with ControlStore.open(isolated_host_state) as store:
         assert store.confirmations() == []
     assert not _admitted(isolated_host_state, tmp_path)
+
+
+def test_a_replaced_docker_daemon_is_refused_automatically_but_can_be_confirmed(
+    tmp_path: Path, isolated_host_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A contained owner died with one recorded operation whose containers ran on a daemon that
+    # another engine has since replaced at the same endpoint.
+    op = "1" * 32
+    runtime = {"docker_engine": {"id": "recorded-engine", "endpoint": "unix:///recorded.sock"}}
+    operation = {
+        "id": op, "scope": f"pb-inv-{op}.scope", "label": f"pluginbench.invocation={op}",
+        "docker": runtime, "dir": str(isolated_host_state / "invocations" / op),
+    }
+    record = {
+        "schema": run_lock.CONTAINED_SCHEMA, "pid": 7, "acquired_at": "earlier", "kind": "judge",
+        "root": str(tmp_path), "state": "active", "operations": [operation], "pending": [],
+    }
+    (isolated_host_state / run_lock.EXECUTION_OWNER).write_text(json.dumps(record))
+    monkeypatch.setattr(invocation_runtime, "verify_scope", lambda operation, **kwargs: {})
+
+    def another_engine(*arguments: str, **kwargs: Any) -> str:
+        assert arguments[0] == "info"
+        return "replacement-engine\n"
+
+    monkeypatch.setattr(invocation_runtime, "_recovery_docker", another_engine)
+    plain = CliRunner().invoke(cli.app, ["app", "cleanup"])
+    assert plain.exit_code == 2
+    assert "is replacement-engine, not recorded-engine" in plain.stderr
+    assert not _admitted(isolated_host_state, tmp_path)
+
+    result = CliRunner().invoke(cli.app, ["app", "cleanup", "--confirm-stopped", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert "Confirmed stopped at" in result.stdout and op in result.stdout
+    with ControlStore.open(isolated_host_state) as store:
+        assert [item["check_id"] for item in store.confirmations()] == [f"7-earlier:labelled:{op}"]
+    assert _admitted(isolated_host_state, tmp_path)
 
 
 @pytest.mark.parametrize(
