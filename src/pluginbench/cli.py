@@ -375,7 +375,7 @@ def _detach(
         if not coordinator.running(launched.launch_id):
             # It claimed its launch and ended before this command saw it own run.lock, with or
             # without taking it: its status says how it ended.
-            phase = run_status(root)["phase"]
+            phase = run_status(root, containers=False)["phase"]
             if phase == "complete":
                 typer.echo(f"The background run for {root} already finished.")
                 typer.echo(f"Report: {root / 'report/report.html'}")
