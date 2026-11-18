@@ -11,7 +11,7 @@ import pytest
 import operation_support
 import resume_support
 from fake_systemd import HANDLERS, register_handlers
-from pluginbench import control_store, invocation_runtime, run_lock
+from pluginbench import claude, control_store, invocation_runtime, run_lock
 from pluginbench.run_lock import ExecutionLock
 
 
@@ -23,6 +23,14 @@ def isolated_cache(
     cache = tmp_path_factory.mktemp("xdg-cache")
     monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
     return cache
+
+
+@pytest.fixture(autouse=True)
+def no_claude_token_file(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The operator's real Claude token file cannot select a credential in tests."""
+    monkeypatch.setattr(claude, "TOKEN_FILE", tmp_path_factory.mktemp("secrets") / "absent")
 
 
 @pytest.fixture(autouse=True)

@@ -67,7 +67,10 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # The forced subagent model joins the coding env, which the Claude vanilla
             # identity binds by value, so the launcher stays v1 and Codex is untouched.
             # The unqualified-version warning names plugin-skill `paths`: text only.
-            "claude.py": "551a620c3645f727102458dbe3fcda4b8a15c60585fad03b81b908326265c4f6",
+            # The operator token may come from a secrets file when the environment has none;
+            # the launch receives the same token variable, so this stays v1. A token with
+            # whitespace inside, or a Keychain lookup off macOS, is refused before any launch.
+            "claude.py": "4b61257181073390c21a956b283fff92a21825eb0f89da4f4193cfeae9546e08",
             "claude_treatments.py": "0149a2dd1c0f0db6f2e29b030885bacbad2e0569e43cdf45c25764181bc9ea97",
             # Discovery proves plugin agents exactly; an agent-free receipt is unchanged and
             # verifies as before unless an agent loads, so the launcher stays v1.

@@ -175,11 +175,14 @@ Claude Code coding evidence is qualified for CLI **2.1.322** in [`claude.py`](..
 
 Coding authenticates only with the operator's Claude subscription token:
 
-- Set `CLAUDE_CODE_OAUTH_TOKEN` in the environment that runs `pluginbench`. A service does not inherit a variable that a shell profile exports.
+- Write the token to `~/.config/secrets/claude-oauth-token`, with mode 600. `~` is the home directory of the process that runs `pluginbench`, so a service finds the file without an exported variable.
+- `CLAUDE_CODE_OAUTH_TOKEN` in the environment that runs `pluginbench` still works and wins over the file. A service does not inherit a variable that a shell profile exports.
+- On Linux, where every executing command runs, set one of those two. The macOS Keychain login is read only on macOS, when neither is set.
+- The token must be one value with no whitespace inside it. A file that holds an old and a new token, as after a careless rotation, is refused.
 - `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, Bedrock, Vertex, and Foundry routing, `DISABLE_PROMPT_CACHING`, and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` are refused in the operator environment, before any container starts, and in every container command.
 - The token reaches the container only as a credentials file in the CLI's private configuration, never in a command's environment. The file is removed before Harbor collects artifacts.
 - After the run, the saved artifacts and the exported workspace are scanned for the token. A match fails the attempt.
-- Independent reviews, both the run's review phase and `pluginbench review`, and `pluginbench judge run --judge claude:MODEL:EFFORT` take only the subscription token too: `CLAUDE_CODE_OAUTH_TOKEN`, or the macOS Keychain login when it is unset. They refuse the same operator-environment variables before any model call; a judge run refuses once, before it reserves any call.
+- Independent reviews, both the run's review phase and `pluginbench review`, and `pluginbench judge run --judge claude:MODEL:EFFORT` take only the subscription token too, selected the same way: `CLAUDE_CODE_OAUTH_TOKEN`, then the token file, then, on macOS only, the Keychain login. They refuse the same operator-environment variables before any model call; a judge run refuses once, before it reserves any call.
 
 PluginBench runs Harbor 0.24.0's `ClaudeCode` agent and refuses to launch when the hash of its `run` source changes. It allows only Harbor's setup, the version check, and one coding command, which it replaces with the pinned launch:
 
