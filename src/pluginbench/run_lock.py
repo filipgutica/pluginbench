@@ -105,7 +105,7 @@ def _owner(fd: int) -> dict[str, object] | None:
     return value
 
 
-def _interrupt(signum: int, frame: FrameType | None) -> None:
+def interrupt(signum: int, frame: FrameType | None) -> None:
     # Reuse the interrupt path: no new attempts start and saved work is checkpointed.
     raise KeyboardInterrupt("stopped by SIGTERM")
 
@@ -217,7 +217,7 @@ def hold(root: Path) -> Iterator[RunLock]:
         os.ftruncate(fd, 0)
         os.pwrite(fd, (json.dumps(owner, indent=2) + "\n").encode(), 0)
         os.fsync(fd)
-        previous_handler = signal.signal(signal.SIGTERM, _interrupt)
+        previous_handler = signal.signal(signal.SIGTERM, interrupt)
         try:
             _held.add(root)
             yield RunLock(root, fd)
@@ -715,9 +715,9 @@ class StopRequested(KeyboardInterrupt):
 
 def check_stop() -> None:
     """Raise StopRequested if a stop was requested for the launch this process owns the host
-    for. Called before each ledger intent: a new attempt, replay or review call. So a stop
-    whose signal was lost still admits no new call, while the operations of an attempt already
-    admitted, such as its measurement after coding, finish as they do after `stop`'s signal."""
+    for. `parallel.run_jobs` calls it before it admits each job, in every phase. So a stop
+    whose signal was lost still admits no new job, while jobs already admitted finish, with
+    their measurement after coding, as they do after `stop`'s signal."""
     lock = _execution
     if lock is not None and lock.stop_requested is not None and lock.stop_requested():
         raise StopRequested("stopped: a stop was requested for this launch")
