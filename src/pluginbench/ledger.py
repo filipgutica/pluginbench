@@ -314,6 +314,23 @@ class Ledger:
         return cls(connection)
 
     @classmethod
+    def recover(cls, path: Path) -> Ledger:
+        """Open read-only, after undoing a write its killed writer left half done.
+
+        A writer killed mid-transaction can leave a hot rollback journal, which a read-only
+        connection cannot roll back. A writable open rolls it back, as SQLite does for the next
+        writer: the ledger returns to its last commit and no committed row changes. Only for a
+        caller that holds the host execution lock, so no writer of this ledger is live.
+        """
+        if path.with_name(f"{path.name}-journal").exists():
+            connection = sqlite3.connect(path, timeout=2)
+            try:
+                connection.execute("PRAGMA user_version").fetchone()
+            finally:
+                connection.close()
+        return cls.read(path)
+
+    @classmethod
     def read(cls, path: Path) -> Ledger:
         """Open read-only, for observers such as `status`; any write raises sqlite3.Error.
 
