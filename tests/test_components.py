@@ -45,7 +45,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # Containers, builds and trials now start only inside an operation, on the daemon
             # it recorded; a launch inside one is unchanged, so this stays v1.
             # Optional measurement provisioning leaves coding launches unchanged (v1).
-            "harbor_backend.py": "e28e95bf6a2058762402c9ff5edd79297399c0cf1796cd210daea4450a54d625",
+            "harbor_backend.py": "db5dec0f89afa0ed9367add3596b5ed4e0eb73b8276c6b640ee9fe3dc7db7b13",
             # The same spawn callback; launches are unchanged. A failed process-group cleanup
             # or output drain now also tells the host lock owner, which records it for the next
             # owner to check. Launches are unchanged.

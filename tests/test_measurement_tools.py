@@ -12,6 +12,7 @@ import subprocess
 import sys
 
 import pytest
+from pluginbench import invocation_runtime
 
 from pluginbench import collectors, components, harbor_backend as harbor, measurement_profiles
 from pluginbench import measurement_tools as tools, mutation
@@ -172,6 +173,8 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
     copies: list[str] = []
     created: list[str] = []
     stopped: list[str] = []
+    labels: list[str] = []
+    scoped = mode in {"tamper", "failed-tests", "path"}
     container_id = "container"
     preload_marker = tmp_path / "node-preload-ran"
     if suffix == "js":
@@ -195,11 +198,10 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
 
     def docker(*args: str, **kwargs: object) -> str:
         nonlocal container, app, container_id
-        harbor._admit_operation_command(args)
         if args[0] == "create":
             assert args[args.index("--network") + 1] == "none"
             assert args[-3] == "sha256:frozen"
-            assert "--label" in args
+            labels.append(args[2])
             if created:
                 assert created[-1] in stopped, "reporter started before collection stopped"
             container_id = f"container-{len(created)}"
@@ -241,7 +243,7 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
                     raw.write_text(raw.read_text().replace(str(tmp_path / "container-0/app"), str(app)))
         return ""
 
-    monkeypatch.setattr(harbor, "_docker", docker)
+    monkeypatch.setattr(harbor, "_docker", harbor._docker if scoped else docker)
 
     def export(**kwargs: object) -> dict[str, object]:
         destination = kwargs["destination"]
@@ -252,6 +254,8 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
     monkeypatch.setattr(harbor, "export_native_source", export)
 
     def execute(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if scoped and (argv[3] != "exec" or "--workdir" not in argv or "--pluginbench-verify" in argv):
+            return subprocess.CompletedProcess(argv, 0, docker(*argv[3:]), "")
         command = argv[argv.index(container_id) + 1:]
         command = [arg.replace("/opt/pluginbench-tools", str(container / "opt/pluginbench-tools"))
                    for arg in command]
@@ -296,7 +300,7 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
                    "sh", "-c", "node main.js; kill -" + ("USR1" if mode == "sigusr1" else "PIPE") + " $$"]
     frozen = tmp_path / "profile.json"
     coverage = profile(name, version).model_copy(update={"command": command, "report_path": report_path})
-    frozen.write_text(json.dumps({"native_task_identity": identity, "test_scope": ["test_*"],
+    frozen.write_text(json.dumps({"native_task_identity": identity, "test_scope": ["test_*"], "observer_version": components.VERSIONS["coverage_observer"],
                                  "coverage": coverage.model_dump(mode="json")}))
     collector = collectors.Collector.model_validate({
         "kind": "coverage", "config": frozen, "scope": ["*"] if mode == "population" else [f"*.{suffix}"], "command": command,
@@ -338,7 +342,7 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
         assert not (destination / "reporting").exists()
         assert not (destination / "collection-data").exists()
         return
-    report, observed_version = collectors._native_coverage(source, collector, tmp_path / "out")
+    report, observed_version, _ = collectors._contained(source, collector, tmp_path / "out", None)
     assert observed_version == version
     assert not path_marker.exists(), "the report exec ran an interpreter from the copied snapshot"
     assert report and (tmp_path / "out/report.raw").is_file()
@@ -347,6 +351,7 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
     assert f"main.{suffix}:4" in lines["covered"]
     assert f"main.{suffix}:2" not in lines["covered"], "collection patched the staged reporter"
     assert len(created) == 2
+    assert len(set(labels)) == 1 and labels[0].startswith(invocation_runtime.LABEL_KEY + "=")
     assert stopped == created
     altered = tmp_path / "container-0/opt/pluginbench-tools" / name / (
         "coverage/jsonreport.py" if suffix == "py" else "node_modules/istanbul-reports/lib/lcovonly/index.js"

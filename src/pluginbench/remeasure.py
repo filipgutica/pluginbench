@@ -847,6 +847,8 @@ def resume_remeasurement(
             f"measurement revision {revision} did not stop while collecting, so it cannot "
             "resume; choose a new --revision name"
         )
+    validate_jobs(state["jobs"])
+    require_host_jobs(int(str(state["jobs"])))
     frozen = load_profiles(study._bound_path(root, state["frozen_profiles"]))
     if state.get("implementation") != _implementation(
         frozen, carried_kinds=_carried_kinds(state)
@@ -855,8 +857,6 @@ def resume_remeasurement(
             f"PluginBench or its observers changed since measurement revision {revision} "
             "started, so a resume would mix two implementations; choose a new --revision name"
         )
-    validate_jobs(state["jobs"])
-    require_host_jobs(int(str(state["jobs"])))
     run, manifest, original = _native_state(root)
     protected = _preserved_inventory(root, manifest, original.parent)
     if (
