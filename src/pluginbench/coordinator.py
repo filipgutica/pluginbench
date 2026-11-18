@@ -497,6 +497,10 @@ def launch(request: LaunchRequest, state: Path | None = None) -> Launch:
             if holding_until is None and _holds_host(state, launch_id):
                 holding_until = time.monotonic() + CLAIM_SECONDS
             if holding_until is None and current.expired:
+                if _holds_host(state, launch_id):
+                    # It took the host just as its gate passed: await its claim, never stop it.
+                    holding_until = time.monotonic() + CLAIM_SECONDS
+                    continue
                 failure = (
                     f"it did not start within {invocation_runtime.GATE_SECONDS:g} seconds; see "
                     f"{target / 'run.log'}"
