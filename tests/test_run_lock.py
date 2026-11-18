@@ -453,18 +453,18 @@ def test_a_failed_record_write_is_never_adopted(
 ) -> None:
     state = tmp_path / "state"
     with run_lock.hold_execution(_owner("run", tmp_path / "a"), state=state) as lock:
-        write = run_lock._write_atomic
+        write = run_lock.write_atomic
 
         def unwritable(path: Path, value: Any) -> None:
             raise OSError("disk full")
 
-        monkeypatch.setattr(run_lock, "_write_atomic", unwritable)
+        monkeypatch.setattr(run_lock, "write_atomic", unwritable)
         with pytest.raises(OSError, match="disk full"):
             lock.settle([])
         with pytest.raises(OSError, match="disk full"):
             run_lock.note_runtime({"docker_engine": {"id": "d"}})
         assert lock.record["runtimes"] == [] and lock.record == _owner_record(state)
-        monkeypatch.setattr(run_lock, "_write_atomic", write)
+        monkeypatch.setattr(run_lock, "write_atomic", write)
 
 
 def test_the_owner_check_never_sees_a_record_another_thread_is_still_adopting(

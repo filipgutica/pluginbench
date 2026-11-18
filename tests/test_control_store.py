@@ -393,7 +393,7 @@ def test_without_a_writable_owner_record_nothing_starts_and_the_obligation_stays
 
     started: list[str] = []
     with monkeypatch.context() as broken:
-        broken.setattr(run_lock, "_write_atomic", unwritable)
+        broken.setattr(run_lock, "write_atomic", unwritable)
         with pytest.raises(OSError, match="read-only"):
             with control_store.execute(_owner(tmp_path / "unrelated")):
                 started.append("work")
@@ -537,7 +537,7 @@ def test_a_failed_measurement_cleanup_leaves_a_normally_exiting_owner_unreleased
 ) -> None:
     daemon = {"up": True}
     disk = {"full": False}
-    write = run_lock._write_atomic
+    write = run_lock.write_atomic
 
     def assert_daemon(runtime: Any, **kwargs: Any) -> None:
         if not daemon["up"]:
@@ -561,7 +561,7 @@ def test_a_failed_measurement_cleanup_leaves_a_normally_exiting_owner_unreleased
     monkeypatch.setattr(
         harbor_backend, "_docker", _measurement_docker(tmp_path / "container.json", on_start=daemon_lost)
     )
-    monkeypatch.setattr(run_lock, "_write_atomic", no_space)
+    monkeypatch.setattr(run_lock, "write_atomic", no_space)
     with control_store.execute(_owner(run)):
         run_lock.note_runtime(_RUNTIME)
         # The measurement fails, its cleanup fails, and the disk is full, so the reason is never
@@ -915,7 +915,7 @@ def test_a_failed_save_after_an_escaped_drain_still_needs_repair(
         with control_store.execute(_owner(run)):
             call = ledger.intent(slot=0, stage="review", attempt_id="a")
             with monkeypatch.context() as full:
-                full.setattr(run_lock, "_write_atomic", no_space)
+                full.setattr(run_lock, "write_atomic", no_space)
                 with pytest.raises((subprocess.TimeoutExpired, OSError)) as failed:
                     processes.run_command(
                         [sys.executable, "-c", _ESCAPING, str(escaped)],
