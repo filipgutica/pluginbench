@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -9,7 +10,8 @@ import pytest
 
 import operation_support
 import resume_support
-from pluginbench import control_store, run_lock
+from fake_systemd import HANDLERS, register_handlers
+from pluginbench import control_store, invocation_runtime, run_lock
 from pluginbench.run_lock import ExecutionLock
 
 
@@ -81,3 +83,19 @@ def operations_in_place(request: pytest.FixtureRequest, monkeypatch: pytest.Monk
     can contain them. Tests marked `real_operations` run them in real or fake systemd scopes."""
     if not request.node.get_closest_marker("real_operations"):
         operation_support.in_place(monkeypatch)
+
+
+@pytest.fixture
+def user_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A real systemd user manager, for tests marked `systemd`. Without one the test skips,
+    unless PLUGINBENCH_REQUIRE_SYSTEMD_TESTS=1 (as in CI) makes that a failure. Scope children
+    load the test handlers from this checkout."""
+    try:
+        invocation_runtime.require_user_manager()
+    except invocation_runtime.HostUnavailable as exc:
+        if os.environ.get("PLUGINBENCH_REQUIRE_SYSTEMD_TESTS") == "1":
+            pytest.fail(f"a systemd user manager is required: {exc}")
+        pytest.skip(f"no systemd user manager: {exc.reason}")
+    source = str(Path(invocation_runtime.__file__).parents[1])
+    monkeypatch.setenv("PYTHONPATH", f"{HANDLERS}{os.pathsep}{source}")
+    register_handlers(monkeypatch)

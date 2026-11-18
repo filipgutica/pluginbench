@@ -50,6 +50,32 @@ jobs:
       - name: Test
         run: pytest
 
+      - name: Start a systemd user manager
+        # The systemd tests need a real user manager and bus. A CI step is not a login session,
+        # so start the runner user's manager explicitly; lingering is fine on a disposable runner.
+        run: |
+          sudo apt-get install -y dbus-user-session
+          uid=$(id -u)
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@${uid}.service"
+          export XDG_RUNTIME_DIR="/run/user/${uid}"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+          for _ in $(seq 30); do
+            state=$(systemctl --user is-system-running || true)
+            case "$state" in running|degraded) exit 0 ;; esac
+            sleep 1
+          done
+          echo "The user manager did not start: ${state:-no answer}"
+          exit 1
+
+      - name: Test with real systemd
+        # Fails, rather than skips, when the user manager is missing.
+        env:
+          PLUGINBENCH_REQUIRE_SYSTEMD_TESTS: "1"
+        run: pytest -m systemd -rs
+
       - name: Build the package
         run: python -m build
 

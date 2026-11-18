@@ -21,7 +21,7 @@ from uuid import uuid4
 import pytest
 
 import pluginbench
-from fake_systemd import HANDLERS, FakeSystemd, register_handlers
+from fake_systemd import HANDLERS, FakeSystemd
 from fake_systemd import fake_systemd_fixture  # noqa: F401  (the fake_systemd fixture)
 from pluginbench import control_store, harbor_backend, invocation_runtime, run_lock
 from pluginbench import ledger as invocation_ledger
@@ -848,18 +848,6 @@ def test_an_owner_killed_during_a_call_has_its_scope_and_escaped_children_stoppe
 
 
 # Real systemd: the scope is a real cgroup, so a setsid descendant cannot leave it.
-
-
-@pytest.fixture
-def user_manager(monkeypatch: pytest.MonkeyPatch) -> None:
-    try:
-        invocation_runtime.require_user_manager()
-    except HostUnavailable as exc:
-        if os.environ.get("PLUGINBENCH_REQUIRE_SYSTEMD_TESTS") == "1":
-            pytest.fail(f"a systemd user manager is required: {exc}")
-        pytest.skip(f"no systemd user manager: {exc.reason}")
-    monkeypatch.setenv("PYTHONPATH", f"{HANDLERS}{os.pathsep}{_SOURCE}")
-    register_handlers(monkeypatch)
 
 
 @pytest.mark.systemd
