@@ -57,15 +57,17 @@ class _Commands(TyperGroup):
     locked host control database, ends the command with an error rather than a traceback.
     `stop` handles its own, so that it still signals."""
 
-    def invoke(self, ctx: Any) -> Any:  # Typer vendors click; its Context has no public name.
+    def main(self, *args: Any, **kwargs: Any) -> Any:
         try:
-            return super().invoke(ctx)
+            return super().main(*args, **kwargs)
         except sqlite3.Error as exc:
             path = run_lock.state_root() / control_store.CONTROL_NAME
-            _error(ValueError(
-                f"a PluginBench database could not be used: {exc}. The host control database "
-                f"is {path}"
-            ))
+            typer.echo(
+                f"Error: a PluginBench database could not be used: {exc}. The host control "
+                f"database is {path}",
+                err=True,
+            )
+            raise SystemExit(2) from exc
 
 
 app = typer.Typer(
