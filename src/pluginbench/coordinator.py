@@ -70,6 +70,7 @@ class LaunchRequest:
     kind: str
     target: Path
     initiator: str = "cli"
+    notify: bool = False
 
     def __post_init__(self) -> None:
         if self.kind not in WORKER_KINDS:
@@ -395,7 +396,24 @@ def status(state: Path | None = None) -> dict[str, Any]:
 
 def _worker_argv(request: LaunchRequest, launch_id: str) -> list[str]:
     return [sys.executable, "-m", "pluginbench", request.kind, str(request.target.resolve()),
-            "--yes", "--foreground", "--launch", launch_id]
+            "--yes", "--foreground", *(["--notify"] if request.notify else []),
+            "--launch", launch_id]
+
+
+def request_stop(target: Path, state: Path | None = None) -> list[str]:
+    """Record a stop for every unfinished worker launch for `target`; return their IDs. Each
+    worker checks it before every call, so it holds even if no signal reaches the worker."""
+    state = state or run_lock.state_root()
+    if not (state / control_store.CONTROL_NAME).exists():
+        return []
+    root = str(target.resolve())
+    with ControlStore.open(state) as store:
+        return [
+            launch.launch_id
+            for launch in store.launches("launching", "active")
+            if launch.kind != "coordinator" and launch.target == root
+            and store.request_stop(launch.launch_id)
+        ]
 
 
 def launch(request: LaunchRequest, state: Path | None = None) -> Launch:

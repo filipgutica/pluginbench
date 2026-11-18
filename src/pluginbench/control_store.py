@@ -11,7 +11,7 @@ container, build and trial only inside one, labelled with its invocation. Its ch
 cover all those may have left, so its obligation clears by itself once they pass. The owner's
 own host commands (such as `git apply`) run unscoped and start no container, so no check covers
 them. An owner record from an earlier build, or one that cannot be read, is one more unknown
-check that only `pluginbench repair --confirm-stopped ROOT` clears, after checking again
+check that only `pluginbench app cleanup --confirm-stopped ROOT` clears, after checking again
 (`confirm_stopped`). The checks:
 - processes: each invocation R's ledger still has open, and each the owner ended. A live process
   in the group the ledger recorded for it blocks, with a hint to stop it (`verify_invocation`).
@@ -341,7 +341,7 @@ def _leader_runs(pid: int, start: object) -> bool:
 def _repair(root: str) -> str:
     return (
         "Once you have checked that nothing of it runs, confirm with "
-        f"`pluginbench repair --confirm-stopped {root}`"
+        f"`pluginbench app cleanup --confirm-stopped {root}`"
     )
 
 
@@ -594,7 +594,7 @@ def _obligation_checks(obligation: dict[str, Any], state: Path) -> list[Check]:
     """What a dead owner may have left running, as checks.
 
     For a contained owner they cover everything (see `contained`). Any other owner is one more
-    unknown check that only `repair --confirm-stopped` clears; its other checks name processes
+    unknown check that only `app cleanup --confirm-stopped` clears; its other checks name processes
     and containers known to still run, which repair never confirms. Each cleanup the owner
     recorded as failed is an unknown check either way.
     """

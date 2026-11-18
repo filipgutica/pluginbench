@@ -21,7 +21,7 @@ from typing import Any, Literal
 import typer
 import yaml
 
-from pluginbench import __version__, control_store, invocation_runtime, run_lock
+from pluginbench import __version__, control_store, coordinator, invocation_runtime, run_lock
 from pluginbench.isolation import RuntimeDriftError
 from pluginbench.evaluation import (
     CheckFailed,
@@ -58,6 +58,11 @@ tasks_app = typer.Typer(help="Browse tasks and emit a pinned evaluation YAML blo
 app.add_typer(tasks_app, name="tasks")
 judge_app = typer.Typer(help="Blinded pairwise judging of two arms' matched submissions.")
 app.add_typer(judge_app, name="judge")
+app_commands = typer.Typer(
+    help="The coordinator: one per account, outside any terminal, watching this host's "
+    "execution. It runs no model and starts no container."
+)
+app.add_typer(app_commands, name="app")
 
 
 @tasks_app.command("pick")
@@ -335,73 +340,18 @@ def _preflight(
         raise CheckFailed(report, report["findings"], root / "check.json") from None
 
 
-def _worker_argv(root: Path, *, notify: bool) -> list[str]:
-    return [
-        sys.executable,
-        "-m",
-        "pluginbench",
-        "run",
-        str(root),
-        "--yes",
-        "--foreground",
-        *(["--notify"] if notify else []),
-    ]
-
-
-_DETACH_TIMEOUT = 30.0
-_SYSTEMD_SCOPE = ["systemd-run", "--user", "--scope", "--collect"]
-
-
-def _systemd_scope() -> list[str]:
-    """`systemd-run` arguments that start a command in its own user scope, if this host can.
-
-    A scope keeps the command's PID, environment, and output, but moves it out of the
-    launcher's cgroup, so stopping the launching terminal, agent session, or service does not
-    kill the run. Hosts without a reachable systemd user manager get an empty list.
-    """
-    if shutil.which(_SYSTEMD_SCOPE[0]) is None:
-        return []
-    try:
-        probe = subprocess.run(
-            [*_SYSTEMD_SCOPE, "--quiet", "true"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    return _SYSTEMD_SCOPE if probe.returncode == 0 else []
-
-
 def _detach(root: Path, *, notify: bool) -> None:
-    """Start the run in its own session and user scope; return once it holds run.lock."""
-    log = root / "run.log"
-    scope = _systemd_scope()
-    with log.open("ab") as output:
-        # systemd-run execs the worker in place, so the child's PID is the worker's.
-        child = subprocess.Popen(
-            [*scope, *_worker_argv(root, notify=notify)],
-            stdin=subprocess.DEVNULL,
-            stdout=output,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    deadline = time.monotonic() + _DETACH_TIMEOUT
-    while (run_lock.owner(root) or {}).get("pid") != child.pid:
-        if child.poll() is not None:
-            raise ValueError(
-                f"background run exited with code {child.returncode} before it started; see {log}"
-            )
-        if time.monotonic() > deadline:
-            raise ValueError(f"background run did not start within {_DETACH_TIMEOUT:g}s; see {log}")
-        time.sleep(0.05)
-    where = "a systemd user scope" if scope else "a new session"
-    typer.echo(f"Started run {root} in the background (process group {child.pid}, in {where}).")
+    """Start the run as a worker in its own systemd scope; return once it owns the host."""
+    launched = coordinator.launch(coordinator.LaunchRequest("run", root, notify=notify))
+    process = launched.process or {}
+    typer.echo(
+        f"Started run {root} in the background (process {process.get('pid')}, in scope "
+        f"{launched.scope})."
+    )
     typer.echo(f"Watch it: pluginbench status {root} --watch")
-    typer.echo(f"Events: {root / 'events.jsonl'}   Log: {log}")
+    typer.echo(f"Events: {root / 'events.jsonl'}   Log: {root / 'run.log'}")
     typer.echo(f"Stop it: pluginbench stop {root}")
-    typer.echo(f"Resume it after a stop or crash: pluginbench run {root}")
+    typer.echo(f"Resume it after a stop or crash: pluginbench resume {root}")
 
 
 @app.callback()
@@ -525,6 +475,24 @@ def run(
         _error(exc)
 
 
+@app.command("resume")
+def resume(
+    run_dir: Path = typer.Argument(..., help="A run directory to resume."),
+    yes: bool = typer.Option(False, "--yes", help="Start without confirmation."),
+    notify: bool = typer.Option(
+        False, "--notify", help="Desktop notifications when the run finishes or fails."
+    ),
+    foreground: bool = typer.Option(
+        False, "--foreground", help="Run in this process instead of in the background."
+    ),
+) -> None:
+    """Resume a run directory: the same as `pluginbench run RUN_DIR`."""
+    if not run_dir.is_dir():
+        _error(ValueError(f"{run_dir} is not a run directory; resume takes one"))
+    run(run_dir, output=None, dry_run=False, as_json=False, yes=yes, notify=notify,
+        foreground=foreground, launch=None)
+
+
 @app.command("check")
 def check(
     config: Path = typer.Argument(
@@ -620,13 +588,18 @@ def dashboard(
 def stop(
     run: Path = typer.Argument(..., help="A run directory started by `pluginbench run`."),
 ) -> None:
-    """Stop a run: SIGTERM only the process group its run.lock records; nothing else."""
+    """Stop a run: record the stop for its background launch, then SIGTERM only the process
+    group its run.lock records; nothing else. The worker checks the recorded stop before each
+    call, so a lost signal cannot let it start another."""
     try:
+        requested = coordinator.request_stop(run)
         owner = run_lock.stop(run)
     except (OSError, ValueError) as exc:
         _error(exc)
         return
-    if owner is None:
+    if owner is None and requested:
+        typer.echo(f"Stop recorded for {run}; its worker starts no further call.")
+    elif owner is None:
         typer.echo(f"No active run owns {run}; nothing signalled.")
     else:
         typer.echo(
@@ -635,38 +608,125 @@ def stop(
         )
 
 
-@app.command("repair")
-def repair(
-    run: Path = typer.Argument(..., help="The root the host block names."),
-    confirm_stopped: bool = typer.Option(
-        False,
-        "--confirm-stopped",
-        help="Confirm you checked that nothing the run's crashed calls started still runs.",
+@app_commands.callback(invoke_without_command=True)
+def app_start(
+    context: typer.Context,
+    foreground: bool = typer.Option(
+        False, "--foreground", help="Run the coordinator in this terminal, for debugging."
     ),
 ) -> None:
-    """Lift a host block that PluginBench cannot verify, on your confirmation.
+    """Start the coordinator in the background, or show the one already running."""
+    if context.invoked_subcommand is not None:
+        return
+    try:
+        if foreground:
+            raise typer.Exit(coordinator.run_foreground())
+        found = coordinator.ensure_started()
+    except (OSError, ValueError) as exc:
+        _error(exc)
+        return
+    typer.echo(
+        f"Coordinator running: process {found['pid']}, launch {found['launch_id']}, "
+        f"since {found['started_at']}."
+    )
+    typer.echo(f"Log: {run_lock.state_root() / coordinator.COORDINATOR_LOG}")
+    typer.echo("Stop it: pluginbench app stop")
 
-    RUN must be exactly the root the block names. Every check runs again first; only checks that
-    still cannot tell are confirmed, never one that finds something running. Each confirmation
-    is recorded with its time.
+
+@app_commands.command("stop")
+def app_stop() -> None:
+    """Stop the coordinator. A worker it started keeps running in its own scope, and the next
+    coordinator adopts it; stop a run with `pluginbench stop RUN_DIR`."""
+    try:
+        found = coordinator.stop()
+    except (OSError, ValueError) as exc:
+        _error(exc)
+        return
+    if found is None:
+        typer.echo("No coordinator runs on this host.")
+    else:
+        typer.echo(f"Stopped the coordinator (process {found['pid']}). Workers keep running.")
+
+
+@app_commands.command("status")
+def app_status(
+    as_json: bool = typer.Option(False, "--json", help="Print one JSON object."),
+) -> None:
+    """Show the coordinator, who executes on this host, and background launches; never writes."""
+    try:
+        current = coordinator.status()
+    except (OSError, ValueError) as exc:
+        _error(exc)
+        return
+    if as_json:
+        typer.echo(json.dumps(current, indent=2))
+        return
+    found = current["coordinator"]
+    typer.echo(
+        f"Coordinator: process {found['pid']}, launch {found['launch_id']}"
+        + (f", monitoring launch {found['adopted']}" if found.get("adopted") else "")
+        if found
+        else "Coordinator: not running. Start it: pluginbench app"
+    )
+    execution = current["execution"]
+    owner = execution["owner"] or {}
+    if not execution["held"]:
+        typer.echo("Execution: idle")
+    elif execution["verified"]:
+        typer.echo(
+            f"Execution: {owner.get('kind')} for {owner.get('root')} (process {owner.get('pid')}"
+            + (f", launch {owner['launch_id']})" if owner.get("launch_id") else ", external run)")
+        )
+    else:
+        typer.echo(
+            f"Execution: held by a process PluginBench cannot verify; see "
+            f"`lslocks | grep {run_lock.state_root() / run_lock.EXECUTION_LOCK}`"
+        )
+    if current["reconciling"]:
+        typer.echo(f"Reconciling: {current['reconciling']}")
+    for launch in current["launches"]:
+        if launch["kind"] != "coordinator":
+            typer.echo(
+                f"Launch {launch['launch_id']}: {launch['kind']} for {launch['target']}, "
+                f"{launch['status']}, desired {launch['desired']}"
+            )
+
+
+@app_commands.command("cleanup")
+def app_cleanup(
+    confirm_stopped: Path | None = typer.Option(
+        None,
+        "--confirm-stopped",
+        metavar="ROOT",
+        help="Confirm you checked that nothing the crashed calls under ROOT started still runs.",
+    ),
+) -> None:
+    """Verify everything a crashed command may have left, so the host can execute again. No
+    model call and no new work.
+
+    With --confirm-stopped ROOT, ROOT must be exactly the root a host block names. Every check
+    runs again first; only checks that still cannot tell are confirmed, never one that finds
+    something running. Each confirmation is recorded with its time.
     """
     try:
-        if not confirm_stopped:
-            raise ValueError(
-                "repair changes nothing without --confirm-stopped; check that nothing the run's "
-                "crashed calls started still runs, then confirm"
-            )
-        target = str(run.resolve())
+        if confirm_stopped is None:
+            state = str(run_lock.state_root())
+            owner = run_lock.ExecutionOwner(kind="recovery", eval=state, root=state)
+            with control_store.execute(owner):
+                pass
+            typer.echo("Every check passed; the host is clean.")
+            return
+        target = str(confirm_stopped.resolve())
         owner = run_lock.ExecutionOwner(kind="recovery", eval=target, root=target)
         with run_lock.hold_execution(owner) as lock:
-            confirmed, at, remaining = control_store.confirm_stopped(lock, run)
+            confirmed, at, remaining = control_store.confirm_stopped(lock, confirm_stopped)
     except (OSError, ValueError, control_store.CleanupBlocked) as exc:
         _error(exc)
         return
     for check, reason in confirmed:
         typer.echo(f"Confirmed stopped at {at}: {check['id']} ({reason.split('. Once')[0]})")
     if not confirmed:
-        typer.echo(f"Every check for {run.resolve()} passed; nothing needed confirming.")
+        typer.echo(f"Every check for {confirm_stopped.resolve()} passed; nothing needed confirming.")
     typer.echo(
         f"{remaining} other run{'s' if remaining != 1 else ''} still wait for cleanup."
         if remaining
