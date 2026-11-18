@@ -577,7 +577,7 @@ _KILLED_WITH_CONTAINER = """
 import json, os, signal, subprocess, sys
 from pathlib import Path
 from unittest.mock import patch
-from pluginbench import control_store, harbor_backend, processes, run_lock
+from pluginbench import control_store, harbor_backend, invocation_runtime, processes, run_lock
 from pluginbench.ledger import LEDGER_NAME, Ledger
 state, run, mode, container = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
 runtime = json.loads(sys.argv[5])
@@ -625,8 +625,11 @@ with control_store.execute(owner, state=state):
             return processes.run_command(
                 [sys.executable, "-c", code, str(container), str(area / "artifacts/worker.json")], **kwargs
             )
+        # The regrade runs as its grading operation, whose entry point this process stands in for.
         with patch.object(harbor_backend, "_private_docker_config", lambda **k: {}), \\
-                patch.object(harbor_backend, "run_command", worker):
+                patch.object(harbor_backend, "run_command", worker), \\
+                patch.object(invocation_runtime, "_current", grading), \\
+                patch.object(invocation_runtime, "_runtime", runtime):
             try:
                 harbor_backend._native_process(
                     area=area, config={}, expected=runtime, harness="codex", timeout=5,

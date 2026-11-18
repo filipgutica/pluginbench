@@ -19,7 +19,7 @@ from pluginbench.invocation_runtime import OperationRequest
 
 # The operation each thread runs in place, as the entry point would in its scope.
 _operations = threading.local()
-_current = invocation_runtime.current
+_state = invocation_runtime._state
 
 
 def run_in_place(
@@ -42,8 +42,9 @@ def run_in_place(
         finally:
             stand_in.kill()
             stand_in.wait()
-    previous = getattr(_operations, "current", None), getattr(_operations, "progress", None)
-    _operations.current, _operations.progress = request.spec.id, progress
+    previous = getattr(_operations, "state", None), getattr(_operations, "progress", None)
+    _operations.state = (request.spec.id, request.spec.docker)
+    _operations.progress = progress
     try:
         value = invocation_runtime.handler(request.operation)(
             json.loads(json.dumps(request.arguments))
@@ -51,7 +52,7 @@ def run_in_place(
     except Exception as exc:
         raise invocation_runtime.rebuild(invocation_runtime.failure(exc)) from exc
     finally:
-        _operations.current, _operations.progress = previous
+        _operations.state, _operations.progress = previous
     return json.loads(json.dumps(value))
 
 
@@ -65,6 +66,6 @@ def in_place(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(invocation_runtime, "run_operation", run_in_place)
     monkeypatch.setattr(invocation_runtime, "require_user_manager", lambda: "systemd-run")
     monkeypatch.setattr(
-        invocation_runtime, "current", lambda: getattr(_operations, "current", None) or _current()
+        invocation_runtime, "_state", lambda: getattr(_operations, "state", None) or _state()
     )
     monkeypatch.setattr(invocation_runtime, "report", _report)

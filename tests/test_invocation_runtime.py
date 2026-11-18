@@ -171,6 +171,22 @@ def test_containers_with_the_operation_label_are_removed_even_after_success(
     assert ("rm", "--force", "--volumes", "mine") in docker.calls
 
 
+def test_the_entry_point_creates_containers_only_on_the_daemon_its_operation_recorded(
+    fake_systemd: FakeSystemd, owned: run_lock.ExecutionLock, docker: _Docker
+) -> None:
+    """Recovery finds an operation's containers on the daemon its owner recorded, so inside the
+    scope that is the only daemon a container may start on, and none without one."""
+    other = {"docker_engine": {"id": "other", "endpoint": "unix:///fake.sock"}}
+    with_docker = _request("recorded", _RUNTIME, runtime=_RUNTIME)
+    assert invocation_runtime.run_operation(with_docker) == with_docker.spec.id
+    assert "another one" in invocation_runtime.run_operation(
+        _request("recorded", _RUNTIME, runtime=other)
+    )
+    assert "recorded no Docker daemon" in invocation_runtime.run_operation(
+        _request("recorded", runtime=_RUNTIME)
+    )
+
+
 def test_a_container_that_survives_removal_keeps_the_owner_unreleased_though_the_error_is_caught(
     fake_systemd: FakeSystemd, docker: _Docker, tmp_path: Path, isolated_host_state: Path
 ) -> None:

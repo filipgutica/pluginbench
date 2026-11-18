@@ -143,11 +143,13 @@ def _docker(
         argv.extend(["--host", endpoint])
         env.pop("DOCKER_CONTEXT", None)
         env.pop("DOCKER_HOST", None)
-    # Inside an operation every container it creates carries its label, so recovery finds it
-    # by that label alone.
+    # Every container carries its operation's label, so recovery finds it by that label alone.
+    # Outside an operation, or in one that recorded another daemon, nothing is created or built.
     if (invocation := invocation_runtime.current()) is not None:
         _admit_operation_command(arguments)
         arguments = invocation_runtime.with_label(arguments, invocation)
+    if invocation_runtime.creates(arguments):
+        invocation_runtime.container_invocation(expected_runtime)
         if arguments[0] == "build":
             _pin_builder(argv, env, timeout)
     command = [*argv, *arguments]
@@ -716,12 +718,13 @@ def _cli_guard(harness: str, version: str) -> str:
 async def run_trial(config: dict[str, Any]) -> dict[str, Any]:
     """Run one native trial, without queue retries or Harbor resume behavior.
 
-    Run by an operation, the trial's containers carry its invocation label (`harbor_labels`).
+    Its operation's invocation comes in the config, and every container of the trial carries
+    its label (`harbor_labels`). A trial without one starts nothing.
     """
     config = dict(config)
     invocation = config.pop(_INVOCATION_KEY, None)
     if invocation is None:
-        return await _run_trial(config)
+        raise ValueError("a native trial runs only inside an operation, whose label it carries")
     from pluginbench import harbor_labels
 
     with harbor_labels.labelled(str(invocation)):
@@ -1634,6 +1637,8 @@ def _native_process(
     auth_file: Path | None = None,
     on_spawn: Callable[[int], None] | None = None,
 ) -> dict[str, object]:
+    # The worker's trial containers carry this operation's label (`run_trial`).
+    invocation = invocation_runtime.container_invocation(expected)
     private = area / "private"
     artifacts = area / "artifacts"
     secrets: tuple[str, ...] = ()
@@ -1676,8 +1681,7 @@ def _native_process(
             artifacts / "docker-client.json",
             _private_docker_config(private=private, env=env, expected_runtime=expected),
         )
-        if (invocation := invocation_runtime.current()) is not None:
-            config = {**config, _INVOCATION_KEY: invocation}
+        config = {**config, _INVOCATION_KEY: invocation}
         codex.write_json(private / "trial.json", config)
         result = run_command(
             [

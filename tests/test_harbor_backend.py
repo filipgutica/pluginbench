@@ -12,6 +12,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from uuid import uuid4
 from typing import Any
 from types import SimpleNamespace
 
@@ -675,7 +676,7 @@ def test_codex_transport_delegates_to_sdk_pipefail_and_preserves_separate_stderr
         monkeypatch.setattr(harbor, "_CODEX_RUN_SHA256", "changed", raising=False)
     if case in {"mismatch", "source-drift", "exit-nonzero", "native-failure", "native-auth-failure"}:
         with pytest.raises((ValueError, RuntimeError)) as failed:
-            asyncio.run(harbor.run_trial(trial_config))
+            asyncio.run(harbor.run_trial({**trial_config, harbor._INVOCATION_KEY: uuid4().hex}))
         if case in {"mismatch", "source-drift", "native-failure", "native-auth-failure"}:
             assert not counter.exists()
         if case == "native-auth-failure":
@@ -685,7 +686,7 @@ def test_codex_transport_delegates_to_sdk_pipefail_and_preserves_separate_stderr
         if case == "source-drift":
             assert not created
         return
-    result = asyncio.run(harbor.run_trial(trial_config))
+    result = asyncio.run(harbor.run_trial({**trial_config, harbor._INVOCATION_KEY: uuid4().hex}))
     assert result["session_id"] == "paid-free"
     assert (agent_directory / "codex.stderr.log").is_file()
     assert diagnostic not in (agent_directory / "codex.txt").read_text()

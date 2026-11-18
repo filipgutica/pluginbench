@@ -29,6 +29,24 @@ from pluginbench.assessment_metrics import inspect_snapshot
 from test_native_harbor import native_task
 
 LABEL = invocation_runtime.LABEL_KEY
+# The Docker runtime an operation recorded, and its daemon behind the fake CLI.
+_RUNTIME: dict[str, object] = {
+    "docker_cli": {}, "docker_engine": {"id": "daemon", "endpoint": "unix:///fake.sock"}
+}
+
+
+_BUILD = ("build", "--quiet", "--provenance=false", "--tag",
+          f"pluginbench-native-build:{'0' * 32}", "/context")
+
+
+def _inside(
+    monkeypatch: pytest.MonkeyPatch, invocation: str | None = None, runtime: object = _RUNTIME
+) -> str:
+    """Run the rest of the test as an operation's entry point, which recorded `runtime`."""
+    invocation = invocation or uuid4().hex
+    monkeypatch.setattr(invocation_runtime, "_current", invocation)
+    monkeypatch.setattr(invocation_runtime, "_runtime", runtime)
+    return invocation
 
 _FAKE_CLI = """#!{python}
 import json, os, sys
@@ -176,8 +194,7 @@ def test_an_operations_trial_worker_gets_its_invocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`_native_process` hands the ID to the Harbor worker, whose `run_trial` labels the trial."""
-    invocation = uuid4().hex
-    monkeypatch.setattr(invocation_runtime, "_current", invocation)
+    invocation = _inside(monkeypatch)
     monkeypatch.setattr(harbor_backend, "_private_docker_config", lambda **kwargs: {})
     configs: list[dict[str, Any]] = []
 
@@ -191,7 +208,7 @@ def test_an_operations_trial_worker_gets_its_invocation(
     (area / "artifacts").mkdir(parents=True)
     harbor_backend._native_process(
         area=area, config={"trial_name": "t"}, harness="codex", timeout=5, install_only=True,
-        expected={"docker_engine": {"endpoint": "unix:///fake.sock"}},
+        expected=_RUNTIME,
     )
     assert configs == [{"trial_name": "t", "pluginbench_invocation": invocation}]
 
@@ -240,14 +257,65 @@ def test_a_direct_docker_create_inside_an_operation_carries_the_label(
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(harbor_backend, "run_command", record)
-    harbor_backend._docker(*arguments)
-    invocation = uuid4().hex
-    monkeypatch.setattr(invocation_runtime, "_current", invocation)
-    harbor_backend._docker(*arguments)
-    outside, inside = calls
-    assert outside == ["docker", *arguments]
-    expected = ["docker", "create", "--label", f"{LABEL}={invocation}", *arguments[1:]]
-    assert inside == (expected if labelled else outside)
+    monkeypatch.setattr(
+        harbor_backend, "_frozen_executable", lambda identity, label: {"resolved_path": "docker"}
+    )
+    frozen = ["docker", "--host", "unix:///fake.sock"]
+    if labelled:  # Outside an operation nothing is created.
+        with pytest.raises(ValueError, match="only inside an operation"):
+            harbor_backend._docker(*arguments, expected_runtime=_RUNTIME)
+    else:
+        harbor_backend._docker(*arguments, expected_runtime=_RUNTIME)
+    invocation = _inside(monkeypatch)
+    harbor_backend._docker(*arguments, expected_runtime=_RUNTIME)
+    inside = calls.pop()
+    expected = [*frozen, "create", "--label", f"{LABEL}={invocation}", *arguments[1:]]
+    assert inside == (expected if labelled else [*frozen, *arguments])
+    assert calls == ([] if labelled else [[*frozen, *arguments]])
+
+
+@pytest.mark.parametrize("arguments", [("create", "image"), _BUILD])
+@pytest.mark.parametrize(
+    "runtime",
+    [None, {"docker_engine": {"id": "other", "endpoint": "unix:///fake.sock"}}, _RUNTIME],
+)
+def test_a_container_starts_only_in_an_operation_on_the_daemon_it_recorded(
+    monkeypatch: pytest.MonkeyPatch, arguments: tuple[str, ...], runtime: object
+) -> None:
+    """Recovery looks for an operation's containers on the daemon it recorded, and only if it
+    recorded one: a container created anywhere else would never be found."""
+    daemon = _Daemon()
+    monkeypatch.setattr(harbor_backend, "run_command", daemon)
+    monkeypatch.setattr(
+        harbor_backend, "_frozen_executable", lambda identity, label: {"resolved_path": "docker"}
+    )
+    monkeypatch.setattr(harbor_backend, "_pin_builder", lambda *args: None)
+    with pytest.raises(ValueError, match="only inside an operation"):
+        harbor_backend._docker(*arguments, expected_runtime=_RUNTIME)
+    _inside(monkeypatch, runtime=runtime)
+    if runtime is _RUNTIME:
+        harbor_backend._docker(*arguments, expected_runtime=_RUNTIME)
+    else:
+        with pytest.raises(ValueError, match="recorded no Docker daemon, or another one"):
+            harbor_backend._docker(*arguments, expected_runtime=_RUNTIME)
+    assert len(daemon.containers) == (arguments[0] == "create" and runtime is _RUNTIME)
+
+
+def test_a_native_trial_runs_only_in_an_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Neither the worker's launch nor the trial itself goes ahead without an invocation."""
+    started: list[object] = []
+    monkeypatch.setattr(harbor_backend, "run_command", lambda *args, **kwargs: started.append(1))
+    area = tmp_path / "area"
+    (area / "artifacts").mkdir(parents=True)
+    with pytest.raises(ValueError, match="only inside an operation"):
+        harbor_backend._native_process(
+            area=area, config={}, harness="codex", timeout=5, install_only=True, expected=_RUNTIME
+        )
+    with pytest.raises(ValueError, match="only inside an operation"):
+        asyncio.run(harbor_backend.run_trial({"agent": {"name": "other"}}))
+    assert started == []
 
 
 @pytest.mark.parametrize(
@@ -319,8 +387,7 @@ def test_recovery_removes_a_crashed_measurements_container_by_its_label_alone(
     source = tmp_path / "source"
     source.mkdir()
     (source / "code.py").write_text("code\n")
-    invocation = uuid4().hex
-    monkeypatch.setattr(invocation_runtime, "_current", invocation)
+    invocation = _inside(monkeypatch, runtime=runtime)
     with pytest.raises(ValueError, match="docker exec failed"):
         harbor_backend.run_native_command(
             snapshot=source,
@@ -368,17 +435,13 @@ def test_an_argument_naming_the_invocation_label_is_refused(
     """Docker keeps the last of repeated labels, in many spellings, so no argument may name it."""
     daemon = _Daemon()
     monkeypatch.setattr(harbor_backend, "run_command", daemon)
-    monkeypatch.setattr(invocation_runtime, "_current", uuid4().hex)
+    _inside(monkeypatch)
     with pytest.raises(ValueError, match="only PluginBench sets"):
         harbor_backend._docker(*arguments)
     assert daemon.containers == {}
     # The same refusal guards Harbor's own `docker container run`.
     with pytest.raises(ValueError, match="only PluginBench sets"):
         invocation_runtime.with_label(("container", "run", *arguments[1:]), uuid4().hex)
-
-
-_BUILD = ("build", "--quiet", "--provenance=false", "--tag",
-          f"pluginbench-native-build:{'0' * 32}", "/context")
 
 
 @pytest.mark.parametrize("driver", ["docker", "docker-container"])
@@ -394,22 +457,22 @@ def test_a_build_inside_an_operation_runs_only_in_the_engines_own_builder(
         command: list[str], *, env: dict[str, str], **kwargs: Any
     ) -> subprocess.CompletedProcess[str]:
         calls.append((command, env))
-        output = f"Name: default\nDriver: {driver}\n" if command[1:3] == ["buildx", "inspect"] else ""
+        output = f"Name: default\nDriver: {driver}\n" if command[3:5] == ["buildx", "inspect"] else ""
         return subprocess.CompletedProcess(command, 0, output, "")
 
     monkeypatch.setattr(harbor_backend, "run_command", record)
-    harbor_backend._docker(*_BUILD)
-    outside = calls.pop()
-    assert outside[1]["BUILDX_BUILDER"] == "operator-builder"  # Outside an operation, unchanged.
-    monkeypatch.setattr(invocation_runtime, "_current", uuid4().hex)
+    monkeypatch.setattr(
+        harbor_backend, "_frozen_executable", lambda identity, label: {"resolved_path": "docker"}
+    )
+    _inside(monkeypatch)
     if driver != "docker":
         with pytest.raises(ValueError, match="built-in builder"):
-            harbor_backend._docker(*_BUILD)
-        assert [command[1] for command, _ in calls] == ["buildx"]  # Never built.
+            harbor_backend._docker(*_BUILD, expected_runtime=_RUNTIME)
+        assert [command[3] for command, _ in calls] == ["buildx"]  # Never built.
         return
-    harbor_backend._docker(*_BUILD)
+    harbor_backend._docker(*_BUILD, expected_runtime=_RUNTIME)
     (inspect, inspect_env), (build, build_env) = calls
-    assert inspect[1:] == ["buildx", "inspect"] and tuple(build[1:]) == _BUILD
+    assert inspect[3:] == ["buildx", "inspect"] and tuple(build[3:]) == _BUILD
     for env in (inspect_env, build_env):
         assert (env["BUILDX_BUILDER"], env["DOCKER_BUILDKIT"]) == ("default", "1")
 
@@ -447,7 +510,7 @@ def test_an_operation_sends_only_the_docker_commands_pluginbench_issues(
 ) -> None:
     daemon = _Daemon()
     monkeypatch.setattr(harbor_backend, "run_command", daemon)
-    monkeypatch.setattr(invocation_runtime, "_current", uuid4().hex)
+    _inside(monkeypatch)
     with pytest.raises(ValueError, match="only the commands PluginBench issues"):
         harbor_backend._docker(*arguments)
     assert daemon.containers == {}
