@@ -34,7 +34,7 @@ state, root, launch_id = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
 (root / "worker-path").write_text(os.environ["PATH"])
 owner = run_lock.ExecutionOwner(kind="run", eval=str(root), root=str(root), launch_id=launch_id)
 with control_store.execute(owner, state=state), run_lock.hold(root):
-    while True:
+    while not (root / "stop-at-once").exists():
         time.sleep(0.02)
 """
 
@@ -147,6 +147,26 @@ def test_background_run_that_exits_before_it_starts_fails_the_command(
     assert result.exit_code == 2
     assert "exited with code 5 before it started" in result.stderr
     assert [launch.status for launch in launches(isolated_host_state).values()] == ["finished"]
+
+
+@pytest.mark.real_operations
+def test_a_background_run_that_ends_before_its_run_lock_is_reported_ended_and_fails(
+    fake_systemd: FakeSystemd, isolated_host_state: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, planned: None, worker: None,
+) -> None:
+    (tmp_path / "stop-at-once").touch()
+    start = invocation_runtime.start_gated
+
+    def descheduled(*args: object, **kwargs: object) -> object:
+        proc = start(*args, **kwargs)  # type: ignore[arg-type]
+        until(lambda: [launch.status for launch in launches(isolated_host_state).values()]
+              == ["finished"])
+        return proc
+
+    monkeypatch.setattr(invocation_runtime, "start_gated", descheduled)
+    result = CliRunner().invoke(cli.app, ["run", str(tmp_path), "--yes"])
+    assert result.exit_code == 2
+    assert f"the background run for {tmp_path} ended before it took" in result.stderr
 
 
 def test_foreground_run_owns_the_lock_and_writes_events(

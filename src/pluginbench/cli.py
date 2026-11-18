@@ -348,7 +348,14 @@ def _detach(root: Path, *, notify: bool) -> None:
     # The worker claims its launch as it takes the host, then takes run.lock.
     deadline = time.monotonic() + invocation_runtime.GATE_SECONDS
     while (run_lock.owner(root) or {}).get("pid") != process.get("pid"):
-        if time.monotonic() > deadline or not coordinator.running(launched.launch_id):
+        if not coordinator.running(launched.launch_id):
+            # It claimed its launch, then ended before it took run.lock: nothing runs now.
+            raise ValueError(
+                f"the background run for {root} ended before it took "
+                f"{root / run_lock.LOCK_NAME}; see `pluginbench status {root}` and "
+                f"{root / 'run.log'}"
+            )
+        if time.monotonic() > deadline:
             raise ValueError(
                 f"the background run did not take {root / run_lock.LOCK_NAME}; see "
                 f"{root / 'run.log'}"
