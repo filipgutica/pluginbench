@@ -583,6 +583,13 @@ def _overlapping() -> list[dict[str, Any]]:
     return sites
 
 
+def _instant(at: int) -> list[dict[str, Any]]:
+    """Site 0 runs from 2,000 to 4,000 ms; site 1 starts and settles at `at`."""
+    sites: list[dict[str, Any]] = _repeat("a")["sites"]
+    sites[1] = {**sites[1], "dispatched_ms": at, "settled_ms": at, "runs": [_ran(at, 0)]}
+    return sites
+
+
 def _tampered(change: Any) -> dict[str, Any]:
     facts = _mutation_facts()
     for repeat in facts["repeats"]:
@@ -622,6 +629,9 @@ def _tampered(change: Any) -> dict[str, Any]:
          "settlement differs from its runs"),
         # With one lane, site 1 runs inside site 0's span.
         (_mutation_facts(*_three(sites=_overlapping()), lanes=1), "lanes hold"),
+        # Site 1 starts and settles at 3,000 ms while site 0 holds the only lane.
+        (_mutation_facts(*_three(sites=_instant(3000)), lanes=1), "lanes hold"),
+        (_tampered(lambda r: r.update(selected=[r["selected"][0]] * 2)), "a site twice"),
         (_tampered(lambda r: r.update(candidate_count=1)), "more sites than it found"),
         (_tampered(lambda r: r.update(candidate_count=0)), "more sites than it found"),
         (_tampered(lambda r: r.update(timing_boundary="exec")), "timed exec, not executor_call"),
@@ -640,6 +650,11 @@ def test_both_reference_rules_refuse_clocks_or_exits_that_contradict_each_other(
 
 def test_sites_that_overlap_within_the_lanes_pass() -> None:
     assert _rule("mutation", _mutation_facts(*_three(sites=_overlapping()), lanes=2)).status == (
+        "pass"
+    )
+    # One lane reused the millisecond its site settled, by a site that settles then too.
+    assert _rule("mutation", _mutation_facts(*_three(), lanes=1)).status == "pass"
+    assert _rule("mutation", _mutation_facts(*_three(sites=_instant(4000)), lanes=1)).status == (
         "pass"
     )
 

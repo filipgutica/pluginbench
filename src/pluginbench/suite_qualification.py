@@ -391,6 +391,8 @@ def _validate(repeat: _Repeat, contract: _MutationContract) -> None:
         raise ValueError(f"the repeat timed {repeat.timing_boundary}, not {TIMING_BOUNDARY}")
     if len(repeat.selected) > repeat.candidate_count:
         raise ValueError("the repeat selected more sites than it found")
+    if len(set(repeat.selected)) != len(repeat.selected):
+        raise ValueError("the repeat selected a site twice")
     attempt = repeat.attempt_ms
     serial = 0
     for call in repeat.baseline:
@@ -428,9 +430,15 @@ def _validate(repeat: _Repeat, contract: _MutationContract) -> None:
         spans.append((site.dispatched_ms, end))
         latest = max(latest, end)
     # A lane dispatches its next site no earlier than its last one settled, so the sites
-    # running at any dispatch, ends excluded, are at most one per lane.
-    if any(sum(start <= at < end for start, end in spans) > contract.lanes for at, _ in spans):
-        raise ValueError(f"more sites ran at once than the {contract.lanes} lanes hold")
+    # running at any dispatch, ends excluded, are at most one per lane. A site that settles
+    # the millisecond it starts shares its lane only with sites that end or start then, so it
+    # needs a lane no site straddles.
+    for at, end in spans:
+        running = sum(
+            (start < at < stop) if at == end else (start <= at < stop) for start, stop in spans
+        )
+        if running + (at == end) > contract.lanes:
+            raise ValueError(f"more sites ran at once than the {contract.lanes} lanes hold")
     if repeat.required_settled_ms is not None and repeat.required_settled_ms < latest:
         raise ValueError("the required phase ended before its sites settled")
     # A call its own cap or site bounds can still return after the attempt's limit.
