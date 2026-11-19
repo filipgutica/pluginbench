@@ -397,30 +397,28 @@ def _host(root: Path) -> dict[str, Any]:
     first, and this run's background launches. Unlike `app status`, it never rolls back a write
     a killed command left in the control database."""
     try:
-        # Read first, under the shared probe: a command that takes the host afterwards shows
-        # as executing, never its own record as a crash.
-        carried = run_lock.unreleased()
+        # The lock's holder and what a free lock leaves come from one observation, so a
+        # command that starts or dies meanwhile is never shown as both, or as neither.
+        execution, carried = run_lock.observe_execution()
         current = coordinator.status(recover=False)
     except sqlite3.Error as exc:
         return {"error": _control_problem(exc)}
     except (OSError, ValueError) as exc:
         return {"error": str(exc)}
-    blocked = [] if carried is None or current["execution"]["held"] else carried
     target = str(root.resolve())
-    execution = current["execution"]
     # Only a verified holder's record says who executes; a stale one names a past owner.
-    owner = execution["owner"] if execution["verified"] else {}
+    owner = execution.record if execution.verified and execution.record else {}
     return {
         "error": None,
         "coordinator": current["coordinator"],
         "execution": {
-            "verified": execution["verified"],
+            "verified": execution.verified,
             "kind": owner.get("kind"),
             "root": owner.get("root"),
             "pid": owner.get("pid"),
             "this_run": owner.get("root") == target,
         }
-        if execution["held"]
+        if execution.held
         else None,
         "reconciling": current["reconciling"],
         # A free lock whose last owner did not release it: every command waits on its checks.
@@ -432,7 +430,7 @@ def _host(root: Path) -> dict[str, Any]:
                 "this_run": item.get("root") == target,
                 "problem": item.get("problem"),
             }
-            for item in blocked
+            for item in carried or []
         ],
         "launches": [
             {key: launch[key] for key in ("launch_id", "kind", "status", "desired")}

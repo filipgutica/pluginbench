@@ -290,7 +290,7 @@ def test_status_names_the_execution_owner_running_this_run(
     assert status["host"]["blocked"] == []
     assert status["host"]["execution"]["this_run"] is True
     assert "; executing this run (run, process" in run_status.format_status(status)
-    assert run_lock.unreleased() is None  # Never the holder's own record, as a crash.
+    assert run_lock.observe_execution()[1] is None  # Never the holder's own record, as a crash.
 
 
 def test_a_released_record_never_names_the_holder(

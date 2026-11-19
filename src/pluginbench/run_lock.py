@@ -443,25 +443,6 @@ def _obligations(value: object) -> tuple[list[dict[str, Any]], list[str]]:
     return kept, problems
 
 
-def unreleased(state: Path | None = None) -> list[dict[str, Any]] | None:
-    """What the next command to take the host lock must verify before it runs, as it will find
-    it (see _carried); None while a process holds the lock. The record is read under a brief
-    shared flock, so no owner can take the lock and replace it meanwhile."""
-    state = state or state_root()
-    try:
-        fd = os.open(state / EXECUTION_LOCK, os.O_RDONLY)
-    except FileNotFoundError:
-        return _carried(state)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return None
-        return _carried(state)
-    finally:
-        os.close(fd)
-
-
 def _obligation_problem(value: object) -> str | None:
     """Why `value` cannot be checked as an owner that may have left work running. Its pid and
     acquired_at are its identity, which a confirmation names; only the fence for an unreadable
@@ -559,27 +540,43 @@ def holds(record: dict[str, object], lock: os.stat_result) -> bool:
 
 def execution_owner(state: Path | None = None) -> LockSnapshot:
     """Observe the host execution lock without taking it."""
+    return observe_execution(state)[0]
+
+
+def observe_execution(
+    state: Path | None = None,
+) -> tuple[LockSnapshot, list[dict[str, Any]] | None]:
+    """One observation of the host execution lock: what an observer sees of it and, while it is
+    free, what the next command to take it must verify first (see _carried); None while held.
+    A free lock's record is read under a brief shared flock, which no owner can take the lock
+    through, so the two always agree."""
     state = state or state_root()
     path = state / EXECUTION_LOCK
-    record, _ = _read_record(state / EXECUTION_OWNER)
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except FileNotFoundError:
-        return LockSnapshot(path, held=False, record=record, verified=False)
-    try:
+    while True:
         try:
-            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-            held = False
-        except BlockingIOError:
-            held = True
-        lock = os.fstat(fd)
-    finally:
-        os.close(fd)
-    # A released record names a past owner, even when its process holds the lock again.
-    verified = (
-        held and record is not None and record.get("state") != "released" and holds(record, lock)
-    )
-    return LockSnapshot(path, held=held, record=record, verified=verified)
+            fd = os.open(path, os.O_RDONLY)
+        except FileNotFoundError:
+            record, carried = _read_record(state / EXECUTION_OWNER)[0], _carried(state)
+            if path.exists():
+                continue  # An owner created the lock during the read: observe it instead.
+            return LockSnapshot(path, held=False, record=record, verified=False), carried
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                record = _read_record(state / EXECUTION_OWNER)[0]
+                # A released record names a past owner, even when its process holds the lock
+                # again.
+                verified = (
+                    record is not None
+                    and record.get("state") != "released"
+                    and holds(record, os.fstat(fd))
+                )
+                return LockSnapshot(path, held=True, record=record, verified=verified), None
+            record = _read_record(state / EXECUTION_OWNER)[0]
+            return LockSnapshot(path, held=False, record=record, verified=False), _carried(state)
+        finally:
+            os.close(fd)
 
 
 def write_atomic(path: Path, value: dict[str, object]) -> None:
