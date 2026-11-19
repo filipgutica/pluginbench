@@ -254,12 +254,19 @@ class Evaluation(BaseModel):
         return self
 
     @model_serializer(mode="wrap")
-    def omit_unset_audits(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+    def omit_unset_fields(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         # Saved evaluations without audited hooks keep their earlier shape, so an earlier build
         # still reads them.
         data: dict[str, object] = handler(self)
         if not self.audited_hooks:
             data.pop("audited_hooks", None)
+        # A Claude evaluation never declares the limits Claude ignores (see `coherent`). Their
+        # defaults are left out, so every dump, such as a scoped operation's arguments, reads
+        # back as the same evaluation.
+        capabilities = data.get("capabilities")
+        if self.runner.harness == "claude" and isinstance(capabilities, dict):
+            for name in UNENFORCED_LIMITS:
+                capabilities.pop(name, None)
         return data
 
 
@@ -1024,9 +1031,6 @@ def prepare_evaluation(
     excluded = {"reviewer": {"cli_version"}}
     if config.runner.cli_version is None:
         excluded["runner"] = {"cli_version"}
-    if config.runner.harness == "claude":
-        # Saved as declared, so a resumed Claude evaluation does not read them as set.
-        excluded["capabilities"] = set(UNENFORCED_LIMITS)
     selection = {
         **config.model_dump(mode="json", exclude=excluded),
         "cli_version_source": "runner.cli_version" if config.runner.cli_version else "host",
