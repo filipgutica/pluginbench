@@ -16,7 +16,7 @@ from functools import partial
 from threading import Event
 from concurrent.futures import CancelledError
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
 
@@ -183,22 +183,29 @@ def validate_review_revision(root: Path, revision: str, *, allow_active: bool = 
     for row in state["records"]:
         if recovered_rows:
             original_row = recovered_rows[row["id"]]
-            if row.get("native_start") != original_row.get("native_start") or row[
-                "packet_id"
-            ] != original_row.get("packet_id"):
+            if any(
+                row.get(key) != original_row.get(key)
+                for key in ("native_start", "packet_id", "superseded")
+            ):
                 raise ValueError("recovered judge invocation start differs from its original")
-        if row.get("native_start") is None:
-            continue
-        path = study._bound_path(root, row["native_start"])
-        if (
-            not recovered_rows
-            and path != directory / "observations" / row["packet_id"] / "native-start.json"
-        ):
-            raise ValueError("judge invocation start differs from its anonymous packet")
-        receipt = study._bound_document(root, row["native_start"])
-        if receipt.get("packet_id") != row["packet_id"]:
-            raise ValueError("judge invocation start binds another packet")
-        starts += 1
+        # A resumed pass gives a row a fresh packet; its earlier calls stay bound as superseded.
+        for call in [*row.get("superseded", []), row]:
+            if call.get("native_start") is None:
+                continue
+            path = study._bound_path(root, call["native_start"])
+            if (
+                not recovered_rows
+                and path != directory / "observations" / call["packet_id"] / "native-start.json"
+            ):
+                raise ValueError("judge invocation start differs from its anonymous packet")
+            receipt = study._bound_document(root, call["native_start"])
+            if receipt.get("packet_id") != call["packet_id"]:
+                raise ValueError("judge invocation start binds another packet")
+            if call is not row and call.get("observation"):
+                observation = study._bound_document(root, call["observation"])
+                if observation.get("packet") != call.get("packet"):
+                    raise ValueError("review observation differs from its bound packet")
+            starts += 1
     if state.get("native_invocations") != starts:
         raise ValueError("judge invocation count differs from bound starts")
     study._bound_path(root, state["adapter"])
@@ -467,7 +474,12 @@ def review_starts(root: Path) -> list[tuple[str, bool]]:
     for receipt in sorted(root.glob("review-revisions/*/observations/*/native-start.json")):
         try:
             state = json.loads((receipt.parents[2] / "review-state.json").read_text())
-            row = next(row for row in state["records"] if row["packet_id"] == receipt.parent.name)
+            row = next(
+                {**call, "id": row["id"]}
+                for row in state["records"]
+                for call in [row, *row.get("superseded", [])]
+                if call["packet_id"] == receipt.parent.name
+            )
         except (OSError, ValueError, KeyError, StopIteration) as error:
             raise ValueError(
                 f"cannot tell which attempt judge call {receipt.parent.name} reviewed, so this "
@@ -538,6 +550,155 @@ def _admit_review(ledger: Ledger, planned: dict[str, tuple[int, str]]) -> None:
         )
 
 
+# A review state of this version can resume. Version 1 revisions predate durable judge output,
+# so a pass cut off by a crash could not tell a finished review from a lost one.
+STATE_SCHEMA_VERSION = 2
+# A judge call's area: its packet copy and private home, outside the run so that no trace path
+# names the run. Its artifacts are written into the run directly.
+_AREA_PREFIX = "pluginbench-judge-"
+
+
+def _receipt_revisions(root: Path) -> dict[str, str]:
+    """The review revision each judge call belongs to, by the ledger row its receipt names."""
+    owners = {}
+    for receipt in root.glob("review-revisions/*/observations/*/native-start.json"):
+        try:
+            invocation = json.loads(receipt.read_text()).get("invocation")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(invocation, str):
+            owners[invocation] = receipt.parents[2].name
+    return owners
+
+
+def _refuse_other_crashed_revisions(root: Path, ledger: Ledger, revision: str) -> None:
+    """Refuse a pass while a crash left another revision's judge call open.
+
+    Marking that call unresolved would lose a finished review that its revision can adopt.
+    """
+    open_calls = {
+        row["id"]
+        for row in ledger.invocations()
+        if row["stage"] == "review" and row["state"] in invocation_ledger.OPEN_STATES
+    }
+    others = sorted(
+        {name for call, name in _receipt_revisions(root).items() if call in open_calls}
+        - {revision}
+    )
+    if others:
+        raise ValueError(
+            f"review revision {others[0]} was cut off by a crash and may hold finished reviews; "
+            f"resume it first with `pluginbench review <run-dir> --revision {others[0]}`"
+        )
+
+
+def _resumable_state(
+    root: Path, directory: Path, revision: str, frozen: dict[str, object]
+) -> dict[str, Any]:
+    """The saved state of a revision this pass resumes, refused unless its settings match."""
+    state: dict[str, Any] = json.loads(
+        validate_review_revision(root, revision, allow_active=True).read_text()
+    )
+    if state.get("schema_version") != STATE_SCHEMA_VERSION:
+        raise ValueError(
+            "this review revision predates resumable reviews and cannot resume; review into a "
+            "new revision"
+        )
+    if state.get("recovery"):
+        raise ValueError("a citation recovery revision cannot resume; resume its original")
+    if (directory.parent / f"{revision}-citations").exists():
+        raise ValueError(f"review revision {revision}-citations binds this revision, so it cannot resume")
+    adapter = state["adapter"]
+    assert isinstance(adapter, dict)
+    if adapter.get("sha256") != study._digest(Path(__file__)):
+        raise ValueError(
+            "other PluginBench code made this review revision, so it cannot resume; review into "
+            "a new revision"
+        )
+    saved = study._bound_document(root, state["protocol"])
+    differs = sorted(key for key, value in frozen.items() if saved.get(key) != value)
+    if differs:
+        raise ValueError(
+            f"this review revision was frozen with other {', '.join(differs)}; resume it with "
+            "the same settings or review into a new revision"
+        )
+    return state
+
+
+def _calls_again(row: dict[str, object]) -> bool:
+    """Whether a resumed pass calls the judge for a row: only when no spent call ended it.
+
+    A refunded call (operator interrupt, provider stop) or one a crash cut off calls again,
+    within the slot's cap. A call that ended `failed_transient` stays as it ended.
+    """
+    if row["status"] in {"pending", "interrupted", "running"}:
+        return True
+    ending = row.get("ending")
+    return isinstance(ending, dict) and (
+        ending["state"] in invocation_ledger.REFUNDED_STATES or ending["state"] == "unresolved"
+    )
+
+
+def _quarantine_artifacts(artifacts: Path) -> str | None:
+    """Check a call's artifacts in place; archive unsupported ones inertly and say why."""
+    if not (artifacts.exists() or artifacts.is_symlink()):
+        return None
+    try:
+        codex.validate_artifacts(artifacts)
+        return None
+    except (OSError, ValueError):
+        pass
+    raw = artifacts.with_name("artifacts.unsupported")
+    artifacts.rename(raw)
+    error = codex.copy_artifacts(raw, artifacts)
+    if raw.is_dir() and not raw.is_symlink():
+        shutil.rmtree(raw)
+    else:
+        raw.unlink()
+    return error
+
+
+def _remove_area(area: object) -> None:
+    """Remove a crashed call's area, which holds a copy of the reviewer's credentials."""
+    if isinstance(area, str) and Path(area).is_absolute() and Path(area).name.startswith(_AREA_PREFIX):
+        shutil.rmtree(area, ignore_errors=True)
+
+
+def _accept(
+    *,
+    root: Path,
+    workspace: Path,
+    packet: Path,
+    inventory: dict[str, str],
+    record: Attempt,
+    selected: Stage,
+    protocol: object,
+    execution: dict[str, object],
+    packet_id: str,
+    model: str,
+    effort: str,
+    harness: str,
+) -> JudgeResponse:
+    """The judge's response, once its call is shown to have left every frozen input as it was."""
+    assert record.before is not None and selected.snapshot is not None
+    if study._inventory(workspace) != inventory or study._inventory(packet) != inventory:
+        raise ValueError("judge mutated the frozen review packet")
+    study._assert_frozen(root)
+    for snapshot in (record.before, selected.snapshot):
+        if inspect_snapshot(snapshot.root)["digest"] != snapshot.digest:
+            raise ValueError("judge source snapshot changed during review")
+    _validate_fixed_bindings(root, protocol)
+    return _validate_response(
+        execution=execution,
+        packet=packet,
+        packet_id=packet_id,
+        root=root,
+        model=model,
+        effort=effort,
+        harness=harness,
+    )
+
+
 def review_study(
     root: Path,
     *,
@@ -551,7 +712,12 @@ def review_study(
     harness: str = "codex",
     jobs: int = 1,
 ) -> Path:
-    """Review each selected submission once; never mutate submitted source."""
+    """Review each selected submission once; never mutate submitted source.
+
+    A revision that exists already resumes with the same settings. It keeps every review that
+    ended, adopts a call a crash cut off once its saved output passes the same acceptance as a
+    live call, and calls the judge again only for rows that no spent call ended.
+    """
     validate_jobs(jobs)
     root = root.resolve()
     study._assert_frozen(root)
@@ -559,8 +725,7 @@ def review_study(
     if original_run.get("status") not in {"complete", "interrupted"}:
         raise ValueError("review requires a complete or interrupted study, not an active run")
     directory = _review_directory(root, revision)
-    if directory.exists():
-        raise ValueError("review state already exists; native judge calls cannot be replayed")
+    resuming = directory.exists()
     study._bound_document(root, original_run["assessment_input"])
     _, records = _load_manifest(root / original_run["assessment_input"]["path"])
     if not model.strip() or not effort.strip() or timeout <= 0:
@@ -581,11 +746,12 @@ def review_study(
     # Read tasks from this run's own frozen copy, even if the run was moved after it stopped.
     tasks = {task.task_id: task for task in study._frozen_study(root).tasks}
     selections = {record.id: record.stages[0] for record in records}
+    by_id = {record.id: record for record in records}
     ledger = _review_ledger(root, len(plan["entries"]))
     try:
         # A review pass runs alone in its run, so a judge call still open was cut off by a crash.
         cleaned = control_store.verify_crashed(ledger, root / LEDGER_NAME, ("review",))
-        ledger.resolve_crashed("review", cleaned=cleaned)
+        _refuse_other_crashed_revisions(root, ledger, revision)
         # A review slot is the coding slot of the attempt it reviews.
         slots = {
             row["id"]: row["slot"]
@@ -594,6 +760,7 @@ def review_study(
         }
         contents = [path.read_text() for path in guidance]
         prompt = _fixed_review_prompt(contents)
+        criteria = _fixed_criteria(contents)
         inputs = {
             record.id: _review_inputs(
                 harness=harness,
@@ -608,17 +775,7 @@ def review_study(
             if record.before is not None
             and (snapshot := selections[record.id].snapshot) is not None
         }
-        _admit_review(ledger, {record: (slots[record], inputs[record]) for record in inputs})
-        directory.mkdir(parents=True)
-        shutil.copyfile(root / "run.json", directory / "original-run.json")
-        limitations = list(LIMITATIONS)
-        limitations[3] = (
-            "Packets omit assigned labels and implementation traces; identical fixed review guidance "
-            "is supplied to every reviewer. Source/task content may reveal a condition. Read-only "
-            "sandboxing does not guarantee filesystem blinding."
-        )
-        protocol = {
-            "schema_version": 2,
+        frozen: dict[str, object] = {
             "harness": harness,
             "model": model,
             "effort": effort,
@@ -626,6 +783,9 @@ def review_study(
             "timeout_seconds": timeout,
             "jobs": jobs,
             "stage": "handoff",
+            "criteria_sha256": _criteria_digest(criteria),
+            "assessment_input": original_run["assessment_input"],
+            "plan": original_run["plan"],
             "selections": {
                 record.id: {
                     "stage_id": selected.id,
@@ -634,67 +794,333 @@ def review_study(
                 for record in records
                 for selected in (selections[record.id],)
             },
-            "review_only": True,
-            "native_accounting": "bound invocation-start receipts",
-            "assessment_input": original_run["assessment_input"],
-            "plan": original_run["plan"],
-            "limitations": limitations,
-            "response_schema": JudgeResponse.model_json_schema(),
         }
-        frozen_guidance = directory / "guidance"
-        frozen_guidance.mkdir()
-        references = []
-        for index, text in enumerate(contents):
-            path = frozen_guidance / f"{index}.md"
-            path.write_text(text)
-            references.append(study._reference(root, path))
-        criteria = _fixed_criteria(contents)
-        criteria_path = directory / "criteria.json"
-        study._write(criteria_path, criteria)
-        protocol.update(
-            revision=revision,
-            guidance=references,
-            criteria=study._reference(root, criteria_path),
-            criteria_sha256=_criteria_digest(criteria),
+        limitations = list(LIMITATIONS)
+        limitations[3] = (
+            "Packets omit assigned labels and implementation traces; identical fixed review guidance "
+            "is supplied to every reviewer. Source/task content may reveal a condition. Read-only "
+            "sandboxing does not guarantee filesystem blinding."
         )
-        study._write(directory / "protocol.json", protocol)
-        shutil.copyfile(Path(__file__), directory / "adapter.py")
-        rows: list[dict[str, object]] = [
-            {
-                "id": record.id,
-                "packet_id": uuid.uuid4().hex,
-                "stage_id": selected.id,
-                "submission_digest": selected.snapshot.digest if selected.snapshot else None,
-                "status": "pending",
-                "observation": None,
-            }
-            for record in records
-            for selected in (selections[record.id],)
-        ]
-        state: dict[str, object] = {
-            "schema_version": 1,
-            "status": "running",
-            "assigned": len(rows),
-            "jobs": jobs,
-            "native_invocations": 0,
-            "call_unit": "native judge invocation attempts, not API requests",
-            "records": rows,
-            "limitations": limitations,
-            "protocol": study._reference(root, directory / "protocol.json"),
-            "adapter": study._reference(root, directory / "adapter.py"),
-            "original_run": study._reference(root, directory / "original-run.json"),
-        }
         state_path = directory / "review-state.json"
-        study._write(state_path, state)
-        mapping = [
-            {**row, "arm": record.arm, "task_id": record.task_id, "implementation_model": record.model}
-            for row, record in zip(rows, records, strict=True)
-        ]
-        study._write(directory / "mapping.json", mapping)
+        state: dict[str, Any]
+        rows: list[dict[str, Any]]
+
+        def observation_of(
+            *,
+            status: str,
+            reason: object,
+            packet: object,
+            selected: Stage,
+            execution: dict[str, object],
+            response: JudgeResponse | None,
+            ending: tuple[str, str | None] | None,
+        ) -> dict[str, object]:
+            assert selected.snapshot is not None
+            return {
+                "schema_version": 1,
+                "status": status,
+                "reason": reason,
+                "packet": packet,
+                "stage_id": selected.id,
+                "submission_digest": selected.snapshot.digest,
+                "requested_model": model,
+                "requested_effort": effort,
+                "execution": execution,
+                "response": response.model_dump(mode="json") if response else None,
+                # The ledger state this call ends in, so a crash before the ledger records it
+                # cannot change how the call counts.
+                "ending": None if ending is None else {"state": ending[0], "error": ending[1]},
+                "method": "AI-identified review judgments; declaration evidence validated against immutable selected submission source",
+                "limitations": limitations,
+            }
+
+        def provider_stop(artifacts: Path) -> study.ProviderStopped | None:
+            """The stop the judge's saved trace records: a limit, auth or provider error."""
+            stop = provider_stops.saved_stop(artifacts, harness)
+            if stop is None:
+                return None
+            return study.ProviderStopped(
+                f"the {harness} reviewer stopped on {stop}. No further review call starts in "
+                "this pass. Once the limit resets or the provider recovers, resume this revision "
+                f"with `pluginbench review <run-dir> --revision {revision}`",
+                f"{harness} stopped on {stop}",
+            )
+
+        def adopt(row: dict[str, Any], start: dict[str, object]) -> dict[str, Any] | None:
+            """End a call a crash cut off from its saved output; None if nothing usable was saved.
+
+            A saved observation already holds the call's outcome. Otherwise a launcher that
+            finished (`host-evidence.json`, written last) with its packet copy still present is
+            accepted exactly as a live call is. The cleanup of both was verified.
+            """
+            record, selected = by_id[str(row["id"])], selections[str(row["id"])]
+            packet_id = str(row["packet_id"])
+            observed = directory / "observations" / packet_id
+            packet = directory / "packets" / packet_id
+            saved = observed / "observation.json"
+            try:
+                observation = json.loads(saved.read_text())
+            except (OSError, ValueError):
+                observation = None  # Absent, or cut off mid-write.
+            if isinstance(observation, dict) and isinstance(observation.get("ending"), dict):
+                if observation.get("response") is not None:
+                    _validate_response(
+                        execution=observation["execution"],
+                        packet=packet,
+                        packet_id=packet_id,
+                        root=root,
+                        model=model,
+                        effort=effort,
+                        harness=harness,
+                    )
+                row.update(
+                    status=observation["status"],
+                    observation=study._reference(root, saved),
+                    ending=observation["ending"],
+                )
+                if observation.get("reason") is not None:
+                    row["reason"] = observation["reason"]
+                return observation["ending"]  # type: ignore[no-any-return]
+            area = start.get("area")
+            artifacts = observed / "artifacts"
+            if (
+                not isinstance(area, str)
+                or not (Path(area) / "workspace").is_dir()
+                or not (artifacts / "host-evidence.json").is_file()
+            ):
+                return None
+            response = None
+            reason: str | None = None
+            ending: tuple[str, str | None]
+            error = _quarantine_artifacts(artifacts)
+            if error is not None:
+                execution = codex.parse_events("", [], harness, requested_effort=effort)
+                execution.update(successful_native_completion=False, error=error)
+                status, reason, ending = "unknown", error, ("failed_transient", error)
+            else:
+                execution = _captured_execution(artifacts, effort, harness)
+                if (stopped := provider_stop(artifacts)) is not None:
+                    status, reason = "unknown", f"judge review failed: ProviderStopped: {stopped}"
+                    ending = ("halted_provider", None)
+                else:
+                    try:
+                        response = _accept(
+                            root=root,
+                            workspace=Path(area) / "workspace",
+                            packet=packet,
+                            inventory=study._bound_document(root, row["packet"])["files"],
+                            record=record,
+                            selected=selected,
+                            protocol=protocol_ref,
+                            execution=execution,
+                            packet_id=packet_id,
+                            model=model,
+                            effort=effort,
+                            harness=harness,
+                        )
+                        status = "reviewed" if response.status == "reviewed" else "unavailable"
+                        if response.status == "unsupported":
+                            reason = "judge reported unsupported source"
+                        ending = ("finished", None)
+                    except (ValueError, OSError) as exc:
+                        status = "unknown"
+                        reason = f"judge review failed: {type(exc).__name__}: {exc}"
+                        ending = invocation_ledger.outcome(exc, spawned=True)
+            study._write(
+                saved,
+                observation_of(
+                    status=status,
+                    reason=reason,
+                    packet=row["packet"],
+                    selected=selected,
+                    execution=execution,
+                    response=response,
+                    ending=ending,
+                ),
+            )
+            row.update(
+                status=status,
+                observation=study._reference(root, saved),
+                ending={"state": ending[0], "error": ending[1]},
+            )
+            if reason is not None:
+                row["reason"] = reason
+            return {"state": ending[0], "error": ending[1]}
+
+        if resuming:
+            state = _resumable_state(root, directory, revision, frozen)
+            protocol_ref = state["protocol"]
+            rows = state["records"]
+            open_calls = {
+                row["id"]: row
+                for row in ledger.invocations()
+                if row["stage"] == "review" and row["state"] in invocation_ledger.OPEN_STATES
+            }
+            crashed: list[tuple[dict[str, object], str]] = []
+            for row in rows:
+                packet_id = str(row["packet_id"])
+                # A crash between a call's start receipt and the state that binds it.
+                receipt = directory / "observations" / packet_id / "native-start.json"
+                if row.get("native_start") is None and receipt.is_file():
+                    binding = directory / "packets" / f"{packet_id}.json"
+                    row.update(
+                        packet=study._reference(root, binding),
+                        native_start=study._reference(root, receipt),
+                        status="running",
+                    )
+                    state["native_invocations"] = int(state["native_invocations"]) + 1
+                if row.get("native_start") is None:
+                    continue
+                start = study._bound_document(root, row["native_start"])
+                call = start.get("invocation")
+                if call not in open_calls:
+                    continue
+                if open_calls[call]["attempt_id"] != row["id"] or call not in cleaned:
+                    raise ValueError(f"judge call {call} cannot be matched to its review row")
+                crashed.append((row, call))
+            for row, call in crashed:
+                start = study._bound_document(root, row["native_start"])
+                ending = row.get("ending")
+                if not isinstance(ending, dict):
+                    ending = adopt(row, start)
+                if ending is not None:
+                    study._write(state_path, state)
+                    ledger.end(call, str(ending["state"]), ending["error"])
+                _remove_area(start.get("area"))
+        ledger.resolve_crashed("review", cleaned=cleaned)
+        if resuming:
+            for row, call in crashed:
+                if row["status"] == "running":
+                    row.update(
+                        status="unknown",
+                        ending={"state": "unresolved", "error": None},
+                        reason="judge call cut off by a crash before its output was saved",
+                    )
+            calling = [index for index, row in enumerate(rows) if _calls_again(row)]
+            study._write(state_path, state)
+            _admit_review(
+                ledger,
+                {
+                    rows[index]["id"]: (slots[rows[index]["id"]], inputs[rows[index]["id"]])
+                    for index in calling
+                    if rows[index]["id"] in inputs
+                },
+            )
+            mapping = json.loads((directory / "mapping.json").read_text())
+            for index in calling:
+                row = rows[index]
+                if row.get("native_start") is not None:
+                    row.setdefault("superseded", []).append(
+                        {
+                            key: row[key]
+                            for key in (
+                                "packet_id", "packet", "native_start", "observation", "status",
+                                "reason", "ending",
+                            )
+                            if key in row
+                        }
+                    )
+                for key in ("packet", "native_start", "reason", "ending"):
+                    row.pop(key, None)
+                # A fresh packet, so no earlier call's receipts or leftovers are overwritten.
+                row.update(packet_id=uuid.uuid4().hex, status="pending", observation=None)
+                record = by_id[str(row["id"])]
+                mapping.append(
+                    {
+                        **{key: value for key, value in row.items() if key != "superseded"},
+                        "arm": record.arm,
+                        "task_id": record.task_id,
+                        "implementation_model": record.model,
+                    }
+                )
+            study._write(directory / "mapping.json", mapping)
+            state["status"] = "running"
+            study._write(state_path, state)
+        else:
+            _admit_review(ledger, {record: (slots[record], inputs[record]) for record in inputs})
+            directory.mkdir(parents=True)
+            shutil.copyfile(root / "run.json", directory / "original-run.json")
+            protocol = {
+                "schema_version": 2,
+                "harness": harness,
+                "model": model,
+                "effort": effort,
+                "seed": seed,
+                "timeout_seconds": timeout,
+                "jobs": jobs,
+                "stage": "handoff",
+                "selections": frozen["selections"],
+                "review_only": True,
+                "native_accounting": "bound invocation-start receipts",
+                "assessment_input": original_run["assessment_input"],
+                "plan": original_run["plan"],
+                "limitations": limitations,
+                "response_schema": JudgeResponse.model_json_schema(),
+            }
+            frozen_guidance = directory / "guidance"
+            frozen_guidance.mkdir()
+            references = []
+            for index, text in enumerate(contents):
+                path = frozen_guidance / f"{index}.md"
+                path.write_text(text)
+                references.append(study._reference(root, path))
+            criteria_path = directory / "criteria.json"
+            study._write(criteria_path, criteria)
+            protocol.update(
+                revision=revision,
+                guidance=references,
+                criteria=study._reference(root, criteria_path),
+                criteria_sha256=_criteria_digest(criteria),
+            )
+            study._write(directory / "protocol.json", protocol)
+            shutil.copyfile(Path(__file__), directory / "adapter.py")
+            rows = [
+                {
+                    "id": record.id,
+                    "packet_id": uuid.uuid4().hex,
+                    "stage_id": selected.id,
+                    "submission_digest": selected.snapshot.digest if selected.snapshot else None,
+                    "status": "pending",
+                    "observation": None,
+                }
+                for record in records
+                for selected in (selections[record.id],)
+            ]
+            state = {
+                "schema_version": STATE_SCHEMA_VERSION,
+                "status": "running",
+                "assigned": len(rows),
+                "jobs": jobs,
+                "native_invocations": 0,
+                "call_unit": "native judge invocation attempts, not API requests",
+                "records": rows,
+                "limitations": limitations,
+                "protocol": study._reference(root, directory / "protocol.json"),
+                "adapter": study._reference(root, directory / "adapter.py"),
+                "original_run": study._reference(root, directory / "original-run.json"),
+            }
+            study._write(state_path, state)
+            mapping = [
+                {**row, "arm": record.arm, "task_id": record.task_id, "implementation_model": record.model}
+                for row, record in zip(rows, records, strict=True)
+            ]
+            study._write(directory / "mapping.json", mapping)
+            calling = list(range(len(records)))
+            protocol_ref = state["protocol"]
         order = list(range(len(records)))
         random.Random(seed).shuffle(order)
-        invocations = 0
+        wanted = set(calling)
+        order = [index for index in order if index in wanted]
+        invocations = int(state["native_invocations"])
         interrupted: KeyboardInterrupt | None = None
+        if not order:
+            # Every row ended: nothing to call, and the revision is as complete as it can be.
+            state["status"] = (
+                "complete" if all(row["status"] == "reviewed" for row in rows) else "incomplete"
+            )
+            study._write(state_path, state)
+            validate_review_revision(root, revision)
+            return state_path
 
         def validate_shared() -> None:
             validate_review_revision(root, revision, allow_active=True)
@@ -734,18 +1160,6 @@ def review_study(
             # Set once the call's outcome is known; it is `finished` only after its observation
             # is saved with an accepted response.
             ending: tuple[str, str | None] | None = None
-
-            def provider_stop(area: Path) -> study.ProviderStopped | None:
-                """The stop the judge's saved trace records: a limit, auth or provider error."""
-                stop = provider_stops.saved_stop(area / "artifacts", harness)
-                if stop is None:
-                    return None
-                return study.ProviderStopped(
-                    f"the {harness} reviewer stopped on {stop}. No further review call starts in "
-                    "this pass. Once the limit resets or the provider recovers, review again into "
-                    "a new revision with `pluginbench review <run-dir> --revision <name>`",
-                    f"{harness} stopped on {stop}",
-                )
 
             def spawn(pid: int) -> None:
                 nonlocal spawned
@@ -788,6 +1202,8 @@ def review_study(
                 row["packet"] = study._reference(root, binding)
                 observed = directory / "observations" / packet_id
                 observed.mkdir(parents=True)
+                # Written by the launcher directly, so they outlive a crash of this process.
+                artifacts = observed / "artifacts"
                 execution: dict[str, object] = {}
                 response = None
                 # An interrupt, or a cleanup that was not verified, ends the pass once this
@@ -795,7 +1211,7 @@ def review_study(
                 call_interrupted: KeyboardInterrupt | control_store.CleanupBlocked | None = None
                 halted: study.ProviderStopped | None = None
                 row["status"] = "running"
-                with tempfile.TemporaryDirectory(prefix="pluginbench-judge-") as temporary:
+                with tempfile.TemporaryDirectory(prefix=_AREA_PREFIX) as temporary:
                     area = Path(temporary)
                     shutil.copytree(packet, area / "workspace")
                     try:
@@ -814,7 +1230,12 @@ def review_study(
                         )
                         study._write(
                             observed / "native-start.json",
-                            {"packet_id": packet_id, "status": "native judge invocation started"},
+                            {
+                                "packet_id": packet_id,
+                                "status": "native judge invocation started",
+                                "invocation": invocation,
+                                "area": str(area),
+                            },
                         )
                         row["native_start"] = study._reference(root, observed / "native-start.json")
                         study._on_coordinator(
@@ -835,29 +1256,25 @@ def review_study(
                                 prompt=prompt,
                                 timeout=timeout,
                                 output_schema=area / "workspace/response-schema.json",
+                                artifacts=artifacts,
                             ),
                             timeout=operations.review_budget(timeout),
                             docker=None,
                             invocation=invocation,
                             started=spawn,
                         )
-                        if (stopped := provider_stop(area)) is not None:
+                        if (stopped := provider_stop(artifacts)) is not None:
                             raise stopped
-                        if (
-                            study._inventory(area / "workspace") != inventory
-                            or study._inventory(packet) != inventory
-                        ):
-                            raise ValueError("judge mutated the frozen review packet")
-                        study._assert_frozen(root)
-                        for snapshot in (record.before, selected.snapshot):
-                            if inspect_snapshot(snapshot.root)["digest"] != snapshot.digest:
-                                raise ValueError("judge source snapshot changed during review")
-                        _validate_fixed_bindings(root, state["protocol"])
-                        response = _validate_response(
-                            execution=execution,
-                            packet=packet,
-                            packet_id=packet_id,
+                        response = _accept(
                             root=root,
+                            workspace=area / "workspace",
+                            packet=packet,
+                            inventory=inventory,
+                            record=record,
+                            selected=selected,
+                            protocol=protocol_ref,
+                            execution=execution,
+                            packet_id=packet_id,
                             model=model,
                             effort=effort,
                             harness=harness,
@@ -875,7 +1292,7 @@ def review_study(
                     except (Exception, KeyboardInterrupt) as exc:
                         if spawned and not isinstance(exc, (KeyboardInterrupt, study.ProviderStopped)):
                             # The launcher can raise after the trace that records a stop is saved.
-                            exc = provider_stop(area) or exc
+                            exc = provider_stop(artifacts) or exc
                         if spawned and isinstance(exc, study.ProviderStopped):
                             # Given back to the slot, still counted by the ceiling, and the
                             # pass admits no further call, as coding does.
@@ -889,44 +1306,39 @@ def review_study(
                         if isinstance(exc, (KeyboardInterrupt, control_store.CleanupBlocked)):
                             call_interrupted = exc
                     finally:
-                        artifacts = area / "artifacts"
-                        if artifacts.exists() or artifacts.is_symlink():
-                            artifact_error = codex.copy_artifacts(artifacts, observed / "artifacts")
-                            if artifact_error:
-                                row.update(status="unknown", reason=artifact_error)
-                                response = None
-                                execution = codex.parse_events("", [], harness, requested_effort=effort)
-                                execution.update(
-                                    successful_native_completion=False, error=artifact_error
-                                )
-                        if not execution:
+                        artifact_error = _quarantine_artifacts(artifacts)
+                        if artifact_error:
+                            row.update(status="unknown", reason=artifact_error)
+                            response = None
+                            execution = codex.parse_events("", [], harness, requested_effort=effort)
                             execution.update(
-                                _captured_execution(observed / "artifacts", effort, harness)
+                                successful_native_completion=False, error=artifact_error
                             )
+                        if not execution:
+                            execution.update(_captured_execution(artifacts, effort, harness))
                         if call_interrupted is not None:
                             execution.update(successful_native_completion=False, error=row["reason"])
-                        observation = {
-                            "schema_version": 1,
-                            "status": row["status"],
-                            "packet": row["packet"],
-                            "stage_id": selected.id,
-                            "submission_digest": selected.snapshot.digest,
-                            "requested_model": model,
-                            "requested_effort": effort,
-                            "execution": execution,
-                            "response": response.model_dump(mode="json") if response else None,
-                            "method": "AI-identified review judgments; declaration evidence validated against immutable selected submission source",
-                            "limitations": limitations,
-                        }
+                        # `finished` only once the observation that holds the response is saved.
+                        concluded = ending or (
+                            ("finished", None)
+                            if response is not None
+                            else ("failed_transient", str(row.get("reason")))
+                        )
                         observation_path = observed / "observation.json"
-                        study._write(observation_path, observation)
+                        study._write(
+                            observation_path,
+                            observation_of(
+                                status=str(row["status"]),
+                                reason=row.get("reason"),
+                                packet=row["packet"],
+                                selected=selected,
+                                execution=execution,
+                                response=response,
+                                ending=concluded if invocation is not None else None,
+                            ),
+                        )
                         row["observation"] = study._reference(root, observation_path)
-                        if ending is None:
-                            ending = (
-                                ("finished", None)
-                                if response is not None
-                                else ("failed_transient", str(row.get("reason")))
-                            )
+                        ending = concluded
                 if call_interrupted is not None:
                     raise call_interrupted
                 if halted is not None:
@@ -941,6 +1353,8 @@ def review_study(
                         observation=None,
                     )
                 ended = None if invocation is None or ending is None else (invocation, *ending)
+                if ended is not None:
+                    row["ending"] = {"state": ended[1], "error": ended[2]}
                 emit(partial(commit_review, index, copy.deepcopy(row), ended=ended))
 
         try:

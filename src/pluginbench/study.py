@@ -2285,6 +2285,18 @@ def report_study(
                     ),
                     "work": _work(observation["execution"]) if observation else None,
                     "execution": observation.get("execution") if observation else None,
+                    # Earlier calls a resumed pass replaced: operational spend, not this
+                    # record's accepted review.
+                    "superseded": [
+                        {
+                            "status": call["status"],
+                            "reason": call.get("reason"),
+                            "work": _work(_bound_document(root, call["observation"])["execution"])
+                            if call.get("observation")
+                            else None,
+                        }
+                        for call in row.get("superseded", [])
+                    ],
                     "limitations": observation.get("response", {}).get("limitations", [])
                     if observation and observation.get("response")
                     else [],

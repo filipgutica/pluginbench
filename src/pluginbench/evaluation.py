@@ -2192,10 +2192,11 @@ def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path
         if previous_path is not None:
             states.add(previous_path)
         starts = {
-            study._bound_path(evidence, row["native_start"]).resolve()
+            study._bound_path(evidence, call["native_start"]).resolve()
             for path in states
             for row in study._bound_document(evidence, study._reference(evidence, path))["records"]
-            if row.get("native_start") is not None
+            for call in [row, *row.get("superseded", [])]
+            if call.get("native_start") is not None
         }
         config["review_projection"] = {
             "original_revision": original_revision,
