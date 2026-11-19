@@ -20,8 +20,11 @@ two readings, so it can be up to 1 ms below the exact interval rounded up:
   cap of their own.
 - Attempt: `Limits.attempt_ms` from before site discovery, if set.
 
-Every call gets the least of the clocks that apply; on a tie the attempt wins, then the site,
-then the command's own cap. A first run stopped at its own 3B cap is a `timeout_kill`. A site
+Every call gets the least of the clocks that apply, as absolute deadlines; on a tie the attempt
+wins, then the site, then the command's own cap. B and every deadline are on the same clock,
+timed around the whole executor call (`TIMING_BOUNDARY`). The launcher rounds a timeout up to
+whole seconds and times only its exec, so a call can return after its deadline: such a late
+return counts as cut by the limit it overran, and a late green is never `survived`. A first run stopped at its own 3B cap is a `timeout_kill`. A site
 deadline that stops a run or leaves no time for one makes the mutant `unconfirmed`, excluded
 from the denominator: an unfinished confirmation never confirms a kill. The attempt limit
 expiring before every required mutant settles is an infrastructure failure, so the attempt is
@@ -68,7 +71,8 @@ OPERATORS = (
 # version 1 sample, so M = 10 and M = 20 measure the same first ten mutants.
 SAMPLE_SIZE = 20
 V1_SAMPLE_SIZE = 10
-# Mutants run in up to this many lanes at once, one container each.
+# Mutants run in up to this many lanes at once, one container each, where the caller runs one
+# measurement at a time. Every other caller keeps one lane (`Limits.lanes`).
 LANES = 4
 # Each container's limits: four lanes need 8 CPUs and 8,192 MiB.
 MEASUREMENT_CPUS, MEASUREMENT_MEMORY_MB = 2, 2048
@@ -231,11 +235,13 @@ class Limits:
 
     `baseline_ms` caps each unmutated baseline run; None takes the profile's coverage timeout,
     the calibration ceiling a reference measures under. `attempt_ms` is the whole attempt's
-    limit; None leaves only the outer operation's bound.
+    limit; None leaves only the outer operation's bound. `lanes` stays 1 unless the caller
+    guarantees that no other measurement runs at the same time: remeasurement can collect two
+    attempts at once, and four lanes each would need eight containers.
     """
 
     sample_size: int = SAMPLE_SIZE
-    lanes: int = LANES
+    lanes: int = 1
     baseline_ms: int | None = None
     attempt_ms: int | None = None
 
@@ -548,8 +554,19 @@ def suite_status(run: Run, process_exit: bool = False) -> int | None:
 
 
 def _cut(call: Mapping[str, object]) -> str | None:
-    """The clock that stopped a version 2 call or left it no time; None when it ran to an exit."""
-    if call["dispatched"] is True and call["timed_out"] is not True:
+    """The clock that stopped a version 2 call, left it no time, or that it overran; None when it
+    ran to an exit within its time.
+
+    The launcher rounds a timeout up to whole seconds and starts its own timer after container
+    setup, so it can return an exit after the engine's limit. Such a late exit counts as cut by
+    the limit it overran, whatever its status: a late green is never `survived`. An exit exactly
+    at the limit is on time.
+    """
+    if (
+        call["dispatched"] is True
+        and call["timed_out"] is not True
+        and int(str(call["elapsed_ms"])) <= int(str(call["timeout_ms"]))
+    ):
         return None
     return str(call["bound"])
 
@@ -855,7 +872,7 @@ class _Attempt:
             stdout_sha256=_digest(directory / "stdout.txt"),
         )
         calls.append(record)
-        if run.timed_out and bound == "attempt":
+        if bound == "attempt" and _cut(record) is not None:
             raise self.expired(started + took)
 
 
@@ -914,6 +931,15 @@ def _mutated(tree: Path, site: Site, work: Path) -> tuple[Path, str]:
 
 def _baseline(runs: list[dict[str, object]]) -> bool:
     return all(run.get("suite_status") == 0 for run in runs)
+
+
+def _green(runs: list[dict[str, object]]) -> bool:
+    """Two version 2 baselines that each ran green within their limits."""
+    return len(runs) == 2 and all(_cut(run) is None for run in runs) and _baseline(runs)
+
+
+def _tsc_ran_v2(destination: Path, result: dict[str, object]) -> bool:
+    return _cut(result) is None and _tsc_ran(destination, result)
 
 
 def _slowest(runs: list[dict[str, object]]) -> int:
@@ -1027,7 +1053,8 @@ def _collect(
     )
     if execute is None:
         measured = measurement_identity(identity)
-        _check_capacity(measured, limits.lanes)
+        if limits.lanes > 1:
+            _check_capacity(measured, limits.lanes)
         execute = native_executor(
             measured, str(coverage["report_path"]), provisioned_tool=coverage.get("provisioned_tool"),
             provisioned_scope=_strings(coverage.get("source_scope") or ["*"])
@@ -1121,7 +1148,7 @@ def _run_required(
             baseline, root, command, attempt.serial_name("baseline"), label="baseline",
             cap_ms=baseline_ms,
         )
-    if not _baseline(baseline):
+    if not _green(baseline):
         return
     slowest = _slowest(baseline)
     if any(_check_command(site.path) == TSC_CHECK for site in selected):
@@ -1133,7 +1160,7 @@ def _run_required(
             )
         finally:
             report["check_baseline"] = checks[0] if checks else None
-        if not _tsc_ran(attempt.destination, checks[0]):
+        if not _tsc_ran_v2(attempt.destination, checks[0]):
             return
     records: dict[int, dict[str, object]] = {}
 
@@ -1239,7 +1266,7 @@ def _run_diagnostics(
             baseline, tree, command, attempt.serial_name("source-only-baseline"),
             label="source-only-baseline", cap_ms=baseline_ms,
         )
-    if not _baseline(baseline):
+    if not _green(baseline):
         return
     slowest = _slowest(baseline)
 
@@ -1671,10 +1698,12 @@ def _tsc_baseline_problem(
     tsc: object,
     selected: list[Site],
     validate: Callable[[object], object] | None = None,
+    ran: Callable[[Path, dict[str, object]], bool] = _tsc_ran,
 ) -> str | None:
     """Why the TypeScript mutants cannot be checked, if so; the tsc baseline runs only for them.
 
-    `validate` checks the tsc run's record; version 1's rule is the default.
+    `validate` checks the tsc run's record and `ran` whether it ran to a known result; version
+    1's rules are the defaults.
     """
     if any(_check_command(site.path) == TSC_CHECK for site in selected) != (tsc is not None):
         raise ValueError("the tsc baseline run differs from the TypeScript mutants it serves")
@@ -1684,7 +1713,7 @@ def _tsc_baseline_problem(
         measured.receipts.runs([tsc], TSC_CHECK, measured.after, measured.suite_timeout)
     else:
         validate(tsc)
-    if not _tsc_ran(measured.directory, _object(tsc)):
+    if not ran(measured.directory, _object(tsc)):
         return "tsc did not report diagnostics on the unmutated tree"
     return None
 
@@ -1800,7 +1829,7 @@ def _metrics_v2(
             report["baseline"], measured.command, measured.after,
             lambda _: (baseline_ms, None, attempt),
         )
-        green = len(baseline) == 2 and _baseline(baseline)
+        green = _green(baseline)
         cut_before_tsc = (
             failure is not None
             and report["check_baseline"] is None
@@ -1814,6 +1843,7 @@ def _metrics_v2(
                 lambda tsc: measured.receipts.calls(
                     [tsc], TSC_CHECK, measured.after, lambda _: (baseline_ms, None, attempt)
                 ),
+                _tsc_ran_v2,
             )
             if problem:
                 incomplete.append(problem)
@@ -1962,7 +1992,7 @@ def _source_only_v2(
         if baseline:
             raise ValueError("a source-only baseline ran with no kill to diagnose")
         return share
-    if len(baseline) != 2 or not _baseline(baseline):
+    if not _green(baseline):
         if interruption is not None:
             return {"status": "incomplete", "reason": "the source-only diagnostic was cut"}
         return {"status": "unavailable", "reason": "source-only baseline red or unstable"}
@@ -2180,6 +2210,13 @@ def compare_mutation(
     result["decision_line_coverage"] = _decision_line_coverage(metrics, coverage_metrics)
     coordinates = _object(coverage_metrics.get("coordinates") or {})
     lines = coordinates.get("line")
+    if "partial_counts" in metrics and metrics["status"] == "incomplete":
+        # A version 2 attempt's settled mutants are partial: no split of them is published.
+        result["execution_split"] = {
+            "status": "incomplete",
+            "reason": "the attempt's mutant outcomes are partial",
+        }
+        return result
     if not isinstance(lines, dict):
         result["execution_split"] = {
             "status": "unavailable",

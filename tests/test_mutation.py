@@ -304,14 +304,17 @@ class Fake:
     """Answers each run from the tree it is given; records the commands and timeouts it saw.
 
     Each run advances `clock` by its duration, one second unless `duration` says otherwise. A
-    run that needs longer than its timeout times out at it. Lanes call it from several threads,
-    so it counts the calls running at once.
+    run that needs longer than its timeout times out at it, unless `late` is set: the real
+    launcher rounds a timeout up to whole seconds and times only its exec, so it can return an
+    exit after the engine's limit. Lanes call it from several threads, so it counts the calls
+    running at once.
     """
 
     def __init__(
         self, behaviour: Behaviour, before: Path, after: Path, clock: Clock | None = None,
-        duration: Duration | None = None,
+        duration: Duration | None = None, late: bool = False,
     ) -> None:
+        self.late = late
         self.behaviour = behaviour
         self.versions = (_files(before), _files(after))
         self.calls: list[tuple[list[str], dict[str, str], int]] = []
@@ -343,7 +346,7 @@ class Fake:
                 (destination / "execution.json").write_text(json.dumps({"error": str(error)}))
                 raise
             took = self.duration(view, timeout)
-            timed_out = timed_out or took > timeout
+            timed_out = timed_out or (took > timeout and not self.late)
             self.clock.advance(timeout if timed_out else took)
         finally:
             with self.lock:
@@ -368,13 +371,14 @@ def _measure(
     name: str = "src/grade.py",
     limits: mutation.Limits | None = None,
     duration: Duration | None = None,
+    late: bool = False,
 ) -> tuple[dict[str, object], Fake, Path]:
     before = _tree(tmp_path / "before", {name: BEFORE, "tests/test_grade.py": "x\n"})
     files = {name: AFTER, "tests/test_grade.py": "x\n", **(after or {})}
     submitted = _tree(tmp_path / "after", files)
     destination = tmp_path / "evidence"
     destination.mkdir()
-    fake = Fake(behaviour, before, submitted, duration=duration)
+    fake = Fake(behaviour, before, submitted, duration=duration, late=late)
     report = mutation.collect_mutation(
         submitted, before, config or _config(), destination, execute=fake, limits=limits,
         clock=fake.clock,
@@ -1083,8 +1087,10 @@ def test_collected_evidence_binds_its_report_and_the_attempt_diff(
     refs = {"mutation": str(paths["mutation"].resolve())}
     measured = evaluate_evidence(after, refs, evidence)["mutation"]
     assert measured["status"] == "available"  # type: ignore[index]
-    # Docker must hold all four lanes before the first container starts.
-    assert capacity == [(4, 4)]
+    # A submission collector may run beside another attempt's, so it keeps one lane and needs
+    # no capacity beyond its one container's.
+    assert capacity == []
+    assert json.loads((paths["mutation"].parent / "report.json").read_text())["lanes"] == 1
     change = compare_snapshots(before, after)
     coverage = {
         "metrics": {
@@ -1465,9 +1471,9 @@ def test_four_lanes_never_become_five(tmp_path: Path) -> None:
         return 0, False, ""
 
     report, fake, destination = _measure(
-        tmp_path, behaviour, after={"src/grade.py": _lines(12)}
+        tmp_path, behaviour, after={"src/grade.py": _lines(12)}, limits=mutation.Limits(lanes=4)
     )
-    assert fake.most_active == 4
+    assert fake.most_active == 4 and report["lanes"] == 4
     metrics = _metrics(report, destination)
     assert (metrics["survived"], metrics["selected"]) == (12, 12)
 
@@ -1486,7 +1492,9 @@ def test_results_follow_the_sample_whatever_order_lanes_finish_in(tmp_path: Path
                 others.release()
         return 0, False, ""
 
-    report, _, destination = _measure(tmp_path, behaviour, after={"src/grade.py": _lines(4)})
+    report, _, destination = _measure(
+        tmp_path, behaviour, after={"src/grade.py": _lines(4)}, limits=mutation.Limits(lanes=4)
+    )
     assert order[-1] == 0 and sorted(order) == [0, 1, 2, 3]
     assert [_object(item)["site"] for item in _list(report["mutants"])] == [0, 1, 2, 3]
     metrics = _metrics(report, destination)
@@ -1522,6 +1530,15 @@ def test_the_attempt_limit_expiring_is_infrastructure_with_its_partial_counts_ap
     # The cut run kept its record: the attempt's limit bound it.
     cut = _object(_list(_object(_list(report["mutants"])[3])["runs"])[0])
     assert (cut["bound"], cut["timeout_ms"], cut["timed_out"]) == ("attempt", 500, True)
+    # Partial outcomes publish no execution split either.
+    change = compare_snapshots(tmp_path / "before", tmp_path / "after")
+    coverage: dict[str, object] = {
+        "metrics": {"coordinates": {"line": {"total": ["src/grade.py:1"], "covered": []}}}
+    }
+    compared = mutation.compare_mutation({"metrics": metrics}, coverage, change)
+    assert compared["status"] == "incomplete" and compared["killed"] is None
+    assert _object(compared["execution_split"])["status"] == "incomplete"
+    assert _object(compared["partial_counts"])["survived"] == 3
     # A forged expiry needs the limit it names.
     _object(report["clocks"])["attempt_ms"] = None
     with pytest.raises(ValueError):
@@ -1578,3 +1595,63 @@ def test_a_version_1_report_still_validates() -> None:
         mutation.mutation_metrics(
             tampered, fixture / "evidence", config=config, snapshot=fixture / "after"
         )
+
+
+# --- Version 2: a launcher that returns after the engine's limit ---------------------------
+
+
+def test_a_late_green_baseline_under_the_attempt_limit_is_infrastructure(tmp_path: Path) -> None:
+    # The launcher takes 750 ms for a 500 ms attempt and still reports a green exit.
+    report, _, destination = _measure(
+        tmp_path, _passing(lambda view: 0), limits=_one_lane(attempt_ms=500),
+        duration=lambda view, timeout: 750, late=True,
+    )
+    first = _object(_list(report["baseline"])[0])
+    assert (first["timed_out"], first["suite_status"], first["elapsed_ms"]) == (False, 0, 750)
+    assert _object(report["infrastructure_failure"])["cause"] == "attempt_deadline"
+    metrics = _metrics(report, destination)
+    assert metrics["status"] == "incomplete" and metrics["killed"] is None
+
+
+@pytest.mark.parametrize(
+    ("first_ms", "outcome"),
+    [
+        (3000, "survived"),  # A green exit exactly at its 3B cap is on time.
+        (3001, "timeout_kill"),  # One millisecond late: stopped at its own cap.
+    ],
+)
+def test_a_late_first_run_is_cut_by_its_own_cap_whatever_it_exits_with(
+    tmp_path: Path, first_ms: int, outcome: str
+) -> None:
+    report, _, destination = _measure(
+        tmp_path, _passing(lambda view: 0), limits=_one_lane(), late=True,
+        duration=lambda view, timeout: first_ms if view.mutated and FIRST in view.source else 1000,
+    )
+    metrics = _metrics(report, destination)
+    assert _object(_list(metrics["mutants"])[0])["outcome"] == outcome
+    assert metrics["status"] == "available"
+
+
+@pytest.mark.parametrize(
+    ("first_ms", "outcome"),
+    [(3000, "survived"), (3001, "unconfirmed")],
+)
+def test_a_late_run_where_the_site_and_its_cap_tie_is_cut_by_the_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_ms: int, outcome: str
+) -> None:
+    # The check takes 3,000 ms of the site's 6,000, so the first run's 3,000 ms cap ties the
+    # site's remaining time: a late green belongs to the site, never to the command.
+    _fake_check(monkeypatch)
+
+    def duration(view: View, timeout: int) -> int:
+        if view.mutated and FIRST in view.source:
+            return 3000 if view.command == mutation.GO_CHECK else first_ms
+        return 1000
+
+    report, _, destination = _measure(
+        tmp_path, lambda view: (0, False, ""), limits=_one_lane(), late=True, duration=duration,
+    )
+    run = _object(_list(_object(_list(report["mutants"])[0])["runs"])[0])
+    assert (run["bound"], run["timeout_ms"]) == ("site", 3000)
+    metrics = _metrics(report, destination)
+    assert _object(_list(metrics["mutants"])[0])["outcome"] == outcome
