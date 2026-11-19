@@ -293,7 +293,7 @@ def _command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *options: str, after: str = AFTER,
     ended: BaseException | None = None, engine: object = _RUNTIME["docker_engine"],
     profile_changes: dict[str, object] | None = None, behaviour: Any = None,
-    standalone: bool = True, answering: str = "daemon",
+    standalone: bool = True, answering: str = "daemon", stray: str | None = None,
 ) -> tuple[Any, list[OperationRequest], dict[str, Any]]:
     """Run `reference-mutation` on a prepared profile, each container a fake run on a fake
     clock. Returns the result, the operations it ran and what the executor saw. `ended` is
@@ -301,7 +301,8 @@ def _command(
     deadline that fires as the handler finishes. `engine` and `profile_changes` alter the
     prepared profile; a repeated option overrides the default before it. Without
     `standalone`, a usage error is raised as itself rather than rendered for a terminal.
-    `answering` is the engine ID Docker gives at the profile's socket."""
+    `answering` is the engine ID Docker gives at the profile's socket. `stray` names a file
+    each run leaves in its receipt directory, as a source copy the executor could not remove."""
     before = _tree(tmp_path / "before", {"src/grade.py": BEFORE})
     after_tree = _tree(tmp_path / "after", {"src/grade.py": after})
     behaviour = behaviour or _passing(lambda view: int(FIRST in view.source))
@@ -327,7 +328,7 @@ def _command(
             raise ended
         return value
 
-    def executor(identity: dict[str, object], *args: Any, **kwargs: Any) -> Fake:
+    def executor(identity: dict[str, object], *args: Any, **kwargs: Any) -> mutation.Executor:
         lock = run_lock.held_execution()
         # The check `harbor_backend._docker` runs before every create, on the daemon this
         # identity names, and the label the create then carries.
@@ -339,7 +340,18 @@ def _command(
             invocation=invocation_runtime.current(), identity=identity,
             lock=None if lock is None else lock.record["kind"],
         )
-        return fake
+        if stray is None:
+            return fake
+
+        def leaving(
+            tree: Path, command: list[str], timeout: int, destination: Path
+        ) -> mutation.Run:
+            run = fake(tree, command, timeout, destination)
+            (destination / stray).parent.mkdir(parents=True, exist_ok=True)
+            (destination / stray).write_text("{}")
+            return run
+
+        return leaving
 
     monkeypatch.setattr(invocation_runtime, "run_operation", recording)
     monkeypatch.setattr(
@@ -463,6 +475,28 @@ def test_a_publication_that_fails_records_why_and_its_output_names_the_cleanup_t
                                   "--output", str(output))
     assert again.exit_code == 2 and requests == []
     assert f"first remove it with `rm -r {output}`" in again.output
+
+
+def test_only_the_evidence_the_pilot_is_meant_to_output_is_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run whose source copy could not be removed leaves it, receipt-named file included:
+    it stays in staging, and the published pilot holds only the expected files."""
+    result, _, _ = _command(
+        tmp_path, monkeypatch, "--attempt-seconds", "600", stray="after/mutation.receipt.json"
+    )
+    assert result.exit_code == 0, result.output
+    published = tmp_path / "reference" / cli.PILOT_DIRECTORY
+    files = sorted(path.relative_to(published) for path in published.rglob("*") if path.is_file())
+    assert Path(cli.PILOT_FILE) in files and Path("repeat-0/report.json") in files
+    assert {path.name for path in files} == {
+        cli.PILOT_FILE, "report.json", "execution.json", "stdout.txt",
+    }
+    assert not list(published.rglob("*.receipt.json")) and not list(published.rglob("after"))
+    # Each run's stray stays behind, unpublished.
+    runs = sum(path.name == "execution.json" for path in files)
+    left = tmp_path / "reference" / "staging"
+    assert len(list(left.rglob("mutation.receipt.json"))) == runs > 0
 
 
 def test_the_pilot_sets_m_lanes_and_the_limit_and_sees_a_censored_repeat(

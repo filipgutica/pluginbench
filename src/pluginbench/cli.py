@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import sqlite3
@@ -14,7 +15,13 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from contextlib import (
+    AbstractContextManager,
+    ExitStack,
+    contextmanager,
+    nullcontext,
+    suppress,
+)
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -673,10 +680,7 @@ def reference_mutation(
                     "reference", arguments,
                     timeout=operations.reference_budget(arguments.attempt_ms), docker=runtime,
                 )
-                # The manifest joins the repeats, and one rename publishes them together.
-                _write_json(staging / PILOT_FILE, {"kind": "reference-mutation-pilot",
-                                                   "facts": facts})
-                staging.rename(published)
+                _publish_pilot(staging, published, facts)
             except BaseException as exc:
                 _record_unpublished(destination, exc)
                 raise
@@ -691,6 +695,45 @@ def reference_mutation(
         control_store.CleanupBlocked,
     ) as exc:
         _error(exc)
+
+
+# What each repeat's runs leave that the pilot publishes, beside the repeat's report.json.
+_RUN_EVIDENCE = frozenset({"execution.json", "stdout.txt", mutation.PRELAUNCH_FAILURE})
+
+
+def _publish_pilot(staging: Path, published: Path, facts: dict[str, Any]) -> None:
+    """Publish the pilot's expected evidence and its manifest together, with one rename.
+
+    Only what the pilot is meant to output moves: each repeat's report, and its runs' receipts,
+    output and prelaunch failures. Anything else a run left, such as a source copy the executor
+    could not remove, stays in staging, unpublished.
+    """
+    assembly = staging.parent / ".publication"
+    assembly.mkdir()
+    _write_json(assembly / PILOT_FILE, {"kind": "reference-mutation-pilot", "facts": facts})
+    for path in sorted(staging.rglob("*")):
+        relative = path.relative_to(staging)
+        if path.is_file() and not path.is_symlink() and _pilot_evidence(relative):
+            (assembly / relative).parent.mkdir(parents=True, exist_ok=True)
+            path.rename(assembly / relative)
+    assembly.rename(published)
+    # What is left of staging goes once empty; a directory holding anything else stays.
+    for directory in sorted((p for p in staging.rglob("*") if p.is_dir()), reverse=True):
+        with suppress(OSError):
+            directory.rmdir()
+    with suppress(OSError):
+        staging.rmdir()
+
+
+def _pilot_evidence(relative: Path) -> bool:
+    """Whether a staged file is one the pilot publishes (`_publish_pilot`)."""
+    if len(relative.parts) < 2 or not re.fullmatch(r"repeat-\d+", relative.parts[0]):
+        return False
+    inside = Path(*relative.parts[1:])
+    if inside == Path("report.json"):
+        return True
+    receipts = mutation._RECEIPTS[mutation.VERSION]
+    return inside.name in _RUN_EVIDENCE and bool(receipts.fullmatch(inside.parent.as_posix()))
 
 
 def _record_unpublished(destination: Path, exc: BaseException) -> None:
