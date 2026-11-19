@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -1727,3 +1728,34 @@ def test_a_late_diagnostic_return_past_the_attempt_limit_leaves_only_the_share_i
     del source["interrupted"]
     with pytest.raises(ValueError, match="diagnostic overran the attempt limit"):
         _metrics(report, destination)
+
+
+@pytest.mark.parametrize(("discovery_ms", "overran"), [(100, False), (101, True)])
+def test_discovery_past_the_attempt_limit_is_infrastructure_with_nothing_sampled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, discovery_ms: int, overran: bool
+) -> None:
+    # A changed Python line with no eligible site; discovery takes `discovery_ms` of 100 ms.
+    before = _tree(tmp_path / "before", {"src/grade.py": BEFORE})
+    after = _tree(tmp_path / "after", {"src/grade.py": BEFORE + "x = 1\n"})
+    destination = tmp_path / "evidence"
+    destination.mkdir()
+    fake = Fake(_passing(lambda view: 0), before, after)
+    find = mutation.find_sites
+
+    def slow(*args: Any, **kwargs: Any) -> Any:
+        fake.clock.advance(discovery_ms)
+        return find(*args, **kwargs)
+
+    monkeypatch.setattr(mutation, "find_sites", slow)
+    report = mutation.collect_mutation(
+        after, before, _config(), destination, execute=fake,
+        limits=_one_lane(attempt_ms=100), clock=fake.clock,
+    )
+    assert report["selected"] == [] and not fake.calls
+    metrics = _metrics(json.loads(json.dumps(report)), destination)
+    if not overran:
+        assert report["infrastructure_failure"] is None
+        assert metrics["status"] == "unavailable"
+        return
+    assert _object(report["infrastructure_failure"])["cause"] == "attempt_deadline"
+    assert metrics["status"] == "incomplete" and metrics["killed"] is None

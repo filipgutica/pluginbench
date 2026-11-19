@@ -1119,6 +1119,12 @@ def _collect(
         "finished_ms": None,
         "python": f"{sys.version_info.major}.{sys.version_info.minor}",
     }
+    if not selected:
+        # Discovery counts against the attempt; with sites, the first baseline checks it.
+        try:
+            attempt.kept_limit()
+        except AttemptDeadline as error:
+            report["infrastructure_failure"] = _failure(error, attempt)
     if selected:
         command = [str(item) for item in coverage["command"]]
         with tempfile.TemporaryDirectory(prefix="pluginbench-mutation-") as temporary:
