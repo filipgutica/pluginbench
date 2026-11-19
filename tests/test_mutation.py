@@ -7,9 +7,11 @@ import hashlib
 import json
 import shutil
 import subprocess
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -136,9 +138,9 @@ def test_sample_takes_one_mutant_per_line_round_robin_over_operators() -> None:
     assert mutation.sample(candidates, "sha256:other") != chosen
 
 
-def test_sample_stops_at_ten_and_takes_every_line_when_fewer() -> None:
+def test_sample_stops_at_m_and_takes_every_line_when_fewer() -> None:
     many = [_site("a.py", line, "relational_boundary") for line in range(1, 30)]
-    assert len(mutation.sample(many, "sha256:x")) == mutation.SAMPLE_SIZE == 10
+    assert len(mutation.sample(many, "sha256:x")) == mutation.SAMPLE_SIZE == 20
     few = [_site("a.py", 1, "relational_boundary"), _site("a.py", 2, "boolean_connective", 3)]
     assert sorted(site.line for site in mutation.sample(few, "sha256:x")) == [1, 2]
 
@@ -159,13 +161,13 @@ def test_sample_stops_at_ten_and_takes_every_line_when_fewer() -> None:
 def test_suite_status_needs_exactly_one_marker_and_a_recorded_exit(
     stdout: str, exit_code: int | None, timed_out: bool, status: int | None
 ) -> None:
-    assert mutation.suite_status(Run(exit_code, timed_out, stdout, 1.0)) == status
+    assert mutation.suite_status(Run(exit_code, timed_out, stdout)) == status
 
 
 def test_csstree_takes_its_suite_status_from_the_process_exit() -> None:
     assert "https://github.com/csstree/csstree" in mutation.PROCESS_EXIT_REPOSITORIES
-    assert mutation.suite_status(Run(2, False, "no marker\n", 1.0), process_exit=True) == 2
-    assert mutation.suite_status(Run(None, False, "", 1.0), process_exit=True) is None
+    assert mutation.suite_status(Run(2, False, "no marker\n"), process_exit=True) == 2
+    assert mutation.suite_status(Run(None, False, ""), process_exit=True) is None
 
 
 TSC_SITE = Site("src/a.ts", 3, 9, "relational_boundary", 0, 1, "<", "<=")
@@ -193,7 +195,42 @@ def _tree(path: Path, files: dict[str, str]) -> Path:
     return path
 
 
-IMAGE = {"image_identity": {"image_id": "sha256:image"}}
+# A prepared task: the installed coding image on top of its base image. Mutation measures in
+# the base image, at two CPUs and 2,048 MiB.
+BASE_IMAGE = {"image_id": "sha256:base", "workdir": "/app"}
+IMAGE = {
+    "image_identity": {"image_id": "sha256:installed"},
+    "toolchain_identity": {"image_id": "sha256:installed", "base_image_identity": BASE_IMAGE},
+    "isolation": {"resources": {"cpus": 1, "memory_mb": 4096}},
+    "resources": {"cpus": 1, "memory_mb": 4096},
+}
+RESOURCES = {"cpus": 2, "memory_mb": 2048}
+
+
+class Clock:
+    """A monotonic clock each thread advances on its own timeline, as parallel lanes do.
+
+    A lane's first reading starts at the latest time any thread reached; the thread that made
+    the clock always reads that latest time, as it does after joining its lanes.
+    """
+
+    def __init__(self) -> None:
+        self.owner = threading.get_ident()
+        self.latest = 0
+        self.local = threading.local()
+        self.lock = threading.Lock()
+
+    def __call__(self) -> int:
+        with self.lock:
+            if threading.get_ident() == self.owner or not hasattr(self.local, "ns"):
+                self.local.ns = self.latest
+            return int(self.local.ns)
+
+    def advance(self, ms: int) -> None:
+        self()
+        with self.lock:
+            self.local.ns += ms * 1_000_000
+            self.latest = max(self.latest, self.local.ns)
 
 
 def _config(**changes: object) -> dict[str, object]:
@@ -218,6 +255,8 @@ class View:
     command: list[str]
     mutated: bool
     seen: int
+    # The sample index of the mutant this run measures, from its receipt directory's name.
+    site: int | None = None
 
     @property
     def source(self) -> str:
@@ -234,7 +273,8 @@ def _receipt(destination: Path, tree: Path, command: list[str], run: Run) -> Non
         json.dumps(
             {
                 "command": command,
-                "image_id": IMAGE["image_identity"]["image_id"],
+                "image_id": BASE_IMAGE["image_id"],
+                "resources": RESOURCES,
                 "before_digest": inspect_snapshot(tree)["digest"],
                 "exit_code": run.exit_code,
                 "timed_out": run.timed_out,
@@ -252,13 +292,33 @@ def _files(tree: Path) -> dict[str, str]:
     }
 
 
-class Fake:
-    """Answers each run from the tree it is given; records the commands and timeouts it saw."""
+# How long a fake run takes in milliseconds, given what it sees and its timeout.
+Duration = Callable[[View, int], int]
 
-    def __init__(self, behaviour: Behaviour, before: Path, after: Path) -> None:
+
+def _second_or_timeout(view: View, timeout: int) -> int:
+    return 1000
+
+
+class Fake:
+    """Answers each run from the tree it is given; records the commands and timeouts it saw.
+
+    Each run advances `clock` by its duration, one second unless `duration` says otherwise. A
+    run that needs longer than its timeout times out at it. Lanes call it from several threads,
+    so it counts the calls running at once.
+    """
+
+    def __init__(
+        self, behaviour: Behaviour, before: Path, after: Path, clock: Clock | None = None,
+        duration: Duration | None = None,
+    ) -> None:
         self.behaviour = behaviour
         self.versions = (_files(before), _files(after))
         self.calls: list[tuple[list[str], dict[str, str], int]] = []
+        self.clock = clock or Clock()
+        self.duration = duration or _second_or_timeout
+        self.lock = threading.Lock()
+        self.active = self.most_active = 0
 
     def __call__(self, tree: Path, command: list[str], timeout: int, destination: Path) -> Run:
         files = _files(tree)
@@ -267,16 +327,29 @@ class Fake:
             all(version.get(path) != text for version in self.versions)
             for path, text in files.items()
         )
-        seen = sum(1 for call in self.calls if call[1] == files and call[0] == command)
-        self.calls.append((command, files, timeout))
+        with self.lock:
+            seen = sum(1 for call in self.calls if call[1] == files and call[0] == command)
+            self.calls.append((command, files, timeout))
+            self.active += 1
+            self.most_active = max(self.most_active, self.active)
+        named = destination.parent.name
+        site = int(named.removeprefix("site-")) if named.startswith("site-") else None
+        view = View(files, command, mutated, seen, site)
         try:
-            status, timed_out, extra = self.behaviour(View(files, command, mutated, seen))
-        except mutation.InfrastructureFailure as error:
-            # The launcher writes its receipt, with the error, whatever happens.
-            (destination / "execution.json").write_text(json.dumps({"error": str(error)}))
-            raise
+            try:
+                status, timed_out, extra = self.behaviour(view)
+            except mutation.InfrastructureFailure as error:
+                # The launcher writes its receipt, with the error, whatever happens.
+                (destination / "execution.json").write_text(json.dumps({"error": str(error)}))
+                raise
+            took = self.duration(view, timeout)
+            timed_out = timed_out or took > timeout
+            self.clock.advance(timeout if timed_out else took)
+        finally:
+            with self.lock:
+                self.active -= 1
         marker = "" if status is None else f"PB-SUITE-EXIT {status}\n"
-        run = Run(None if timed_out else status, timed_out, extra + marker, 1.0)
+        run = Run(None if timed_out else status, timed_out, extra + marker)
         _receipt(destination, tree, command, run)
         return run
 
@@ -293,15 +366,18 @@ def _measure(
     after: dict[str, str] | None = None,
     config: dict[str, object] | None = None,
     name: str = "src/grade.py",
+    limits: mutation.Limits | None = None,
+    duration: Duration | None = None,
 ) -> tuple[dict[str, object], Fake, Path]:
     before = _tree(tmp_path / "before", {name: BEFORE, "tests/test_grade.py": "x\n"})
     files = {name: AFTER, "tests/test_grade.py": "x\n", **(after or {})}
     submitted = _tree(tmp_path / "after", files)
     destination = tmp_path / "evidence"
     destination.mkdir()
-    fake = Fake(behaviour, before, submitted)
+    fake = Fake(behaviour, before, submitted, duration=duration)
     report = mutation.collect_mutation(
-        submitted, before, config or _config(), destination, execute=fake
+        submitted, before, config or _config(), destination, execute=fake, limits=limits,
+        clock=fake.clock,
     )
     return json.loads(json.dumps(report)), fake, destination
 
@@ -329,9 +405,9 @@ def test_kills_are_confirmed_by_one_rerun_and_survivors_run_once(tmp_path: Path)
         "src/grade.py:2",
         "src/grade.py:4",
     ]
-    # Two baseline runs, the kill and its confirmation, then the survivor once; mutants get
-    # three times the slower baseline plus a minute.
-    assert [call[2] for call in fake.calls] == [100, 100, 63, 63, 63]
+    # Two baseline runs at the profile's 100 s, then, in lanes, each mutant's first run at its
+    # 3B cap, B being one second, and the kill's confirmation at what is left of its 6B.
+    assert sorted(call[2] for call in fake.calls) == [3000, 3000, 5000, 100_000, 100_000]
     # No test file changed, so the share is a measured zero with no source-only runs.
     assert metrics["test_change_kill_share"] == {
         "status": "available",
@@ -360,7 +436,9 @@ def test_a_timeout_counts_as_a_kill_without_a_rerun(tmp_path: Path) -> None:
     assert len(fake.calls) == 4
 
 
-def test_a_kill_whose_confirmation_times_out_is_reported_timed_out(tmp_path: Path) -> None:
+def test_a_kill_whose_confirmation_the_deadline_cuts_is_unconfirmed_never_a_kill(
+    tmp_path: Path,
+) -> None:
     report, _, destination = _measure(
         tmp_path,
         lambda view: (
@@ -370,8 +448,9 @@ def test_a_kill_whose_confirmation_times_out_is_reported_timed_out(tmp_path: Pat
         ),
     )
     metrics = _metrics(report, destination)
-    assert (metrics["killed"], metrics["timed_out"], metrics["survived"]) == (1, 1, 1)
-    assert _object(_list(metrics["mutants"])[0])["outcome"] == "timeout"
+    assert (metrics["killed"], metrics["timed_out"], metrics["unconfirmed"]) == (0, 0, 1)
+    assert (metrics["survived"], metrics["valid"], metrics["bug_catch_percent"]) == (1, 1, 0.0)
+    assert _object(_list(metrics["mutants"])[0])["outcome"] == "unconfirmed"
 
 
 def test_the_share_is_a_measured_zero_without_test_changes_whatever_the_headline(
@@ -467,7 +546,7 @@ def test_the_native_executor_tells_infrastructure_failures_from_integrity_violat
     monkeypatch.setattr(harbor_backend, "run_native_command", native)
     execute = mutation.native_executor({}, "cov.json")
     with pytest.raises(Exception) as raised:
-        execute(tmp_path, ["suite"], 10, tmp_path / "run")
+        execute(tmp_path, ["suite"], 10_000, tmp_path / "run")
     assert type(raised.value) is kind
 
 
@@ -518,7 +597,10 @@ def test_docker_lost_before_launch_leaves_the_attempt_incomplete_and_drift_fails
     before = _tree(tmp_path / "before", {"src/grade.py": BEFORE})
     after = _tree(tmp_path / "after", {"src/grade.py": AFTER})
 
+    clock = Clock()
+
     def native(**kwargs: object) -> dict[str, object]:
+        clock.advance(1000)
         snapshot, destination, command = (
             kwargs["snapshot"],
             kwargs["destination"],
@@ -529,7 +611,7 @@ def test_docker_lost_before_launch_leaves_the_attempt_incomplete_and_drift_fails
         # The launcher's runtime check fails on the first mutant, before it writes a receipt.
         if (snapshot / "src/grade.py").read_text() != AFTER:
             raise error
-        _receipt(destination, snapshot, command, Run(0, False, "PB-SUITE-EXIT 0\n", 1))
+        _receipt(destination, snapshot, command, Run(0, False, "PB-SUITE-EXIT 0\n"))
         return dict(json.loads((destination / "execution.json").read_text()))
 
     monkeypatch.setattr(harbor_backend, "run_native_command", native)
@@ -538,9 +620,13 @@ def test_docker_lost_before_launch_leaves_the_attempt_incomplete_and_drift_fails
     execute = mutation.native_executor({}, "cov.json")
     if kind == "drift":
         with pytest.raises(isolation.RuntimeDriftError):
-            mutation.collect_mutation(after, before, _config(), destination, execute=execute)
+            mutation.collect_mutation(
+                after, before, _config(), destination, execute=execute, clock=clock
+            )
         return
-    report = mutation.collect_mutation(after, before, _config(), destination, execute=execute)
+    report = mutation.collect_mutation(
+        after, before, _config(), destination, execute=execute, clock=clock
+    )
     metrics = mutation.mutation_metrics(report, destination, config=_config(), snapshot=after)
     assert metrics["status"] == "incomplete"
     assert str(metrics["reason"]).startswith(f"infrastructure failure: {_UNVERIFIED}: ")
@@ -582,7 +668,10 @@ def test_a_run_without_a_suite_status_leaves_the_attempt_incomplete(tmp_path: Pa
         lambda view: (0, False, "PB-SUITE-EXIT 1\n" if SECOND in view.source else ""),
     )
     metrics = _metrics(report, destination)
-    assert metrics["status"] == "incomplete" and metrics["errors"] == 1
+    # An incomplete attempt's counts are partial, under their own key, never pooled ones.
+    assert metrics["status"] == "incomplete" and metrics["errors"] is None
+    assert _object(metrics["partial_counts"])["errors"] == 1
+    assert metrics["killed"] is None and metrics["valid"] is None
     assert metrics["bug_catch_percent"] is None
 
 
@@ -706,7 +795,8 @@ def test_a_check_that_cannot_run_is_an_error_not_an_invalid_mutant(
         name="src/grade.go",
     )
     metrics = _metrics(report, destination)
-    assert (metrics["errors"], metrics["invalid"], metrics["status"]) == (2, 0, "incomplete")
+    partial = _object(metrics["partial_counts"])
+    assert (partial["errors"], partial["invalid"], metrics["status"]) == (2, 0, "incomplete")
 
 
 def test_typescript_mutants_are_invalid_only_for_new_tsc_errors(
@@ -762,14 +852,23 @@ def test_a_new_test_file_is_left_out_of_the_source_only_suite(tmp_path: Path) ->
     )
     metrics = _metrics(report, destination)
     assert _object(metrics["test_change_kill_share"])["kills_needing_test_changes"] == 1
-    labels = sorted({path.name.split("-", 1)[1] for path in (destination / "runs").iterdir()})
-    assert labels == [
-        "baseline",
-        "mutant-0",
-        "mutant-0-source-only",
-        "mutant-1",
-        "mutant-1-source-only",
-        "source-only-baseline",
+    # Serial runs are numbered; each mutant's runs are named by its site, whichever lane ran it.
+    runs = sorted(
+        path.relative_to(destination / "runs").as_posix()
+        for path in (destination / "runs").glob("**/execution.json")
+    )
+    assert runs == [
+        "000-baseline/execution.json",
+        "001-baseline/execution.json",
+        "002-source-only-baseline/execution.json",
+        "003-source-only-baseline/execution.json",
+        "site-000/00-mutant/execution.json",
+        "site-000/01-mutant/execution.json",
+        "site-001/00-mutant/execution.json",
+        "site-001/01-mutant/execution.json",
+        "source-only-site-000/00-mutant/execution.json",
+        "source-only-site-001/00-mutant/execution.json",
+        "source-only-site-001/01-mutant/execution.json",
     ]
 
 
@@ -883,7 +982,26 @@ def _edit_receipt(directory: Path, run: dict[str, object], **changes: object) ->
             report["baseline"][1].update(receipts="runs/999-alias"),
         ),
         lambda report, directory: report["mutants"][0].update(mutated_sha256="sha256:0"),
-        lambda report, directory: report["mutants"][0]["runs"][0].update(timeout_seconds=1),
+        lambda report, directory: report["mutants"][0]["runs"][0].update(timeout_ms=1),
+        # The confirmation claims a start that leaves it no time: its clocks no longer add up.
+        lambda report, directory: report["mutants"][0]["runs"][1].update(
+            started_ms=report["mutants"][0]["dispatched_ms"] + 6000
+        ),
+        lambda report, directory: report["mutants"][0]["runs"][1].update(bound="command"),
+        lambda report, directory: report["mutants"][0].update(
+            dispatched_ms=report["mutants"][0]["dispatched_ms"] + 1
+        ),
+        lambda report, directory: _edit_receipt(
+            directory, report["baseline"][0], resources={"cpus": 4, "memory_mb": 2048}
+        ),
+        # The run used the installed coding image, not the task's base image.
+        lambda report, directory: _edit_receipt(
+            directory, report["baseline"][0], image_id="sha256:installed"
+        ),
+        lambda report, directory: report.update(sample_size=1),
+        lambda report, directory: report["mutants"][1].update(settled_ms=None),
+        lambda report, directory: report.update(required_settled_ms=None),
+        lambda report, directory: report["clocks"].update(baseline_ms=0),
     ],
     ids=[
         "sample-order",
@@ -905,6 +1023,15 @@ def _edit_receipt(directory: Path, run: dict[str, object], **changes: object) ->
         "receipts-symlink-alias",
         "mutant-bytes",
         "timeout-limit",
+        "confirmation-start",
+        "confirmation-bound",
+        "dispatch-time",
+        "receipt-resources",
+        "installed-image",
+        "sample-size",
+        "unsettled",
+        "required-phase",
+        "baseline-clock",
     ],
 )
 def test_tampered_reports_are_refused(
@@ -922,7 +1049,12 @@ def test_collected_evidence_binds_its_report_and_the_attempt_diff(
     before = _tree(tmp_path / "before", {"src/grade.py": BEFORE})
     after = _tree(tmp_path / "after", {"src/grade.py": AFTER})
 
+    # Each container run takes a second on the clock the collector reads.
+    clock = Clock()
+    monkeypatch.setattr(mutation, "time", SimpleNamespace(monotonic_ns=clock))
+
     def native(**kwargs: object) -> dict[str, object]:
+        clock.advance(1000)
         snapshot, destination, command = (
             kwargs["snapshot"],
             kwargs["destination"],
@@ -933,19 +1065,26 @@ def test_collected_evidence_binds_its_report_and_the_attempt_diff(
         failing = int((snapshot / "src/grade.py").read_text() != AFTER)
         destination.mkdir(parents=True, exist_ok=True)
         _receipt(
-            destination, snapshot, command, Run(failing, False, f"PB-SUITE-EXIT {failing}\n", 1)
+            destination, snapshot, command, Run(failing, False, f"PB-SUITE-EXIT {failing}\n")
         )
         return dict(json.loads((destination / "execution.json").read_text()))
 
     monkeypatch.setattr(harbor_backend, "run_native_command", native)
+    capacity: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        harbor_backend, "assert_capacity",
+        lambda inputs, *, jobs: capacity.append((len(inputs), jobs)),
+    )
     config = tmp_path / "mutation.json"
     config.write_text(json.dumps(_config()))
-    collector = Collector(kind="mutation", config=config, scope=["*"], tool_version="mutation-v1")
+    collector = Collector(kind="mutation", config=config, scope=["*"], tool_version=mutation.VERSION)
     evidence = tmp_path / "evidence"
     paths = collect_measurements(after, evidence, [collector], before=before)
     refs = {"mutation": str(paths["mutation"].resolve())}
     measured = evaluate_evidence(after, refs, evidence)["mutation"]
     assert measured["status"] == "available"  # type: ignore[index]
+    # Docker must hold all four lanes before the first container starts.
+    assert capacity == [(4, 4)]
     change = compare_snapshots(before, after)
     coverage = {
         "metrics": {
@@ -1006,7 +1145,11 @@ def test_decision_line_coverage_uses_all_unique_candidate_lines(
     if case == "unavailable catch rate":
         def behaviour(view: View) -> tuple[int | None, bool, str]:
             return 1, False, ""
-    report, _, destination = _measure(tmp_path, behaviour, after={"src/grade.py": source})
+    # Ten mutants leave two of twelve candidate lines unsampled.
+    limits = mutation.Limits(sample_size=10) if case == "unsampled lines" else None
+    report, _, destination = _measure(
+        tmp_path, behaviour, after={"src/grade.py": source}, limits=limits
+    )
     if case == "unparsed candidates":
         report["unparsed_files"] = {"src/other.py": "parse failed"}
     metrics = _metrics(report, destination)
@@ -1147,3 +1290,291 @@ def test_javascript_and_typescript_sites_from_the_pinned_oxc_parser(tmp_path: Pa
     ]
     condition = next(site for site in sites if site.original == "y === z")
     assert condition.replacement == "!(y === z)"
+
+
+# --- Version 2: clocks, lanes and version 1 reports ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "ms"),
+    [(0, 0, 0), (0, 1, 1), (0, 999_999, 1), (0, 1_000_000, 1), (0, 1_000_001, 2), (7, 2_000_007, 2)],
+)
+def test_elapsed_time_is_whole_milliseconds_rounded_up(start: int, end: int, ms: int) -> None:
+    assert mutation.elapsed_ms(start, end) == ms
+
+
+@pytest.mark.parametrize(
+    ("started", "cap", "deadline", "attempt", "expected"),
+    [
+        # The command's own cap binds only while it is strictly the least time left.
+        (0, 3000, 3001, None, ("command", 3000)),
+        (0, 3000, 3000, None, ("site", 3000)),
+        (1, 3000, 3000, None, ("site", 2999)),
+        # The attempt wins every tie.
+        (0, 3000, 3000, 3000, ("attempt", 3000)),
+        (0, 3000, 3001, 3001, ("command", 3000)),
+        (0, None, 6000, 6000, ("attempt", 6000)),
+        (0, None, 6000, 6001, ("site", 6000)),
+        # No time left: the call never starts.
+        (6000, None, 6000, None, ("site", 0)),
+        (6001, None, 6000, 9000, ("site", -1)),
+        (0, 100_000, None, None, ("command", 100_000)),
+    ],
+)
+def test_a_call_gets_the_least_time_left_and_ties_go_to_the_attempt_then_the_site(
+    started: int,
+    cap: int | None,
+    deadline: int | None,
+    attempt: int | None,
+    expected: tuple[str, int],
+) -> None:
+    assert mutation.call_limit(
+        started_ms=started, cap_ms=cap, deadline_ms=deadline, attempt_ms=attempt
+    ) == expected
+
+
+def _fake_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Go-style build check for Python files, so a test can spend a mutant's time on it."""
+    monkeypatch.setattr(mutation, "_check_command", lambda path: mutation.GO_CHECK)
+
+
+def _one_lane(**limits: int | None) -> mutation.Limits:
+    return mutation.Limits(lanes=1, **limits)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("check_ms", "outcome", "first_timeout"),
+    [
+        # B is one second: the first run's cap is 3,000 ms, the site's deadline 6,000 ms.
+        (2999, "timeout_kill", 3000),  # 3,001 ms left: the run stops at its own cap.
+        (3000, "unconfirmed", 3000),  # 3,000 ms left: a tie, so the site cut it.
+        (3001, "unconfirmed", 2999),
+        (6000, "unconfirmed", None),  # No time left: the first run never starts.
+    ],
+)
+def test_a_first_run_timeout_is_a_kill_only_at_its_own_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, check_ms: int, outcome: str,
+    first_timeout: int | None,
+) -> None:
+    _fake_check(monkeypatch)
+
+    def behaviour(view: View) -> tuple[int | None, bool, str]:
+        if view.command == mutation.GO_CHECK:
+            return 0, False, ""
+        if view.mutated and FIRST in view.source:
+            return None, True, ""
+        return (1 if view.mutated else 0), False, ""
+
+    report, fake, destination = _measure(
+        tmp_path, behaviour, limits=_one_lane(),
+        duration=lambda view, timeout: (
+            check_ms if view.command == mutation.GO_CHECK and FIRST in view.source else 1000
+        ),
+    )
+    metrics = _metrics(report, destination)
+    first = _object(_list(metrics["mutants"])[0])
+    assert first["outcome"] == outcome
+    runs = _list(_object(_list(report["mutants"])[0])["runs"])
+    assert [_object(run).get("timeout_ms") for run in runs] == [first_timeout or 6000 - check_ms]
+    assert (metrics["timed_out"], metrics["unconfirmed"]) == (
+        (1, 0) if outcome == "timeout_kill" else (0, 1)
+    )
+    # A first run cut by the site is never counted: only the second mutant's kill remains.
+    assert metrics["valid"] == (2 if outcome == "timeout_kill" else 1)
+    assert len([call for call in fake.calls if call[0] == ["suite"]]) == (
+        2 + 2 + (0 if first_timeout is None else 1)
+    )
+
+
+@pytest.mark.parametrize(
+    ("first_ms", "confirmation", "outcome"),
+    [
+        (3000, (1, False), "killed"),  # 3,000 ms left, and the rerun reproduces the kill.
+        (3000, (None, True), "unconfirmed"),  # The rerun reaches the site deadline.
+        (2999, (None, True), "unconfirmed"),
+        (3000, (0, False), "flaky"),
+    ],
+)
+def test_a_confirmation_the_site_deadline_cuts_is_unconfirmed_never_a_kill(
+    tmp_path: Path, first_ms: int, confirmation: tuple[int | None, bool], outcome: str
+) -> None:
+    def behaviour(view: View) -> tuple[int | None, bool, str]:
+        if view.mutated and FIRST in view.source:
+            return (1, False, "") if view.seen == 0 else (*confirmation, "")
+        return 0, False, ""
+
+    def duration(view: View, timeout: int) -> int:
+        # The kill's first run ends at `first_ms` with a status; its rerun takes all it has.
+        if view.mutated and FIRST in view.source:
+            return first_ms if view.seen == 0 else timeout
+        return 1000
+
+    report, _, destination = _measure(
+        tmp_path, behaviour, limits=_one_lane(), duration=duration
+    )
+    metrics = _metrics(report, destination)
+    assert _object(_list(metrics["mutants"])[0])["outcome"] == outcome
+    runs = _list(_object(_list(report["mutants"])[0])["runs"])
+    assert _object(runs[1])["timeout_ms"] == 6000 - first_ms
+    assert metrics["killed"] == (1 if outcome == "killed" else 0)
+
+
+def test_baselines_get_their_cap_and_b_is_the_slower_rounded_up(tmp_path: Path) -> None:
+    durations = iter([800, 1200])
+
+    def duration(view: View, timeout: int) -> int:
+        return next(durations) if not view.mutated else 1000
+
+    report, fake, destination = _measure(
+        tmp_path, _passing(_kills_first), limits=_one_lane(baseline_ms=4000), duration=duration
+    )
+    assert [call[2] for call in fake.calls[:2]] == [4000, 4000]
+    # B = 1,200 ms: each first run is capped at 3,600 ms.
+    assert {call[2] for call in fake.calls[2:] if call[2] != 7200 - 1000} == {3600}
+    assert _metrics(report, destination)["status"] == "available"
+
+
+def test_a_baseline_that_reaches_its_cap_is_red(tmp_path: Path) -> None:
+    report, _, destination = _measure(
+        tmp_path,
+        lambda view: (None, True, "") if not view.mutated else (0, False, ""),
+        limits=_one_lane(baseline_ms=4000),
+    )
+    metrics = _metrics(report, destination)
+    assert metrics["status"] == "unavailable" and "baseline red" in str(metrics["reason"])
+
+
+def _lines(count: int) -> str:
+    """A changed file with one relational site on each of `count` lines."""
+    return "".join(f"value_{index} = flag < {index}\n" for index in range(count))
+
+
+def test_four_lanes_never_become_five(tmp_path: Path) -> None:
+    barrier = threading.Barrier(4, timeout=10)
+    waited = threading.Lock()
+    gates = [0]
+
+    def behaviour(view: View) -> tuple[int | None, bool, str]:
+        if view.mutated:
+            with waited:
+                gates[0] += 1
+                wait = gates[0] <= 4
+            if wait:
+                barrier.wait()  # Only four lanes running at once get past this.
+            return 0, False, ""
+        return 0, False, ""
+
+    report, fake, destination = _measure(
+        tmp_path, behaviour, after={"src/grade.py": _lines(12)}
+    )
+    assert fake.most_active == 4
+    metrics = _metrics(report, destination)
+    assert (metrics["survived"], metrics["selected"]) == (12, 12)
+
+
+def test_results_follow_the_sample_whatever_order_lanes_finish_in(tmp_path: Path) -> None:
+    others = threading.Semaphore(0)
+    order: list[int] = []
+
+    def behaviour(view: View) -> tuple[int | None, bool, str]:
+        if view.site is not None:
+            if view.site == 0:
+                for _ in range(3):
+                    assert others.acquire(timeout=10)  # The first site settles last.
+            order.append(view.site)
+            if view.site != 0:
+                others.release()
+        return 0, False, ""
+
+    report, _, destination = _measure(tmp_path, behaviour, after={"src/grade.py": _lines(4)})
+    assert order[-1] == 0 and sorted(order) == [0, 1, 2, 3]
+    assert [_object(item)["site"] for item in _list(report["mutants"])] == [0, 1, 2, 3]
+    metrics = _metrics(report, destination)
+    selected = _list(report["selected"])
+    assert [
+        (_object(row)["site"], _object(row)["line"]) for row in _list(metrics["mutants"])
+    ] == [(index, _object(selected[index])["line"]) for index in range(4)]
+    assert _object(metrics["sites"]) == {
+        "settled": [0, 1, 2, 3], "interrupted": [], "unstarted": []
+    }
+
+
+def test_the_attempt_limit_expiring_is_infrastructure_with_its_partial_counts_apart(
+    tmp_path: Path,
+) -> None:
+    # Two baselines take 2,000 ms; one lane then measures sites a second each, until 5,500 ms
+    # cuts the fourth site's run: an infrastructure failure, never an observation.
+    report, _, destination = _measure(
+        tmp_path, _passing(lambda view: 0), after={"src/grade.py": _lines(8)},
+        limits=_one_lane(attempt_ms=5500),
+    )
+    failure = _object(report["infrastructure_failure"])
+    assert failure["cause"] == "attempt_deadline" and failure["receipts"] is None
+    assert report["required_settled_ms"] is None
+    metrics = _metrics(report, destination)
+    assert metrics["status"] == "incomplete"
+    assert str(metrics["reason"]).startswith("infrastructure failure: the attempt's 5500 ms")
+    assert (metrics["killed"], metrics["valid"], metrics["survived"]) == (None, None, None)
+    assert _object(metrics["partial_counts"])["survived"] == 3
+    assert _object(metrics["sites"]) == {
+        "settled": [0, 1, 2], "interrupted": [3], "unstarted": [4, 5, 6, 7]
+    }
+    # The cut run kept its record: the attempt's limit bound it.
+    cut = _object(_list(_object(_list(report["mutants"])[3])["runs"])[0])
+    assert (cut["bound"], cut["timeout_ms"], cut["timed_out"]) == ("attempt", 500, True)
+    # A forged expiry needs the limit it names.
+    _object(report["clocks"])["attempt_ms"] = None
+    with pytest.raises(ValueError):
+        _metrics(report, destination)
+
+
+def test_the_attempt_limit_refuses_a_site_once_it_has_passed(tmp_path: Path) -> None:
+    report, fake, destination = _measure(
+        tmp_path, _passing(lambda view: 0), after={"src/grade.py": _lines(4)},
+        limits=_one_lane(attempt_ms=4000),
+    )
+    # Baselines end at 2,000 ms, two sites at 4,000 ms: the third is never dispatched.
+    assert len(fake.calls) == 4
+    metrics = _metrics(report, destination)
+    assert _object(metrics["sites"]) == {"settled": [0, 1], "interrupted": [], "unstarted": [2, 3]}
+    assert _object(report["infrastructure_failure"])["cause"] == "attempt_deadline"
+
+
+def test_required_mutants_run_first_and_a_later_expiry_cuts_only_the_diagnostic(
+    tmp_path: Path,
+) -> None:
+    # Both mutants are killed by the full suite; the source-only baseline starts after both
+    # settle, and the limit expires during it.
+    report, fake, destination = _measure(
+        tmp_path,
+        _passing(lambda view: 1),
+        after={"tests/test_grade.py": "y\n"},
+        limits=_one_lane(attempt_ms=6500),
+    )
+    labels = [_object(call)["label"] for call in _list(_object(report["source_only"])["baseline"])]
+    assert labels == ["source-only-baseline"]
+    suite = [call for call in fake.calls if "tests/test_grade.py" in call[1]]
+    assert suite[-1][1]["tests/test_grade.py"] == "x\n"  # The last run was diagnostic.
+    assert report["infrastructure_failure"] is None and report["required_settled_ms"] == 6000
+    metrics = _metrics(report, destination)
+    assert (metrics["status"], metrics["killed"], metrics["valid"]) == ("available", 2, 2)
+    share = _object(metrics["test_change_kill_share"])
+    assert share["status"] == "incomplete"
+
+
+def test_a_version_1_report_still_validates() -> None:
+    fixture = Path(__file__).parent / "fixtures" / "mutation-v1"
+    report = json.loads((fixture / "evidence" / "report.json").read_text())
+    config = json.loads((fixture / "profile.json").read_text())
+    assert report["version"] == mutation.V1 and config["observer_version"] == 1
+    metrics = mutation.mutation_metrics(
+        report, fixture / "evidence", config=config, snapshot=fixture / "after"
+    )
+    assert metrics == json.loads((fixture / "metrics.json").read_text())
+    # The version 1 rules still apply: ten mutants, `3 x slowest + 60 s` timeouts.
+    tampered = json.loads(json.dumps(report))
+    tampered["mutants"][0]["runs"][0]["timeout_seconds"] = 64
+    with pytest.raises(ValueError, match="launcher receipt"):
+        mutation.mutation_metrics(
+            tampered, fixture / "evidence", config=config, snapshot=fixture / "after"
+        )

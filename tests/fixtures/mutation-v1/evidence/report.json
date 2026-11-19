@@ -1,0 +1,224 @@
+{
+ "after_digest": "sha256:5a7dcaa344bb7ce1ef142e3ee44a925a576b9ac3d23a384c99ee28af245c7aba",
+ "baseline": [
+  {
+   "elapsed_seconds": 1.0,
+   "exit_code": 0,
+   "label": "baseline",
+   "receipts": "runs/000-baseline",
+   "stdout_sha256": "sha256:d12c9680cd0a7ae0e68fb79aebf9e42b1a319aba7b309e659e207f955fc3e20a",
+   "suite_status": 0,
+   "timed_out": false,
+   "timeout_seconds": 100
+  },
+  {
+   "elapsed_seconds": 1.0,
+   "exit_code": 0,
+   "label": "baseline",
+   "receipts": "runs/001-baseline",
+   "stdout_sha256": "sha256:d12c9680cd0a7ae0e68fb79aebf9e42b1a319aba7b309e659e207f955fc3e20a",
+   "suite_status": 0,
+   "timed_out": false,
+   "timeout_seconds": 100
+  }
+ ],
+ "before_digest": "sha256:65a03be2cfaf975ea5829d0b3e93b2996045a9c91738a3fd5b494a58fc522cf9",
+ "candidates": [
+  {
+   "column": 8,
+   "end": 53,
+   "line": 2,
+   "operator": "condition_negation",
+   "original": "score >= 90 and bonus",
+   "path": "src/grade.py",
+   "replacement": "not (score >= 90 and bonus)",
+   "start": 32
+  },
+  {
+   "column": 14,
+   "end": 40,
+   "line": 2,
+   "operator": "relational_boundary",
+   "original": ">=",
+   "path": "src/grade.py",
+   "replacement": ">",
+   "start": 38
+  },
+  {
+   "column": 20,
+   "end": 47,
+   "line": 2,
+   "operator": "boolean_connective",
+   "original": "and",
+   "path": "src/grade.py",
+   "replacement": "or",
+   "start": 44
+  },
+  {
+   "column": 19,
+   "end": 103,
+   "line": 4,
+   "operator": "condition_negation",
+   "original": "score == 80",
+   "path": "src/grade.py",
+   "replacement": "not (score == 80)",
+   "start": 92
+  },
+  {
+   "column": 25,
+   "end": 100,
+   "line": 4,
+   "operator": "equality_negation",
+   "original": "==",
+   "path": "src/grade.py",
+   "replacement": "!=",
+   "start": 98
+  }
+ ],
+ "changed_production_lines": [
+  "src/grade.py:2",
+  "src/grade.py:3",
+  "src/grade.py:4"
+ ],
+ "check_baseline": null,
+ "generated_files": [],
+ "infrastructure_failure": null,
+ "language": "python",
+ "mutants": [
+  {
+   "check": null,
+   "mutated_sha256": "sha256:1996c0ffdbf5c638393018412ab2c6c20d7bd93d6faf9b95af42402e6b6ee4de",
+   "runs": [
+    {
+     "elapsed_seconds": 1.0,
+     "exit_code": 1,
+     "label": "mutant-0",
+     "receipts": "runs/004-mutant-0",
+     "stdout_sha256": "sha256:e26d3519b6853ba03dd34089ef0e58d922ad9338c93ca06fcc61eb2b565df5aa",
+     "suite_status": 1,
+     "timed_out": false,
+     "timeout_seconds": 63
+    },
+    {
+     "elapsed_seconds": 1.0,
+     "exit_code": 1,
+     "label": "mutant-0",
+     "receipts": "runs/005-mutant-0",
+     "stdout_sha256": "sha256:e26d3519b6853ba03dd34089ef0e58d922ad9338c93ca06fcc61eb2b565df5aa",
+     "suite_status": 1,
+     "timed_out": false,
+     "timeout_seconds": 63
+    }
+   ],
+   "site": 0,
+   "source_only": {
+    "mutated_sha256": "sha256:1996c0ffdbf5c638393018412ab2c6c20d7bd93d6faf9b95af42402e6b6ee4de",
+    "placed": true,
+    "runs": [
+     {
+      "elapsed_seconds": 1.0,
+      "exit_code": 1,
+      "label": "mutant-0-source-only",
+      "receipts": "runs/006-mutant-0-source-only",
+      "stdout_sha256": "sha256:e26d3519b6853ba03dd34089ef0e58d922ad9338c93ca06fcc61eb2b565df5aa",
+      "suite_status": 1,
+      "timed_out": false,
+      "timeout_seconds": 63
+     },
+     {
+      "elapsed_seconds": 1.0,
+      "exit_code": 1,
+      "label": "mutant-0-source-only",
+      "receipts": "runs/007-mutant-0-source-only",
+      "stdout_sha256": "sha256:e26d3519b6853ba03dd34089ef0e58d922ad9338c93ca06fcc61eb2b565df5aa",
+      "suite_status": 1,
+      "timed_out": false,
+      "timeout_seconds": 63
+     }
+    ]
+   }
+  },
+  {
+   "check": null,
+   "mutated_sha256": "sha256:628e2c323d5b6f927369e64aa63028007b6d49c513b621bbce117cb1948bbb32",
+   "runs": [
+    {
+     "elapsed_seconds": 1.0,
+     "exit_code": 0,
+     "label": "mutant-1",
+     "receipts": "runs/008-mutant-1",
+     "stdout_sha256": "sha256:d12c9680cd0a7ae0e68fb79aebf9e42b1a319aba7b309e659e207f955fc3e20a",
+     "suite_status": 0,
+     "timed_out": false,
+     "timeout_seconds": 63
+    }
+   ],
+   "site": 1
+  }
+ ],
+ "operators": [
+  "relational_boundary",
+  "equality_negation",
+  "boolean_connective",
+  "condition_negation"
+ ],
+ "python": "3.12",
+ "sample_size": 10,
+ "selected": [
+  {
+   "column": 14,
+   "end": 40,
+   "line": 2,
+   "operator": "relational_boundary",
+   "original": ">=",
+   "path": "src/grade.py",
+   "replacement": ">",
+   "start": 38
+  },
+  {
+   "column": 25,
+   "end": 100,
+   "line": 4,
+   "operator": "equality_negation",
+   "original": "==",
+   "path": "src/grade.py",
+   "replacement": "!=",
+   "start": 98
+  }
+ ],
+ "source_only": {
+  "baseline": [
+   {
+    "elapsed_seconds": 1.0,
+    "exit_code": 0,
+    "label": "source-only-baseline",
+    "receipts": "runs/002-source-only-baseline",
+    "stdout_sha256": "sha256:d12c9680cd0a7ae0e68fb79aebf9e42b1a319aba7b309e659e207f955fc3e20a",
+    "suite_status": 0,
+    "timed_out": false,
+    "timeout_seconds": 100
+   },
+   {
+    "elapsed_seconds": 1.0,
+    "exit_code": 0,
+    "label": "source-only-baseline",
+    "receipts": "runs/003-source-only-baseline",
+    "stdout_sha256": "sha256:d12c9680cd0a7ae0e68fb79aebf9e42b1a319aba7b309e659e207f955fc3e20a",
+    "suite_status": 0,
+    "timed_out": false,
+    "timeout_seconds": 100
+   }
+  ],
+  "changed_test_files": [
+   "tests/test_grade.py"
+  ],
+  "restored": {
+   "tests/test_grade.py": "sha256:73cb3858a687a8494ca3323053016282f3dad39d42cf62ca4e79dda2aac7d9ac"
+  },
+  "status": "measured"
+ },
+ "suite_status": "marker",
+ "unparsed_files": {},
+ "unsupported_files": [],
+ "version": "mutation-v1"
+}

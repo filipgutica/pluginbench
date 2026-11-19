@@ -1,12 +1,32 @@
 """Mutation bug-catch rate (preregistration M1): single-site mutants of an attempt's own code.
 
 Sites are decision operators on the production lines an attempt added or changed. A
-deterministic sample of at most ten mutants, one per line, each runs the task's frozen
-coverage-profile command in its frozen image, offline. The collector records raw facts: every
-candidate site, the selected mutants, each run's suite status and receipt. `mutation_metrics`
-derives every outcome and count from those facts, so a report cannot carry a count its runs do
-not support. `compare_mutation` binds a report to its attempt's diff and adds the descriptive
-split by line execution.
+deterministic sample of at most M mutants, one per line, each runs the task's frozen
+coverage-profile command in the task's base image, offline. The collector records raw facts:
+every candidate site, the selected mutants, each run's suite status, clock readings and
+receipt. `mutation_metrics` derives every outcome and count from those facts, so a report
+cannot carry a count its runs do not support. `compare_mutation` binds a report to its
+attempt's diff and adds the descriptive split by line execution.
+
+Version 2 reports (this observer) are bounded. Every clock reading is the whole milliseconds
+since the attempt started, on the monotonic clock, rounded up; a duration is the difference of
+two readings, so it can be up to 1 ms below the exact interval rounded up:
+
+- Baseline: two clean runs of the unmutated tree, each capped at `Limits.baseline_ms` (4T for
+  a submission, T being the task's qualified reference baseline; a calibration ceiling for the
+  reference that measures T). B is the slower of the two, timed around the executor call.
+- Site: each mutant has 6B from its dispatch, shared by its build or type check, its first run
+  and its confirmation. The first run is also capped at 3B; a check and a confirmation have no
+  cap of their own.
+- Attempt: `Limits.attempt_ms` from before site discovery, if set.
+
+Every call gets the least of the clocks that apply; on a tie the attempt wins, then the site,
+then the command's own cap. A first run stopped at its own 3B cap is a `timeout_kill`. A site
+deadline that stops a run or leaves no time for one makes the mutant `unconfirmed`, excluded
+from the denominator: an unfinished confirmation never confirms a kill. The attempt limit
+expiring before every required mutant settles is an infrastructure failure, so the attempt is
+retried, never observed. Version 1 reports (ten mutants, serial, a `3 x slowest + 60 s`
+timeout and confirmations past it counted as kills) still validate.
 """
 
 from __future__ import annotations
@@ -22,6 +42,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tokenize
 from collections import Counter
@@ -33,7 +54,9 @@ from pluginbench import components, isolation, source_only
 from pluginbench.assessment_metrics import _added_source_lines, compare_snapshots, inspect_snapshot
 from pluginbench.collectors import CollectorUnavailable
 
-VERSION = "mutation-v1"
+VERSION = "mutation-v2"
+# Reports this observer still validates, oldest first.
+V1 = "mutation-v1"
 GO_OBSERVER = "go-mutation-v1"
 OPERATORS = (
     "relational_boundary",
@@ -41,7 +64,22 @@ OPERATORS = (
     "boolean_connective",
     "condition_negation",
 )
-SAMPLE_SIZE = 10
+# M, the most mutants one attempt measures. A timing pilot pins it; its first ten sites are the
+# version 1 sample, so M = 10 and M = 20 measure the same first ten mutants.
+SAMPLE_SIZE = 20
+V1_SAMPLE_SIZE = 10
+# Mutants run in up to this many lanes at once, one container each.
+LANES = 4
+# Each container's limits: four lanes need 8 CPUs and 8,192 MiB.
+MEASUREMENT_CPUS, MEASUREMENT_MEMORY_MB = 2, 2048
+# A submission baseline's cap in reference baselines (T), and a site's deadline and its first
+# run's cap in submission baselines (B). Version 2 adds no grace: B is timed around the whole
+# executor call, so it already holds the container start, copy and export that version 1's
+# 60 s grace allowed for, and the launcher bounds those steps itself (60 s, 300 s for copies).
+BASELINE_FACTOR, SITE_FACTOR, FIRST_RUN_FACTOR = 4, 6, 3
+# What a version 2 run's elapsed time covers. The launcher records no exec-only time, so B is
+# the whole `run_native_command` call: container create, copies, exec, export and cleanup.
+TIMING_BOUNDARY = "executor_call"
 LANGUAGES = frozenset({"python", "go", "typescript", "javascript"})
 # Generated files the preregistration names: anko's goyacc parser and sql-formatter's nearley
 # grammar. They are excluded by task repository, as the frozen task.toml records it.
@@ -57,6 +95,8 @@ GO_CHECK = ["bash", "-c", "go build ./... && go test -run '^$' ./..."]
 TSC_CHECK = ["bash", "-c", "npx --no-install tsc --noEmit --pretty false"]
 # Bash's exits for a command it could not run, such as a toolchain missing from the image.
 _NOT_RUNNABLE = frozenset({126, 127})
+# Version 1's mutant timeout, `ceil(3 x slowest baseline + 60 s)`; operations.py also bounds a
+# mutation collect with it.
 TIMEOUT_FACTOR, TIMEOUT_GRACE_SECONDS = 3, 60
 SUITE_MARKER = re.compile(r"^PB-SUITE-EXIT (\d+)\r?$", re.MULTILINE)
 _TSC_ERROR = re.compile(r"^(?:(?P<file>.+)\(\d+,\d+\): )?error (?P<code>TS\d+): (?P<message>.*)$")
@@ -85,19 +125,40 @@ _DOCKER_FAILURE = re.compile(r"^docker \S+ failed: ")
 _RUNTIME_UNVERIFIED = "Cannot verify the frozen Harbor and Docker runtime"
 # The executor's record of a run whose launcher stopped before it wrote execution.json.
 PRELAUNCH_FAILURE = "prelaunch-failure.json"
-# The only receipt directory name `_Runner` writes.
-_RECEIPTS = re.compile(r"runs/\d{3,}-[a-z0-9-]+")
-METHOD = (
-    "single-site mutants of changed production lines (relational boundary, equality negation, "
-    "boolean connective, condition negation); at most one mutant per line, ten per attempt, "
-    "sampled by sha256 order and round-robin over operators; each runs the frozen "
-    "coverage-profile command; kills confirmed by one rerun"
-)
-LIMITATIONS = (
-    "arms produce different mutant populations, so this compares test suites on each arm's own "
-    "code, not test quality in isolation; timeouts count as kills and are reported separately; "
-    "the timeout baseline includes container start and source export time"
-)
+# The receipt directory names each report version writes: serial runs are numbered; version 2
+# names each mutant's runs by its site, so lanes never share a counter or a directory.
+_RECEIPTS = {
+    V1: re.compile(r"runs/\d{3,}-[a-z0-9-]+"),
+    VERSION: re.compile(r"runs/(?:\d{3,}-[a-z0-9-]+|(?:source-only-)?site-\d{3,}/\d{2,}-[a-z0-9-]+)"),
+}
+METHOD = {
+    V1: (
+        "single-site mutants of changed production lines (relational boundary, equality "
+        "negation, boolean connective, condition negation); at most one mutant per line, ten "
+        "per attempt, sampled by sha256 order and round-robin over operators; each runs the "
+        "frozen coverage-profile command; kills confirmed by one rerun"
+    ),
+    VERSION: (
+        "single-site mutants of changed production lines (relational boundary, equality "
+        "negation, boolean connective, condition negation); at most one mutant per line and M "
+        "per attempt, sampled by sha256 order and round-robin over operators; each runs the "
+        "frozen coverage-profile command in the task's base image, four at a time; kills "
+        "confirmed by one rerun within the mutant's deadline"
+    ),
+}
+LIMITATIONS = {
+    V1: (
+        "arms produce different mutant populations, so this compares test suites on each arm's "
+        "own code, not test quality in isolation; timeouts count as kills and are reported "
+        "separately; the timeout baseline includes container start and source export time"
+    ),
+    VERSION: (
+        "arms produce different mutant populations, so this compares test suites on each arm's "
+        "own code, not test quality in isolation; a first run stopped at three baselines counts "
+        "as a kill and is reported separately; a mutant whose deadline cut a run is unconfirmed "
+        "and excluded; baselines include container start and source export time"
+    ),
+}
 
 
 class SiteError(ValueError):
@@ -112,6 +173,18 @@ class InfrastructureFailure(Exception):
     """Docker or the host could not run a command: the attempt is incomplete, not the revision.
 
     Not a ValueError, so it is never mistaken for an integrity violation, which fails closed.
+    `receipts` names the failing run's receipt directory once the engine knows it.
+    """
+
+    def __init__(self, reason: str, receipts: str | None = None) -> None:
+        super().__init__(reason)
+        self.receipts = receipts
+
+
+class AttemptDeadline(InfrastructureFailure):
+    """The whole attempt's limit expired before every required mutant settled.
+
+    Infrastructure, never an observation of the submission: the attempt is retried.
     """
 
 
@@ -143,11 +216,67 @@ class Run:
     exit_code: int | None
     timed_out: bool
     stdout: str
-    elapsed_seconds: float
 
 
-# Runs `command` on a copy of `tree` with a timeout in seconds, leaving receipts in a directory.
+# Runs `command` on a copy of `tree` with a timeout in milliseconds, leaving receipts in a
+# directory. The engine times each call itself. Lanes call it from several threads at once.
 Executor = Callable[[Path, list[str], int, Path], Run]
+# Monotonic nanoseconds; `time.monotonic_ns` outside tests.
+Clock = Callable[[], int]
+
+
+@dataclass(frozen=True)
+class Limits:
+    """One attempt's sample size, lanes and clocks, in whole milliseconds.
+
+    `baseline_ms` caps each unmutated baseline run; None takes the profile's coverage timeout,
+    the calibration ceiling a reference measures under. `attempt_ms` is the whole attempt's
+    limit; None leaves only the outer operation's bound.
+    """
+
+    sample_size: int = SAMPLE_SIZE
+    lanes: int = LANES
+    baseline_ms: int | None = None
+    attempt_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.sample_size < 1 or self.lanes < 1:
+            raise ValueError("mutation needs at least one mutant and one lane")
+        if any(value is not None and value < 1 for value in (self.baseline_ms, self.attempt_ms)):
+            raise ValueError("mutation clocks must be positive milliseconds")
+
+
+def submission_baseline_ms(reference_ms: int) -> int:
+    """A submission baseline's cap, 4T, from the task's qualified reference baseline T."""
+    return BASELINE_FACTOR * reference_ms
+
+
+def elapsed_ms(start_ns: int, end_ns: int) -> int:
+    """Whole milliseconds between two monotonic readings, rounded up."""
+    return -(-(end_ns - start_ns) // 1_000_000)
+
+
+def call_limit(
+    *, started_ms: int, cap_ms: int | None, deadline_ms: int | None, attempt_ms: int | None
+) -> tuple[str, int]:
+    """The clock that bounds a call starting at `started_ms`, and the time it leaves.
+
+    A call gets the least of the attempt's remaining time, its site's remaining time and its
+    own cap. On a tie the attempt wins, then the site, then the command, so a timeout at a
+    shared limit never counts as the command's own. Time left at or below zero means the call
+    is not started.
+    """
+    limits = [
+        (name, value)
+        for name, value in (
+            ("attempt", None if attempt_ms is None else attempt_ms - started_ms),
+            ("site", None if deadline_ms is None else deadline_ms - started_ms),
+            ("command", cap_ms),
+        )
+        if value is not None
+    ]
+    least = min(value for _, value in limits)
+    return next(item for item in limits if item[1] == least)
 
 
 # --- Site finding -------------------------------------------------------------------------
@@ -418,8 +547,57 @@ def suite_status(run: Run, process_exit: bool = False) -> int | None:
     return int(markers[0]) if len(markers) == 1 else None
 
 
+def _cut(call: Mapping[str, object]) -> str | None:
+    """The clock that stopped a version 2 call or left it no time; None when it ran to an exit."""
+    if call["dispatched"] is True and call["timed_out"] is not True:
+        return None
+    return str(call["bound"])
+
+
+# A version 2 outcome when a clock, not the suite, ended the mutant's runs. The attempt's own
+# limit leaves the mutant interrupted: unsettled, and its attempt is retried.
+_CUT_FIRST = {"command": "timeout_kill", "site": "unconfirmed", "attempt": "interrupted"}
+# A later run or a check has no cap of its own, so whatever stopped it short of the attempt's
+# limit leaves the mutant unconfirmed.
+_CUT_LATER = {"command": "unconfirmed", "site": "unconfirmed", "attempt": "interrupted"}
+
+
+def site_outcome(runs: list[dict[str, object]]) -> str | None:
+    """A version 2 mutant's outcome from its suite runs; None needs another run.
+
+    killed (two nonzero statuses), timeout_kill (a first run stopped at its own 3B cap),
+    survived (one green run), flaky (nonzero, then green), unconfirmed (the site deadline cut
+    a run or left none), error (a run with no suite status) or interrupted (the attempt's limit
+    cut it). suite_qualification re-derives this table for the reference rule, and
+    tests/test_mutation.py checks the two agree.
+    """
+    if not runs:
+        return None
+    first = runs[0]
+    if (cut := _cut(first)) is not None:
+        return _CUT_FIRST[cut]
+    if first["suite_status"] is None:
+        return "error"
+    if first["suite_status"] == 0:
+        return "survived"
+    if len(runs) == 1:
+        return None
+    second = runs[1]
+    if (cut := _cut(second)) is not None:
+        return _CUT_LATER[cut]
+    if second["suite_status"] is None:
+        return "error"
+    return "flaky" if second["suite_status"] == 0 else "killed"
+
+
+# A mutant's outcomes that settle it, and those its counts pool.
+SETTLED = ("killed", "timeout_kill", "survived", "invalid", "flaky", "unconfirmed", "error")
+KILLS = ("killed", "timeout_kill")
+
+
 def outcome(runs: list[dict[str, object]]) -> str | None:
-    """killed, timeout, survived, flaky or error from a mutant's runs; None needs a rerun."""
+    """Version 1: killed, timeout, survived, flaky or error from a mutant's runs; None needs a
+    rerun."""
     if not runs:
         return None
     first = runs[0]
@@ -465,11 +643,49 @@ def tsc_errors(stdout: str, site: Site | None = None) -> Counter[str]:
 # --- Collection ----------------------------------------------------------------------------
 
 
+def measurement_identity(identity: Mapping[str, object]) -> dict[str, object]:
+    """The task identity mutation runs under: the task's base image, 2 CPUs and 2,048 MiB.
+
+    Preparation installs the coding harness on the task's base image and names the result the
+    task's image. Mutation measures in the base image it saved as
+    `toolchain_identity.base_image_identity`, so submissions from every harness, and the
+    reference, run in one image.
+    """
+    toolchain = identity.get("toolchain_identity")
+    base = toolchain.get("base_image_identity") if isinstance(toolchain, dict) else None
+    runtime = identity.get("isolation")
+    if not isinstance(base, dict) or not isinstance(runtime, dict):
+        raise ValueError(
+            "mutation measures in the task's base image, and this task identity records no "
+            "toolchain_identity.base_image_identity or isolation runtime"
+        )
+    resources = {"cpus": MEASUREMENT_CPUS, "memory_mb": MEASUREMENT_MEMORY_MB}
+    return {
+        **identity,
+        "image_identity": base,
+        "resources": resources,
+        "isolation": {**runtime, "resources": resources},
+    }
+
+
+def _check_capacity(identity: Mapping[str, object], lanes: int) -> None:
+    """Refuse to start unless Docker holds every lane's container at once."""
+    from pluginbench.harbor_backend import assert_capacity
+
+    runtime = identity["isolation"]
+    assert isinstance(runtime, dict)
+    assert_capacity([[runtime]] * lanes, jobs=lanes)
+
+
 def native_executor(
     identity: dict[str, object], report_path: str, *, provisioned_tool: object = None,
     provisioned_scope: list[str] | None = None
 ) -> Executor:
-    """Run commands with `run_native_command` in the frozen task image, timing each run."""
+    """Run commands with `run_native_command` under `identity`, in a fresh container each.
+
+    The launcher takes whole seconds, so a timeout is rounded up to the next second; the engine
+    classifies each run on its own millisecond clocks.
+    """
     from pluginbench.harbor_backend import run_native_command
     from pluginbench.measurement_tools import ProvisionedCommandOptions, read_tool
 
@@ -478,8 +694,7 @@ def native_executor(
         {"provisioned_tool": tool, "provisioned_scope": provisioned_scope} if tool is not None else {}
     )
 
-    def execute(tree: Path, command: list[str], timeout: int, destination: Path) -> Run:
-        started = time.monotonic()
+    def execute(tree: Path, command: list[str], timeout_ms: int, destination: Path) -> Run:
         try:
             receipt = run_native_command(
                 snapshot=tree,
@@ -487,7 +702,7 @@ def native_executor(
                 destination=destination,
                 command=command,
                 report_path=report_path,
-                timeout=timeout,
+                timeout=max(1, -(-timeout_ms // 1000)),
                 produce_report=False,
                 **tool_options,
             )
@@ -514,13 +729,11 @@ def native_executor(
                 shutil.rmtree(destination / name, ignore_errors=True)
             for report in destination.glob("report.raw*"):
                 report.unlink()
-        elapsed = time.monotonic() - started
         exit_code = receipt.get("exit_code")
         return Run(
             exit_code=exit_code if isinstance(exit_code, int) else None,
             timed_out=receipt.get("timed_out") is True,
             stdout=str(receipt.get("stdout") or ""),
-            elapsed_seconds=elapsed,
         )
 
     return execute
@@ -559,34 +772,131 @@ def _check_command(path: str) -> list[str] | None:
     return GO_CHECK if suffix == ".go" else TSC_CHECK if suffix in _TS_SUFFIXES else None
 
 
-class _Runner:
-    """Numbers each run's receipt directory and records what the report needs from it."""
+class _Attempt:
+    """One attempt's clock, executor and serial receipt names, shared by its lanes.
 
-    def __init__(self, execute: Executor, destination: Path, process_exit: bool) -> None:
-        self.execute, self.destination, self.count = execute, destination, 0
-        self.process_exit = process_exit
-        # The receipt directory of the run in progress, named by an infrastructure failure.
-        self.current: str | None = None
+    Times are whole milliseconds since the attempt started, before site discovery.
+    """
 
-    def __call__(
-        self, tree: Path, command: list[str], timeout: int, label: str
-    ) -> dict[str, object]:
-        directory = self.destination / "runs" / f"{self.count:03d}-{label}"
-        self.count += 1
-        directory.mkdir(parents=True)
-        self.current = directory.relative_to(self.destination).as_posix()
-        run = self.execute(tree, command, timeout, directory)
-        (directory / "stdout.txt").write_bytes(run.stdout.encode())
-        return {
+    def __init__(
+        self, execute: Executor, destination: Path, process_exit: bool, clock: Clock,
+        started: int, attempt_ms: int | None,
+    ) -> None:
+        self.execute, self.destination, self.process_exit = execute, destination, process_exit
+        self.clock, self.started, self.attempt_ms = clock, started, attempt_ms
+        # Only the serial phase numbers its runs; a lane names its runs by their site.
+        self.serial = 0
+
+    def now(self) -> int:
+        return elapsed_ms(self.started, self.clock())
+
+    def expired(self, now: int) -> AttemptDeadline:
+        return AttemptDeadline(f"the attempt's {self.attempt_ms} ms limit expired at {now} ms")
+
+    def admit(self) -> int:
+        """A site's dispatch time; refused once the attempt's limit has passed."""
+        now = self.now()
+        if self.attempt_ms is not None and now >= self.attempt_ms:
+            raise self.expired(now)
+        return now
+
+    def serial_name(self, label: str) -> str:
+        name = f"runs/{self.serial:03d}-{label}"
+        self.serial += 1
+        return name
+
+    def call(
+        self,
+        calls: list[dict[str, object]],
+        tree: Path,
+        command: list[str],
+        name: str,
+        *,
+        label: str,
+        cap_ms: int | None,
+        deadline_ms: int | None = None,
+    ) -> None:
+        """Run `command` within its clocks and append its record to `calls`.
+
+        A call with no time left is recorded as not dispatched. Once the attempt's limit cuts a
+        call or leaves it no time, the record is kept and AttemptDeadline is raised.
+        """
+        started = self.now()
+        bound, left = call_limit(
+            started_ms=started, cap_ms=cap_ms, deadline_ms=deadline_ms, attempt_ms=self.attempt_ms
+        )
+        record: dict[str, object] = {
             "label": label,
-            "exit_code": run.exit_code,
-            "timed_out": run.timed_out,
-            "suite_status": suite_status(run, self.process_exit),
-            "elapsed_seconds": round(run.elapsed_seconds, 3),
-            "timeout_seconds": timeout,
-            "receipts": self.current,
-            "stdout_sha256": _digest(directory / "stdout.txt"),
+            "started_ms": started,
+            "bound": bound,
+            "timeout_ms": left,
+            "dispatched": left > 0,
         }
+        if left <= 0:
+            calls.append(record)
+            if bound == "attempt":
+                raise self.expired(started)
+            return
+        directory = self.destination / name
+        directory.mkdir(parents=True)
+        try:
+            run = self.execute(tree, command, left, directory)
+        except InfrastructureFailure as error:
+            error.receipts = name
+            raise
+        took = self.now() - started
+        (directory / "stdout.txt").write_bytes(run.stdout.encode())
+        record.update(
+            exit_code=run.exit_code,
+            timed_out=run.timed_out,
+            suite_status=suite_status(run, self.process_exit),
+            elapsed_ms=took,
+            receipts=name,
+            stdout_sha256=_digest(directory / "stdout.txt"),
+        )
+        calls.append(record)
+        if run.timed_out and bound == "attempt":
+            raise self.expired(started + took)
+
+
+def _in_lanes(lanes: int, count: int, work: Callable[[int, int], None]) -> None:
+    """`work(lane, index)` for every index in order, in at most `lanes` threads at once.
+
+    Each lane takes the next index when it is free, so indices start in order and finish in any
+    order. The first failure stops new indices; running ones finish, each within its own clocks.
+    An integrity failure is raised before an infrastructure one, so the attempt fails closed.
+    """
+    lock = threading.Lock()
+    next_index = 0
+    failures: list[BaseException] = []
+
+    def lane(number: int) -> None:
+        nonlocal next_index
+        while True:
+            with lock:
+                if failures or next_index >= count:
+                    return
+                index, next_index = next_index, next_index + 1
+            try:
+                work(number, index)
+            except BaseException as error:  # Re-raised in the caller's thread below.
+                with lock:
+                    failures.append(error)
+                return
+
+    threads = [
+        threading.Thread(target=lane, args=(number,), name=f"mutation-lane-{number}")
+        for number in range(min(lanes, count))
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if failures:
+        raise next(
+            (error for error in failures if not isinstance(error, InfrastructureFailure)),
+            failures[0],
+        )
 
 
 def _mutated(tree: Path, site: Site, work: Path) -> tuple[Path, str]:
@@ -603,10 +913,16 @@ def _mutated(tree: Path, site: Site, work: Path) -> tuple[Path, str]:
 
 
 def _baseline(runs: list[dict[str, object]]) -> bool:
-    return all(run["suite_status"] == 0 for run in runs)
+    return all(run.get("suite_status") == 0 for run in runs)
+
+
+def _slowest(runs: list[dict[str, object]]) -> int:
+    """B: the slower of two green version 2 baselines, in milliseconds."""
+    return max(int(str(run["elapsed_ms"])) for run in runs)
 
 
 def _timeout(runs: list[dict[str, object]]) -> int:
+    """Version 1's mutant timeout in seconds."""
     slowest = max(float(str(run["elapsed_seconds"])) for run in runs)
     return math.ceil(TIMEOUT_FACTOR * slowest + TIMEOUT_GRACE_SECONDS)
 
@@ -655,8 +971,14 @@ def collect_mutation(
     destination: Path,
     *,
     execute: Executor | None = None,
+    limits: Limits | None = None,
+    clock: Clock | None = None,
 ) -> dict[str, object]:
-    """Measure one submission; `root` is a disposable copy of it, never modified."""
+    """Measure one submission; `root` is a disposable copy of it, never modified.
+
+    Without `execute`, each run is a fresh container of the task's base image
+    (`measurement_identity`), and Docker must hold every lane at once.
+    """
     if config.get("observer_version") != components.VERSIONS["mutation_observer"]:
         raise components.ObserverError(
             f"mutation observer version {config.get('observer_version')} froze this profile, and "
@@ -665,7 +987,10 @@ def collect_mutation(
         )
     implementation = observer_identity()
     try:
-        return _collect(root, before, config, destination, execute)
+        return _collect(
+            root, before, config, destination, execute, limits or Limits(),
+            clock or time.monotonic_ns,
+        )
     finally:
         if observer_identity() != implementation:
             raise components.ObserverError(
@@ -674,22 +999,42 @@ def collect_mutation(
             )
 
 
+def _failure(error: InfrastructureFailure, attempt: _Attempt) -> dict[str, object]:
+    return {
+        "reason": str(error),
+        "receipts": error.receipts,
+        "cause": "attempt_deadline" if isinstance(error, AttemptDeadline) else "executor",
+        "at_ms": attempt.now(),
+    }
+
+
 def _collect(
     root: Path,
     before: Path,
     config: dict[str, object],
     destination: Path,
     execute: Executor | None,
+    limits: Limits,
+    clock: Clock,
 ) -> dict[str, object]:
+    started = clock()  # The attempt's clock starts before site discovery.
     coverage = config["coverage"]
     identity = config["native_task_identity"]
     assert isinstance(coverage, dict) and isinstance(identity, dict)
+    baseline_ms = (
+        limits.baseline_ms if limits.baseline_ms is not None
+        else 1000 * int(coverage["timeout_seconds"])
+    )
     if execute is None:
+        measured = measurement_identity(identity)
+        _check_capacity(measured, limits.lanes)
         execute = native_executor(
-            identity, str(coverage["report_path"]), provisioned_tool=coverage.get("provisioned_tool"),
+            measured, str(coverage["report_path"]), provisioned_tool=coverage.get("provisioned_tool"),
             provisioned_scope=_strings(coverage.get("source_scope") or ["*"])
         )
-    run = _Runner(execute, destination, _process_exit(config))
+    attempt = _Attempt(
+        execute, destination, _process_exit(config), clock, started, limits.attempt_ms
+    )
     change = compare_snapshots(before, root)
     generated = set(_strings(config["generated_files"]))
     changed = sorted(
@@ -704,7 +1049,7 @@ def _collect(
         key=lambda site: (site.path, site.start, site.end, OPERATORS.index(site.operator)),
     )
     after_digest = str(change["after_digest"])
-    selected = sample(candidates, after_digest)
+    selected = sample(candidates, after_digest, limits.sample_size)
     report: dict[str, object] = {
         "version": VERSION,
         "language": str(config["language"]),
@@ -712,7 +1057,13 @@ def _collect(
         "before_digest": change["before_digest"],
         "after_digest": after_digest,
         "operators": list(OPERATORS),
-        "sample_size": SAMPLE_SIZE,
+        "sample_size": limits.sample_size,
+        "lanes": limits.lanes,
+        "clocks": {
+            "baseline_ms": baseline_ms,
+            "attempt_ms": limits.attempt_ms,
+            "timing_boundary": TIMING_BOUNDARY,
+        },
         "generated_files": sorted(generated),
         "changed_production_lines": changed,
         "unsupported_files": sorted(files - supported),
@@ -721,103 +1072,206 @@ def _collect(
         "selected": [asdict(site) for site in selected],
         "baseline": [],
         "check_baseline": None,
-        "source_only": _source_only_state(before, root, config.get("source_only_reference_paths")),
         "mutants": [],
+        # When every required mutant had settled: later work is diagnostic only.
+        "required_settled_ms": None,
+        "source_only": _source_only_state(before, root, config.get("source_only_reference_paths")),
         "infrastructure_failure": None,
+        "finished_ms": None,
         "python": f"{sys.version_info.major}.{sys.version_info.minor}",
     }
     if selected:
         command = [str(item) for item in coverage["command"]]
-        try:
-            _run_mutants(
-                run, root, before, report, selected, command, int(coverage["timeout_seconds"])
-            )
-        except InfrastructureFailure as error:
-            report["infrastructure_failure"] = {"reason": str(error), "receipts": run.current}
+        with tempfile.TemporaryDirectory(prefix="pluginbench-mutation-") as temporary:
+            work = Path(temporary)
+            try:
+                _run_required(attempt, root, report, selected, command, baseline_ms, limits, work)
+            except InfrastructureFailure as error:
+                report["infrastructure_failure"] = _failure(error, attempt)
+            else:
+                if report["required_settled_ms"] is not None:
+                    source = _object(report["source_only"])
+                    try:
+                        _run_diagnostics(
+                            attempt, before, root, report, selected, command, baseline_ms,
+                            limits, work,
+                        )
+                    except InfrastructureFailure as error:
+                        # The headline is sealed: only the diagnostic is incomplete.
+                        source["interrupted"] = _failure(error, attempt)
+    report["finished_ms"] = attempt.now()
     return report
 
 
-def _run_mutants(
-    run: _Runner,
+def _run_required(
+    attempt: _Attempt,
     root: Path,
-    before: Path,
     report: dict[str, object],
     selected: list[Site],
     command: list[str],
-    suite_timeout: int,
+    baseline_ms: int,
+    limits: Limits,
+    work: Path,
 ) -> None:
-    """The baseline, then each selected mutant, recorded into `report` as each run ends."""
-    baseline = [run(root, command, suite_timeout, "baseline") for _ in range(2)]
+    """The baselines, serially, then every selected mutant in lanes, recorded into `report`."""
+    baseline: list[dict[str, object]] = []
     report["baseline"] = baseline
+    for _ in range(2):
+        attempt.call(
+            baseline, root, command, attempt.serial_name("baseline"), label="baseline",
+            cap_ms=baseline_ms,
+        )
     if not _baseline(baseline):
         return
-    timeout = _timeout(baseline)
+    slowest = _slowest(baseline)
     if any(_check_command(site.path) == TSC_CHECK for site in selected):
-        result = run(root, TSC_CHECK, suite_timeout, "tsc-baseline")
-        report["check_baseline"] = result
-        if not _tsc_ran(run.destination, result):
-            return
-    source_state = _object(report["source_only"])
-    with tempfile.TemporaryDirectory(prefix="pluginbench-mutation-") as temporary:
-        work = Path(temporary)
-        source_tree = work / "source-only"
-        source_baseline: list[dict[str, object]] = []
-        if source_state["status"] == "measured" and source_state["changed_test_files"]:
-            _source_only_tree(
-                before, root, _strings(source_state["changed_test_files"]), source_tree
+        checks: list[dict[str, object]] = []
+        try:
+            attempt.call(
+                checks, root, TSC_CHECK, attempt.serial_name("tsc-baseline"),
+                label="tsc-baseline", cap_ms=baseline_ms,
             )
-            source_baseline = [
-                run(source_tree, command, suite_timeout, "source-only-baseline") for _ in range(2)
-            ]
-            source_state["baseline"] = source_baseline
-        mutants: list[dict[str, object]] = []
-        report["mutants"] = mutants
-        for index, site in enumerate(selected):
-            tree, mutated = _mutated(root, site, work / "mutant")
-            record: dict[str, object] = {"site": index, "mutated_sha256": mutated, "check": None}
-            check = _check_command(site.path)
-            if check is not None:
-                record["check"] = run(tree, check, suite_timeout, f"mutant-{index}-check")
-                state = _check_state(
-                    run.destination, record["check"], report["check_baseline"], site
-                )
-                if state != "valid":
-                    mutants.append(record)
-                    continue
-            runs: list[dict[str, object]] = []
-            while outcome(runs) is None:
-                runs.append(run(tree, command, timeout, f"mutant-{index}"))
-            record["runs"] = runs
-            if (
-                source_baseline
-                and _baseline(source_baseline)
-                and outcome(runs) in ("killed", "timeout")
-            ):
-                record["source_only"] = _source_only_runs(
-                    run, site, source_tree, root, work, command, _timeout(source_baseline), index
-                )
-            mutants.append(record)
+        finally:
+            report["check_baseline"] = checks[0] if checks else None
+        if not _tsc_ran(attempt.destination, checks[0]):
+            return
+    records: dict[int, dict[str, object]] = {}
+
+    def measure(lane: int, index: int) -> None:
+        _measure_mutant(
+            attempt, root, selected[index], index, work / f"lane-{lane}", command, slowest,
+            report["check_baseline"], records,
+        )
+
+    try:
+        _in_lanes(limits.lanes, len(selected), measure)
+    finally:
+        # In sample order, whatever order the lanes finished in.
+        report["mutants"] = [records[index] for index in sorted(records)]
+    report["required_settled_ms"] = attempt.now()
 
 
-def _source_only_runs(
-    run: _Runner,
-    site: Site,
-    source_tree: Path,
+def _namer(prefix: str) -> Callable[[str], str]:
+    """Receipt names for one site's runs, numbered within the site."""
+    count = 0
+
+    def name(label: str) -> str:
+        nonlocal count
+        count += 1
+        return f"{prefix}/{count - 1:02d}-{label}"
+
+    return name
+
+
+def _measure_mutant(
+    attempt: _Attempt,
     root: Path,
-    work: Path,
-    command: list[str],
-    timeout: int,
+    site: Site,
     index: int,
-) -> dict[str, object]:
-    """The source-only suite on the same mutant; a site the filter changed has none."""
-    placed = source_tree / site.path
-    if not placed.is_file() or placed.read_bytes() != (root / site.path).read_bytes():
-        return {"placed": False}
-    tree, mutated = _mutated(source_tree, site, work / "source-only-mutant")
+    scratch: Path,
+    command: list[str],
+    slowest: int,
+    check_baseline: object,
+    records: dict[int, dict[str, object]],
+) -> None:
+    """One mutant: its check, then runs until its outcome is known, within 6B of dispatch."""
+    dispatched = attempt.admit()
+    tree, mutated = _mutated(root, site, scratch)
+    deadline = dispatched + SITE_FACTOR * slowest
     runs: list[dict[str, object]] = []
-    while outcome(runs) is None:
-        runs.append(run(tree, command, timeout, f"mutant-{index}-source-only"))
-    return {"placed": True, "mutated_sha256": mutated, "runs": runs}
+    record: dict[str, object] = {
+        "site": index,
+        "mutated_sha256": mutated,
+        "dispatched_ms": dispatched,
+        "check": None,
+        "runs": runs,
+        "settled_ms": None,
+    }
+    records[index] = record
+    name = _namer(f"runs/site-{index:03d}")
+    check = _check_command(site.path)
+    if check is not None:
+        checks: list[dict[str, object]] = []
+        try:
+            attempt.call(
+                checks, tree, check, name("check"), label="check", cap_ms=None,
+                deadline_ms=deadline,
+            )
+        finally:
+            record["check"] = checks[0] if checks else None
+        if _check_state_v2(attempt.destination, checks[0], check_baseline, site) != "valid":
+            record["settled_ms"] = attempt.now()
+            return
+    while site_outcome(runs) is None:
+        attempt.call(
+            runs, tree, command, name("mutant"), label="mutant",
+            cap_ms=None if runs else FIRST_RUN_FACTOR * slowest, deadline_ms=deadline,
+        )
+    record["settled_ms"] = attempt.now()
+
+
+def _run_diagnostics(
+    attempt: _Attempt,
+    before: Path,
+    root: Path,
+    report: dict[str, object],
+    selected: list[Site],
+    command: list[str],
+    baseline_ms: int,
+    limits: Limits,
+    work: Path,
+) -> None:
+    """The source-only suite on each kill, after every required mutant has settled."""
+    source = _object(report["source_only"])
+    if source["status"] != "measured" or not source["changed_test_files"]:
+        return
+    kills = [
+        record for record in _runs(report["mutants"]) if site_outcome(_runs(record["runs"])) in KILLS
+    ]
+    if not kills:
+        return
+    tree = work / "source-only"
+    _source_only_tree(before, root, _strings(source["changed_test_files"]), tree)
+    baseline: list[dict[str, object]] = []
+    source["baseline"] = baseline
+    for _ in range(2):
+        attempt.call(
+            baseline, tree, command, attempt.serial_name("source-only-baseline"),
+            label="source-only-baseline", cap_ms=baseline_ms,
+        )
+    if not _baseline(baseline):
+        return
+    slowest = _slowest(baseline)
+
+    def measure(lane: int, number: int) -> None:
+        record = kills[number]
+        index = int(str(record["site"]))
+        site = selected[index]
+        placed = tree / site.path
+        if not placed.is_file() or placed.read_bytes() != (root / site.path).read_bytes():
+            record["source_only"] = {"placed": False}
+            return
+        dispatched = attempt.admit()
+        mutant, mutated = _mutated(tree, site, work / f"lane-{lane}")
+        runs: list[dict[str, object]] = []
+        diagnostic: dict[str, object] = {
+            "placed": True,
+            "mutated_sha256": mutated,
+            "dispatched_ms": dispatched,
+            "runs": runs,
+            "settled_ms": None,
+        }
+        record["source_only"] = diagnostic
+        name = _namer(f"runs/source-only-site-{index:03d}")
+        deadline = dispatched + SITE_FACTOR * slowest
+        while site_outcome(runs) is None:
+            attempt.call(
+                runs, mutant, command, name("mutant"), label="source-only-mutant",
+                cap_ms=None if runs else FIRST_RUN_FACTOR * slowest, deadline_ms=deadline,
+            )
+        diagnostic["settled_ms"] = attempt.now()
+
+    _in_lanes(limits.lanes, len(kills), measure)
 
 
 def _stdout(destination: Path, result: dict[str, object]) -> str:
@@ -857,6 +1311,17 @@ def _check_state(destination: Path, check: object, baseline: object, site: Site)
     return "invalid" if errors - known else "valid"
 
 
+def _check_state_v2(destination: Path, check: object, baseline: object, site: Site) -> str:
+    """A version 2 check: unconfirmed or interrupted when a clock stopped it, else as version 1.
+
+    A check has no cap of its own, so only the site deadline or the attempt's limit stops it.
+    """
+    result = _object(check)
+    if (cut := _cut(result)) is not None:
+        return _CUT_LATER[cut]
+    return _check_state(destination, result, baseline, site)
+
+
 # --- Metrics -------------------------------------------------------------------------------
 
 
@@ -880,17 +1345,26 @@ def _runs(value: object) -> list[dict[str, object]]:
 
 
 class _Receipts:
-    """Checks run records against their saved output and the launcher's execution.json."""
+    """Checks run records against their saved output and the launcher's execution.json.
 
-    def __init__(self, directory: Path, config: dict[str, object]) -> None:
-        self.directory = directory
+    A version 1 run used the profile's own task image; a version 2 run used
+    `measurement_identity`: the base image, at two CPUs and 2,048 MiB.
+    """
+
+    def __init__(self, directory: Path, config: dict[str, object], version: str) -> None:
+        self.directory, self.version = directory, version
         self.process_exit = _process_exit(config)
-        identity = _object(_object(config["native_task_identity"])["image_identity"])
-        self.image = identity["image_id"]
+        identity = _object(config["native_task_identity"])
+        self.resources: dict[str, object] | None = None
+        if version == VERSION:
+            identity = measurement_identity(identity)
+            self.resources = _object(identity["resources"])
+        self.image = _object(identity["image_identity"])["image_id"]
         self.seen: set[str] = set()
 
     def _own(self, receipts: object) -> Path:
-        """A run's receipt directory, named as `_Runner` names it; no two runs share one.
+        """A run's receipt directory, named as its report version names it; no two runs share
+        one.
 
         Only that one spelling is accepted, and it must not pass through a link, so the name
         alone tells two directories apart.
@@ -898,7 +1372,7 @@ class _Receipts:
         name = str(receipts)
         path = self.directory / name
         if (
-            not _RECEIPTS.fullmatch(name)
+            not _RECEIPTS[self.version].fullmatch(name)
             or name in self.seen
             or path.resolve() != self.directory.resolve() / name
         ):
@@ -910,42 +1384,86 @@ class _Receipts:
         """A run's launcher receipt."""
         return _object(json.loads((self._own(receipts) / "execution.json").read_text()))
 
+    def _check(self, item: dict[str, object], command: list[str], tree: str) -> None:
+        """One run record against its saved output and its launcher receipt."""
+        stdout = _stdout(self.directory, item)
+        exit_code = item["exit_code"]
+        recorded = Run(
+            exit_code=exit_code if isinstance(exit_code, int) else None,
+            timed_out=item["timed_out"] is True,
+            stdout=stdout,
+        )
+        if suite_status(recorded, self.process_exit) != item["suite_status"]:
+            raise ValueError("a mutation run's suite status differs from its saved output")
+        receipt = self.receipt(item["receipts"])
+        if (
+            receipt.get("command") != command
+            or receipt.get("image_id") != self.image
+            or receipt.get("before_digest") != tree
+            or receipt.get("exit_code") != exit_code
+            or receipt.get("timed_out") is not item["timed_out"]
+            or str(receipt.get("stdout") or "") != stdout
+            or (self.resources is not None and receipt.get("resources") != self.resources)
+        ):
+            raise ValueError("a mutation run's record differs from its launcher receipt")
+
     def runs(
         self, value: object, command: list[str], tree: str, timeout: int
     ) -> list[dict[str, object]]:
-        """Run records that re-derive from their output and match their receipts.
+        """Version 1 run records that re-derive from their output and match their receipts.
 
         `tree` is the digest of the tree each run must have measured, and `timeout` its limit.
         """
         runs = _runs(value)
         for item in runs:
-            stdout = _stdout(self.directory, item)
-            exit_code = item["exit_code"]
-            recorded = Run(
-                exit_code=exit_code if isinstance(exit_code, int) else None,
-                timed_out=item["timed_out"] is True,
-                stdout=stdout,
-                elapsed_seconds=float(str(item["elapsed_seconds"])),
-            )
-            if suite_status(recorded, self.process_exit) != item["suite_status"]:
-                raise ValueError("a mutation run's suite status differs from its saved output")
-            receipt = self.receipt(item["receipts"])
-            if (
-                receipt.get("command") != command
-                or receipt.get("image_id") != self.image
-                or receipt.get("before_digest") != tree
-                or receipt.get("exit_code") != exit_code
-                or receipt.get("timed_out") is not item["timed_out"]
-                or str(receipt.get("stdout") or "") != stdout
-                or item["timeout_seconds"] != timeout
-            ):
+            self._check(item, command, tree)
+            if item["timeout_seconds"] != timeout:
                 raise ValueError("a mutation run's record differs from its launcher receipt")
         return runs
 
-    def infrastructure(self, value: object) -> str:
-        """An infrastructure failure's reason, as the failing run's receipt records it."""
+    def calls(
+        self, value: object, command: list[str], tree: str, clocks: _CallClocks
+    ) -> list[dict[str, object]]:
+        """Version 2 call records: each started within its clocks, in order, and each that ran
+        matches its saved output and launcher receipt.
+
+        `clocks(position)` gives the cap and site deadline of the call at that position.
+        """
+        calls = _runs(value)
+        earliest = 0
+        for position, item in enumerate(calls):
+            cap, deadline, attempt_ms = clocks(position)
+            started = _whole(item["started_ms"])
+            bound, left = call_limit(
+                started_ms=started, cap_ms=cap, deadline_ms=deadline, attempt_ms=attempt_ms
+            )
+            if (
+                started < earliest
+                or item["bound"] != bound
+                or item["timeout_ms"] != left
+                or item["dispatched"] is not (left > 0)
+            ):
+                raise ValueError("a mutation run's clocks differ from its recorded start")
+            if left > 0:
+                self._check(item, command, tree)
+                earliest = started + _whole(item["elapsed_ms"])
+            elif set(item) != {"label", "started_ms", "bound", "timeout_ms", "dispatched"}:
+                raise ValueError("a mutation run that never started records a result")
+        return calls
+
+    def infrastructure(self, value: object, attempt_ms: object = None) -> str:
+        """An infrastructure failure's reason, as the failing run's receipt records it.
+
+        A version 2 attempt-limit expiry has no failing run: it needs the limit it names.
+        """
         record = _object(value)
         reason = str(record["reason"])
+        if self.version == VERSION and record.get("cause") == "attempt_deadline":
+            if record["receipts"] is not None or attempt_ms is None:
+                raise ValueError("a mutation attempt-limit expiry differs from its clocks")
+            return reason
+        if self.version == VERSION and record.get("cause") != "executor":
+            raise ValueError("a mutation infrastructure failure names no known cause")
         directory = self._own(record["receipts"])
         launched, prelaunch = directory / "execution.json", directory / PRELAUNCH_FAILURE
         if launched.is_file() == prelaunch.is_file():
@@ -966,8 +1484,19 @@ class _Receipts:
         return reason
 
 
+# A version 2 call's cap, site deadline and attempt limit, by its position among its site's runs.
+_CallClocks = Callable[[int], tuple[int | None, int | None, int | None]]
+
+
+def _whole(value: object) -> int:
+    """A recorded millisecond reading: a whole number, never negative."""
+    if type(value) is not int or value < 0:
+        raise ValueError("mutation clocks are whole milliseconds")
+    return value
+
+
 def _settled(runs: list[dict[str, object]]) -> str:
-    """A mutant's outcome; its runs must end exactly where the outcome became known."""
+    """A version 1 mutant's outcome; its runs must end exactly where the outcome became known."""
     state = outcome(runs)
     if state is None or any(outcome(runs[:count]) is not None for count in range(1, len(runs))):
         raise ValueError("a mutant's runs do not end where its outcome is known")
@@ -1017,6 +1546,26 @@ class _Measured:
     receipts: _Receipts
 
 
+# The outcome counts a report publishes, and the outcome each counts.
+_COUNTS = (
+    ("killed", "killed"),
+    ("timed_out", "timeout"),
+    ("survived", "survived"),
+    ("invalid", "invalid"),
+    ("flaky", "flaky"),
+    ("errors", "error"),
+)
+_COUNTS_V2 = (
+    ("killed", "killed"),
+    ("timed_out", "timeout_kill"),
+    ("survived", "survived"),
+    ("invalid", "invalid"),
+    ("flaky", "flaky"),
+    ("unconfirmed", "unconfirmed"),
+    ("errors", "error"),
+)
+
+
 def mutation_metrics(
     report: dict[str, object], directory: Path, *, config: dict[str, object], snapshot: Path
 ) -> dict[str, object]:
@@ -1024,15 +1573,21 @@ def mutation_metrics(
 
     `directory` holds the report's run receipts, `config` is its frozen profile and `snapshot`
     the measured submission. Each run must match its launcher receipt: the profile's command
-    and image, and the tree that run measured, which is rebuilt here from the snapshot.
+    and image, and the tree that run measured, which is rebuilt here from the snapshot. A
+    version 1 and a version 2 report decode alike, each by its own rules.
     """
-    if report.get("version") != VERSION:
+    version = report.get("version")
+    if version not in (V1, VERSION):
         raise ValueError("mutation report version differs from this observer")
+    assert isinstance(version, str)
     if report.get("suite_status") != config.get("suite_status"):
         raise ValueError("mutation report's suite status rule differs from its frozen profile")
+    size = V1_SAMPLE_SIZE if version == V1 else report.get("sample_size")
+    if type(size) is not int or size < 1:
+        raise ValueError("mutation report's sample size is not a positive whole number")
     candidates = _sites(report["candidates"])
     selected = _sites(report["selected"])
-    if selected != sample(candidates, str(report["after_digest"])):
+    if selected != sample(candidates, str(report["after_digest"]), size):
         raise ValueError("selected mutants are not the preregistered sample of the candidates")
     if not set(site.coordinate() for site in candidates) <= set(
         _strings(report["changed_production_lines"])
@@ -1047,7 +1602,7 @@ def mutation_metrics(
         after=_tree_digest(files),
         command=_strings(coverage["command"]),
         suite_timeout=int(str(coverage["timeout_seconds"])),
-        receipts=_Receipts(directory, config),
+        receipts=_Receipts(directory, config, version),
     )
     if measured.after != report["after_digest"]:
         raise ValueError("mutation report differs from its measured snapshot")
@@ -1055,8 +1610,8 @@ def mutation_metrics(
     unsupported = _strings(report["unsupported_files"])
     result: dict[str, object] = {
         "before_digest": report["before_digest"],
-        "method": METHOD,
-        "limitations": LIMITATIONS,
+        "method": METHOD[version],
+        "limitations": LIMITATIONS[version],
         "candidate_count": len(candidates),
         "candidate_line_count": len(candidate_lines),
         "candidate_lines": candidate_lines,
@@ -1067,6 +1622,8 @@ def mutation_metrics(
         "unsupported_files": unsupported,
         "unsupported_file_count": len(unsupported),
     }
+    if version == VERSION:
+        return _metrics_v2(report, measured, selected, result)
     unavailable: str | None = None
     incomplete = sorted(_object(report["unparsed_files"]))
     rows: list[dict[str, object]] = []
@@ -1091,17 +1648,7 @@ def mutation_metrics(
             incomplete.append(problem)
         else:
             share, rows = _mutant_rows(measured, report, selected, share, _timeout(baseline))
-    counts = {
-        key: sum(row["outcome"] == state for row in rows)
-        for key, state in (
-            ("killed", "killed"),
-            ("timed_out", "timeout"),
-            ("survived", "survived"),
-            ("invalid", "invalid"),
-            ("flaky", "flaky"),
-            ("errors", "error"),
-        )
-    }
+    counts = {key: sum(row["outcome"] == state for row in rows) for key, state in _COUNTS}
     if counts["errors"]:
         incomplete.append(f"{counts['errors']} mutant runs reported no suite status")
     killed = counts["killed"] + counts["timed_out"]
@@ -1119,13 +1666,24 @@ def mutation_metrics(
     return result
 
 
-def _tsc_baseline_problem(measured: _Measured, tsc: object, selected: list[Site]) -> str | None:
-    """Why the TypeScript mutants cannot be checked, if so; the tsc baseline runs only for them."""
+def _tsc_baseline_problem(
+    measured: _Measured,
+    tsc: object,
+    selected: list[Site],
+    validate: Callable[[object], object] | None = None,
+) -> str | None:
+    """Why the TypeScript mutants cannot be checked, if so; the tsc baseline runs only for them.
+
+    `validate` checks the tsc run's record; version 1's rule is the default.
+    """
     if any(_check_command(site.path) == TSC_CHECK for site in selected) != (tsc is not None):
         raise ValueError("the tsc baseline run differs from the TypeScript mutants it serves")
     if tsc is None:
         return None
-    measured.receipts.runs([tsc], TSC_CHECK, measured.after, measured.suite_timeout)
+    if validate is None:
+        measured.receipts.runs([tsc], TSC_CHECK, measured.after, measured.suite_timeout)
+    else:
+        validate(tsc)
     if not _tsc_ran(measured.directory, _object(tsc)):
         return "tsc did not report diagnostics on the unmutated tree"
     return None
@@ -1138,11 +1696,10 @@ def _mutant_rows(
     share: dict[str, object],
     timeout: int,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
-    """Each selected mutant's outcome row, and the share state after the source-only baseline."""
+    """Version 1: each selected mutant's outcome row, and the share state after the source-only
+    baseline."""
     source = _object(report["source_only"])
-    restored = _object(source.get("restored") or {})
-    source_files = {path: digest for path, digest in measured.files.items() if path not in restored}
-    source_files.update({path: digest for path, digest in restored.items() if digest is not None})
+    source_files = _source_files(measured, source)
     source_timeout = 0
     if share["status"] == "available" and share["changed_test_files"]:
         source_baseline = measured.receipts.runs(
@@ -1192,6 +1749,278 @@ def _mutant_rows(
     return share, rows
 
 
+def _source_files(measured: _Measured, source: dict[str, object]) -> dict[str, object]:
+    """The source-only tree's files: the measured snapshot with the left-out files restored."""
+    restored = _object(source.get("restored") or {})
+    files = {path: digest for path, digest in measured.files.items() if path not in restored}
+    files.update({path: digest for path, digest in restored.items() if digest is not None})
+    return files
+
+
+def _metrics_v2(
+    report: dict[str, object],
+    measured: _Measured,
+    selected: list[Site],
+    result: dict[str, object],
+) -> dict[str, object]:
+    """A version 2 report's outcomes, counts and the partition of its sample.
+
+    The partition is settled, interrupted (started, unsettled) and unstarted site indices. An
+    incomplete attempt publishes its counts only as `partial_counts`, never as the pooled
+    `killed` and `valid`.
+    """
+    clocks = _object(report["clocks"])
+    baseline_ms = _whole(clocks["baseline_ms"])
+    attempt_ms = clocks["attempt_ms"]
+    if (
+        baseline_ms < 1
+        or not (attempt_ms is None or (type(attempt_ms) is int and attempt_ms >= 1))
+        or clocks["timing_boundary"] != TIMING_BOUNDARY
+        or type(report["lanes"]) is not int
+        or int(str(report["lanes"])) < 1
+    ):
+        raise ValueError("mutation report's clocks or lanes are malformed")
+    attempt = attempt_ms if isinstance(attempt_ms, int) else None
+    unavailable: str | None = None
+    incomplete = sorted(_object(report["unparsed_files"]))
+    failure = report["infrastructure_failure"]
+    if failure is not None:
+        incomplete.append(
+            "infrastructure failure: " + measured.receipts.infrastructure(failure, attempt)
+        )
+    rows: list[dict[str, object]] = []
+    states: dict[int, str | None] = {}
+    share = _share_state(_object(report["source_only"]))
+    required = False
+    if not selected:
+        if not incomplete:
+            unavailable = "no candidate sites on changed production lines"
+    else:
+        baseline = measured.receipts.calls(
+            report["baseline"], measured.command, measured.after,
+            lambda _: (baseline_ms, None, attempt),
+        )
+        green = len(baseline) == 2 and _baseline(baseline)
+        cut_before_tsc = (
+            failure is not None
+            and report["check_baseline"] is None
+            and any(_check_command(site.path) == TSC_CHECK for site in selected)
+        )
+        if failure is None and not green:
+            unavailable = "baseline red or unstable"
+        elif green and not cut_before_tsc:
+            problem = _tsc_baseline_problem(
+                measured, report["check_baseline"], selected,
+                lambda tsc: measured.receipts.calls(
+                    [tsc], TSC_CHECK, measured.after, lambda _: (baseline_ms, None, attempt)
+                ),
+            )
+            if problem:
+                incomplete.append(problem)
+            else:
+                required = True
+                states, rows = _mutant_rows_v2(
+                    measured, report, selected, _slowest(baseline), attempt, failure is not None
+                )
+    if (report["required_settled_ms"] is not None) != (required and failure is None):
+        raise ValueError("mutation report's required phase differs from its mutants")
+    settled = sorted(index for index, state in states.items() if state is not None)
+    counts = {key: sum(row["outcome"] == state for row in rows) for key, state in _COUNTS_V2}
+    if counts["errors"]:
+        incomplete.append(f"{counts['errors']} mutant runs reported no suite status")
+    killed = counts["killed"] + counts["timed_out"]
+    valid = killed + counts["survived"]
+    if unavailable is None and not incomplete and not valid:
+        unavailable = "no valid mutants"
+    status = "incomplete" if incomplete else "unavailable" if unavailable else "available"
+    result["sample_size"] = report["sample_size"]
+    result["sites"] = {
+        "settled": settled,
+        "interrupted": sorted(index for index, state in states.items() if state is None),
+        "unstarted": [index for index in range(len(selected)) if index not in states],
+    }
+    if status == "incomplete":
+        # Partial: no consumer may pool these with a complete attempt's counts.
+        result.update({key: None for key, _ in _COUNTS_V2}, killed=None, valid=None)
+        result["partial_counts"] = {**counts, "kills": killed, "valid": valid}
+    else:
+        result.update(counts, killed=killed, valid=valid)
+        result["partial_counts"] = None
+    result["mutants"] = rows
+    result["status"] = status
+    result["reason"] = "; ".join(incomplete) if incomplete else unavailable
+    result["bug_catch_percent"] = round(100 * killed / valid, 6) if status == "available" else None
+    if required and failure is None:
+        share = _source_only_v2(measured, report, selected, share, rows, attempt)
+    result["test_change_kill_share"] = _share(share, rows, valid, status)
+    return result
+
+
+def _mutant_rows_v2(
+    measured: _Measured,
+    report: dict[str, object],
+    selected: list[Site],
+    slowest: int,
+    attempt_ms: int | None,
+    interrupted: bool,
+) -> tuple[dict[int, str | None], list[dict[str, object]]]:
+    """Each started mutant's state (None while unsettled) and the settled mutants' rows.
+
+    Lanes start sites in sample order, so a complete attempt records every site once; an
+    interrupted one records the sites it started, in order.
+    """
+    mutants = _runs(report["mutants"])
+    if any(type(item["site"]) is not int for item in mutants):
+        raise ValueError("mutation report does not record every selected mutant once")
+    indices = [int(str(item["site"])) for item in mutants]
+    if (
+        indices != list(range(len(selected)))
+        if not interrupted
+        else indices != sorted(set(indices)) or not set(indices) <= set(range(len(selected)))
+    ):
+        raise ValueError("mutation report does not record every selected mutant once")
+    states: dict[int, str | None] = {}
+    rows: list[dict[str, object]] = []
+    for record in mutants:
+        index = int(str(record["site"]))
+        site = selected[index]
+        mutated = _mutant_digest(measured.snapshot, site)
+        if record["mutated_sha256"] != mutated:
+            raise ValueError("a mutant's recorded bytes are not its site's mutation")
+        tree = _tree_digest({**measured.files, site.path: mutated})
+        deadline = _whole(record["dispatched_ms"]) + SITE_FACTOR * slowest
+        state: str | None = "valid"
+        check = _check_command(site.path)
+        if check is None and record["check"] is not None:
+            raise ValueError("a mutant's build or tsc check is missing or unexpected")
+        if check is not None:
+            if record["check"] is None:
+                if not interrupted or record["runs"]:
+                    raise ValueError("a mutant's build or tsc check is missing or unexpected")
+                state = None
+            else:
+                [result] = measured.receipts.calls(
+                    [record["check"]], check, tree, lambda _: (None, deadline, attempt_ms)
+                )
+                state = _check_state_v2(
+                    measured.directory, result, report["check_baseline"], site
+                )
+                if state != "valid" and record["runs"]:
+                    raise ValueError("a mutant ran after its check settled it")
+        if state == "valid":
+            runs = measured.receipts.calls(
+                record["runs"], measured.command, tree,
+                lambda position: (
+                    FIRST_RUN_FACTOR * slowest if position == 0 else None, deadline, attempt_ms
+                ),
+            )
+            state = site_outcome(runs)
+            if any(site_outcome(runs[:count]) is not None for count in range(1, len(runs))):
+                raise ValueError("a mutant's runs do not end where its outcome is known")
+        if state == "interrupted":
+            state = None
+        if (state is None) != (record["settled_ms"] is None) or (state is None and not interrupted):
+            raise ValueError("a mutant's settlement differs from its runs")
+        states[index] = state
+        if state is not None:
+            rows.append({
+                "site": index,
+                "path": site.path,
+                "line": site.line,
+                "operator": site.operator,
+                "outcome": state,
+            })
+    return states, rows
+
+
+def _source_only_v2(
+    measured: _Measured,
+    report: dict[str, object],
+    selected: list[Site],
+    share: dict[str, object],
+    rows: list[dict[str, object]],
+    attempt_ms: int | None,
+) -> dict[str, object]:
+    """Each kill's source-only outcome, onto its row, and the share state after the source-only
+    baseline. The diagnostic runs only after every required mutant settled, so cutting it never
+    changes the headline."""
+    source = _object(report["source_only"])
+    if share["status"] != "available" or not share["changed_test_files"]:
+        return share
+    clocks = _object(report["clocks"])
+    baseline_ms = _whole(clocks["baseline_ms"])
+    files = _source_files(measured, source)
+    kills = [row for row in rows if row["outcome"] in KILLS]
+    interruption = source.get("interrupted")
+    if interruption is not None:
+        measured.receipts.infrastructure(interruption, attempt_ms)
+    baseline = measured.receipts.calls(
+        source["baseline"], measured.command, _tree_digest(files),
+        lambda _: (baseline_ms, None, attempt_ms),
+    )
+    if not kills:
+        if baseline:
+            raise ValueError("a source-only baseline ran with no kill to diagnose")
+        return share
+    if len(baseline) != 2 or not _baseline(baseline):
+        if interruption is not None:
+            return {"status": "incomplete", "reason": "the source-only diagnostic was cut"}
+        return {"status": "unavailable", "reason": "source-only baseline red or unstable"}
+    slowest = _slowest(baseline)
+    records = {int(str(item["site"])): item for item in _runs(report["mutants"])}
+    for row in kills:
+        index = int(str(row["site"]))
+        record = records[index]
+        if "source_only" not in record:
+            if interruption is None:
+                raise ValueError("a kill has no source-only diagnostic")
+            row["source_only"] = "not measured"
+            continue
+        row["source_only"] = _source_only_outcome_v2(
+            measured, record["source_only"], selected[index], files, slowest, attempt_ms,
+            interruption is not None,
+        )
+    return share
+
+
+def _source_only_outcome_v2(
+    measured: _Measured,
+    value: object,
+    site: Site,
+    source_files: dict[str, object],
+    slowest: int,
+    attempt_ms: int | None,
+    interrupted: bool,
+) -> str:
+    record = _object(value)
+    placed = source_files.get(site.path) == measured.files[site.path]
+    if record.get("placed") is not placed:
+        raise ValueError("a source-only mutant's placement differs from its source-only tree")
+    if not placed:
+        return "not placed"
+    mutated = _mutant_digest(measured.snapshot, site)
+    if record["mutated_sha256"] != mutated:
+        raise ValueError("a source-only mutant's bytes are not its site's mutation")
+    tree = _tree_digest({**source_files, site.path: mutated})
+    deadline = _whole(record["dispatched_ms"]) + SITE_FACTOR * slowest
+    runs = measured.receipts.calls(
+        record["runs"], measured.command, tree,
+        lambda position: (
+            FIRST_RUN_FACTOR * slowest if position == 0 else None, deadline, attempt_ms
+        ),
+    )
+    state = site_outcome(runs)
+    if any(site_outcome(runs[:count]) is not None for count in range(1, len(runs))):
+        raise ValueError("a mutant's runs do not end where its outcome is known")
+    if state is None or state == "interrupted":
+        if not interrupted or record["settled_ms"] is not None:
+            raise ValueError("a source-only mutant's settlement differs from its runs")
+        return "interrupted"
+    if record["settled_ms"] is None:
+        raise ValueError("a source-only mutant's settlement differs from its runs")
+    return state
+
+
 def _strings(value: object) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError("mutation report requires string lists")
@@ -1228,6 +2057,10 @@ def _source_only_outcome(
     return _settled(measured.receipts.runs(record["runs"], measured.command, tree, timeout))
 
 
+# Source-only outcomes that leave a kill's need for the test changes unknown.
+_UNSURE = ("flaky", "error", "not placed", "unconfirmed", "interrupted", "not measured")
+
+
 def _share(
     state: dict[str, object], rows: list[dict[str, object]], valid: int, headline: str
 ) -> dict[str, object]:
@@ -1243,7 +2076,7 @@ def _share(
     if headline != "available":
         return {"status": headline, "reason": "the bug-catch rate is not available"}
     outcomes = [str(row["source_only"]) for row in rows if "source_only" in row]
-    if unsure := sorted({item for item in outcomes if item in ("flaky", "error", "not placed")}):
+    if unsure := sorted({item for item in outcomes if item in _UNSURE}):
         return {
             "status": "incomplete",
             "reason": "source-only suite outcome unknown for a mutant: " + ", ".join(unsure),
@@ -1338,6 +2171,11 @@ def compare_mutation(
             "test_change_kill_share",
         )
     }
+    # Version 2 only: unconfirmed mutants, the sample's partition and an incomplete attempt's
+    # counts, which stay apart from the pooled ones.
+    result.update(
+        {key: metrics.get(key) for key in ("unconfirmed", "sites", "partial_counts") if key in metrics}
+    )
     coverage_metrics = _object((coverage or {}).get("metrics") or {})
     result["decision_line_coverage"] = _decision_line_coverage(metrics, coverage_metrics)
     coordinates = _object(coverage_metrics.get("coordinates") or {})
@@ -1354,7 +2192,7 @@ def compare_mutation(
         for group in ("executed", "unexecuted", "not_in_population")
     }
     for row in _runs(metrics["mutants"]):
-        if row["outcome"] not in ("killed", "timeout", "survived"):
+        if row["outcome"] not in ("killed", "timeout", "timeout_kill", "survived"):
             continue
         line = f"{row['path']}:{row['line']}"
         group = (

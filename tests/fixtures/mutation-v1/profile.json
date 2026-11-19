@@ -1,0 +1,20 @@
+{
+ "coverage": {
+  "command": [
+   "suite"
+  ],
+  "report_path": "cov.json",
+  "timeout_seconds": 100
+ },
+ "generated_files": [],
+ "language": "python",
+ "native_task_identity": {
+  "image_identity": {
+   "image_id": "sha256:image"
+  }
+ },
+ "observer_version": 1,
+ "site_finders": {},
+ "source_only_reference_paths": [],
+ "suite_status": "marker"
+}

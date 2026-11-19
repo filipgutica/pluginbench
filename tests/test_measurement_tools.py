@@ -326,7 +326,7 @@ def test_native_coverage_uses_vendored_tool_outside_task_tree(
         destination = tmp_path / "out"
         if mode in {"mutation", "sigpipe-mutation"}:
             run = mutation.native_executor(identity, report_path, provisioned_tool=tool.model_dump())(
-                source, command, 30, destination,
+                source, command, 30_000, destination,
             )
             assert run.exit_code == (141 if mode == "sigpipe-mutation" else 0)
         else:
@@ -416,7 +416,7 @@ def test_mutation_forwards_the_same_frozen_tool(
 
     monkeypatch.setattr(harbor, "run_native_command", native)
     execute = mutation.native_executor({}, "coverage.json", provisioned_tool=tool.model_dump())
-    assert execute(tmp_path, ["suite"], 10, tmp_path / "run").exit_code == 0
+    assert execute(tmp_path, ["suite"], 10_000, tmp_path / "run").exit_code == 0
 
 
 @pytest.mark.parametrize("explicit", [None, ["lib/**"]])

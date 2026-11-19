@@ -183,7 +183,10 @@ def test_the_production_rules_refuse_every_suite_today() -> None:
     result = freeze(SUITE, _all(), POLICY)
 
     assert result.suite is None
-    assert any(b.gate == "mutation" and "no qualification rule yet" in b.reason
+    assert any(b.gate == "stability" and "no qualification rule yet" in b.reason
+               for b in result.blockers)
+    # The mutation rules exist now; empty facts prove nothing.
+    assert any(b.gate == "mutation" and b.reason.startswith("unavailable: malformed")
                for b in result.blockers)
 
 
@@ -317,3 +320,228 @@ def test_importing_qualification_loads_no_other_pluginbench_module() -> None:
 
     assert path == suite_qualification.__file__  # The same source this test run imports.
     assert loaded == ["pluginbench", "pluginbench.benchmark", "pluginbench.suite_qualification"]
+
+
+# --- Reference mutation rules ------------------------------------------------------------
+#
+# Synthetic receipts as `reference_mutation.measure_reference` records them: B is one second
+# (baselines of 1,000 ms), so a mutant's first run is capped at 3,000 ms and its runs share
+# 6,000 ms from dispatch. Sites run one after another from 2,000 ms.
+
+
+def _ran(started: int, elapsed: int, status: int | None = 0, timed_out: bool = False) -> dict[str, Any]:
+    return {"started_ms": started, "dispatched": True, "elapsed_ms": elapsed,
+            "exit_code": None if timed_out else 0, "timed_out": timed_out,
+            "suite_status": None if timed_out else status}
+
+
+# Each outcome's runs from dispatch at `t`, and how long the mutant takes.
+_OUTCOMES: dict[str, tuple[Any, int]] = {
+    "survived": (lambda t: [_ran(t, 1000)], 1000),
+    "killed": (lambda t: [_ran(t, 1000, 1), _ran(t + 1000, 1000, 1)], 2000),
+    "timeout_kill": (lambda t: [_ran(t, 3000, timed_out=True)], 3000),
+    "flaky": (lambda t: [_ran(t, 1000, 1), _ran(t + 1000, 1000, 0)], 2000),
+    "unconfirmed": (lambda t: [_ran(t, 1000, 1), _ran(t + 1000, 5000, timed_out=True)], 6000),
+    "error": (lambda t: [_ran(t, 1000, None)], 1000),
+}
+
+
+def _repeat(run: str, outcomes: tuple[str, ...] = ("killed", "survived"), **changes: Any) -> dict[str, Any]:
+    sites, t = [], 2000
+    for index, state in enumerate(outcomes):
+        runs, took = _OUTCOMES[state]
+        sites.append({"site": index, "dispatched_ms": t, "settled_ms": t + took, "check": None,
+                      "runs": runs(t)})
+        t += took
+    return {
+        "run_id": run, "report_sha256": _digest(f"report {run}"),
+        "before_digest": "sha256:before", "after_digest": "sha256:after",
+        "image_id": "sha256:base", "resources": {"cpus": 2, "memory_mb": 2048},
+        "timing_boundary": "executor_call", "candidate_count": 5,
+        "selected": [f"src/a.py:{index + 1}:5:relational_boundary" for index in range(len(outcomes))],
+        "baseline_ms": 100_000, "attempt_ms": None,
+        "baseline": [_ran(0, 1000), _ran(1000, 1000)], "check_baseline": None,
+        "sites": sites, "required_settled_ms": t, "infrastructure_failure": None,
+        **changes,
+    }
+
+
+def _contract(**changes: Any) -> dict[str, Any]:
+    return {"sample_size": 20, "lanes": 4, "resources": {"cpus": 2, "memory_mb": 2048},
+            "baseline_factor": 4, "site_factor": 6, "first_run_factor": 3,
+            "headroom_percent": 150, **changes}
+
+
+def _mutation_facts(*repeats: dict[str, Any], **contract: Any) -> dict[str, Any]:
+    return {"contract": _contract(**contract),
+            "repeats": list(repeats) or [_repeat(f"run-{i}") for i in range(3)]}
+
+
+def _rule(gate: str, facts: dict[str, Any], task: SuiteTask = SUITE.tasks[0]) -> Verdict:
+    return suite_qualification._RULES[gate](_receipt(task, gate, **facts), task)
+
+
+def _forged(facts: dict[str, Any]) -> dict[str, Any]:
+    facts["repeats"][1]["sites"][0]["outcome"] = "killed"
+    return facts
+
+
+def _three(**changes: Any) -> list[dict[str, Any]]:
+    return [_repeat(f"run-{i}", **changes) for i in range(3)]
+
+
+@pytest.mark.parametrize(
+    ("facts", "status", "reason"),
+    [
+        (_mutation_facts(), "pass", None),
+        # 0/n with n > 0 is a measured zero, and passes.
+        (_mutation_facts(*_three(outcomes=("survived", "survived"))), "pass", None),
+        (_mutation_facts(*_three(outcomes=("timeout_kill", "survived"))), "pass", None),
+        # A verdict written into the facts is refused, never read.
+        (_forged(_mutation_facts()), "unavailable", "malformed"),
+        ({**_mutation_facts(), "passed": True}, "unavailable", "malformed"),
+        (_mutation_facts(_repeat("a"), _repeat("b")), "unavailable", "2 reference repeats"),
+        (_mutation_facts(_repeat("a"), _repeat("a"), _repeat("b")), "unavailable", "reused"),
+        (_mutation_facts(_repeat("a"), _repeat("b"), _repeat("c", after_digest="sha256:x")),
+         "unavailable", "different inputs"),
+        (_mutation_facts(_repeat("a"), _repeat("b"),
+                         _repeat("c", resources={"cpus": 4, "memory_mb": 2048})),
+         "unavailable", "other resources"),
+        (_mutation_facts(_repeat("a"), _repeat("b"),
+                         _repeat("c", infrastructure_failure="attempt_deadline")),
+         "unavailable", "interrupted"),
+        (_mutation_facts(*_three(baseline=[_ran(0, 1000), _ran(1000, 1000, 1)])),
+         "fail", "baseline is red"),
+        (_mutation_facts(*_three(baseline=[_ran(0, 1000), _ran(1000, 100_000, timed_out=True)])),
+         "unavailable", "no status"),
+        (_mutation_facts(*_three(outcomes=())), "fail", "no mutation site"),
+        (_mutation_facts(*_three(selected=[f"src/a.py:{i}:5:x" for i in range(3)])),
+         "unavailable", "not accounted for"),
+        (_mutation_facts(*_three(outcomes=("unconfirmed", "survived"))),
+         "unavailable", "unconfirmed"),
+        (_mutation_facts(*_three(outcomes=("error", "survived"))), "unavailable", "error"),
+        (_mutation_facts(*_three(required_settled_ms=None)), "unavailable", "required phase"),
+        (_mutation_facts(_repeat("a"), _repeat("b"), _repeat("c", outcomes=("survived", "survived"))),
+         "fail", "different outcomes"),
+        (_mutation_facts(_repeat("a"), _repeat("b"), _repeat(
+            "c", selected=["src/a.py:9:5:x", "src/a.py:2:5:relational_boundary"])),
+         "fail", "selected different sites"),
+        (_mutation_facts(*_three(outcomes=("flaky", "flaky"))), "fail", "no valid mutant"),
+    ],
+)
+def test_the_mutation_rule_recomputes_outcomes_from_raw_runs(
+    facts: dict[str, Any], status: str, reason: str | None
+) -> None:
+    verdict = _rule("mutation", facts)
+    assert verdict.status == status
+    assert reason is None or reason in str(verdict.reason)
+
+
+def test_a_run_whose_start_contradicts_its_clocks_proves_nothing() -> None:
+    facts = _mutation_facts()
+    # The confirmation claims it never started, with 5,000 ms of its site's 6,000 left.
+    facts["repeats"][0]["sites"][0]["runs"][1] = {"started_ms": 3000, "dispatched": False}
+    assert _rule("mutation", facts).status == "unavailable"
+    # A confirmation that started with no time left cannot have run.
+    facts = _mutation_facts()
+    facts["repeats"][0]["sites"][0]["runs"][1]["started_ms"] = 8000
+    assert _rule("mutation", facts).status == "unavailable"
+
+
+def test_a_tsc_mutant_needs_a_tsc_baseline_that_ran() -> None:
+    check = {**_ran(2000, 0), "kind": "tsc", "diagnostics": 0, "new_diagnostics": 0}
+    repeats = _three()
+    for repeat in repeats:
+        repeat["sites"][1]["check"] = {**check, "started_ms": repeat["sites"][1]["dispatched_ms"]}
+    assert _rule("mutation", _mutation_facts(*repeats)).status == "unavailable"
+    for repeat in repeats:
+        repeat["check_baseline"] = {**_ran(2000, 0), "kind": "tsc", "diagnostics": 0}
+    assert _rule("mutation", _mutation_facts(*repeats)).status == "pass"
+    # A mutant that adds a tsc error is invalid; the other still makes the population valid.
+    for repeat in repeats:
+        repeat["sites"][1]["check"]["new_diagnostics"] = 1
+        repeat["sites"][1]["check"]["diagnostics"] = 1
+        repeat["sites"][1]["check"]["exit_code"] = 2
+        repeat["sites"][1]["runs"] = []
+    assert _rule("mutation", _mutation_facts(*repeats)).status == "pass"
+
+
+def _timed(*settled: int, sample_size: int = 2, headroom: int = 200) -> dict[str, Any]:
+    """Three repeats whose last site settles at each `settled`; with M = n the projection is
+    the measured time."""
+    repeats = []
+    for index, end in enumerate(settled):
+        repeat = _repeat(f"run-{index}")
+        repeat["sites"][1]["settled_ms"] = end
+        repeat["required_settled_ms"] = end
+        repeats.append(repeat)
+    return _mutation_facts(*repeats, sample_size=sample_size, headroom_percent=headroom)
+
+
+def _limited(seconds: int) -> SuiteTask:
+    return SUITE.tasks[0].model_copy(update={"mutation_timeout_seconds": seconds})
+
+
+@pytest.mark.parametrize(
+    ("facts", "seconds", "status"),
+    [
+        # 5,000 ms x 200% = 10 s: equality passes, one millisecond more fails.
+        (_timed(4000, 5000, 4500), 10, "pass"),
+        (_timed(4000, 5001, 4500), 10, "fail"),
+        (_timed(4000, 5000, 4500), 9, "fail"),
+        # Two of M = 20 sites in four lanes: one wave measured, five projected.
+        (_timed(5000, 5000, 5000, sample_size=20, headroom=100), 17, "pass"),
+        (_timed(5000, 5000, 5000, sample_size=20, headroom=100), 16, "fail"),
+    ],
+)
+def test_mutation_time_projects_the_full_sample_and_fits_it_with_headroom(
+    facts: dict[str, Any], seconds: int, status: str
+) -> None:
+    assert _rule("mutation_time", facts, _limited(seconds)).status == status
+
+
+def test_the_projection_scales_waves_of_lanes() -> None:
+    project = suite_qualification.projected_ms
+    assert project(setup_ms=2000, settled_ms=5000, sites=20, sample_size=20, lanes=4) == 5000
+    assert project(setup_ms=2000, settled_ms=5000, sites=2, sample_size=20, lanes=4) == 17000
+    # Ten sites are three waves of four; twenty are five.
+    assert project(setup_ms=2000, settled_ms=5000, sites=10, sample_size=20, lanes=4) == 7000
+    # Rounded up to the next whole millisecond.
+    assert project(setup_ms=0, settled_ms=1001, sites=12, sample_size=20, lanes=4) == 1669
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda facts: facts["repeats"][2].update(infrastructure_failure="executor"),
+        lambda facts: facts["repeats"][1].update(required_settled_ms=None),
+        lambda facts: facts["repeats"][0]["sites"][1].update(settled_ms=None),
+        lambda facts: facts["repeats"][0].update(sites=facts["repeats"][0]["sites"][:1]),
+        lambda facts: facts["repeats"].pop(),
+    ],
+    ids=["censored", "required-open", "unsettled", "site-missing", "two-repeats"],
+)
+def test_a_missing_or_censored_timing_is_unavailable(change: Any) -> None:
+    facts = _timed(4000, 5000, 4500)
+    change(facts)
+    assert _rule("mutation_time", facts, _limited(1000)).status == "unavailable"
+
+
+def test_a_lowered_limit_changes_only_the_time_verdict_and_a_new_profile_stales_both() -> None:
+    task = SUITE.tasks[0]
+    facts = _timed(4000, 5000, 4500)
+    receipts = [_receipt(task, gate, **facts) for gate in ("mutation", "mutation_time")]
+    pins = suite_qualification._pins(SUITE, task)
+
+    def reasons(subject: SuiteTask) -> dict[str, list[str]]:
+        current = suite_qualification._pins(SUITE, subject)
+        return {r.gate: suite_qualification._gate_reasons(
+            [r], suite_qualification._GATES[r.gate], subject, current) for r in receipts}
+
+    assert reasons(_limited(10)) == {"mutation": [], "mutation_time": []}
+    lowered = reasons(_limited(9))
+    assert lowered["mutation"] == [] and lowered["mutation_time"][0].startswith("fail: projected")
+    assert suite_qualification._pins(SUITE, _limited(9)) == pins
+    profile = task.model_copy(update={"observer_profile_sha256": _digest("other profile")})
+    assert all(found[0].startswith("stale: produced against other observer_profile_sha256")
+               for found in reasons(profile).values())

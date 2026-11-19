@@ -1,0 +1,49 @@
+{
+ "before_digest": "sha256:65a03be2cfaf975ea5829d0b3e93b2996045a9c91738a3fd5b494a58fc522cf9",
+ "bug_catch_percent": 50.0,
+ "candidate_count": 5,
+ "candidate_line_count": 2,
+ "candidate_lines": [
+  "src/grade.py:2",
+  "src/grade.py:4"
+ ],
+ "changed_production_line_count": 3,
+ "errors": 0,
+ "flaky": 0,
+ "invalid": 0,
+ "killed": 1,
+ "limitations": "arms produce different mutant populations, so this compares test suites on each arm's own code, not test quality in isolation; timeouts count as kills and are reported separately; the timeout baseline includes container start and source export time",
+ "method": "single-site mutants of changed production lines (relational boundary, equality negation, boolean connective, condition negation); at most one mutant per line, ten per attempt, sampled by sha256 order and round-robin over operators; each runs the frozen coverage-profile command; kills confirmed by one rerun",
+ "mutants": [
+  {
+   "line": 2,
+   "operator": "relational_boundary",
+   "outcome": "killed",
+   "path": "src/grade.py",
+   "source_only": "killed"
+  },
+  {
+   "line": 4,
+   "operator": "equality_negation",
+   "outcome": "survived",
+   "path": "src/grade.py"
+  }
+ ],
+ "reason": null,
+ "selected": 2,
+ "status": "available",
+ "survived": 1,
+ "test_change_kill_share": {
+  "changed_test_files": [
+   "tests/test_grade.py"
+  ],
+  "kills_needing_test_changes": 0,
+  "percent": 0.0,
+  "status": "available"
+ },
+ "timed_out": 0,
+ "unparsed_files": {},
+ "unsupported_file_count": 0,
+ "unsupported_files": [],
+ "valid": 2
+}
