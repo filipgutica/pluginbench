@@ -416,14 +416,15 @@ def _signal(found: dict[str, Any], signum: signal.Signals) -> None:
         os.close(handle)
 
 
-def status(state: Path | None = None) -> dict[str, Any]:
+def status(state: Path | None = None, *, recover: bool = True) -> dict[str, Any]:
     """What an observer sees of the coordinator and the host execution lock. It writes nothing
-    but the rollback of a transaction a killed writer left unfinished."""
+    but the rollback of a transaction a killed writer left unfinished; with `recover` false,
+    such a transaction raises sqlite3.Error instead."""
     state = state or run_lock.state_root()
     snapshot = run_lock.execution_owner(state)
     reconciling, launches = None, []
     if (state / control_store.CONTROL_NAME).exists():
-        with ControlStore.open(state, readonly=True) as store:
+        with ControlStore.open(state, readonly=True, recover=recover) as store:
             reconciling = store.reconciling()
             launches = [asdict(launch) for launch in store.launches("launching", "active", "fenced")]
     return {

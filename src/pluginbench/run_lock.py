@@ -443,10 +443,10 @@ def _obligations(value: object) -> tuple[list[dict[str, Any]], list[str]]:
     return kept, problems
 
 
-def unreleased(record: object) -> list[dict[str, Any]]:
-    """The owners a free lock's last record says may have left work, which the next command
-    must verify before it runs: none for a host that never recorded an owner."""
-    return [] if record is None else _obligations(record)[0]
+def unreleased(state: Path | None = None) -> list[dict[str, Any]]:
+    """What the next command to take a free host lock must verify before it runs, as it will
+    find it: see _carried."""
+    return _carried(state or state_root())
 
 
 def _obligation_problem(value: object) -> str | None:

@@ -180,11 +180,13 @@ def _now() -> str:
 class ControlStore:
     """The host control database. Short transactions; never held across an external command."""
 
-    def __init__(self, path: Path, *, readonly: bool = False) -> None:
+    def __init__(self, path: Path, *, readonly: bool = False, recover: bool = True) -> None:
         if readonly:
             # Writes nothing, not even the file's mode, except to roll back a transaction a
-            # killed writer left unfinished; an older database is refused, not upgraded.
-            roll_back_unfinished_write(path)
+            # killed writer left unfinished, unless `recover` is false: then that transaction
+            # makes the open fail. An older database is refused, not upgraded.
+            if recover:
+                roll_back_unfinished_write(path)
             self._db = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=5)
             version = self._db.execute("PRAGMA user_version").fetchone()[0]
             if version != SCHEMA_VERSION:
@@ -214,15 +216,20 @@ class ControlStore:
 
     @classmethod
     @contextmanager
-    def open(cls, state: Path, *, readonly: bool = False) -> Iterator[ControlStore]:
-        store = cls(state / CONTROL_NAME, readonly=readonly)
+    def open(
+        cls, state: Path, *, readonly: bool = False, recover: bool = True
+    ) -> Iterator[ControlStore]:
+        store = cls(state / CONTROL_NAME, readonly=readonly, recover=recover)
         try:
             yield store
         finally:
             store._db.close()
 
     def reconciling(self) -> str | None:
-        reason: str | None = self._db.execute("SELECT reconciling FROM host_state").fetchone()[0]
+        row = self._db.execute("SELECT reconciling FROM host_state").fetchone()
+        if row is None:
+            raise sqlite3.DatabaseError("the host control database has no host_state row")
+        reason: str | None = row[0]
         return reason
 
     def set_reconciling(self, reason: str | None) -> None:

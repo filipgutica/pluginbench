@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import signal
 import sqlite3
+import subprocess
+import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,7 +15,8 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from pluginbench import cli, harbor_backend, run_lock, run_status
+from pluginbench import cli, control_store, coordinator, harbor_backend, run_lock, run_status
+from pluginbench.control_store import ControlStore
 from pluginbench.ledger import LEDGER_NAME, Ledger
 
 USAGE = {
@@ -260,7 +264,7 @@ def test_status_names_a_crashed_owner_of_this_run_that_blocks_the_next_command(
     root = _run(tmp_path / "run", states=STATES, ledger=True)
     # A run killed before it released the host lock: schema 1 records always count as unreleased.
     crashed = {"schema": 1, "pid": 7, "acquired_at": "earlier", "kind": "run",
-               "eval": str(root.resolve()), "root": str(root.resolve() / "evidence")}
+               "eval": str(root.resolve()), "root": str(root.resolve())}
     (isolated_host_state / run_lock.EXECUTION_OWNER).write_text(json.dumps(crashed))
 
     status = run_status.run_status(root)
@@ -268,7 +272,8 @@ def test_status_names_a_crashed_owner_of_this_run_that_blocks_the_next_command(
     host = status["host"]
     assert host["error"] is None and host["execution"] is None and host["launches"] == []
     assert host["blocked"] == [
-        {"name": "7-earlier", "kind": "run", "root": crashed["root"], "this_run": True}
+        {"name": "7-earlier", "kind": "run", "root": crashed["root"], "this_run": True,
+         "problem": None}
     ]
     shown = run_status.format_status(status)
     assert "Host: no coordinator; idle" in shown
@@ -285,6 +290,81 @@ def test_status_names_the_execution_owner_running_this_run(
     assert status["host"]["blocked"] == []
     assert status["host"]["execution"]["this_run"] is True
     assert "; executing this run (run, process" in run_status.format_status(status)
+
+
+def test_status_names_the_fence_an_unreadable_owner_record_leaves(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    root = _run(tmp_path / "run", states=STATES, ledger=True)
+    (isolated_host_state / run_lock.EXECUTION_OWNER).write_text("{")
+
+    status = run_status.run_status(root)
+
+    [fence] = status["host"]["blocked"]
+    assert fence["root"] == str(isolated_host_state) and fence["this_run"] is False
+    assert "cannot be read" in fence["problem"]
+    assert (
+        f"`pluginbench app cleanup --confirm-stopped {isolated_host_state}`"
+        in run_status.format_status(status)
+    )
+
+
+def test_status_lists_only_this_runs_launches(tmp_path: Path, isolated_host_state: Path) -> None:
+    root = _run(tmp_path / "run", states=STATES, ledger=True)
+    with ControlStore.open(isolated_host_state) as store:
+        for launch_id, target in (("mine", root.resolve()), ("other", tmp_path / "other")):
+            store.create_launch(coordinator._ticket(launch_id, "run", "cli", target, "scope"))
+
+    status = run_status.run_status(root)
+
+    assert status["host"]["launches"] == [
+        {"launch_id": "mine", "kind": "run", "status": "launching", "desired": "run"}
+    ]
+    assert "Launch mine: run, launching, desired run" in run_status.format_status(status)
+
+
+# A writer killed mid-transaction leaves a hot journal (see test_control_store).
+_KILLED_MID_WRITE = """
+import os, signal, sqlite3, sys
+db = sqlite3.connect(sys.argv[1], isolation_level=None)
+db.execute("PRAGMA cache_size = 1")
+db.execute("BEGIN IMMEDIATE")
+db.execute("UPDATE host_state SET reconciling = 'half written'")
+db.execute("CREATE TABLE spill (x)")
+db.executemany("INSERT INTO spill VALUES (?)", [("x" * 1000,) for _ in range(200)])
+os.kill(os.getpid(), signal.SIGKILL)
+"""
+
+
+def test_status_leaves_a_killed_control_write_for_app_status_to_roll_back(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    root = _run(tmp_path / "run", states=STATES, ledger=True)
+    database = isolated_host_state / control_store.CONTROL_NAME
+    with ControlStore.open(isolated_host_state):
+        pass
+    killed = subprocess.run([sys.executable, "-c", _KILLED_MID_WRITE, str(database)], check=False)
+    assert killed.returncode == -signal.SIGKILL
+    journal = database.with_name(f"{database.name}-journal")
+    before = (database.read_bytes(), journal.read_bytes())
+
+    status = run_status.run_status(root)
+
+    assert (database.read_bytes(), journal.read_bytes()) == before
+    assert "`pluginbench app status` reads and repairs it" in status["host"]["error"]
+    assert status["phase"] == "stopped"  # The run's own status still reads.
+
+
+def test_a_control_database_without_its_host_row_is_reported_not_raised(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    root = _run(tmp_path / "run", states=STATES, ledger=True)
+    with ControlStore.open(isolated_host_state):
+        pass
+    with sqlite3.connect(isolated_host_state / control_store.CONTROL_NAME) as db:
+        db.execute("DELETE FROM host_state")
+
+    assert "no host_state row" in run_status.run_status(root)["host"]["error"]
 
 
 def test_a_failed_run_shows_its_error(tmp_path: Path) -> None:

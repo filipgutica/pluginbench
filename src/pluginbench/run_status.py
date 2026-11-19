@@ -381,25 +381,20 @@ def _phase(
     return "not_started" if run is None else "stopped"
 
 
-def _concerns(record: dict[str, Any], target: str) -> bool:
-    """Whether an execution owner record names this run: as its target, or by its evidence."""
-    return any(
-        isinstance(value, str) and Path(value).is_relative_to(target)
-        for value in (record.get("eval"), record.get("root"))
-    )
-
-
 def _host(root: Path) -> dict[str, Any]:
     """What `app status` shows of the host, with what concerns this run: the coordinator, the
-    execution lock's owner, a reconciling reason, crashed owners the next command must verify,
-    and this run's background launches."""
+    verified execution lock owner, a reconciling reason, what the next command must verify
+    first, and this run's background launches. Unlike `app status`, it never rolls back a write
+    a killed command left in the control database."""
     try:
-        current = coordinator.status()
+        current = coordinator.status(recover=False)
+        blocked = [] if current["execution"]["held"] else run_lock.unreleased()
     except (OSError, ValueError, sqlite3.Error) as exc:
-        return {"error": str(exc)}
+        return {"error": f"{exc}; `pluginbench app status` reads and repairs it"}
     target = str(root.resolve())
     execution = current["execution"]
-    owner = execution["owner"] or {}
+    # Only a verified holder's record says who executes; a stale one names a past owner.
+    owner = execution["owner"] if execution["verified"] else {}
     return {
         "error": None,
         "coordinator": current["coordinator"],
@@ -408,22 +403,21 @@ def _host(root: Path) -> dict[str, Any]:
             "kind": owner.get("kind"),
             "root": owner.get("root"),
             "pid": owner.get("pid"),
-            "this_run": _concerns(owner, target),
+            "this_run": owner.get("root") == target,
         }
         if execution["held"]
         else None,
         "reconciling": current["reconciling"],
         # A free lock whose last owner did not release it: every command waits on its checks.
-        "blocked": []
-        if execution["held"]
-        else [
+        "blocked": [
             {
                 "name": control_store.obligation_name(item),
                 "kind": item.get("kind"),
                 "root": item.get("root"),
-                "this_run": _concerns(item, target),
+                "this_run": item.get("root") == target,
+                "problem": item.get("problem"),
             }
-            for item in run_lock.unreleased(execution["owner"])
+            for item in blocked
         ],
         "launches": [
             {key: launch[key] for key in ("launch_id", "kind", "status", "desired")}
@@ -700,6 +694,13 @@ def _host_lines(host: dict[str, Any] | None) -> list[str]:
     if host["reconciling"]:
         lines.append(f"Reconciling: {host['reconciling']}")
     for item in host["blocked"]:
+        if item["problem"]:
+            lines.append(
+                f"Blocked: the host's owner record cannot be trusted: {item['problem']}. Check "
+                "that nothing PluginBench started still runs, then run `pluginbench app cleanup "
+                f"--confirm-stopped {item['root']}`"
+            )
+            continue
         where = "this run" if item["this_run"] else item["root"]
         lines.append(
             f"Blocked: crashed {item['kind']} for {where} ({item['name']}) must be verified "
