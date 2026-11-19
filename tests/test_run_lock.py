@@ -496,3 +496,58 @@ def test_the_owner_check_never_sees_a_record_another_thread_is_still_adopting(
             stop.set()
             checker.join()
     assert lost == []
+
+
+def test_an_observer_reading_the_owner_record_never_delays_an_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    with run_lock.hold_execution(_owner("run", tmp_path / "old"), state=state):
+        pass  # The lock file now exists and is free.
+    parse = json.loads
+    started: list[str] = []
+
+    def slow_parse(text: Any, **options: Any) -> Any:
+        if not started:
+            started.append("new")
+            # An observer stalled while it parses must not hold the probe an owner waits out.
+            with run_lock.hold_execution(_owner("run", tmp_path / "new"), state=state):
+                pass
+        return parse(text, **options)
+
+    monkeypatch.setattr(json, "loads", slow_parse)
+    snapshot, carried = run_lock.observe_execution(state)
+    monkeypatch.undo()
+
+    # The observation is the record as it was under the probe: the old owner's clean release,
+    # not the new owner's record that replaced it meanwhile.
+    assert started == ["new"]
+    assert snapshot.record is not None and snapshot.record["root"] == str(tmp_path / "old")
+    assert not snapshot.held and carried == []
+
+
+def test_an_observer_keeps_the_record_it_opened_under_the_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    with run_lock.hold_execution(_owner("run", tmp_path / "old"), state=state):
+        pass
+    close = os.close
+    started: list[str] = []
+
+    def close_then_start_an_owner(fd: int) -> None:
+        close(fd)
+        if not started:
+            started.append("new")
+            # The probe's descriptor is the first one closed: a new owner publishes at once.
+            with run_lock.hold_execution(_owner("run", tmp_path / "new"), state=state):
+                pass
+
+    monkeypatch.setattr(os, "close", close_then_start_an_owner)
+    snapshot, _ = run_lock.observe_execution(state)
+    monkeypatch.undo()
+
+    assert started == ["new"]
+    assert snapshot.record is not None and snapshot.record["root"] == str(tmp_path / "old")
