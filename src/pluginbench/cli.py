@@ -746,11 +746,13 @@ def _record_unpublished(destination: Path, exc: BaseException) -> None:
 
 
 def _pilot_outcome(exc: BaseException) -> dict[str, object]:
-    """Why a pilot published nothing. A deadline, an unverified cleanup, a launch failure or a
-    file it could not write is infrastructure."""
-    infrastructure = isinstance(exc, (OSError, control_store.CleanupBlocked)) or (
-        isinstance(exc, invocation_runtime.OperationFailed) and not exc.type
-    )
+    """Why a pilot published nothing. A deadline, an unverified cleanup, a host or Docker
+    engine that cannot contain the operation, a launch failure or a file it could not write
+    is infrastructure."""
+    infrastructure = isinstance(exc, (
+        OSError, control_store.CleanupBlocked, invocation_runtime.HostUnavailable,
+        invocation_runtime.EngineUnavailable,
+    )) or (isinstance(exc, invocation_runtime.OperationFailed) and not exc.type)
     return {
         "published": False,
         "infrastructure": infrastructure,
@@ -807,13 +809,16 @@ def _reference_summary(facts: dict[str, Any]) -> list[str]:
 
 
 def _baseline_state(run: dict[str, Any]) -> str:
-    """A baseline run's time and how its suite ended: green only on suite status 0."""
+    """A baseline run's time and how its suite ended: green only on suite status 0, and
+    unavailable when it printed no suite status."""
     if not run["dispatched"]:
         return "not run"
     took = f"{run['elapsed_ms'] / 1000:.1f} s"
     if run["timed_out"]:
         return f"{took} timed out"
     status = run["suite_status"]
+    if status is None:
+        return f"{took} unavailable (no suite status, exit {run['exit_code']})"
     return f"{took} {'green' if status == 0 else f'red (suite status {status})'}"
 
 

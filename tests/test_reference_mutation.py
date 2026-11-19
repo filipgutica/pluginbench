@@ -428,8 +428,10 @@ def test_the_command_times_the_reference_in_one_operation_and_freeze_can_never_r
 @pytest.mark.parametrize(
     "ended",
     [control_store.CleanupBlocked("cleanup of invocation x was not verified"),
-     invocation_runtime.OperationDeadlineExceeded("operation reference did not return")],
-    ids=["cleanup unverified", "deadline"],
+     invocation_runtime.OperationDeadlineExceeded("operation reference did not return"),
+     invocation_runtime.HostUnavailable("no systemd user manager answers"),
+     invocation_runtime.EngineUnavailable("Docker at unix:///fake.sock did not answer")],
+    ids=["cleanup unverified", "deadline", "host unavailable", "engine unavailable"],
 )
 def test_repeats_that_ended_before_their_cleanup_was_proven_are_never_published(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ended: BaseException
@@ -531,6 +533,19 @@ def test_a_red_baseline_is_shown_and_its_repeat_is_incomplete_never_complete(
     first = result.output.splitlines()[0]
     assert "red (suite status 1)" in first and "required work unsettled" in first
     assert first.endswith("; incomplete")
+
+
+def test_a_baseline_with_no_suite_status_is_shown_unavailable_never_red(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _, _ = _command(
+        tmp_path, monkeypatch, "--attempt-seconds", "600",
+        behaviour=lambda view: (0 if view.mutated else None, False, ""),
+    )
+    assert result.exit_code == 0, result.output
+    first = result.output.splitlines()[0]
+    assert "1.0 s unavailable (no suite status, exit None)" in first
+    assert "red (" not in first and first.endswith("; incomplete")
 
 
 @pytest.mark.parametrize(
