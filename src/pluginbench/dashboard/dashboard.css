@@ -103,3 +103,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   .facts dd { margin-bottom: var(--space-2); }
   .updated { margin-left: 0; width: 100%; }
 }
+
+.column-help { margin-top: var(--space-4); max-width: 70ch; }
+.column-help summary { cursor: pointer; font-weight: 600; }
+.column-help p { margin: var(--space-2) 0; }

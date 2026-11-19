@@ -47,7 +47,7 @@ See [running evaluations](running-evaluations.md#compare-runs) for gate statisti
 | Changed-line coverage | Share of the agent's added executable source lines that its submitted tests run. Running a line does not prove its behavior is checked. | % covered | `Changed-line coverage %` | Gate chooses |
 | Changed-branch coverage | Share of branches on the agent's added source lines that its submitted tests take. | % covered | `Changed-branch coverage %` | Gate chooses |
 | Redundant added tests | Added tests whose covered added lines are all covered by other tests. Candidates only: equal coverage does not mean equal assertions. | tests | `Redundant added tests` | Gate chooses |
-| Mutation bug-catch rate | Share of valid mutants on the agent's changed decision logic that its submitted test suite fails on. Each arm mutates its own code, so populations differ. | % killed | `Mutation bug-catch rate %` | Gate chooses |
+| Mutation bug-catch rate | Think of testing a smoke alarm by lighting a few small, safe fires and counting how many it beeps for. Each fire is a mutant: one small deliberate bug placed in decision logic the agent changed, up to 10 per attempt. The rate is the percentage of mutants the agent's test suite (the tests it left in the repository) catches. It shows whether the tests notice small logic bugs; a separate grade checks whether the code itself is correct. Each agent is mutated in its own code, so two agents' mutants are not the same bugs. | % caught | `Mutation bug-catch rate %` | Gate chooses |
 | Test-change kill share | Share of valid mutants killed only because of the agent's test changes: the suite without them does not fail. Zero when the agent changed no test file. | % of valid mutants | `Test-change kill share %` | Gate chooses |
 | Decision-line execution coverage | Share of changed production lines holding at least one M1 candidate site that the tests execute, counting each line once before mutant sampling. Go uses the line population, not statement blocks. Candidate lines the coverage tool does not track, such as continuation lines of a multi-line condition, are excluded and counted. Unavailable with no eligible lines or no line coverage; incomplete when an eligible file lacks line coverage or candidate parsing is incomplete. Measures execution, not assertion strength or branch completeness. The risky-logic catch rate is the M1 bug-catch rate. | % covered | `Decision-line execution coverage %` | Gate chooses |
 | Duplicated added test lines | Added test lines inside a six-line block that repeats elsewhere in the added tests. | lines | `Duplicated added test lines` | Gate chooses |
@@ -60,6 +60,46 @@ See [running evaluations](running-evaluations.md#compare-runs) for gate statisti
 | Scope findings | Unnecessary changes beyond the task, as reported by the independent reviewer. Each issue has one category; fewer means fewer reported issues of this kind. | findings | `Scope review findings` | Gate chooses |
 | Maintainability findings | Complexity, duplication, or unclear responsibilities, as reported by the independent reviewer. Each issue has one category; fewer means fewer reported issues of this kind. | findings | `Maintainability review findings` | Gate chooses |
 | Tests findings | Missing, misleading, or low-value tests, as reported by the independent reviewer. Each issue has one category; fewer means fewer reported issues of this kind. | findings | `Tests review findings` | Gate chooses |
+
+## Mutation bug-catch rate: do the tests catch bugs?
+
+Testing a smoke alarm means lighting a few small, safe fires and counting how many it beeps for.
+Each fire is a **mutant**: one small deliberate bug in decision logic the agent changed.
+The rate is `caught ÷ (caught + survived)` as a percentage: 7 caught, 3 survived gives 70%.
+
+### How it is measured
+
+Mutants make four edits: comparison boundaries (`<` to `<=`), equality flips (`==` to `!=`), `and`/`or` swaps, and negated conditions (`if x` to `if not x`).
+
+1. The agent's **test suite** (the tests it left in the repository) runs on unchanged code and must pass.
+2. One bug is added, and the suite runs again.
+3. If it fails, the mutant is caught ("killed") and rerun once to confirm.
+4. If it passes, it slipped through ("survived").
+
+### What counts
+
+- **Caught:** the suite fails both runs, or runs more than 3 times the normal run.
+- **Left out:** invalid (breaks the build), flaky (result changes between runs), or not confirmed in time.
+- **Not available:** no eligible decision logic changed, or the suite fails before any bug is added.
+
+### What `M` is
+
+- `M` is 10, the most mutants measured per attempt.
+- Mutants are picked the same way from changed lines, so reruns test the same bugs.
+- Rates move in 10% steps per attempt; results compare averages over many attempts.
+
+### Reading the rate
+
+- A high rate means tests notice small logic bugs in changed code.
+- Each agent is mutated in its own code, so two agents' mutants differ.
+- It does not say the code is correct; the correctness grade covers that.
+- It does not say the tests check everything.
+
+### Versus coverage
+
+- Coverage says a line ran.
+- A test that calls a function and checks nothing can reach 100% coverage and catch 0 mutants.
+- The bug-catch rate asks whether tests notice when code is wrong.
 
 ## Report files
 

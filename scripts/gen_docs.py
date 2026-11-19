@@ -112,6 +112,49 @@ def config_reference() -> str:
     return "\n".join(lines)
 
 
+# The plain-words explanation readers of the published metrics page get; the dashboard and the
+# report carry shorter versions of the same text.
+MUTATION_EXPLAINER = """## Mutation bug-catch rate: do the tests catch bugs?
+
+Testing a smoke alarm means lighting a few small, safe fires and counting how many it beeps for.
+Each fire is a **mutant**: one small deliberate bug in decision logic the agent changed.
+The rate is `caught ÷ (caught + survived)` as a percentage: 7 caught, 3 survived gives 70%.
+
+### How it is measured
+
+Mutants make four edits: comparison boundaries (`<` to `<=`), equality flips (`==` to `!=`), `and`/`or` swaps, and negated conditions (`if x` to `if not x`).
+
+1. The agent's **test suite** (the tests it left in the repository) runs on unchanged code and must pass.
+2. One bug is added, and the suite runs again.
+3. If it fails, the mutant is caught ("killed") and rerun once to confirm.
+4. If it passes, it slipped through ("survived").
+
+### What counts
+
+- **Caught:** the suite fails both runs, or runs more than 3 times the normal run.
+- **Left out:** invalid (breaks the build), flaky (result changes between runs), or not confirmed in time.
+- **Not available:** no eligible decision logic changed, or the suite fails before any bug is added.
+
+### What `M` is
+
+- `M` is 10, the most mutants measured per attempt.
+- Mutants are picked the same way from changed lines, so reruns test the same bugs.
+- Rates move in 10% steps per attempt; results compare averages over many attempts.
+
+### Reading the rate
+
+- A high rate means tests notice small logic bugs in changed code.
+- Each agent is mutated in its own code, so two agents' mutants differ.
+- It does not say the code is correct; the correctness grade covers that.
+- It does not say the tests check everything.
+
+### Versus coverage
+
+- Coverage says a line ran.
+- A test that calls a function and checks nothing can reach 100% coverage and catch 0 mutants.
+- The bug-catch rate asks whether tests notice when code is wrong."""
+
+
 def metrics_reference() -> str:
     lines = [
         "# Metrics glossary",
@@ -139,6 +182,7 @@ def metrics_reference() -> str:
         direction = "Lower for paired token bounds" if name in TOKEN_METRICS else "Gate chooses"
         values = (title, explanation, unit, f"`{name}`", direction)
         lines.append("| " + " | ".join(cell(value) for value in values) + " |")
+    lines += ["", MUTATION_EXPLAINER]
     lines += [
         "",
         "## Report files",
