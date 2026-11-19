@@ -704,8 +704,9 @@ def _write_json(path: Path, value: object) -> None:
 
 
 def _reference_summary(facts: dict[str, Any]) -> list[str]:
-    """One line per reference repeat, in seconds from its start: baselines, first dispatch,
-    when the M = 10 prefix and the whole sample settled, and whether a limit censored it."""
+    """One line per reference repeat, in seconds from its start: each baseline's time and
+    suite status, first dispatch, when the M = 10 prefix and the whole sample settled, and
+    whether the repeat completed its required work, was censored by a limit, or neither."""
     sample = int(facts["contract"]["sample_size"])
 
     def seconds(ms: int | None) -> str:
@@ -720,10 +721,7 @@ def _reference_summary(facts: dict[str, Any]) -> list[str]:
     lines = []
     for index, repeat in enumerate(facts["repeats"]):
         sites, selected = repeat["sites"], len(repeat["selected"])
-        baselines = ", ".join(
-            seconds(run["elapsed_ms"]) if run["dispatched"] else "not run"
-            for run in repeat["baseline"]
-        )
+        baselines = ", ".join(_baseline_state(run) for run in repeat["baseline"])
         parts = [
             f"repeat {index}: {selected} of {repeat['candidate_count']} candidates",
             f"baselines {baselines or 'none'}",
@@ -737,10 +735,24 @@ def _reference_summary(facts: dict[str, Any]) -> list[str]:
         parts.append(f"all settled {seconds(settled(sites, selected))}")
         parts.append(f"required work {seconds(repeat['required_settled_ms'])}")
         failure = repeat["infrastructure_failure"]
-        parts.append("clean" if failure is None else f"censored ({failure})")
+        if failure is not None:
+            parts.append(f"censored ({failure})")
+        else:
+            parts.append("incomplete" if repeat["required_settled_ms"] is None else "complete")
         lines.append("; ".join(parts))
     lines.append(f"M = {sample}, {facts['contract']['lanes']} lanes. No model calls.")
     return lines
+
+
+def _baseline_state(run: dict[str, Any]) -> str:
+    """A baseline run's time and how its suite ended: green only on suite status 0."""
+    if not run["dispatched"]:
+        return "not run"
+    took = f"{run['elapsed_ms'] / 1000:.1f} s"
+    if run["timed_out"]:
+        return f"{took} timed out"
+    status = run["suite_status"]
+    return f"{took} {'green' if status == 0 else f'red (suite status {status})'}"
 
 
 @app.command("status")

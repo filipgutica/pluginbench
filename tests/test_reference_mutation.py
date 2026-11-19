@@ -290,7 +290,7 @@ _RUNTIME: dict[str, object] = {
 def _command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *options: str, after: str = AFTER,
     ended: BaseException | None = None, engine: object = _RUNTIME["docker_engine"],
-    profile_changes: dict[str, object] | None = None,
+    profile_changes: dict[str, object] | None = None, behaviour: Any = None,
 ) -> tuple[Any, list[OperationRequest], dict[str, Any]]:
     """Run `reference-mutation` on a prepared profile, each container a fake run on a fake
     clock. Returns the result, the operations it ran and what the executor saw. `ended` is
@@ -299,7 +299,8 @@ def _command(
     prepared profile; a repeated option overrides the default before it."""
     before = _tree(tmp_path / "before", {"src/grade.py": BEFORE})
     after_tree = _tree(tmp_path / "after", {"src/grade.py": after})
-    fake = Fake(_passing(lambda view: int(FIRST in view.source)), before, after_tree)
+    behaviour = behaviour or _passing(lambda view: int(FIRST in view.source))
+    fake = Fake(behaviour, before, after_tree)
     isolation = {"resources": {"cpus": 1, "memory_mb": 4096}, "docker_cli": {},
                  "docker_engine": engine}
     profile = tmp_path / "mutation.json"
@@ -396,7 +397,8 @@ def test_the_command_times_the_reference_in_one_operation_and_freeze_can_never_r
     }
     lines = result.output.splitlines()
     assert [line.split(":")[0] for line in lines[:3]] == ["repeat 0", "repeat 1", "repeat 2"]
-    assert all(line.endswith("clean") for line in lines[:3])
+    assert all("baselines 1.0 s green, 1.0 s green;" in line for line in lines[:3])
+    assert all(line.endswith("; complete") for line in lines[:3])
     assert "M = 20, 4 lanes. No model calls." in result.output
     assert "Not a qualification receipt." in result.output
 
@@ -440,10 +442,24 @@ def test_the_pilot_sets_m_lanes_and_the_limit_and_sees_a_censored_repeat(
     assert request.timeout == operations.reference_budget(13_000)
     first = result.output.splitlines()[0]
     assert first.startswith("repeat 0: 12 of ")
-    assert "baselines 1.0 s, 1.0 s" in first and "first mutant 2.0 s" in first
+    assert "baselines 1.0 s green, 1.0 s green" in first and "first mutant 2.0 s" in first
     # The M = 10 prefix is reported apart from the whole sample.
     assert "first 10 settled 12.0 s" in first
     assert "all settled unsettled" in first and first.endswith("censored (attempt_deadline)")
+
+
+def test_a_red_baseline_is_shown_and_its_repeat_is_incomplete_never_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The unmutated suite fails: no mutant can be measured against it.
+    result, _, _ = _command(
+        tmp_path, monkeypatch, "--attempt-seconds", "600",
+        behaviour=lambda view: (0 if view.mutated else 1, False, ""),
+    )
+    assert result.exit_code == 0, result.output
+    first = result.output.splitlines()[0]
+    assert "red (suite status 1)" in first and "required work unsettled" in first
+    assert first.endswith("; incomplete")
 
 
 @pytest.mark.parametrize(
