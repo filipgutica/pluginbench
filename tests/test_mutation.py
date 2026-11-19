@@ -1766,30 +1766,31 @@ def test_the_measurement_runtime_passes_the_runtime_check_of_a_saved_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Shaped as harbor_backend.runtime_identity saves it, enforcement fields included.
-    saved = native_support.runtime_identity()
-    saved["resources"] = {
+    resources: dict[str, object] = {
         "cpus": 1, "memory_mb": 1024, "cpu_enforcement": "limit", "memory_enforcement": "limit"
     }
+    saved = {**native_support.runtime_identity(), "resources": resources}
     asked: list[tuple[int, int]] = []
 
     def current(*, cpus: int, memory_mb: int, harness: str) -> dict[str, object]:
         asked.append((cpus, memory_mb))
-        resources = {**saved["resources"], "cpus": cpus, "memory_mb": memory_mb}
-        return {**saved, "resources": resources}
+        return {**saved, "resources": {**resources, "cpus": cpus, "memory_mb": memory_mb}}
 
     monkeypatch.setattr(harbor_backend, "runtime_identity", current)
     identity = {
         "toolchain_identity": {"base_image_identity": {"reference": "base"}},
         "image_identity": {"reference": "task"},
         "isolation": saved,
-        "resources": saved["resources"],
+        "resources": resources,
     }
 
     measured = mutation.measurement_identity(identity)
-    harbor_backend.assert_runtime(measured["isolation"], launcher=False, harbor=False)
+    runtime = measured["isolation"]
+    assert isinstance(runtime, dict)
+    harbor_backend.assert_runtime(runtime, launcher=False, harbor=False)
 
     assert asked == [(mutation.MEASUREMENT_CPUS, mutation.MEASUREMENT_MEMORY_MB)]
-    assert measured["resources"] == measured["isolation"]["resources"] == {
+    assert measured["resources"] == runtime["resources"] == {
         "cpus": mutation.MEASUREMENT_CPUS,
         "memory_mb": mutation.MEASUREMENT_MEMORY_MB,
         "cpu_enforcement": "limit",
