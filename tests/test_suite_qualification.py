@@ -556,6 +556,14 @@ def _both(facts: dict[str, Any]) -> tuple[str, str]:
     return (_rule("mutation", facts, task).status, _rule("mutation_time", facts, task).status)
 
 
+def _overlapping() -> list[dict[str, Any]]:
+    """Two sites with one start: valid in two lanes, impossible in one."""
+    sites: list[dict[str, Any]] = _repeat("a")["sites"]
+    sites[1] = {**sites[1], "dispatched_ms": 2000, "settled_ms": 3000,
+                "runs": [_ran(2000, 1000)]}
+    return sites
+
+
 def _tampered(change: Any) -> dict[str, Any]:
     facts = _mutation_facts()
     for repeat in facts["repeats"]:
@@ -568,8 +576,14 @@ def _tampered(change: Any) -> dict[str, Any]:
     [
         # A 1 ms attempt limit that 1,000 ms baselines and every site would have overrun.
         (_tampered(lambda r: r.update(attempt_ms=1)), "contradicts the time it had left"),
-        # The last site's run ends at 5,000 ms, one past a 4,999 ms limit, yet nothing was cut.
-        (_tampered(lambda r: r.update(attempt_ms=4999)), "overran its attempt limit"),
+        # The last site's run is cut by a 4,999 ms limit, yet the site is marked settled.
+        (_tampered(lambda r: r.update(attempt_ms=4999)), "settlement differs from its runs"),
+        # Its own 3,000 ms cap bounds the last site's first run, which returns 500 ms late at
+        # 7,500 ms: a timeout kill, and past the 7,200 ms attempt limit, yet nothing was cut.
+        (_tampered(lambda r: (r["sites"][1]["runs"][0].update(elapsed_ms=3500),
+                              r["sites"][1].update(settled_ms=7500),
+                              r.update(required_settled_ms=7500, attempt_ms=7200))),
+         "overran its attempt limit"),
         # A red baseline its own cap bounded, returning at 2,000 ms past a 1,999 ms limit.
         (_mutation_facts(*_three(baseline=[_ran(0, 1000), _ran(1000, 1000, 1)], sites=[],
                                  required_settled_ms=None, attempt_ms=1999)),
@@ -584,6 +598,14 @@ def _tampered(change: Any) -> dict[str, Any]:
         (_tampered(lambda r: r["baseline"][1].update(started_ms=500)), "baseline runs overlap"),
         (_tampered(lambda r: r["sites"][0]["runs"][1].update(started_ms=2500)), "out of order"),
         (_tampered(lambda r: r.update(required_settled_ms=4000)), "before its sites settled"),
+        # A failed first run with no confirmation has no outcome yet, so it cannot be settled.
+        (_tampered(lambda r: r["sites"][0].update(runs=r["sites"][0]["runs"][:1])),
+         "settlement differs from its runs"),
+        # With one lane, site 1 runs inside site 0's span.
+        (_mutation_facts(*_three(sites=_overlapping()), lanes=1), "lanes hold"),
+        (_tampered(lambda r: r.update(candidate_count=1)), "more sites than it found"),
+        (_tampered(lambda r: r.update(candidate_count=0)), "more sites than it found"),
+        (_tampered(lambda r: r.update(timing_boundary="exec")), "timed exec, not executor_call"),
         # Discovery that left a changed file unparsed, or in a language with no finder.
         (_tampered(lambda r: r.update(unparsed_files=["src/broken.py"])), "incomplete"),
         (_tampered(lambda r: r.update(unsupported_files=["src/lib.rs"])), "incomplete"),
@@ -595,6 +617,12 @@ def test_both_reference_rules_refuse_clocks_or_exits_that_contradict_each_other(
     for gate in ("mutation", "mutation_time"):
         verdict = _rule(gate, facts, _limited(1000))
         assert verdict.status == "unavailable" and reason in str(verdict.reason), gate
+
+
+def test_sites_that_overlap_within_the_lanes_pass() -> None:
+    assert _rule("mutation", _mutation_facts(*_three(sites=_overlapping()), lanes=2)).status == (
+        "pass"
+    )
 
 
 def test_an_attempt_limit_the_repeat_kept_to_passes_both_rules() -> None:
@@ -631,7 +659,7 @@ def test_a_late_exit_is_cut_by_the_limit_it_overran() -> None:
 
 def _faster(facts: dict[str, Any]) -> dict[str, Any]:
     """The same repeats, run IDs and report digests, with the last site's run 1 ms shorter."""
-    faster = json.loads(json.dumps(facts))
+    faster: dict[str, Any] = json.loads(json.dumps(facts))
     for repeat in faster["repeats"]:
         repeat["sites"][1]["runs"][0]["elapsed_ms"] -= 1
     return faster

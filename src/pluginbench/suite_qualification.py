@@ -189,6 +189,8 @@ def _correctness(receipt: Receipt, task: SuiteTask) -> Verdict:
 # candidates, since sampling lives outside this module's import boundary.
 
 REFERENCE_REPEATS = 3
+# What B and every deadline time: the whole executor call (mutation.TIMING_BOUNDARY).
+TIMING_BOUNDARY = "executor_call"
 _Whole = Annotated[int, Field(strict=True, ge=0)]
 
 
@@ -380,9 +382,15 @@ def _site_outcome(site: _Site, slowest: int, attempt: int | None, contract: _Mut
 def _validate(repeat: _Repeat, contract: _MutationContract) -> None:
     """Check one repeat's clock readings, shared by both reference rules.
 
-    Calls run in order, each starts within its limits, each settlement follows its site's calls,
-    and an uninterrupted repeat keeps to its attempt limit. Raises ValueError on a contradiction.
+    The repeat timed executor calls and sampled no more sites than it found. Calls run in
+    order, each starts within its limits, a site is settled exactly when its calls give it an
+    outcome, no more sites run at once than the contract has lanes, and an uninterrupted repeat
+    keeps to its attempt limit. Raises ValueError on a contradiction.
     """
+    if repeat.timing_boundary != TIMING_BOUNDARY:
+        raise ValueError(f"the repeat timed {repeat.timing_boundary}, not {TIMING_BOUNDARY}")
+    if len(repeat.selected) > repeat.candidate_count:
+        raise ValueError("the repeat selected more sites than it found")
     attempt = repeat.attempt_ms
     serial = 0
     for call in repeat.baseline:
@@ -399,6 +407,7 @@ def _validate(repeat: _Repeat, contract: _MutationContract) -> None:
     green = len(ends) == 2 and all(cut is None and status == 0 for cut, status in ends)
     slowest = max((call.elapsed_ms or 0 for call in repeat.baseline), default=0)
     latest = serial
+    spans: list[tuple[int, int]] = []
     for site in repeat.sites:
         if site.dispatched_ms < serial:
             raise ValueError(f"site {site.site} started before the baselines ended")
@@ -412,9 +421,16 @@ def _validate(repeat: _Repeat, contract: _MutationContract) -> None:
             moment = call.ended_ms
         if site.settled_ms is not None and site.settled_ms < moment:
             raise ValueError(f"site {site.site} settled before its runs ended")
-        if calls:
-            _site_outcome(site, slowest, attempt, contract)
-        latest = max(latest, site.settled_ms if site.settled_ms is not None else moment)
+        state = _site_outcome(site, slowest, attempt, contract)
+        if (site.settled_ms is not None) != (state not in (None, "interrupted")):
+            raise ValueError(f"site {site.site}'s settlement differs from its runs")
+        end = site.settled_ms if site.settled_ms is not None else moment
+        spans.append((site.dispatched_ms, end))
+        latest = max(latest, end)
+    # A lane dispatches its next site no earlier than its last one settled, so the sites
+    # running at any dispatch, ends excluded, are at most one per lane.
+    if any(sum(start <= at < end for start, end in spans) > contract.lanes for at, _ in spans):
+        raise ValueError(f"more sites ran at once than the {contract.lanes} lanes hold")
     if repeat.required_settled_ms is not None and repeat.required_settled_ms < latest:
         raise ValueError("the required phase ended before its sites settled")
     # A call its own cap or site bounds can still return after the attempt's limit.

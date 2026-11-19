@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import itertools
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
-from test_mutation import AFTER, BEFORE, FIRST, Fake, View, _config, _passing, _tree
+from test_mutation import AFTER, BEFORE, FIRST, Fake, View, _config, _lines, _passing, _tree
 
 from pluginbench import harbor_backend, mutation, reference_mutation, suite_qualification
 from pluginbench.benchmark import SuiteTask
@@ -209,3 +210,38 @@ def test_only_the_reference_producer_runs_four_lanes_and_checks_docker_holds_the
     assert {report["lanes"] for report in reports} == {mutation.LANES} == {4}
     # Everyone else keeps one lane: a submission collect may run beside another.
     assert mutation.Limits().lanes == 1
+
+
+def test_four_lanes_of_eight_sites_pass_both_rules(tmp_path: Path) -> None:
+    # Each repeat's first four mutants wait for each other, so four sites run at once.
+    barrier = threading.Barrier(4, timeout=10)
+    lock = threading.Lock()
+    mutants = [0]
+
+    def behaviour(view: View) -> tuple[int | None, bool, str]:
+        if view.mutated:
+            with lock:
+                wave, mutants[0] = mutants[0] % 8 < 4, mutants[0] + 1
+            if wave:
+                barrier.wait()
+        return 0, False, ""
+
+    before = _tree(tmp_path / "before", {"src/grade.py": BEFORE})
+    after = _tree(tmp_path / "after", {"src/grade.py": _lines(8)})
+    fake = Fake(behaviour, before, after)
+    receipts = measure_reference(
+        before=before, after=after, config=_config(), contract=Contract(headroom_percent=150),
+        pins=PINS, destination=tmp_path / "reference", execute=fake, clock=fake.clock,
+    )
+    for repeat in receipts[0].facts["repeats"]:
+        dispatched = sorted(site["dispatched_ms"] for site in repeat["sites"])
+        assert len(dispatched) == 8 and dispatched[:4] == [2000] * 4 and dispatched[4] > 2000
+    for receipt in receipts:
+        assert suite_qualification._RULES[receipt.gate](receipt, TASK).status == "pass"
+    # The same evidence claimed for three lanes ran more sites at once than they hold.
+    facts = receipts[0].facts
+    three = receipts[0].model_copy(update={"facts": {
+        **facts, "contract": {**facts["contract"], "lanes": 3}
+    }})
+    verdict = suite_qualification._RULES["mutation"](three, TASK)
+    assert verdict.status == "unavailable" and "3 lanes hold" in str(verdict.reason)
