@@ -19,7 +19,6 @@ class NativeInvocationKwargs(TypedDict):
     prompt: str
     timeout: int
     output_schema: Path | None
-    artifacts: Path
 
 
 def _existing_study(
@@ -171,8 +170,7 @@ def _judge(
         if behavior == "source_mutation":
             source = next((root / "attempts").glob("*/handoff/snapshot/src/answer.py"))
             source.write_text("changed original source\n")
-        # Where the launcher writes them: inside the run, not the temporary area.
-        artifacts = Path(str(kwargs["artifacts"]))
+        artifacts = area / "artifacts"
         artifacts.mkdir()
         if severity is not None:
             issues = response["issues"]
@@ -300,7 +298,7 @@ def test_unsupported_review_artifacts_cannot_leak_host_data_or_count_findings(
 
     def linked_review(*, area: Path, **kwargs: Unpack[NativeInvocationKwargs]) -> dict[str, object]:
         execution = native(area=area, **kwargs)
-        (kwargs["artifacts"] / "other-log").symlink_to(secret)
+        (area / "artifacts/other-log").symlink_to(secret)
         return execution
 
     monkeypatch.setattr(codex, "invoke", linked_review)
@@ -432,7 +430,7 @@ def test_interrupted_judge_binds_reportable_usage_and_pending_assignments(
         execution = invoke(area=area, **kwargs)
         if len(calls) != interrupted_call:
             return execution
-        artifacts = kwargs["artifacts"]
+        artifacts = area / "artifacts"
         # Native KeyboardInterrupt archives traces but bypasses host-evidence parsing.
         (artifacts / "host-evidence.json").unlink()
         (artifacts / "stdout.jsonl").write_text(
@@ -517,6 +515,35 @@ def test_interrupted_judge_binds_reportable_usage_and_pending_assignments(
     assert replaced["status"] == "reviewed"
     assert replaced["superseded"][0]["work"]["elapsed_seconds"] == 2.5
     assert report["independent_review"]["native_invocation_requests"] == 3
+    # A start bound twice would count one call twice.
+    path = root / "review-revisions/review/review-state.json"
+    state = json.loads(path.read_text())
+    retried = next(row for row in state["records"] if row.get("superseded"))
+    retried["superseded"].append(retried["superseded"][0])
+    state["native_invocations"] += 1
+    path.write_text(json.dumps(state))
+    with pytest.raises(ValueError, match="bound more than once"):
+        study_review.validate_review_revision(root, "review")
+
+
+def test_a_crashed_call_s_area_is_trusted_only_when_its_packet_copy_names_the_call(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "run"
+    root.mkdir()
+
+    def area(parent: Path, name: str, packet_id: str) -> str:
+        (parent / name / "workspace").mkdir(parents=True)
+        (parent / name / "workspace/packet.json").write_text(json.dumps({"packet_id": packet_id}))
+        return str(parent / name)
+
+    owned = area(tmp_path, "pluginbench-judge-a", "p1")
+    assert study_review._owned_area(root, owned, "p1") == Path(owned)
+    # Another call's area, an unexpected name, a path inside the run, or a relative path.
+    assert study_review._owned_area(root, owned, "p2") is None
+    assert study_review._owned_area(root, area(tmp_path, "other-b", "p1"), "p1") is None
+    assert study_review._owned_area(root, area(root, "pluginbench-judge-c", "p1"), "p1") is None
+    assert study_review._owned_area(root, "pluginbench-judge-a", "p1") is None
 
 
 def test_interruption_before_judge_call_binds_all_pending_review_rows(
@@ -916,8 +943,8 @@ def test_parallel_judge_interrupt_keeps_active_observations_costs_and_unstarted_
             started.append(packet_id)
         gate.wait(timeout=5)
         if ordinal == 0:
-            kwargs["artifacts"].mkdir()
-            (kwargs["artifacts"] / "execution.json").write_text(
+            (area / "artifacts").mkdir()
+            (area / "artifacts/execution.json").write_text(
                 json.dumps(
                     {
                         "usage": {"input_tokens": 30, "output_tokens": 7},

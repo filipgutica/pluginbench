@@ -91,6 +91,7 @@ from pluginbench.study_review import (
     _fixed_criteria,
     _review_directory,
     recover_review_citations,
+    resume_calls,
     review_study,
     validate_review_revision,
 )
@@ -1418,10 +1419,13 @@ def _resume_inputs(
         if selection["review_revision"] is not None:
             validate_review_revision(evidence, str(selection["review_revision"]))
         else:
-            if (evidence / "review-revisions/review").exists():
-                raise ValueError("review evidence already exists; model calls cannot be replayed")
             guidance = _frozen_review_guidance(root, selection, config.reviewer)
-            calls = sum(record.stages[-1].snapshot is not None for record in manifest.records)
+            # A first review that a crash or Stop cut off resumes; it is not started again.
+            calls = (
+                resume_calls(evidence, "review")
+                if (evidence / "review-revisions/review").exists()
+                else sum(record.stages[-1].snapshot is not None for record in manifest.records)
+            )
     return selection, profiles, guidance, calls
 
 
@@ -1535,15 +1539,19 @@ def plan_review(root: Path, revision: str) -> dict[str, object]:
         raise ValueError(
             f"this run has not finished its first review; finish it with `pluginbench run {root}`"
         )
-    if _review_directory(root / "evidence", revision).exists():
-        raise ValueError(f"review revision {revision} already exists; choose a new --revision name")
     _frozen_review_guidance(root, selection, config.reviewer)
-    _, manifest, _ = _native_state(root / "evidence")
-    return {
-        "name": selection["name"],
-        "revision": revision,
-        "review_calls": sum(record.stages[-1].snapshot is not None for record in manifest.records),
-    }
+    if _review_directory(root / "evidence", revision).exists():
+        # A revision a crash or Stop cut off resumes with the reviewer it was started with.
+        calls = resume_calls(root / "evidence", revision)
+        if calls == 0:
+            raise ValueError(
+                f"review revision {revision} has no review left to call; choose a new "
+                "--revision name"
+            )
+    else:
+        _, manifest, _ = _native_state(root / "evidence")
+        calls = sum(record.stages[-1].snapshot is not None for record in manifest.records)
+    return {"name": selection["name"], "revision": revision, "review_calls": calls}
 
 
 def review_evaluation(
@@ -1568,10 +1576,19 @@ def review_evaluation(
     if config.reviewer is None:
         raise ValueError("this run has no reviewer, so it has no review to repeat")
     guidance = _frozen_review_guidance(root, selection, config.reviewer)
+    recorded = _object(selection.get("reviewer_overrides", {})).get(revision)
+    resuming = _review_directory(root / "evidence", revision).exists()
+    if resuming and recorded and reviewer is None:
+        # Resumed with the reviewer that started it; review_study refuses any other.
+        reviewer = Runner.model_validate(
+            {key: _object(recorded)[key] for key in ("harness", "model", "reasoning")}
+        )
     identity = reviewer or config.reviewer
     _review_preflight({"reviewer": identity.model_dump(mode="json")})
     override = None
-    if reviewer is not None:
+    if resuming and recorded:
+        override = _object(recorded)  # Its attribution stays as recorded when it started.
+    elif reviewer is not None:
         override = {
             **reviewer.model_dump(mode="json", include={"harness", "model", "reasoning"}),
             "harness_version": _harness_version(reviewer.harness),

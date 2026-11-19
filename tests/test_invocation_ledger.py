@@ -605,6 +605,9 @@ REVIEW_BOUNDARIES = (
     "after-output",  # after the launcher finished, before acceptance
     "before-state",  # after the observation, before the state that binds it
     "before-ledger-end",  # after the final state, before the ledger records the ending
+    "after-stop",  # the launcher saved a provider stop and raised; killed before the outcome
+    "after-error",  # the launcher raised with no stop; killed before the outcome
+    "creating",  # while the revision is being created, before any call
 )
 
 
@@ -622,12 +625,20 @@ def _review_boundary_child() -> None:
 
     def invoke(**kwargs: Any) -> dict[str, object]:
         execution = judged(**kwargs)
-        if boundary == "after-output":
+        artifacts = kwargs["area"] / "artifacts"
+        if boundary in {"after-stop", "after-error"}:
+            # Only a launcher that returned writes its success marker.
+            (artifacts / "host-evidence.json").unlink()
+        if boundary == "after-stop":
+            (artifacts / "host-trace-0.jsonl").write_text(codex_rollout("usage_limit_exceeded"))
+        if boundary in {"after-output", "after-stop", "after-error"}:
             kill()
         return execution
 
     def written(path: Path, value: object) -> None:
         if boundary == "before-receipt" and path.name == "native-start.json":
+            kill()
+        if boundary == "creating" and path.name == "mapping.json":
             kill()
         bound = path.name == "review-state.json"
         if bound and boundary == "before-receipt-bound" and any(
@@ -662,6 +673,12 @@ def _review_boundary_child() -> None:
         ("after-output", "issues", 1, "finished"),
         ("before-state", "issues", 1, "finished"),
         ("before-ledger-end", "issues", 1, "finished"),
+        # A saved provider stop is given back to the slot even without the success marker.
+        ("after-stop", "issues", 2, "halted_provider"),
+        # A launcher error the crash lost: the call counts, keeps its usage, and calls again.
+        ("after-error", "issues", 2, "unresolved"),
+        # A revision cut off while being created was never published, and starts afresh.
+        ("creating", "issues", 2, None),
         # A call that failed keeps its ending, and its failure signature, and is not called again.
         ("before-state", "bad_json", 1, "failed_transient"),
         ("before-ledger-end", "bad_json", 1, "failed_transient"),
@@ -669,7 +686,7 @@ def _review_boundary_child() -> None:
 )
 def test_a_review_killed_at_each_boundary_resumes_without_repeating_a_finished_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str, behavior: str,
-    calls_again: int, first: str,
+    calls_again: int, first: str | None,
 ) -> None:
     root = test_study_review._existing_study(tmp_path, monkeypatch)
     temporary = tmp_path / "child-tmp"
@@ -688,10 +705,12 @@ def test_a_review_killed_at_each_boundary_resumes_without_repeating_a_finished_c
     calls = test_study_review._judge(monkeypatch, root)
     path = study_review.review_study(root)
     assert len(calls) == calls_again
-    assert sorted(_states(root, "review")) == sorted([first, *["finished"] * calls_again])
+    assert sorted(_states(root, "review")) == sorted(
+        [*([first] if first else []), *["finished"] * calls_again]
+    )
     state = json.loads(path.read_text())
     # A call killed before its start receipt counts in the ledger but started nothing.
-    started = calls_again + (boundary != "before-receipt")
+    started = calls_again + (boundary not in {"before-receipt", "creating"})
     assert state["native_invocations"] == started
     assert study_review.validate_review_revision(root, "review") == path
     starts = study_review.review_starts(root)
@@ -702,7 +721,42 @@ def test_a_review_killed_at_each_boundary_resumes_without_repeating_a_finished_c
     # it. Before the receipt, nothing has launched, so the area holds only a packet copy.
     left = list(temporary.glob("pluginbench-judge-*"))
     assert len(left) == (boundary == "before-receipt")
+    # A revision a crash left in staging is never listed or counted.
+    names = sorted(path.name for path in (root / "review-revisions").iterdir())
+    assert names[-1] == "review" and len(names) == 1 + (boundary == "creating")
+    assert all(name.startswith(".staging-review-") for name in names[:-1])
+    if first == "unresolved" and boundary == "after-error":
+        [replaced] = [row for row in state["records"] if row.get("superseded")]
+        kept = study._bound_document(root, replaced["superseded"][0]["observation"])
+        # The scrubbed artifacts the call saved stay in evidence.
+        assert kept["ending"] == {"state": "unresolved", "error": None}
+        assert kept["execution"]["elapsed_seconds"] == 2.5
     assert all(not (area / "private").exists() for area in left)
+
+
+def test_resume_refuses_a_saved_observation_that_differs_from_its_validated_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    child = subprocess.run(
+        [
+            sys.executable, "-c", "import test_invocation_ledger as t; t._review_boundary_child()",
+            str(root), "before-state", "issues",
+        ],
+        env={**os.environ, "PYTHONPATH": _PATH, "TMPDIR": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert child.returncode == -signal.SIGKILL, child.stderr
+    [saved] = (root / "review-revisions/review/observations").glob("*/observation.json")
+    observation = json.loads(saved.read_text())
+    observation["response"]["issues"] = []  # Findings no saved trace supports.
+    saved.write_text(json.dumps(observation))
+    calls = test_study_review._judge(monkeypatch, root)
+    with pytest.raises(ValueError, match="differs from its validated response"):
+        study_review.review_study(root)
+    assert calls == []
 
 
 def test_resume_refuses_other_settings_and_changed_review_code(
@@ -795,7 +849,7 @@ def test_a_provider_halt_in_review_gives_the_call_back_and_stops_the_pass(
 
     def limited(**kwargs: Any) -> dict[str, object]:
         execution = judged(**kwargs)
-        trace = kwargs["artifacts"] / "host-trace-0.jsonl"
+        trace = kwargs["area"] / "artifacts/host-trace-0.jsonl"
         trace.write_text(codex_rollout("usage_limit_exceeded"))
         if raises:  # As the launcher can, once the trace is saved.
             raise ValueError("native artifacts failed validation")
