@@ -221,17 +221,28 @@ def test_an_unvalidated_duplicate_task_is_refused() -> None:
 def _reference(**changes: Any) -> dict[str, Any]:
     """Reference-agent rows as harbor_backend.run_reference_agents records them, with the
     source-only grade of each reconstructed submission."""
-    def row(patch: int, reward: int) -> dict[str, Any]:
+    def row(agent: str, patch: int, reward: int) -> dict[str, Any]:
+        export, patch_sha = _digest(f"export {agent}"), _digest(f"patch {patch}")
         return {"status": "complete", "cleanup": {"status": "complete"}, "exception_info": None,
-                "reconstruction": {"status": "complete"}, "patch_bytes": patch,
-                "verifier_result": {"rewards": {"reward": reward}},
-                "source_only": {"status": "complete", "passed": bool(reward)}}
+                "export_digest": export,
+                "reconstruction": {"status": "complete", "patch_sha256": patch_sha},
+                "patch_bytes": patch, "verifier_result": {"rewards": {"reward": reward}},
+                "source_only": {"status": "complete", "passed": bool(reward), "fail_reason": None,
+                                "export_digest": export, "native_patch_sha256": patch_sha}}
 
-    rows = {"oracle": row(120, 1), "nop": row(0, 0)}
+    rows = {"oracle": row("oracle", 120, 1), "nop": row("nop", 0, 0)}
     for path, value in changes.items():
-        agent, key = path.split("__")
-        rows[agent][key] = value
+        agent, key, *field = path.split("__")
+        if value is _ABSENT:
+            del rows[agent][key]
+        elif field:
+            rows[agent][key] = {**rows[agent][key], field[0]: value}
+        else:
+            rows[agent][key] = value
     return rows
+
+
+_ABSENT = object()
 
 
 @pytest.mark.parametrize(
@@ -242,8 +253,14 @@ def _reference(**changes: Any) -> dict[str, Any]:
         ({"nop__patch_bytes": 40}, "fail"),
         ({"nop__verifier_result": {"rewards": {"reward": 1}}}, "fail"),
         ({"oracle__verifier_result": {"rewards": {"reward": 0}}}, "fail"),
-        ({"oracle__source_only": {"status": "complete", "passed": False}}, "fail"),
-        ({"nop__source_only": {"status": "complete", "passed": True}}, "fail"),
+        ({"oracle__source_only__passed": False}, "fail"),
+        ({"nop__source_only__passed": True}, "fail"),
+        # A crashed or unsupported verifier is no test result, even when it reads as a fail.
+        ({"nop__source_only__fail_reason": "verifier_crashed_on_submission"}, "unavailable"),
+        ({"nop__source_only__fail_reason": "unsupported_submission"}, "unavailable"),
+        ({"oracle__source_only__native_patch_sha256": "f" * 64}, "unavailable"),
+        ({"nop__source_only__export_digest": "f" * 64}, "unavailable"),
+        ({"oracle__exception_info": _ABSENT}, "unavailable"),
         ({"oracle__patch_bytes": "120"}, "unavailable"),
         ({"oracle__reconstruction": {"status": "skipped"}}, "unavailable"),
         ({"nop__source_only": None}, "unavailable"),

@@ -130,8 +130,9 @@ def _reference(agent: str, row: object, expected: bool) -> Verdict:
     cleanup, reconstruction = row.get("cleanup"), row.get("reconstruction")
     if not isinstance(cleanup, dict) or cleanup.get("status") != "complete":
         return Verdict(status="unavailable", reason=f"{agent}: trial cleanup incomplete")
-    if row.get("exception_info") is not None:
-        return Verdict(status="unavailable", reason=f"{agent}: trial failed")
+    # The producer records an explicit null for a clean trial; an absent key proves nothing.
+    if "exception_info" not in row or row["exception_info"] is not None:
+        return Verdict(status="unavailable", reason=f"{agent}: trial failed or unrecorded")
     if not isinstance(reconstruction, dict) or reconstruction.get("status") != "complete":
         return Verdict(status="unavailable", reason=f"{agent}: graded patch not reconstructed")
     size = row.get("patch_bytes")
@@ -142,12 +143,22 @@ def _reference(agent: str, row: object, expected: bool) -> Verdict:
             "the reference solution's graded patch is empty" if expected
             else "the empty submission produced a graded patch"))
     reward = _reward(row.get("verifier_result"))
-    grade = row.get("source_only")
-    passed = grade.get("passed") if isinstance(grade, dict) else None
     if reward is None:
         return Verdict(status="unavailable", reason=f"{agent}: verifier reward is not binary")
-    if not isinstance(grade, dict) or grade.get("status") != "complete" or type(passed) is not bool:
+    grade = row.get("source_only")
+    if not isinstance(grade, dict) or grade.get("status") != "complete":
         return Verdict(status="unavailable", reason=f"{agent}: no source-only grade")
+    # A grade with a fail reason (the verifier crashed, or the submission is unsupported)
+    # says nothing about the tests: only the verifier's own pass or fail counts.
+    passed = grade.get("passed")
+    if type(passed) is not bool or "fail_reason" not in grade or grade["fail_reason"] is not None:
+        return Verdict(status="unavailable", reason=f"{agent}: source-only grade is not a test result")
+    # The grade is of this trial's reconstructed patch, not another submission's.
+    if (grade.get("export_digest") != row.get("export_digest")
+            or grade.get("native_patch_sha256") != reconstruction.get("patch_sha256")
+            or not isinstance(row.get("export_digest"), str)
+            or not isinstance(reconstruction.get("patch_sha256"), str)):
+        return Verdict(status="unavailable", reason=f"{agent}: source-only grade is of another submission")
     for source, value in (("verifier reward", reward), ("source-only grade", passed)):
         if value is not expected:
             return Verdict(status="fail", reason=(
