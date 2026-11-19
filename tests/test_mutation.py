@@ -1683,3 +1683,47 @@ def test_a_last_return_past_the_attempt_limit_is_infrastructure_whatever_bound_i
     report.update(infrastructure_failure=None, required_settled_ms=6600)
     with pytest.raises(ValueError, match="overran its limit"):
         _metrics(report, destination)
+
+
+@pytest.mark.parametrize(("took", "overran"), [(3500, False), (3600, True)])
+def test_a_late_diagnostic_return_past_the_attempt_limit_leaves_only_the_share_incomplete(
+    tmp_path: Path, took: int, overran: bool
+) -> None:
+    # The full suite kills both mutants and seals at 6,000 ms. The source-only baselines take
+    # 6,000-8,000 ms; it misses the first mutant (8,000-9,000 ms). The second's first run starts
+    # at 9,000 ms under its own 3,000 ms cap, before the 12,500 ms attempt limit, and returns
+    # late at 9,000 + `took` ms.
+    def rule(view: View) -> int:
+        return int(view.files["tests/test_grade.py"] == "changed\n")
+
+    def duration(view: View, timeout: int) -> int:
+        source_only = view.mutated and view.files["tests/test_grade.py"] == "x\n"
+        return took if source_only and SECOND in view.source else 1000
+
+    report, _, destination = _measure(
+        tmp_path, _passing(rule), after={"tests/test_grade.py": "changed\n"},
+        limits=_one_lane(attempt_ms=12_500), late=True, duration=duration,
+    )
+    assert report["infrastructure_failure"] is None and report["required_settled_ms"] == 6000
+    late = [
+        _object(run) for row in _list(report["mutants"])
+        for run in _list(_object(_object(row)["source_only"])["runs"])
+        if _object(run)["elapsed_ms"] == took
+    ]
+    assert [(run["bound"], run["timeout_ms"]) for run in late] == [("command", 3000)]
+    metrics = _metrics(report, destination)
+    assert (metrics["status"], metrics["killed"], metrics["valid"]) == ("available", 2, 2)
+    source = _object(report["source_only"])
+    share = _object(metrics["test_change_kill_share"])
+    if not overran:
+        assert "interrupted" not in source
+        assert (share["status"], share["percent"]) == ("available", 50.0)
+        return
+    assert _object(source["interrupted"])["cause"] == "attempt_deadline"
+    # Every kill has a source-only outcome, yet the diagnostic was cut.
+    assert all("source_only" in _object(row) for row in _list(metrics["mutants"]))
+    assert share == {"status": "incomplete", "reason": "the source-only diagnostic was cut"}
+    # The same diagnostic recorded as uninterrupted is refused.
+    del source["interrupted"]
+    with pytest.raises(ValueError, match="diagnostic overran the attempt limit"):
+        _metrics(report, destination)

@@ -1281,6 +1281,7 @@ def _run_diagnostics(
             label="source-only-baseline", cap_ms=baseline_ms,
         )
     if not _green(baseline):
+        attempt.kept_limit()
         return
     slowest = _slowest(baseline)
 
@@ -1313,6 +1314,7 @@ def _run_diagnostics(
         diagnostic["settled_ms"] = attempt.now()
 
     _in_lanes(limits.lanes, len(kills), measure)
+    attempt.kept_limit()
 
 
 def _stdout(destination: Path, result: dict[str, object]) -> str:
@@ -1902,6 +1904,15 @@ def _metrics_v2(
     return result
 
 
+def _last_return(calls: list[dict[str, object]], readings: list[object]) -> int:
+    """The latest of these calls' ends and these settlement readings (None when unset)."""
+    ends = [
+        _whole(call["started_ms"]) + (_whole(call["elapsed_ms"]) if call["dispatched"] else 0)
+        for call in calls
+    ]
+    return max([0, *ends, *(_whole(value) for value in readings if value is not None)])
+
+
 def _required_end(report: dict[str, object]) -> int:
     """When the required work last returned: its sealing reading, or its latest call's end.
 
@@ -1913,12 +1924,7 @@ def _required_end(report: dict[str, object]) -> int:
     for record in _runs(report["mutants"]):
         calls.extend(_runs([record["check"]] if record["check"] is not None else []))
         calls.extend(_runs(record["runs"]))
-    ends = [
-        _whole(call["started_ms"]) + (_whole(call["elapsed_ms"]) if call["dispatched"] else 0)
-        for call in calls
-    ]
-    sealed = report["required_settled_ms"]
-    return max([*ends, 0 if sealed is None else _whole(sealed)])
+    return _last_return(calls, [report["required_settled_ms"]])
 
 
 def _mutant_rows_v2(
@@ -2023,13 +2029,20 @@ def _source_only_v2(
         source["baseline"], measured.command, _tree_digest(files),
         lambda _: (baseline_ms, None, attempt_ms),
     )
+    cut = {"status": "incomplete", "reason": "the source-only diagnostic was cut"}
+
+    def kept_limit(calls: list[dict[str, object]], readings: list[object]) -> None:
+        if attempt_ms is not None and _last_return(calls, readings) > attempt_ms:
+            raise ValueError("an uninterrupted source-only diagnostic overran the attempt limit")
+
     if not kills:
         if baseline:
             raise ValueError("a source-only baseline ran with no kill to diagnose")
         return share
     if not _green(baseline):
         if interruption is not None:
-            return {"status": "incomplete", "reason": "the source-only diagnostic was cut"}
+            return cut
+        kept_limit(baseline, [])
         return {"status": "unavailable", "reason": "source-only baseline red or unstable"}
     slowest = _slowest(baseline)
     records = {int(str(item["site"])): item for item in _runs(report["mutants"])}
@@ -2045,6 +2058,16 @@ def _source_only_v2(
             measured, record["source_only"], selected[index], files, slowest, attempt_ms,
             interruption is not None,
         )
+    if interruption is not None:
+        return cut  # Even when every kill has an outcome: the attempt overran its limit.
+    diagnostics = [
+        _object(record["source_only"]) for record in records.values()
+        if "source_only" in record and _object(record["source_only"])["placed"] is True
+    ]
+    kept_limit(
+        baseline + [run for item in diagnostics for run in _runs(item["runs"])],
+        [item["settled_ms"] for item in diagnostics],
+    )
     return share
 
 
