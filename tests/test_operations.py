@@ -25,10 +25,16 @@ from pluginbench.collectors import Collector
 from pluginbench.measurement_profiles import CoverageSettings, MeasurementSettings
 
 
-def _evaluation(tmp_path: Path) -> evaluation.Evaluation:
+_RUNNERS = {
+    "codex": {"harness": "codex", "model": "gpt-6-luna", "reasoning": "low"},
+    "claude": {"harness": "claude", "model": "claude-opus-5-5", "reasoning": "medium"},
+}
+
+
+def _evaluation(tmp_path: Path, harness: str = "codex") -> evaluation.Evaluation:
     (tmp_path / "guidance.md").write_text("Reuse the owning implementation.\n")
     raw = {
-        "runner": {"harness": "codex", "model": "gpt-6-luna", "reasoning": "low"},
+        "runner": _RUNNERS[harness],
         "guidance": {"candidate": ["guidance.md"]},
         "tasks": {"dataset": "example/tasks", "version": "1", "ids": ["example/one"]},
         "measurements": ["tokens", "lines"],
@@ -105,11 +111,15 @@ def test_each_handler_passes_its_validated_arguments_to_its_implementation(
     assert value == ([{"report": 1}, "1.0", "tool"] if operation == "collect" else {"done": True})
 
 
+@pytest.mark.parametrize("harness", ["codex", "claude"])
 @pytest.mark.parametrize("mode", ["check", "prepare"])
 def test_preflight_runs_the_check_or_the_preparation_on_the_same_evaluation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: Literal["check", "prepare"]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: Literal["check", "prepare"],
+    harness: str,
 ) -> None:
-    config = _evaluation(tmp_path)
+    # A Claude evaluation must read back too: its dump once listed the default limits Claude
+    # ignores, and the handler refused them as declared, so no Claude check could start.
+    config = _evaluation(tmp_path, harness)
     calls: list[tuple[str, evaluation.Evaluation, Path]] = []
 
     def check(config: evaluation.Evaluation, output: Path, **kwargs: Any) -> dict[str, object]:
@@ -123,7 +133,8 @@ def test_preflight_runs_the_check_or_the_preparation_on_the_same_evaluation(
     monkeypatch.setattr(evaluation, "check_evaluation", check)
     monkeypatch.setattr(evaluation, "prepare_evaluation", prepare)
     arguments = operations.Preflight(mode=mode, config=config, output=tmp_path / "runs")
-    value = operations.preflight(arguments.model_dump(mode="json"))
+    # As operations.run sends it to the scoped handler.
+    value = operations.preflight(json.loads(arguments.model_dump_json()))
     # The evaluation survives JSON unchanged, its resolved guidance path included.
     assert calls == [(mode, config, tmp_path / "runs")]
     assert calls[0][1].treatments["candidate"].guidance == [tmp_path / "guidance.md"]
