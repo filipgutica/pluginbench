@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -169,6 +170,51 @@ def test_guidance_guard_checks_ancestors_and_rejects_git_or_symlinks(
     (workspace / "linked").symlink_to(tmp_path)
     with pytest.raises(ValueError, match="linked"):
         codex.reject_guidance(workspace, include_ancestors=False)
+
+
+def test_ancestor_guard_skips_only_empty_instruction_folders(tmp_path: Path) -> None:
+    # Sandboxes leave empty .codex and .agents folders in /tmp; anything else above is refused.
+    workspace = tmp_path / "attempt" / "workspace"
+    workspace.mkdir(parents=True)
+    (tmp_path / ".agents").mkdir()
+    (tmp_path / "attempt" / ".codex").mkdir()
+    codex.reject_guidance(workspace)
+    (tmp_path / ".claude").symlink_to(tmp_path / ".agents")
+    (tmp_path / "CLAUDE.md").symlink_to(tmp_path / "missing")
+    with pytest.raises(ValueError, match=r"\.claude, .*CLAUDE\.md"):
+        codex.reject_guidance(workspace)
+    (tmp_path / ".claude").unlink()
+    (tmp_path / "CLAUDE.md").unlink()
+    # A folder filled after an earlier check is refused when the attempt is admitted.
+    (tmp_path / "attempt" / ".codex" / "AGENTS.md").write_text("Be terse.\n")
+    with pytest.raises(ValueError, match=r"attempt/\.codex"):
+        codex.reject_guidance(workspace)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any folder")
+def test_ancestor_guard_stops_on_a_folder_it_cannot_read(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex").chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            codex.reject_guidance(workspace)
+    finally:
+        (tmp_path / ".codex").chmod(0o700)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root looks up any path")
+def test_ancestor_guard_stops_on_a_folder_it_cannot_look_into(tmp_path: Path) -> None:
+    # Without search permission no entry's metadata can be read; that is not "absent".
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o600)
+    try:
+        with pytest.raises(PermissionError):
+            codex.guidance_above(locked / "attempt" / "workspace")
+    finally:
+        locked.chmod(0o700)
 
 
 def test_preflight_checks_help_without_model_calls(monkeypatch: pytest.MonkeyPatch) -> None:

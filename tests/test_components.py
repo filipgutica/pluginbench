@@ -26,7 +26,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # unchanged.
             # The reviewer's execution.json records whether its artifacts were scrubbed with its
             # process group stopped, so only those enter a run; no launch changes.
-            "codex.py": "b3ead8cc2ff8f66aed850184776eca043a127386a23dd2b85994138986371b53",
+            # The parent-folder guidance scan skips empty folders, which hold no instructions;
+            # it admits only attempts it refused before, so launches are unchanged.
+            "codex.py": "14b0cb3ebe85f09e4b90e1b9dba467e729bb5c7fa6edd18684906856a38ac3d7",
             # The Claude launch contract; tests/test_codex_identity.py proves Codex launches equal.
             # Measurement and regrade skip launch-only runtime fields; coding checks are unchanged.
             # Audited command hooks keep native usage; with no audited_hooks every launch is

@@ -1213,6 +1213,43 @@ def test_check_passes_tasks_with_and_without_a_coverage_tool_in_one_config(
     assert not (checkable["output"] / "evidence").exists()
 
 
+def test_check_refuses_guidance_above_the_temporary_directory(
+    checkable: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Attempts start under the temporary directory and refuse instruction folders above it,
+    # so a stray one there must stop the check, not every paid attempt.
+    temporary = tmp_path / "outer" / "tmp"
+    temporary.mkdir(parents=True)
+    # An empty folder, as sandboxes leave, holds no instructions and is not refused.
+    (temporary / ".agents").mkdir()
+    (tmp_path / "outer" / ".codex").mkdir()
+    (tmp_path / "outer" / ".codex" / "AGENTS.md").write_text("Be terse.\n")
+    monkeypatch.setattr(tempfile, "tempdir", str(temporary))
+
+    result = CliRunner().invoke(
+        cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"])]
+    )
+
+    assert result.exit_code != 0
+    assert f"attempt: {tmp_path / 'outer' / '.codex'}. Remove them" in result.stderr
+    assert not checkable["calls"]
+
+
+def test_check_refuses_a_relative_temporary_directory(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Python makes a relative TMPDIR absolute from the working directory, before check sees it.
+    monkeypatch.setenv("TMPDIR", "scratch")
+
+    result = CliRunner().invoke(
+        cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"])]
+    )
+
+    assert result.exit_code != 0
+    assert "must be absolute paths: TMPDIR=scratch" in result.stderr
+    assert not checkable["calls"]
+
+
 def test_check_accepts_an_unverified_codex_version_and_warns_once(
     checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
