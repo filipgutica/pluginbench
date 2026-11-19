@@ -817,6 +817,18 @@ class _Attempt:
             raise self.expired(now)
         return now
 
+    def kept_limit(self) -> int:
+        """The reading that ends the required work; refused if it is past the attempt's limit.
+
+        A call cut by its own cap or its site can still return after the attempt's limit, so
+        the last return is checked here, once every call has returned. Exactly at the limit is
+        on time.
+        """
+        now = self.now()
+        if self.attempt_ms is not None and now > self.attempt_ms:
+            raise self.expired(now)
+        return now
+
     def serial_name(self, label: str) -> str:
         name = f"runs/{self.serial:03d}-{label}"
         self.serial += 1
@@ -1149,6 +1161,7 @@ def _run_required(
             cap_ms=baseline_ms,
         )
     if not _green(baseline):
+        attempt.kept_limit()
         return
     slowest = _slowest(baseline)
     if any(_check_command(site.path) == TSC_CHECK for site in selected):
@@ -1161,6 +1174,7 @@ def _run_required(
         finally:
             report["check_baseline"] = checks[0] if checks else None
         if not _tsc_ran_v2(attempt.destination, checks[0]):
+            attempt.kept_limit()
             return
     records: dict[int, dict[str, object]] = {}
 
@@ -1175,7 +1189,7 @@ def _run_required(
     finally:
         # In sample order, whatever order the lanes finished in.
         report["mutants"] = [records[index] for index in sorted(records)]
-    report["required_settled_ms"] = attempt.now()
+    report["required_settled_ms"] = attempt.kept_limit()
 
 
 def _namer(prefix: str) -> Callable[[str], str]:
@@ -1854,6 +1868,8 @@ def _metrics_v2(
                 )
     if (report["required_settled_ms"] is not None) != (required and failure is None):
         raise ValueError("mutation report's required phase differs from its mutants")
+    if failure is None and attempt is not None and _required_end(report) > attempt:
+        raise ValueError("an uninterrupted mutation attempt overran its limit")
     settled = sorted(index for index, state in states.items() if state is not None)
     counts = {key: sum(row["outcome"] == state for row in rows) for key, state in _COUNTS_V2}
     if counts["errors"]:
@@ -1884,6 +1900,25 @@ def _metrics_v2(
         share = _source_only_v2(measured, report, selected, share, rows, attempt)
     result["test_change_kill_share"] = _share(share, rows, valid, status)
     return result
+
+
+def _required_end(report: dict[str, object]) -> int:
+    """When the required work last returned: its sealing reading, or its latest call's end.
+
+    The source-only diagnostic runs after the seal and is not part of it.
+    """
+    calls = _runs(report["baseline"])
+    if report["check_baseline"] is not None:
+        calls.append(_object(report["check_baseline"]))
+    for record in _runs(report["mutants"]):
+        calls.extend(_runs([record["check"]] if record["check"] is not None else []))
+        calls.extend(_runs(record["runs"]))
+    ends = [
+        _whole(call["started_ms"]) + (_whole(call["elapsed_ms"]) if call["dispatched"] else 0)
+        for call in calls
+    ]
+    sealed = report["required_settled_ms"]
+    return max([*ends, 0 if sealed is None else _whole(sealed)])
 
 
 def _mutant_rows_v2(

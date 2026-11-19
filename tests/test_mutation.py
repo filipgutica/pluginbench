@@ -1655,3 +1655,31 @@ def test_a_late_run_where_the_site_and_its_cap_tie_is_cut_by_the_site(
     assert (run["bound"], run["timeout_ms"]) == ("site", 3000)
     metrics = _metrics(report, destination)
     assert _object(_list(metrics["mutants"])[0])["outcome"] == outcome
+
+
+@pytest.mark.parametrize(("took", "overran"), [(3500, False), (3600, True)])
+def test_a_last_return_past_the_attempt_limit_is_infrastructure_whatever_bound_its_call(
+    tmp_path: Path, took: int, overran: bool
+) -> None:
+    # Site 1, the last, starts its first run at 3,000 ms: its 3,000 ms cap ends at 6,000 ms,
+    # before the attempt's 6,500 ms limit, so the cap bounds it. It returns late, at 3,000 +
+    # `took` ms: past its cap, so a timeout kill, and at 6,600 ms past the attempt's limit too.
+    report, _, destination = _measure(
+        tmp_path, _passing(lambda view: 0), limits=_one_lane(attempt_ms=6500), late=True,
+        duration=lambda view, timeout: took if view.site == 1 else 1000,
+    )
+    run = _object(_list(_object(_list(report["mutants"])[1])["runs"])[0])
+    assert (run["bound"], run["timeout_ms"], run["elapsed_ms"]) == ("command", 3000, took)
+    metrics = _metrics(report, destination)
+    if not overran:
+        assert report["infrastructure_failure"] is None and report["required_settled_ms"] == 6500
+        assert metrics["status"] == "available" and metrics["timed_out"] == 1
+        return
+    failure = _object(report["infrastructure_failure"])
+    assert failure["cause"] == "attempt_deadline" and report["required_settled_ms"] is None
+    assert metrics["status"] == "incomplete" and metrics["killed"] is None
+    assert _object(metrics["partial_counts"])["timed_out"] == 1
+    # The same evidence sealed as uninterrupted is refused.
+    report.update(infrastructure_failure=None, required_settled_ms=6600)
+    with pytest.raises(ValueError, match="overran its limit"):
+        _metrics(report, destination)

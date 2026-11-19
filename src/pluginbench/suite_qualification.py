@@ -417,9 +417,11 @@ def _validate(repeat: _Repeat, contract: _MutationContract) -> None:
         latest = max(latest, site.settled_ms if site.settled_ms is not None else moment)
     if repeat.required_settled_ms is not None and repeat.required_settled_ms < latest:
         raise ValueError("the required phase ended before its sites settled")
+    # A call its own cap or site bounds can still return after the attempt's limit.
+    returned = max(latest, repeat.required_settled_ms or 0)
     if repeat.infrastructure_failure is None and attempt is not None:
         cut = [end for end in ends if end[0] == "attempt"]
-        if cut or (repeat.required_settled_ms or 0) > attempt:
+        if cut or returned > attempt:
             raise ValueError("an uninterrupted repeat overran its attempt limit")
 
 

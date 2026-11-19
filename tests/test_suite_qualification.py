@@ -570,6 +570,10 @@ def _tampered(change: Any) -> dict[str, Any]:
         (_tampered(lambda r: r.update(attempt_ms=1)), "contradicts the time it had left"),
         # The last site's run ends at 5,000 ms, one past a 4,999 ms limit, yet nothing was cut.
         (_tampered(lambda r: r.update(attempt_ms=4999)), "overran its attempt limit"),
+        # A red baseline its own cap bounded, returning at 2,000 ms past a 1,999 ms limit.
+        (_mutation_facts(*_three(baseline=[_ran(0, 1000), _ran(1000, 1000, 1)], sites=[],
+                                 required_settled_ms=None, attempt_ms=1999)),
+         "overran its attempt limit"),
         (_tampered(lambda r: r["sites"][0]["runs"][0].update(exit_code=None)),
          "suite status with no exit code"),
         (_tampered(lambda r: r["sites"][0]["runs"][1].update(exit_code=None, timed_out=True)),
