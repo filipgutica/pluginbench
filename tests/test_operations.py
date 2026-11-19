@@ -1,4 +1,4 @@
-"""The handler table: the five operations a scope may run, and the arguments each accepts."""
+"""The handler table: the six operations a scope may run, and the arguments each accepts."""
 
 from __future__ import annotations
 
@@ -20,9 +20,12 @@ from pluginbench import (
     harbor_backend,
     invocation_runtime,
     operations,
+    reference_mutation,
 )
 from pluginbench.collectors import Collector
 from pluginbench.measurement_profiles import CoverageSettings, MeasurementSettings
+from pluginbench.reference_mutation import Contract
+from pluginbench.suite_qualification import REFERENCE_REPEATS
 
 
 _RUNNERS = {
@@ -54,6 +57,7 @@ _MODELS: dict[str, type[BaseModel]] = {
     "grading": operations.Grading,
     "review": operations.Review,
     "collect": operations.Collect,
+    "reference": operations.Reference,
 }
 
 
@@ -81,34 +85,46 @@ def _cases(tmp_path: Path) -> dict[str, tuple[Any, str, dict[str, Any]]]:
             {"root": tmp_path / "source", "collector": _collector(tmp_path),
              "destination": tmp_path / "coverage", "baseline": None},
         ),
+        "reference": (
+            reference_mutation, "measure_repeats",
+            {"before": tmp_path / "before", "after": tmp_path / "after",
+             "config": {"native_task_identity": {}}, "contract": Contract(headroom_percent=150),
+             "destination": tmp_path / "reference", "attempt_ms": 60_000},
+        ),
     }
 
 
-def test_the_handler_table_names_the_five_operations_and_each_resolves() -> None:
+def test_the_handler_table_names_the_six_operations_and_each_resolves() -> None:
     assert sorted(invocation_runtime.HANDLERS) == [
-        "coding", "collect", "grading", "preflight", "review",
+        "coding", "collect", "grading", "preflight", "reference", "review",
     ]
     for target in invocation_runtime.HANDLERS.values():
         module, name = target.split(":")
         assert callable(getattr(importlib.import_module(module), name))
 
 
-@pytest.mark.parametrize("operation", ["coding", "grading", "review", "collect"])
+@pytest.mark.parametrize("operation", ["coding", "grading", "review", "collect", "reference"])
 def test_each_handler_passes_its_validated_arguments_to_its_implementation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
     owner, name, arguments = _cases(tmp_path)[operation]
     seen: dict[str, Any] = {}
 
+    returned: dict[str, Any] = {
+        "collect": (({"report": 1}, "1.0", "tool"), [{"report": 1}, "1.0", "tool"]),
+        "reference": ({"repeats": []}, {"repeats": []}),
+    }
+    result, expected = returned.get(operation, ({"done": True}, {"done": True}))
+
     def implementation(*args: Any, **kwargs: Any) -> Any:
         seen.update(kwargs)
-        return ({"report": 1}, "1.0", "tool") if operation == "collect" else {"done": True}
+        return result
 
     monkeypatch.setattr(owner, name, implementation)
     # As a caller sends it: the model dumped to JSON.
     value = getattr(operations, operation)(_MODELS[operation](**arguments).model_dump(mode="json"))
     assert seen == arguments
-    assert value == ([{"report": 1}, "1.0", "tool"] if operation == "collect" else {"done": True})
+    assert value == expected
 
 
 @pytest.mark.parametrize("harness", ["codex", "claude"])
@@ -144,7 +160,7 @@ def test_preflight_runs_the_check_or_the_preparation_on_the_same_evaluation(
 @pytest.mark.parametrize(
     ("operation", "field"),
     [("coding", "area"), ("grading", "directory"), ("review", "output_schema"),
-     ("collect", "root"), ("collect", "collector")],
+     ("collect", "root"), ("collect", "collector"), ("reference", "destination")],
 )
 def test_a_relative_path_is_refused_since_the_handler_runs_elsewhere(
     tmp_path: Path, operation: str, field: str
@@ -223,6 +239,9 @@ _ROUTED = {
     "run_reference_agents": {("evaluation", "_reference_agents")},
     # `run_evaluation` is a test helper that no production code calls.
     "prepare_evaluation": {("evaluation", "run_evaluation")},
+    # Its receipts need a verified manifest's pins; no production caller has them yet.
+    "measure_reference": set(),
+    "measure_repeats": {("reference_mutation", "measure_reference")},
 }
 
 
@@ -264,6 +283,65 @@ def test_the_image_budgets_match_harbor_backends_pull_and_build_timeouts() -> No
             [timeout] = [item.value for item in node.keywords if item.arg == "timeout"]
             timeouts[str(node.args[0].value)] = ast.literal_eval(timeout)
     assert timeouts == {"pull": operations.IMAGE_PULL, "build": operations.IMAGE_BUILD}
+
+
+def _measurement_call_overhead() -> int:
+    """Every Docker step one `run_native_command` call can make, each at its own cap, summed in
+    order through the launcher functions it calls. Its measured command is not one of them."""
+    tree = ast.parse(Path(harbor_backend.__file__).read_text())
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    [default] = [
+        node.value.value for node in tree.body
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "_DOCKER_TIMEOUT"
+        and isinstance(node.value, ast.Constant)
+    ]
+    assert isinstance(default, int)
+
+    def cap(call: ast.Call, function: ast.FunctionDef) -> int:
+        value = next((k.value for k in call.keywords if k.arg in ("timeout", "limit")), None)
+        if isinstance(value, ast.Name):  # A parameter: its default.
+            arguments = function.args
+            named = arguments.args[len(arguments.args) - len(arguments.defaults):]
+            pairs = [*zip(named, arguments.defaults), *zip(arguments.kwonlyargs,
+                                                           arguments.kw_defaults)]
+            value = next((d for a, d in pairs if a.arg == value.id), None)
+        if value is None or (isinstance(value, ast.Name) and value.id == "_DOCKER_TIMEOUT"):
+            return default
+        return int(ast.literal_eval(value))
+
+    def bound(name: str, stack: tuple[str, ...]) -> int:
+        function, total = functions[name], 0
+        helpers = [node for node in ast.walk(function)
+                   if isinstance(node, ast.FunctionDef) and node is not function]
+        inner = {id(call) for helper in helpers for call in ast.walk(helper)}
+        for call in ast.walk(function):
+            if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+                continue
+            callee = call.func.id
+            if callee in ("docker", "_docker"):
+                # A local `docker` helper's own `_docker` call is counted at each of its calls.
+                if callee == "docker" or id(call) not in inner:
+                    total += cap(call, function)
+            elif callee in functions and callee not in (*stack, name):
+                total += bound(callee, (*stack, name))
+        return total
+
+    return bound("run_native_command", ())
+
+
+def test_the_measurement_call_overhead_is_the_launchers_docker_steps_at_their_caps() -> None:
+    """`operations` restates it so the hashed launcher file stays unchanged; a changed step or
+    cap there must change the reference budget too."""
+    assert operations.MEASUREMENT_CALL_OVERHEAD == _measurement_call_overhead()
+
+
+def test_the_reference_budget_holds_a_slow_final_call_in_every_repeat() -> None:
+    """Each repeat's last call starts a millisecond before its attempt limit, so its command's
+    timeout is rounded up to a whole second past the limit, and every launcher step around it
+    takes its whole cap. The lanes' last calls overlap, so each repeat has one such call."""
+    attempt_ms = 1_800_500
+    repeat = (attempt_ms - 1) / 1000 + 1 + _measurement_call_overhead()
+    assert operations.reference_budget(attempt_ms) >= REFERENCE_REPEATS * repeat
 
 
 def test_each_operation_budget_outlasts_its_implementations_own_timeouts(

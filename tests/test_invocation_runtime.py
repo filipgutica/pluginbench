@@ -198,6 +198,82 @@ def test_the_entry_point_creates_containers_only_on_the_daemon_its_operation_rec
     )
 
 
+@pytest.mark.parametrize("outcome", ["return", "fail", "hang"])
+def test_a_reference_measurement_runs_as_its_registered_operation_and_leaves_nothing(
+    fake_systemd: FakeSystemd,
+    owned: run_lock.ExecutionLock,
+    docker: _Docker,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    """However the measurement ends, its scope and its labelled containers are gone after it.
+    A hung one is killed at its budget: each repeat's attempt limit and rounding second, here
+    with no launcher overhead."""
+    from pluginbench import operations
+    from pluginbench.reference_mutation import Contract
+
+    monkeypatch.setenv("PB_FAKE_REFERENCE", outcome)
+    monkeypatch.setattr(invocation_runtime, "KILL_GRACE", 0.5)
+    invocation = uuid4().hex
+    destination = tmp_path / "reference"
+    destination.mkdir()
+    docker.containers = {"mine": invocation, "other": uuid4().hex}
+    arguments = operations.Reference(
+        before=tmp_path / "before", after=tmp_path / "after", config={},
+        contract=Contract(headroom_percent=150), destination=destination, attempt_ms=1000,
+    )
+    monkeypatch.setattr(operations, "MEASUREMENT_CALL_OVERHEAD", 0)
+    budget = operations.reference_budget(arguments.attempt_ms)
+    assert budget == 6
+
+    def measure() -> Any:
+        return operations.run(
+            "reference", arguments, timeout=budget, docker=_RUNTIME, invocation=invocation
+        )
+
+    if outcome == "return":
+        assert measure() == {}
+    elif outcome == "fail":
+        with pytest.raises(ValueError, match="reference measurement failed"):
+            measure()
+    else:
+        with pytest.raises(OperationDeadlineExceeded, match="within 6 seconds"):
+            measure()
+        assert _gone(_pid(destination / "escaped"), within=1)
+    assert f"pb-inv-{invocation}.scope" in (fake_systemd.root / "log").read_text()
+    assert docker.containers.keys() == {"other"}
+    assert ("rm", "--force", "--volumes", "mine") in docker.calls
+    assert _record(owned.state)["operations"] == []
+
+
+@pytest.mark.parametrize(
+    ("engine", "message"),
+    [("other", "another Docker engine, other, answers"),
+     ("", r"did not answer \(no engine ID\)")],
+    ids=["replaced engine", "no answer"],
+)
+def test_an_operation_on_an_engine_that_does_not_answer_as_itself_is_never_recorded(
+    fake_systemd: FakeSystemd,
+    owned: run_lock.ExecutionLock,
+    docker: _Docker,
+    tmp_path: Path,
+    engine: str,
+    message: str,
+) -> None:
+    """Its cleanup could never prove its containers gone, so it would fence the host for every
+    later operation. Refused before anything is recorded or started, the host stays usable."""
+    docker.engine = engine
+    marker = tmp_path / "ran"
+    request = _request("echo", _RUNTIME, value=1, marker=str(marker))
+    with pytest.raises(invocation_runtime.EngineUnavailable, match=message):
+        invocation_runtime.run_operation(request)
+    assert not marker.exists() and fake_systemd.units() == []
+    assert not (owned.state / "invocations" / request.spec.id).exists()
+    assert _record(owned.state)["operations"] == []
+    assert invocation_runtime.run_operation(_request("echo", value=2)) == 2
+
+
 def test_a_container_that_survives_removal_fences_the_host_until_a_later_check_removes_it(
     fake_systemd: FakeSystemd, docker: _Docker, tmp_path: Path, isolated_host_state: Path
 ) -> None:

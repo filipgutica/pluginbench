@@ -134,6 +134,7 @@ def test_public_commands_cover_evaluations_reports_and_task_selection() -> None:
     assert set(get_group(cli.app).commands) == {
         "init",
         "check",
+        "reference-mutation",
         "run",
         "status",
         "dashboard",

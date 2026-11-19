@@ -13,6 +13,7 @@ finite budget that leaves its implementation's own timeouts room to end it first
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -21,8 +22,10 @@ from uuid import uuid4
 from pydantic import AfterValidator, BaseModel, ConfigDict
 
 from pluginbench import invocation_runtime
+from pluginbench.benchmark import Count
 from pluginbench.collectors import Collector
 from pluginbench.evaluation import Evaluation
+from pluginbench.reference_mutation import Contract
 
 # What an operation has beyond the timeout its implementation applies to its main command:
 # after a Harbor worker, its export and cleanup; after a reviewer, its trace and receipts;
@@ -41,6 +44,14 @@ MEASUREMENT_PREPARATION = 1800
 PREPARED_IMAGES = 3
 IMAGE_PULL = 600
 IMAGE_BUILD = 1800
+# What one measurement container call (`harbor_backend.run_native_command`) may take beyond its
+# command's own timeout, every Docker step it can make at its own cap, one after another: the
+# runtime check; create and start; the tool's directory, copy and probe; the workdir clearing,
+# snapshot copy and the export of it; the stale report's removal; stop and the export after;
+# the report copy; and cleanup. tests/test_operations.py recomputes it from that file. It is
+# deliberately the sum over every step in the function: a mutation call skips some of them,
+# such as the report copy, so it can take less (3,240 s by one count), never more.
+MEASUREMENT_CALL_OVERHEAD = 3660
 
 
 def _absolute(path: Path) -> Path:
@@ -132,6 +143,21 @@ class Requalify(_Arguments):
     destination: AbsolutePath
 
 
+class Reference(_Arguments):
+    """`reference_mutation.measure_repeats`: a task's reference measured three times, for the
+    timing pilot. It takes no pins and writes no receipt, so nothing it produces can qualify a
+    task. `config` is the task's prepared mutation profile, whose frozen Docker runtime the
+    operation records. Unlike a submission's collect, each repeat needs a declared limit: the
+    operation's budget derives from it."""
+
+    before: AbsolutePath
+    after: AbsolutePath
+    config: dict[str, Any]
+    contract: Contract
+    destination: AbsolutePath
+    attempt_ms: Count
+
+
 def run(
     operation: str,
     arguments: _Arguments,
@@ -180,6 +206,15 @@ def requalify_budget(task_dir: Path) -> int:
     from pluginbench import harbor_backend
 
     return REFERENCE_AGENTS * coding_budget(task_dir, harbor_backend._REFERENCE_AGENT_TIMEOUT)
+
+
+def reference_budget(attempt_ms: int) -> int:
+    """A reference measurement's whole budget. Each repeat gets its attempt limit, then the
+    second its last command's timeout is rounded up to, then one launcher call's overhead:
+    a call starts only while the limit has time left, and the lanes' last calls run at once."""
+    from pluginbench.suite_qualification import REFERENCE_REPEATS
+
+    return REFERENCE_REPEATS * (math.ceil(attempt_ms / 1000) + 1 + MEASUREMENT_CALL_OVERHEAD)
 
 
 def review_budget(timeout: int) -> int:
@@ -270,6 +305,13 @@ def collect(arguments: dict[str, Any]) -> list[object]:
     from pluginbench import collectors
 
     return list(collectors._run_collector(**dict(Collect.model_validate(arguments))))
+
+
+def reference(arguments: dict[str, Any]) -> dict[str, object]:
+    """The three repeats' raw facts. The caller publishes them once cleanup is verified."""
+    from pluginbench import reference_mutation
+
+    return reference_mutation.measure_repeats(**dict(Reference.model_validate(arguments)))
 
 
 def preflight(arguments: dict[str, Any]) -> object:

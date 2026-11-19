@@ -1,10 +1,11 @@
-"""The pluginbench command line: init, check, run, status, dashboard, stop, compare, report,
-review, measure, judge."""
+"""The pluginbench command line: init, check, reference-mutation, run, status, dashboard, stop,
+compare, report, review, measure, judge."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import sqlite3
@@ -14,7 +15,13 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from contextlib import (
+    AbstractContextManager,
+    ExitStack,
+    contextmanager,
+    nullcontext,
+    suppress,
+)
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -23,7 +30,14 @@ import typer
 import yaml
 from typer.core import TyperGroup
 
-from pluginbench import __version__, control_store, coordinator, invocation_runtime, run_lock
+from pluginbench import (
+    __version__,
+    control_store,
+    coordinator,
+    invocation_runtime,
+    mutation,
+    run_lock,
+)
 from pluginbench.isolation import RuntimeDriftError
 from pluginbench.evaluation import (
     CheckFailed,
@@ -577,6 +591,235 @@ def check(
         control_store.CleanupBlocked,
     ) as exc:
         _error(exc)
+
+
+# The timing pilot's published directory and its manifest, and what a pilot that published
+# nothing records beside its staged repeats instead.
+PILOT_DIRECTORY = "pilot"
+PILOT_FILE = "pilot.json"
+PILOT_OUTCOME = "outcome.json"
+
+
+@app.command("reference-mutation")
+def reference_mutation(
+    profile: Path = typer.Argument(
+        ..., help="The task's prepared mutation profile, mutation.json, with its frozen runtime."
+    ),
+    before: Path = typer.Option(..., "--before", help="The task's frozen starting tree."),
+    after: Path = typer.Option(
+        ..., "--after", help="The starting tree with the verified oracle change applied."
+    ),
+    attempt_seconds: int = typer.Option(
+        ..., "--attempt-seconds", min=1, help="Each repeat's whole attempt limit."
+    ),
+    headroom_percent: int = typer.Option(
+        ..., "--headroom-percent", min=1,
+        help="How far the mutation limit must exceed the projected reference time; 150 = 1.5x.",
+    ),
+    sample_size: int = typer.Option(
+        mutation.SAMPLE_SIZE, "--sample-size", min=1, help="M, the mutants each repeat measures."
+    ),
+    lanes: int = typer.Option(
+        mutation.LANES, "--lanes", min=1, max=mutation.LANES,
+        help="Mutant containers each repeat runs at once.",
+    ),
+    output: Path | None = typer.Option(
+        None, "--output", help="New directory for the pilot's repeats and timings."
+    ),
+) -> None:
+    """Time a task's reference mutation for the timing pilot: three repeats, no model calls.
+
+    Pilot only. It writes no qualification receipt and takes no pins, so `freeze` can never
+    read what it measures. The receipts come from pins a verified suite manifest supplies.
+    """
+    from pluginbench import operations
+    from pluginbench.measurement_profiles import CoverageSettings
+    from pluginbench.reference_mutation import Contract
+
+    try:
+        # Everything is checked before the host is taken: a repeat can run for hours.
+        destination = (output or _new_run_directory("reference-")).resolve()
+        if destination.exists():
+            raise ValueError(
+                f"{destination} already exists; give a new --output. A pilot that published "
+                f"nothing says why in its {PILOT_OUTCOME}: to run it again there, first remove "
+                f"it with `rm -r {shlex.quote(str(destination))}`"
+            )
+        trees = before.resolve(), after.resolve()
+        for tree in trees:
+            if not tree.is_dir():
+                raise ValueError(f"{tree} is not a directory")
+            if destination.is_relative_to(tree):
+                raise ValueError(f"{destination} is inside {tree}, which it would change")
+        config = json.loads(profile.read_text())
+        identity = config.get("native_task_identity") if isinstance(config, dict) else None
+        if not isinstance(identity, dict):
+            raise ValueError(f"{profile} is not a prepared mutation profile")
+        # The worker reads the settings with their defaults filled in, as validated here.
+        coverage = CoverageSettings.model_validate(config.get("coverage"))
+        config = {**config, "coverage": coverage.model_dump(mode="json")}
+        # The repeats run in a staging directory, published only once cleanup is verified.
+        staging = destination / "staging"
+        arguments = operations.Reference(
+            before=trees[0], after=trees[1], config=config,
+            contract=Contract(
+                headroom_percent=headroom_percent, sample_size=sample_size, lanes=lanes
+            ),
+            destination=staging, attempt_ms=1000 * attempt_seconds,
+        )
+        # The frozen runtime the profile saved: its containers start on that daemon only.
+        runtime = mutation.measurement_identity(identity)["isolation"]
+        assert isinstance(runtime, dict)  # `measurement_identity` requires one.
+        invocation_runtime.require_recoverable(runtime)
+        with _execution("preflight", profile, destination):
+            destination.mkdir(parents=True)
+            published = destination / PILOT_DIRECTORY
+            try:
+                # It returns only once the scope is gone and no labelled container is left.
+                facts = operations.run(
+                    "reference", arguments,
+                    timeout=operations.reference_budget(arguments.attempt_ms), docker=runtime,
+                )
+                _publish_pilot(staging, published, facts)
+            except BaseException as exc:
+                _record_unpublished(destination, exc)
+                raise
+        for line in _reference_summary(facts):
+            typer.echo(line)
+        typer.echo(f"Pilot timings: {published / PILOT_FILE}. Not a qualification receipt.")
+    except (
+        OSError,
+        ValueError,
+        subprocess.SubprocessError,
+        RuntimeDriftError,
+        control_store.CleanupBlocked,
+    ) as exc:
+        _error(exc)
+
+
+# What each repeat's runs leave that the pilot publishes, beside the repeat's report.json.
+_RUN_EVIDENCE = frozenset({"execution.json", "stdout.txt", mutation.PRELAUNCH_FAILURE})
+
+
+def _publish_pilot(staging: Path, published: Path, facts: dict[str, Any]) -> None:
+    """Publish the pilot's expected evidence and its manifest together, with one rename.
+
+    Only what the pilot is meant to output moves: each repeat's report, and its runs' receipts,
+    output and prelaunch failures. Anything else a run left, such as a source copy the executor
+    could not remove, stays in staging, unpublished.
+    """
+    assembly = staging.parent / ".publication"
+    assembly.mkdir()
+    _write_json(assembly / PILOT_FILE, {"kind": "reference-mutation-pilot", "facts": facts})
+    for path in sorted(staging.rglob("*")):
+        relative = path.relative_to(staging)
+        if path.is_file() and not path.is_symlink() and _pilot_evidence(relative):
+            (assembly / relative).parent.mkdir(parents=True, exist_ok=True)
+            path.rename(assembly / relative)
+    assembly.rename(published)
+    # What is left of staging goes once empty; a directory holding anything else stays.
+    for directory in sorted((p for p in staging.rglob("*") if p.is_dir()), reverse=True):
+        with suppress(OSError):
+            directory.rmdir()
+    with suppress(OSError):
+        staging.rmdir()
+
+
+def _pilot_evidence(relative: Path) -> bool:
+    """Whether a staged file is one the pilot publishes (`_publish_pilot`)."""
+    if len(relative.parts) < 2 or not re.fullmatch(r"repeat-\d+", relative.parts[0]):
+        return False
+    inside = Path(*relative.parts[1:])
+    if inside == Path("report.json"):
+        return True
+    receipts = mutation._RECEIPTS[mutation.VERSION]
+    return inside.name in _RUN_EVIDENCE and bool(receipts.fullmatch(inside.parent.as_posix()))
+
+
+def _record_unpublished(destination: Path, exc: BaseException) -> None:
+    """Record why a pilot published nothing beside its staged repeats, which stay for
+    inspection and prove nothing. If even that cannot be written, the error says so."""
+    try:
+        _write_json(destination / PILOT_OUTCOME, _pilot_outcome(exc))
+    except OSError as error:
+        exc.add_note(f"Why it published nothing could not be recorded in {destination}: {error}")
+
+
+def _pilot_outcome(exc: BaseException) -> dict[str, object]:
+    """Why a pilot published nothing. A deadline, an unverified cleanup, a host or Docker
+    engine that cannot contain the operation, a launch failure or a file it could not write
+    is infrastructure."""
+    infrastructure = isinstance(exc, (
+        OSError, control_store.CleanupBlocked, invocation_runtime.HostUnavailable,
+        invocation_runtime.EngineUnavailable,
+    )) or (isinstance(exc, invocation_runtime.OperationFailed) and not exc.type)
+    return {
+        "published": False,
+        "infrastructure": infrastructure,
+        "error": f"{type(exc).__name__}: {exc}",
+    }
+
+
+def _write_json(path: Path, value: object) -> None:
+    """Write `value` whole or not at all: readers never see half a file."""
+    partial = path.with_name(f".{path.name}.partial")
+    partial.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    os.replace(partial, path)
+
+
+def _reference_summary(facts: dict[str, Any]) -> list[str]:
+    """One line per reference repeat, in seconds from its start: each baseline's time and
+    suite status, first dispatch, when the M = 10 prefix and the whole sample settled, and
+    whether the repeat completed its required work, was censored by a limit, or neither."""
+    sample = int(facts["contract"]["sample_size"])
+
+    def seconds(ms: int | None) -> str:
+        return "unsettled" if ms is None else f"{ms / 1000:.1f} s"
+
+    def settled(sites: list[dict[str, Any]], count: int) -> int | None:
+        chosen = [site for site in sites if site["site"] < count]
+        if len(chosen) < count or any(site["settled_ms"] is None for site in chosen):
+            return None
+        return max((site["settled_ms"] for site in chosen), default=0)
+
+    lines = []
+    for index, repeat in enumerate(facts["repeats"]):
+        sites, selected = repeat["sites"], len(repeat["selected"])
+        baselines = ", ".join(_baseline_state(run) for run in repeat["baseline"])
+        parts = [
+            f"repeat {index}: {selected} of {repeat['candidate_count']} candidates",
+            f"baselines {baselines or 'none'}",
+            f"first mutant {seconds(min((s['dispatched_ms'] for s in sites), default=None))}",
+        ]
+        if selected > mutation.V1_SAMPLE_SIZE:
+            parts.append(
+                f"first {mutation.V1_SAMPLE_SIZE} settled "
+                f"{seconds(settled(sites, mutation.V1_SAMPLE_SIZE))}"
+            )
+        parts.append(f"all settled {seconds(settled(sites, selected))}")
+        parts.append(f"required work {seconds(repeat['required_settled_ms'])}")
+        failure = repeat["infrastructure_failure"]
+        if failure is not None:
+            parts.append(f"censored ({failure})")
+        else:
+            parts.append("incomplete" if repeat["required_settled_ms"] is None else "complete")
+        lines.append("; ".join(parts))
+    lines.append(f"M = {sample}, {facts['contract']['lanes']} lanes. No model calls.")
+    return lines
+
+
+def _baseline_state(run: dict[str, Any]) -> str:
+    """A baseline run's time and how its suite ended: green only on suite status 0, and
+    unavailable when it printed no suite status."""
+    if not run["dispatched"]:
+        return "not run"
+    took = f"{run['elapsed_ms'] / 1000:.1f} s"
+    if run["timed_out"]:
+        return f"{took} timed out"
+    status = run["suite_status"]
+    if status is None:
+        return f"{took} unavailable (no suite status, exit {run['exit_code']})"
+    return f"{took} {'green' if status == 0 else f'red (suite status {status})'}"
 
 
 @app.command("status")
