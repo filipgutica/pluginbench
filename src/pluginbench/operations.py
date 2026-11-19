@@ -48,7 +48,9 @@ IMAGE_BUILD = 1800
 # command's own timeout, every Docker step it can make at its own cap, one after another: the
 # runtime check; create and start; the tool's directory, copy and probe; the workdir clearing,
 # snapshot copy and the export of it; the stale report's removal; stop and the export after;
-# the report copy; and cleanup. tests/test_operations.py recomputes it from that file.
+# the report copy; and cleanup. tests/test_operations.py recomputes it from that file. It is
+# deliberately the sum over every step in the function: a mutation call skips some of them,
+# such as the report copy, so it can take less (3,240 s by one count), never more.
 MEASUREMENT_CALL_OVERHEAD = 3660
 
 
