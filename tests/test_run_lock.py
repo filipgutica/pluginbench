@@ -505,23 +505,23 @@ def test_an_observer_reading_the_owner_record_never_delays_an_owner(
     state.mkdir()
     with run_lock.hold_execution(_owner("run", tmp_path / "old"), state=state):
         pass  # The lock file now exists and is free.
-    opened = run_lock._open_record
+    parse = json.loads
     started: list[str] = []
 
-    def slow_reader(path: Path) -> Any:
-        read = opened(path)
-
-        def read_while_an_owner_starts() -> Any:
-            # An observer stalled in its read must not hold the probe the owner waits out.
+    def slow_parse(text: Any, **options: Any) -> Any:
+        if not started:
+            started.append("new")
+            # An observer stalled while it parses must not hold the probe an owner waits out.
             with run_lock.hold_execution(_owner("run", tmp_path / "new"), state=state):
-                started.append("new")
-            return read()
+                pass
+        return parse(text, **options)
 
-        return read_while_an_owner_starts
-
-    monkeypatch.setattr(run_lock, "_open_record", slow_reader)
+    monkeypatch.setattr(json, "loads", slow_parse)
     snapshot, carried = run_lock.observe_execution(state)
+    monkeypatch.undo()
 
+    # The observation is the record as it was under the probe: the old owner's clean release,
+    # not the new owner's record that replaced it meanwhile.
     assert started == ["new"]
-    # The observation is the record as it was opened: the old owner's clean release.
+    assert snapshot.record is not None and snapshot.record["root"] == str(tmp_path / "old")
     assert not snapshot.held and carried == []

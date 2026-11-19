@@ -188,7 +188,11 @@ class ControlStore:
             if recover:
                 roll_back_unfinished_write(path)
             self._db = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=5)
-            version = self._db.execute("PRAGMA user_version").fetchone()[0]
+            try:
+                version = self._db.execute("PRAGMA user_version").fetchone()[0]
+            except BaseException:
+                self._db.close()
+                raise
             if version != SCHEMA_VERSION:
                 self._db.close()
                 raise sqlite3.DatabaseError(

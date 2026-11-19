@@ -401,19 +401,14 @@ _MISSING = object()
 
 def _load_record(path: Path) -> tuple[Any, str | None]:
     """The parsed JSON at `path`, or None and why it cannot be read; _MISSING if absent."""
-    try:
-        return json.loads(path.read_text()), None
-    except FileNotFoundError:
-        return _MISSING, None
-    except (OSError, ValueError) as exc:
-        return None, f"it cannot be read: {exc}"
+    return _open_record(path)()
 
 
 def _open_record(path: Path) -> Callable[[], tuple[Any, str | None]]:
     """Open the record at `path` now and return what reads it, as _load_record does, later.
     Records are replaced atomically, so the read finds the version current when it was opened."""
     try:
-        stream = path.open("rb")
+        stream = path.open()
     except FileNotFoundError:
         return lambda: (_MISSING, None)
     except OSError as exc:
