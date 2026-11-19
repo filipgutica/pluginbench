@@ -2539,8 +2539,7 @@ def test_review_resumes_a_cut_off_revision_with_the_reviewer_that_started_it(
     with pytest.raises(KeyboardInterrupt, match="operator stop"):
         evaluation.review_evaluation(root, "second", reviewer=claude_reviewer)
     overrides = evaluation._load_selection(root)["reviewer_overrides"]
-    assert isinstance(overrides, dict)
-    recorded = overrides["second"]
+    assert isinstance(overrides, dict) and overrides["second"]["model"] == "claude-opus-5-5"
     monkeypatch.setattr(codex, "invoke", reviewed)
 
     # No reviewer options: the revision resumes with the Claude reviewer it was started with.
