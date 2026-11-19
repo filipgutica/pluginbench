@@ -296,6 +296,64 @@ def test_the_image_budgets_match_harbor_backends_pull_and_build_timeouts() -> No
     assert timeouts == {"pull": operations.IMAGE_PULL, "build": operations.IMAGE_BUILD}
 
 
+def _measurement_call_overhead() -> int:
+    """Every Docker step one `run_native_command` call can make, each at its own cap, summed in
+    order through the launcher functions it calls. Its measured command is not one of them."""
+    tree = ast.parse(Path(harbor_backend.__file__).read_text())
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    [default] = [
+        node.value.value for node in tree.body
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "_DOCKER_TIMEOUT"
+        and isinstance(node.value, ast.Constant)
+    ]
+
+    def cap(call: ast.Call, function: ast.FunctionDef) -> int:
+        value = next((k.value for k in call.keywords if k.arg in ("timeout", "limit")), None)
+        if isinstance(value, ast.Name):  # A parameter: its default.
+            arguments = function.args
+            named = arguments.args[len(arguments.args) - len(arguments.defaults):]
+            pairs = [*zip(named, arguments.defaults), *zip(arguments.kwonlyargs,
+                                                           arguments.kw_defaults)]
+            value = next((d for a, d in pairs if a.arg == value.id), None)
+        if value is None or (isinstance(value, ast.Name) and value.id == "_DOCKER_TIMEOUT"):
+            return default
+        return int(ast.literal_eval(value))
+
+    def bound(name: str, stack: tuple[str, ...]) -> int:
+        function, total = functions[name], 0
+        helpers = [node for node in ast.walk(function)
+                   if isinstance(node, ast.FunctionDef) and node is not function]
+        inner = {id(call) for helper in helpers for call in ast.walk(helper)}
+        for call in ast.walk(function):
+            if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+                continue
+            callee = call.func.id
+            if callee in ("docker", "_docker"):
+                # A local `docker` helper's own `_docker` call is counted at each of its calls.
+                if callee == "docker" or id(call) not in inner:
+                    total += cap(call, function)
+            elif callee in functions and callee not in (*stack, name):
+                total += bound(callee, (*stack, name))
+        return total
+
+    return bound("run_native_command", ())
+
+
+def test_the_measurement_call_overhead_is_the_launchers_docker_steps_at_their_caps() -> None:
+    """`operations` restates it so the hashed launcher file stays unchanged; a changed step or
+    cap there must change the reference budget too."""
+    assert operations.MEASUREMENT_CALL_OVERHEAD == _measurement_call_overhead()
+
+
+def test_the_reference_budget_holds_a_slow_final_call_in_every_repeat() -> None:
+    """Each repeat's last call starts a millisecond before its attempt limit, so its command's
+    timeout is rounded up to a whole second past the limit, and every launcher step around it
+    takes its whole cap. The lanes' last calls overlap, so each repeat has one such call."""
+    attempt_ms = 1_800_500
+    repeat = (attempt_ms - 1) / 1000 + 1 + _measurement_call_overhead()
+    assert operations.reference_budget(attempt_ms) >= REFERENCE_REPEATS * repeat
+
+
 def test_each_operation_budget_outlasts_its_implementations_own_timeouts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -310,12 +368,6 @@ def test_each_operation_budget_outlasts_its_implementations_own_timeouts(
     assert operations.coding_budget(task, 900) > worker(task_dir=task, agent_seconds=900)
     assert operations.grading_budget(task) > worker(task_dir=task)
     assert operations.review_budget(600) > 600
-    # Every repeat at its whole attempt limit, rounded up, then its last containers' setup and
-    # export, as a collect allows around its command.
-    attempts = REFERENCE_REPEATS * 1801
-    assert operations.reference_budget(1_800_500) - attempts >= (
-        REFERENCE_REPEATS * operations.AROUND_COLLECTOR
-    )
     assert operations.collect_budget(_collector(tmp_path)) > _collector(tmp_path).timeout_seconds
     mutation = tmp_path / "mutation.json"
     mutation.write_text(json.dumps({"coverage": {"timeout_seconds": 100}}))

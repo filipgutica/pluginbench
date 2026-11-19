@@ -44,6 +44,12 @@ MEASUREMENT_PREPARATION = 1800
 PREPARED_IMAGES = 3
 IMAGE_PULL = 600
 IMAGE_BUILD = 1800
+# What one measurement container call (`harbor_backend.run_native_command`) may take beyond its
+# command's own timeout, every Docker step it can make at its own cap, one after another: the
+# runtime check; create and start; the tool's directory, copy and probe; the workdir clearing,
+# snapshot copy and the export of it; the stale report's removal; stop and the export after;
+# the report copy; and cleanup. tests/test_operations.py recomputes it from that file.
+MEASUREMENT_CALL_OVERHEAD = 3660
 
 
 def _absolute(path: Path) -> Path:
@@ -201,14 +207,12 @@ def requalify_budget(task_dir: Path) -> int:
 
 
 def reference_budget(attempt_ms: int) -> int:
-    """A reference measurement's whole budget: each repeat's attempt limit, then the
-    allowance a collect gets around the same launcher call for its containers' setup and
-    export. The lanes' last calls overshoot the limit together, so each repeat gets one. A
-    launcher whose every Docker step hangs to its own limit can still exceed it; the outer
-    kill is then an infrastructure failure, as an attempt limit's expiry is."""
+    """A reference measurement's whole budget. Each repeat gets its attempt limit, then the
+    second its last command's timeout is rounded up to, then one launcher call's overhead:
+    a call starts only while the limit has time left, and the lanes' last calls run at once."""
     from pluginbench.suite_qualification import REFERENCE_REPEATS
 
-    return REFERENCE_REPEATS * (math.ceil(attempt_ms / 1000) + AROUND_COLLECTOR)
+    return REFERENCE_REPEATS * (math.ceil(attempt_ms / 1000) + 1 + MEASUREMENT_CALL_OVERHEAD)
 
 
 def review_budget(timeout: int) -> int:
