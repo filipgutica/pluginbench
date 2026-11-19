@@ -642,7 +642,9 @@ def reference_mutation(
         identity = config.get("native_task_identity") if isinstance(config, dict) else None
         if not isinstance(identity, dict):
             raise ValueError(f"{profile} is not a prepared mutation profile")
-        CoverageSettings.model_validate(config.get("coverage"))
+        # The worker reads the settings with their defaults filled in, as validated here.
+        coverage = CoverageSettings.model_validate(config.get("coverage"))
+        config = {**config, "coverage": coverage.model_dump(mode="json")}
         # The repeats run in a staging directory, published only once cleanup is verified.
         staging = destination / "staging"
         arguments = operations.Reference(

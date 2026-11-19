@@ -510,6 +510,22 @@ def test_a_daemon_cleanup_could_not_check_is_refused_before_the_host_is_taken(
     assert taken == [] and requests == []
 
 
+def test_the_worker_gets_the_coverage_settings_with_the_defaults_they_were_validated_with(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coverage = {"command": ["suite"], "report_path": "cov.json", "tool_version": "7.6"}
+    result, [request], _ = _command(
+        tmp_path, monkeypatch, "--attempt-seconds", "600",
+        profile_changes={"coverage": coverage},
+    )
+    assert result.exit_code == 0, result.output
+    sent = request.arguments["config"]["coverage"]
+    assert sent["timeout_seconds"] == 600 and sent["format"] == "lcov"
+    # The baseline cap the repeats ran under is that default.
+    published = json.loads((tmp_path / "reference" / cli.PILOT_FILE).read_text())
+    assert {r["baseline_ms"] for r in published["facts"]["repeats"]} == {600_000}
+
+
 def test_a_profile_whose_engine_was_replaced_is_refused_before_the_host_is_taken(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
