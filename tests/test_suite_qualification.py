@@ -632,6 +632,13 @@ def _tampered(change: Any) -> dict[str, Any]:
         # Site 1 starts and settles at 3,000 ms while site 0 holds the only lane.
         (_mutation_facts(*_three(sites=_instant(3000)), lanes=1), "lanes hold"),
         (_tampered(lambda r: r.update(selected=[r["selected"][0]] * 2)), "a site twice"),
+        # Its own 1,000 ms cap bounds the second baseline, which returns red at 2,600 ms, past
+        # the 2,500 ms limit. Nothing was sealed or cut by the attempt: only the last return
+        # shows the overrun.
+        (_mutation_facts(*_three(
+            baseline=[_ran(0, 1000), _ran(1000, 1600, 1)], baseline_ms=1000, attempt_ms=2500,
+            sites=[], required_settled_ms=None)),
+         "overran its attempt limit"),
         (_tampered(lambda r: r.update(candidate_count=1)), "more sites than it found"),
         (_tampered(lambda r: r.update(candidate_count=0)), "more sites than it found"),
         (_tampered(lambda r: r.update(timing_boundary="exec")), "timed exec, not executor_call"),
