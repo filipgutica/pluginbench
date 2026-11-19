@@ -362,6 +362,7 @@ def _repeat(run: str, outcomes: tuple[str, ...] = ("killed", "survived"), **chan
         "baseline_ms": 100_000, "attempt_ms": None,
         "baseline": [_ran(0, 1000), _ran(1000, 1000)], "check_baseline": None,
         "sites": sites, "required_settled_ms": t, "infrastructure_failure": None,
+        "unparsed_files": [], "unsupported_files": [],
         **changes,
     }
 
@@ -410,9 +411,12 @@ def _three(**changes: Any) -> list[dict[str, Any]]:
         (_mutation_facts(_repeat("a"), _repeat("b"),
                          _repeat("c", infrastructure_failure="attempt_deadline")),
          "unavailable", "interrupted"),
-        (_mutation_facts(*_three(baseline=[_ran(0, 1000), _ran(1000, 1000, 1)])),
+        # No mutant runs after a baseline that is not green.
+        (_mutation_facts(*_three(baseline=[_ran(0, 1000), _ran(1000, 1000, 1)], sites=[],
+                                 required_settled_ms=None)),
          "fail", "baseline is red"),
-        (_mutation_facts(*_three(baseline=[_ran(0, 1000), _ran(1000, 100_000, timed_out=True)])),
+        (_mutation_facts(*_three(baseline=[_ran(0, 1000), _ran(1000, 100_000, timed_out=True)],
+                                 sites=[], required_settled_ms=None)),
          "unavailable", "no status"),
         (_mutation_facts(*_three(outcomes=())), "fail", "no mutation site"),
         (_mutation_facts(*_three(selected=[f"src/a.py:{i}:5:x" for i in range(3)])),
@@ -467,8 +471,8 @@ def test_a_tsc_mutant_needs_a_tsc_baseline_that_ran() -> None:
 
 
 def _timed(*settled: int, sample_size: int = 2, headroom: int = 200) -> dict[str, Any]:
-    """Three repeats whose last site settles at each `settled`; with M = n the projection is
-    the measured time."""
+    """Three repeats whose last site settles at each `settled`, at least 5,000 ms, when its
+    run has ended; with M = n the projection is the measured time."""
     repeats = []
     for index, end in enumerate(settled):
         repeat = _repeat(f"run-{index}")
@@ -486,9 +490,9 @@ def _limited(seconds: int) -> SuiteTask:
     ("facts", "seconds", "status"),
     [
         # 5,000 ms x 200% = 10 s: equality passes, one millisecond more fails.
-        (_timed(4000, 5000, 4500), 10, "pass"),
-        (_timed(4000, 5001, 4500), 10, "fail"),
-        (_timed(4000, 5000, 4500), 9, "fail"),
+        (_timed(5000, 5000, 5000), 10, "pass"),
+        (_timed(5000, 5001, 5000), 10, "fail"),
+        (_timed(5000, 5000, 5000), 9, "fail"),
         # Two of M = 20 sites in four lanes: one wave measured, five projected.
         (_timed(5000, 5000, 5000, sample_size=20, headroom=100), 17, "pass"),
         (_timed(5000, 5000, 5000, sample_size=20, headroom=100), 16, "fail"),
@@ -522,14 +526,14 @@ def test_the_projection_scales_waves_of_lanes() -> None:
     ids=["censored", "required-open", "unsettled", "site-missing", "two-repeats"],
 )
 def test_a_missing_or_censored_timing_is_unavailable(change: Any) -> None:
-    facts = _timed(4000, 5000, 4500)
+    facts = _timed(5000, 5000, 5000)
     change(facts)
     assert _rule("mutation_time", facts, _limited(1000)).status == "unavailable"
 
 
 def test_a_lowered_limit_changes_only_the_time_verdict_and_a_new_profile_stales_both() -> None:
     task = SUITE.tasks[0]
-    facts = _timed(4000, 5000, 4500)
+    facts = _timed(5000, 5000, 5000)
     receipts = [_receipt(task, gate, **facts) for gate in ("mutation", "mutation_time")]
     pins = suite_qualification._pins(SUITE, task)
 
@@ -545,3 +549,95 @@ def test_a_lowered_limit_changes_only_the_time_verdict_and_a_new_profile_stales_
     profile = task.model_copy(update={"observer_profile_sha256": _digest("other profile")})
     assert all(found[0].startswith("stale: produced against other observer_profile_sha256")
                for found in reasons(profile).values())
+
+
+def _both(facts: dict[str, Any]) -> tuple[str, str]:
+    task = _limited(1000)
+    return (_rule("mutation", facts, task).status, _rule("mutation_time", facts, task).status)
+
+
+def _tampered(change: Any) -> dict[str, Any]:
+    facts = _mutation_facts()
+    for repeat in facts["repeats"]:
+        change(repeat)
+    return facts
+
+
+@pytest.mark.parametrize(
+    ("facts", "reason"),
+    [
+        # A 1 ms attempt limit that 1,000 ms baselines and every site would have overrun.
+        (_tampered(lambda r: r.update(attempt_ms=1)), "contradicts the time it had left"),
+        # The last site's run ends at 5,000 ms, one past a 4,999 ms limit, yet nothing was cut.
+        (_tampered(lambda r: r.update(attempt_ms=4999)), "overran its attempt limit"),
+        (_tampered(lambda r: r["sites"][0]["runs"][0].update(exit_code=None)),
+         "suite status with no exit code"),
+        (_tampered(lambda r: r["sites"][0]["runs"][1].update(exit_code=None, timed_out=True)),
+         "timed out records an exit"),
+        (_tampered(lambda r: [site.update(settled_ms=0) for site in r["sites"]]),
+         "settled before its runs ended"),
+        (_tampered(lambda r: r["sites"][0].update(dispatched_ms=1500)), "before the baselines"),
+        (_tampered(lambda r: r["baseline"][1].update(started_ms=500)), "baseline runs overlap"),
+        (_tampered(lambda r: r["sites"][0]["runs"][1].update(started_ms=2500)), "out of order"),
+        (_tampered(lambda r: r.update(required_settled_ms=4000)), "before its sites settled"),
+        # Discovery that left a changed file unparsed, or in a language with no finder.
+        (_tampered(lambda r: r.update(unparsed_files=["src/broken.py"])), "incomplete"),
+        (_tampered(lambda r: r.update(unsupported_files=["src/lib.rs"])), "incomplete"),
+    ],
+)
+def test_both_reference_rules_refuse_clocks_or_exits_that_contradict_each_other(
+    facts: dict[str, Any], reason: str
+) -> None:
+    for gate in ("mutation", "mutation_time"):
+        verdict = _rule(gate, facts, _limited(1000))
+        assert verdict.status == "unavailable" and reason in str(verdict.reason), gate
+
+
+def test_an_attempt_limit_the_repeat_kept_to_passes_both_rules() -> None:
+    # The required phase ends at 5,000 ms: a limit of exactly 5,000 ms holds it.
+    assert _both(_tampered(lambda r: r.update(attempt_ms=5000))) == ("pass", "pass")
+
+
+def test_a_late_exit_is_cut_by_the_limit_it_overran() -> None:
+    # A green first run 1 ms past its 3,000 ms cap is a timeout kill, not a survivor; one
+    # exactly at the cap is on time.
+    late = _tampered(lambda r: r["sites"][1]["runs"][0].update(elapsed_ms=3001))
+    for repeat in late["repeats"]:
+        repeat["sites"][1]["settled_ms"] = repeat["required_settled_ms"] = 7001
+    assert _rule("mutation", late).status == "pass"
+    outcomes = suite_qualification._repeat_outcomes(
+        suite_qualification._MutationFacts.model_validate(late).repeats[0],
+        suite_qualification._MutationContract.model_validate(_contract()),
+    )
+    assert outcomes == ("killed", "timeout_kill")
+    on_time = _tampered(lambda r: r["sites"][1]["runs"][0].update(elapsed_ms=3000))
+    for repeat in on_time["repeats"]:
+        repeat["sites"][1]["settled_ms"] = repeat["required_settled_ms"] = 7000
+    assert suite_qualification._repeat_outcomes(
+        suite_qualification._MutationFacts.model_validate(on_time).repeats[0],
+        suite_qualification._MutationContract.model_validate(_contract()),
+    ) == ("killed", "survived")
+    # A late green baseline under the attempt limit, with no interruption recorded, is refused.
+    baseline = _tampered(lambda r: r.update(attempt_ms=100_000))
+    for repeat in baseline["repeats"]:
+        repeat["baseline"][0]["elapsed_ms"] = 1000
+        repeat["attempt_ms"] = 999
+    assert _both(baseline) == ("unavailable", "unavailable")
+
+
+def test_freeze_refuses_time_and_outcome_verdicts_from_different_repeats(
+    passing: dict[str, Any],
+) -> None:
+    task = SUITE.tasks[0]
+    batch = _mutation_facts()
+    other = _mutation_facts(*[_repeat(f"other-{i}") for i in range(3)])
+    receipts = [r for r in _all() if not (r.task == task.content_sha256 and r.gate in {
+        "mutation", "mutation_time"})]
+    same = [_receipt(task, "mutation", **batch), _receipt(task, "mutation_time", **batch)]
+    assert freeze(SUITE, receipts + same, POLICY).suite == SUITE
+    mixed = [_receipt(task, "mutation", **batch), _receipt(task, "mutation_time", **other)]
+    result = freeze(SUITE, receipts + mixed, POLICY)
+    assert result.suite is None
+    assert [(b.gate, b.reason) for b in result.blockers] == [
+        ("mutation_time", "unavailable: cites other reference repeats than its mutation receipt")
+    ]

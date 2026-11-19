@@ -91,12 +91,18 @@ def measure_reference(
         )
         data = json.dumps(report, sort_keys=True).encode()
         (directory / "report.json").write_bytes(data)
-        mutation.mutation_metrics(report, directory, config=config, snapshot=after)
+        # Validates every run against its receipt, and names the files discovery could not use.
+        metrics = mutation.mutation_metrics(report, directory, config=config, snapshot=after)
         _check_sample(report, contract)
         if index and report["candidates"] != candidates:
             raise ValueError("reference repeats found different mutation candidates")
         candidates = _list(report["candidates"])
-        repeats.append(_repeat(report, directory, measured, hashlib.sha256(data).hexdigest()))
+        repeat = _repeat(report, directory, measured, hashlib.sha256(data).hexdigest())
+        repeat.update(
+            unparsed_files=sorted(_object(metrics["unparsed_files"])),
+            unsupported_files=sorted(str(path) for path in _list(metrics["unsupported_files"])),
+        )
+        repeats.append(repeat)
     facts = {"contract": contract.facts(), "repeats": repeats}
     receipts = tuple(
         Receipt(

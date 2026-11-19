@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from test_mutation import AFTER, BEFORE, FIRST, Fake, View, _config, _passing, _tree
 
-from pluginbench import mutation, reference_mutation, suite_qualification
+from pluginbench import harbor_backend, mutation, reference_mutation, suite_qualification
 from pluginbench.benchmark import SuiteTask
 from pluginbench.reference_mutation import Contract, measure_reference
 from pluginbench.suite_qualification import Receipt
@@ -121,24 +121,30 @@ def test_a_flaky_reference_differs_across_repeats_and_fails(tmp_path: Path) -> N
 
 # --- The rules' classifier is the engine's --------------------------------------------------
 
-# A run's end: ("ran", status) or ("cut", clock), where `cut` covers a run a clock stopped
-# and one it left no time to start.
-_ENDS = [("ran", 0), ("ran", 1), ("ran", None)] + [
+# A run's end: ("ran", status) on time, ("late", (clock, status)) for an exit after its limit,
+# or ("timeout" | "skipped", clock) for a run a clock stopped or left no time to start.
+_ENDS: list[tuple[str, Any]] = [("ran", 0), ("ran", 1), ("ran", None)] + [
     (kind, clock) for kind in ("timeout", "skipped") for clock in ("command", "site", "attempt")
-]
+] + [("late", (clock, status)) for clock in ("command", "site", "attempt") for status in (0, 1)]
 
 
 def _engine_call(end: tuple[str, Any]) -> dict[str, object]:
     kind, value = end
     if kind == "ran":
-        return {"dispatched": True, "timed_out": False, "suite_status": value, "bound": "command"}
+        return {"dispatched": True, "timed_out": False, "suite_status": value, "bound": "command",
+                "elapsed_ms": 10, "timeout_ms": 10}
+    if kind == "late":
+        return {"dispatched": True, "timed_out": False, "suite_status": value[1],
+                "bound": value[0], "elapsed_ms": 11, "timeout_ms": 10}
     return {"dispatched": kind == "timeout", "timed_out": kind == "timeout",
-            "suite_status": None, "bound": value}
+            "suite_status": None, "bound": value, "elapsed_ms": 10, "timeout_ms": 10}
 
 
 def _rule_end(end: tuple[str, Any]) -> tuple[str | None, int | None]:
     kind, value = end
-    return (None, value) if kind == "ran" else (value, None)
+    if kind == "ran":
+        return None, value
+    return (value[0], value[1]) if kind == "late" else (value, None)
 
 
 @pytest.mark.parametrize("length", [0, 1, 2])
@@ -158,3 +164,48 @@ def test_the_rule_bounds_every_call_as_the_engine_does() -> None:
         assert suite_qualification._limit(started, cap, deadline, attempt) == mutation.call_limit(
             started_ms=started, cap_ms=cap, deadline_ms=deadline, attempt_ms=attempt
         )
+
+
+def test_a_file_discovery_could_not_use_leaves_both_gates_unavailable(tmp_path: Path) -> None:
+    before = _tree(tmp_path / "before", {"src/grade.py": BEFORE})
+    after = _tree(tmp_path / "after", {
+        "src/grade.py": AFTER, "src/broken.py": "def (:\n", "src/lib.rs": "fn f() {}\n",
+    })
+    fake = Fake(_passing(lambda view: int(FIRST in view.source)), before, after)
+    receipts = measure_reference(
+        before=before, after=after, config=_config(), contract=Contract(headroom_percent=150),
+        pins=PINS, destination=tmp_path / "reference", execute=fake, clock=fake.clock,
+    )
+    repeat = receipts[0].facts["repeats"][0]
+    assert (repeat["unparsed_files"], repeat["unsupported_files"]) == (
+        ["src/broken.py"], ["src/lib.rs"]
+    )
+    for receipt in receipts:
+        verdict = suite_qualification._RULES[receipt.gate](receipt, TASK)
+        assert verdict.status == "unavailable" and "population is incomplete" in str(verdict.reason)
+
+
+def test_only_the_reference_producer_runs_four_lanes_and_checks_docker_holds_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = _tree(tmp_path / "before", {"src/grade.py": BEFORE})
+    after = _tree(tmp_path / "after", {"src/grade.py": AFTER})
+    fake = Fake(_passing(lambda view: int(FIRST in view.source)), before, after)
+    capacity: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        harbor_backend, "assert_capacity",
+        lambda inputs, *, jobs: capacity.append((len(inputs), jobs)),
+    )
+    monkeypatch.setattr(mutation, "native_executor", lambda identity, *args, **kwargs: fake)
+    measure_reference(
+        before=before, after=after, config=_config(), contract=Contract(headroom_percent=150),
+        pins=PINS, destination=tmp_path / "reference", clock=fake.clock,
+    )
+    assert capacity == [(4, 4)] * 3
+    reports = [
+        json.loads((tmp_path / "reference" / f"repeat-{i}" / "report.json").read_text())
+        for i in range(3)
+    ]
+    assert {report["lanes"] for report in reports} == {mutation.LANES} == {4}
+    # Everyone else keeps one lane: a submission collect may run beside another.
+    assert mutation.Limits().lanes == 1

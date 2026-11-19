@@ -14,6 +14,7 @@ later check (B3c); a frozen suite authorizes no paid call.
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from typing import Annotated, Any, Literal
@@ -205,7 +206,15 @@ class _Call(_Value):
     def _ended(self) -> _Call:
         if self.dispatched != (self.elapsed_ms is not None and self.timed_out is not None):
             raise ValueError("a run has a result exactly when it started")
+        if self.timed_out and (self.exit_code is not None or self.suite_status is not None):
+            raise ValueError("a run that timed out records an exit")
+        if self.suite_status is not None and self.exit_code is None:
+            raise ValueError("a run records a suite status with no exit code")
         return self
+
+    @property
+    def ended_ms(self) -> int:
+        return self.started_ms + (self.elapsed_ms or 0)
 
 
 class _Check(_Call):
@@ -263,6 +272,10 @@ class _Repeat(_Value):
     sites: tuple[_Site, ...]
     required_settled_ms: _Whole | None
     infrastructure_failure: Literal["executor", "attempt_deadline"] | None
+    # Changed production files no finder parsed, and those in a language with no finder: either
+    # leaves the candidate population incomplete.
+    unparsed_files: tuple[str, ...]
+    unsupported_files: tuple[str, ...]
 
 
 class _MutationFacts(_Value):
@@ -284,16 +297,19 @@ def _limit(
     return next(item for item in limits if item[1] == least)
 
 
-# A run's end: the clock that stopped it or left it no time (None when it ran to an exit), and
-# its suite status.
+# A run's end: the clock that stopped it, left it no time or that it overran (None when it ran
+# to an exit within its time), and its suite status.
 _End = tuple[str | None, int | None]
 
 
 def _end(call: _Call, cap: int | None, deadline: int | None, attempt: int | None) -> _End:
+    """A run's end against the limits recomputed from its start (mutation._cut): a run that
+    returns after its limit is cut by that limit, whatever it exited with."""
     bound, left = _limit(call.started_ms, cap, deadline, attempt)
     if call.dispatched != (left > 0):
         raise ValueError("a run's start contradicts the time it had left")
-    return (bound if not call.dispatched or call.timed_out else None), call.suite_status
+    on_time = call.dispatched and not call.timed_out and (call.elapsed_ms or 0) <= left
+    return (None if on_time else bound), call.suite_status
 
 
 def _settle(ends: Sequence[_End]) -> str | None:
@@ -317,10 +333,10 @@ def _settle(ends: Sequence[_End]) -> str | None:
     return "flaky" if status == 0 else "killed"
 
 
-def _ran(check: _Check) -> bool:
-    """Whether a tsc baseline ran to a known result (mutation._tsc_ran)."""
+def _ran(check: _Check, end: _End) -> bool:
+    """Whether a tsc baseline ran to a known result within its time (mutation._tsc_ran_v2)."""
     code = check.exit_code
-    return (check.dispatched and not check.timed_out and code is not None
+    return (end[0] is None and code is not None
             and code not in (126, 127) and (code == 0 or bool(check.diagnostics)))
 
 
@@ -361,12 +377,67 @@ def _site_outcome(site: _Site, slowest: int, attempt: int | None, contract: _Mut
     return state
 
 
+def _validate(repeat: _Repeat, contract: _MutationContract) -> None:
+    """Check one repeat's clock readings, shared by both reference rules.
+
+    Calls run in order, each starts within its limits, each settlement follows its site's calls,
+    and an uninterrupted repeat keeps to its attempt limit. Raises ValueError on a contradiction.
+    """
+    attempt = repeat.attempt_ms
+    serial = 0
+    for call in repeat.baseline:
+        if call.started_ms < serial:
+            raise ValueError("baseline runs overlap")
+        _end(call, repeat.baseline_ms, None, attempt)
+        serial = call.ended_ms
+    if repeat.check_baseline is not None:
+        if repeat.check_baseline.started_ms < serial:
+            raise ValueError("the tsc baseline overlaps the baselines")
+        _end(repeat.check_baseline, repeat.baseline_ms, None, attempt)
+        serial = repeat.check_baseline.ended_ms
+    ends = [_end(call, repeat.baseline_ms, None, attempt) for call in repeat.baseline]
+    green = len(ends) == 2 and all(cut is None and status == 0 for cut, status in ends)
+    slowest = max((call.elapsed_ms or 0 for call in repeat.baseline), default=0)
+    latest = serial
+    for site in repeat.sites:
+        if site.dispatched_ms < serial:
+            raise ValueError(f"site {site.site} started before the baselines ended")
+        calls = ([site.check] if site.check is not None else []) + list(site.runs)
+        if not green and calls:
+            raise ValueError(f"site {site.site} ran without a green baseline")
+        moment = site.dispatched_ms
+        for call in calls:
+            if call.started_ms < moment:
+                raise ValueError(f"site {site.site}'s runs are out of order")
+            moment = call.ended_ms
+        if site.settled_ms is not None and site.settled_ms < moment:
+            raise ValueError(f"site {site.site} settled before its runs ended")
+        if calls:
+            _site_outcome(site, slowest, attempt, contract)
+        latest = max(latest, site.settled_ms if site.settled_ms is not None else moment)
+    if repeat.required_settled_ms is not None and repeat.required_settled_ms < latest:
+        raise ValueError("the required phase ended before its sites settled")
+    if repeat.infrastructure_failure is None and attempt is not None:
+        cut = [end for end in ends if end[0] == "attempt"]
+        if cut or (repeat.required_settled_ms or 0) > attempt:
+            raise ValueError("an uninterrupted repeat overran its attempt limit")
+
+
 def _facts(receipt: Receipt) -> _MutationFacts | Verdict:
-    """The receipt's facts, or why they prove nothing: malformed, forged, reused or mixed."""
+    """The receipt's facts, or why they prove nothing: malformed, forged, reused, mixed,
+    contradicted by their own clocks, or over an incomplete candidate population."""
     try:
         facts = _MutationFacts.model_validate(receipt.facts)
     except ValueError as error:
         return Verdict(status="unavailable", reason=f"malformed reference mutation facts: {error}")
+    for repeat in facts.repeats:
+        try:
+            _validate(repeat, facts.contract)
+        except ValueError as error:
+            return Verdict(status="unavailable", reason=f"repeat {repeat.run_id}: {error}")
+        if repeat.unparsed_files or repeat.unsupported_files:
+            return Verdict(status="unavailable", reason=(
+                f"repeat {repeat.run_id}: the candidate population is incomplete"))
     repeats = facts.repeats
     if len(repeats) != REFERENCE_REPEATS:
         return Verdict(status="unavailable", reason=(
@@ -387,8 +458,11 @@ def _repeat_outcomes(repeat: _Repeat, contract: _MutationContract) -> tuple[str,
     if repeat.infrastructure_failure is not None:
         return Verdict(status="unavailable", reason=(
             f"repeat {repeat.run_id} was interrupted: {repeat.infrastructure_failure}"))
-    statuses = [c.suite_status if c.dispatched and not c.timed_out else None
-                for c in repeat.baseline]
+    statuses = [
+        status if cut is None else None
+        for cut, status in (_end(c, repeat.baseline_ms, None, repeat.attempt_ms)
+                            for c in repeat.baseline)
+    ]
     if len(statuses) != 2 or None in statuses:
         return Verdict(status="unavailable", reason=f"repeat {repeat.run_id}: baseline has no status")
     if any(status != 0 for status in statuses):
@@ -401,11 +475,11 @@ def _repeat_outcomes(repeat: _Repeat, contract: _MutationContract) -> tuple[str,
         return Verdict(status="unavailable", reason=(
             f"repeat {repeat.run_id}: the sample is not accounted for"))
     tsc = any(site.check is not None and site.check.kind == "tsc" for site in repeat.sites)
-    if tsc and (repeat.check_baseline is None or not _ran(repeat.check_baseline)):
+    check = repeat.check_baseline
+    if tsc and (check is None or not _ran(
+            check, _end(check, repeat.baseline_ms, None, repeat.attempt_ms))):
         return Verdict(status="unavailable", reason=(
             f"repeat {repeat.run_id}: tsc did not run on the unmutated tree"))
-    for call in repeat.baseline:
-        _end(call, repeat.baseline_ms, None, repeat.attempt_ms)
     slowest = max(call.elapsed_ms or 0 for call in repeat.baseline)
     outcomes = []
     for site in repeat.sites:
@@ -549,6 +623,11 @@ def freeze(suite: Suite, receipts: Iterable[Receipt], policy: Policy) -> Freeze:
             reasons = _gate_reasons(found.get((task_id, gate.name), []), gate, task, pins)
             bucket = blockers if gate.required else diagnostics
             bucket.extend(Finding(task=task_id, gate=gate.name, reason=reason) for reason in reasons)
+        paired = [found.get((task_id, gate), []) for gate in _SAME_REPEATS]
+        if all(len(receipts) == 1 for receipts in paired) and len(
+                {_cited(receipts[0]) for receipts in paired}) != 1:
+            blockers.append(Finding(task=task_id, gate=_SAME_REPEATS[1], reason=(
+                f"unavailable: cites other reference repeats than its {_SAME_REPEATS[0]} receipt")))
     clusters = Counter(task.repository_cluster for task in suite.tasks)
     if len(suite.tasks) < policy.min_tasks:
         blockers.append(Finding(task=None, gate=None, reason=(
@@ -567,6 +646,19 @@ def freeze(suite: Suite, receipts: Iterable[Receipt], policy: Policy) -> Freeze:
         tasks=len(suite.tasks),
         repositories=len(clusters),
     )
+
+
+# Gates whose verdicts must rest on one batch of reference repeats: the time verdict is about the
+# same runs whose outcomes qualified the task.
+_SAME_REPEATS = ("mutation", "mutation_time")
+
+
+def _cited(receipt: Receipt) -> str:
+    """The repeat evidence a reference mutation receipt cites: its run IDs and report digests."""
+    repeats = receipt.facts.get("repeats")
+    rows = repeats if isinstance(repeats, list) else []
+    return json.dumps([[row.get("run_id"), row.get("report_sha256")] if isinstance(row, dict)
+                       else None for row in rows], sort_keys=True)
 
 
 def _gate_reasons(
