@@ -233,6 +233,7 @@ def test_ids_are_pinned() -> None:
     assert PACKAGE.id == "cafcce55c350ae2bc4a26a1e7cf9fefc2075c1b45d535473d1ef701ab9adc051"
     assert CLAUDE.revision == "cafa581673918d8ec66796571c0f389adc605afbccf2df1856c8232e6cd53efb"
     assert CELL.slots()[0].id == "79ae6b3baf0d6503a6ae5649224357e612c9f916c4e0115ee2806f6b619d28eb"
+    assert CLAUDE_REVIEWER.contract == "e04bbb81ed8b9f490a1e64097fd2458a0b38bf8b8601d2d50b34be90e83e0cff"
     # Non-ASCII text is escaped, so the bytes hashed never depend on an encoder's default.
     assert benchmark._identity("entrant", {"name": "caf\u00e9"}) == "329d46bc4aed735336c0c52c8ceb2c7d7485e66bc6b67e7ca91966f73474ed88"
 
