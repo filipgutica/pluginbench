@@ -306,6 +306,12 @@ def _command(
 
     def executor(identity: dict[str, object], *args: Any, **kwargs: Any) -> Fake:
         lock = run_lock.held_execution()
+        # The check `harbor_backend._docker` runs before every create, on the daemon this
+        # identity names, and the label the create then carries.
+        runtime = identity["isolation"]
+        assert isinstance(runtime, dict)
+        invocation = invocation_runtime.container_invocation(runtime)
+        seen["create"] = invocation_runtime.with_label(("create", "image"), invocation)
         seen.update(
             invocation=invocation_runtime.current(), identity=identity,
             lock=None if lock is None else lock.record["kind"],
@@ -342,6 +348,9 @@ def test_the_command_measures_the_reference_in_one_operation_whose_receipts_free
     # the command holds the host.
     assert request.spec.docker == _RUNTIME
     assert seen["invocation"] == request.spec.id
+    assert seen["create"] == (
+        "create", "--label", f"{invocation_runtime.LABEL_KEY}={request.spec.id}", "image"
+    )
     assert seen["lock"] == "preflight"
     assert seen["identity"]["image_identity"] == BASE_IMAGE
     # Freeze reads the receipts as written: their pins match the task, so both rules run.
