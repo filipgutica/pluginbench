@@ -611,7 +611,8 @@ def reference_mutation(
         mutation.SAMPLE_SIZE, "--sample-size", min=1, help="M, the mutants each repeat measures."
     ),
     lanes: int = typer.Option(
-        mutation.LANES, "--lanes", min=1, help="Mutant containers each repeat runs at once."
+        mutation.LANES, "--lanes", min=1, max=mutation.LANES,
+        help="Mutant containers each repeat runs at once.",
     ),
     output: Path | None = typer.Option(
         None, "--output", help="New directory for the pilot's repeats and timings."
@@ -623,21 +624,29 @@ def reference_mutation(
     read what it measures. The receipts come from pins a verified suite manifest supplies.
     """
     from pluginbench import operations
+    from pluginbench.measurement_profiles import CoverageSettings
     from pluginbench.reference_mutation import Contract
 
     try:
+        # Everything is checked before the host is taken: a repeat can run for hours.
         destination = (output or _new_run_directory("reference-")).resolve()
         if destination.exists():
             raise ValueError(f"{destination} already exists; give a new --output")
+        trees = before.resolve(), after.resolve()
+        for tree in trees:
+            if not tree.is_dir():
+                raise ValueError(f"{tree} is not a directory")
+            if destination.is_relative_to(tree):
+                raise ValueError(f"{destination} is inside {tree}, which it would change")
         config = json.loads(profile.read_text())
         identity = config.get("native_task_identity") if isinstance(config, dict) else None
         if not isinstance(identity, dict):
             raise ValueError(f"{profile} is not a prepared mutation profile")
-        # Everything is checked before the host is taken: a repeat can run for hours. The
-        # repeats run in a staging directory, published only once cleanup is verified.
+        CoverageSettings.model_validate(config.get("coverage"))
+        # The repeats run in a staging directory, published only once cleanup is verified.
         staging = destination / "staging"
         arguments = operations.Reference(
-            before=before.resolve(), after=after.resolve(), config=config,
+            before=trees[0], after=trees[1], config=config,
             contract=Contract(
                 headroom_percent=headroom_percent, sample_size=sample_size, lanes=lanes
             ),
@@ -646,6 +655,7 @@ def reference_mutation(
         # The frozen runtime the profile saved: its containers start on that daemon only.
         runtime = mutation.measurement_identity(identity)["isolation"]
         assert isinstance(runtime, dict)  # `measurement_identity` requires one.
+        invocation_runtime.require_recoverable(runtime)
         with _execution("preflight", profile, destination):
             destination.mkdir(parents=True)
             try:

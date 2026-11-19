@@ -236,6 +236,22 @@ def container_invocation(runtime: dict[str, object] | None) -> str:
     return invocation
 
 
+def require_recoverable(runtime: object) -> None:
+    """Refuse a Docker runtime whose containers cleanup could not prove gone: `verify_labelled`
+    asks the recorded engine, by its ID, at a local Unix socket. Check it before an operation
+    on it is recorded, or a failed check fences the host."""
+    engine = runtime.get("docker_engine") if isinstance(runtime, dict) else None
+    engine_id = engine.get("id") if isinstance(engine, dict) else None
+    endpoint = engine.get("endpoint") if isinstance(engine, dict) else None
+    if not isinstance(engine_id, str) or not engine_id:
+        raise ValueError(
+            "the Docker runtime records no engine ID, so cleanup could not prove its "
+            "containers gone"
+        )
+    if not isinstance(endpoint, str) or not endpoint.startswith("unix://"):
+        raise ValueError(f"the recorded Docker endpoint {endpoint!r} is not a local Unix socket")
+
+
 def with_label(arguments: tuple[str, ...], invocation: str) -> tuple[str, ...]:
     """Docker `arguments` with the invocation's label right after the subcommand, when they
     create a container; otherwise unchanged.

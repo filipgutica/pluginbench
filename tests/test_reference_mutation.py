@@ -289,18 +289,27 @@ _RUNTIME: dict[str, object] = {
 
 def _command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *options: str, after: str = AFTER,
-    ended: BaseException | None = None,
+    ended: BaseException | None = None, engine: object = _RUNTIME["docker_engine"],
+    profile_changes: dict[str, object] | None = None,
 ) -> tuple[Any, list[OperationRequest], dict[str, Any]]:
     """Run `reference-mutation` on a prepared profile, each container a fake run on a fake
     clock. Returns the result, the operations it ran and what the executor saw. `ended` is
     raised once the handler has returned, as the owner raises an unverified cleanup or a
-    deadline that fires as the handler finishes."""
+    deadline that fires as the handler finishes. `engine` and `profile_changes` alter the
+    prepared profile; a repeated option overrides the default before it."""
     before = _tree(tmp_path / "before", {"src/grade.py": BEFORE})
     after_tree = _tree(tmp_path / "after", {"src/grade.py": after})
     fake = Fake(_passing(lambda view: int(FIRST in view.source)), before, after_tree)
-    identity = {**IMAGE, "isolation": {"resources": {"cpus": 1, "memory_mb": 4096}, **_RUNTIME}}
+    isolation = {"resources": {"cpus": 1, "memory_mb": 4096}, "docker_cli": {},
+                 "docker_engine": engine}
     profile = tmp_path / "mutation.json"
-    profile.write_text(json.dumps(_config(native_task_identity=identity)))
+    # As preparation saves it: the coverage settings whole (`CoverageSettings`).
+    coverage = {"command": ["suite"], "report_path": "cov.json", "timeout_seconds": 100,
+                "tool_version": "7.6", "format": "coverage-py-json"}
+    profile.write_text(json.dumps(_config(**{
+        "native_task_identity": {**IMAGE, "isolation": isolation}, "coverage": coverage,
+        **(profile_changes or {}),
+    })))
     requests: list[OperationRequest] = []
     seen: dict[str, Any] = {}
     in_place = invocation_runtime.run_operation  # `operation_support.run_in_place`
@@ -451,6 +460,58 @@ def test_an_invalid_input_is_refused_before_the_host_is_taken(
     )
     assert result.exit_code == 2 and message in result.output
     assert taken == [] and requests == []
+
+
+@pytest.mark.parametrize(
+    ("engine", "message"),
+    [({"endpoint": "unix:///fake.sock"}, "records no engine ID"),
+     ({"id": "", "endpoint": "unix:///fake.sock"}, "records no engine ID"),
+     ({"id": "daemon", "endpoint": "tcp://10.0.0.2:2375"}, "not a local Unix socket"),
+     (None, "records no engine ID")],
+)
+def test_a_daemon_cleanup_could_not_check_is_refused_before_the_host_is_taken(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engine: object, message: str
+) -> None:
+    """Cleanup asks the recorded engine by its ID at a Unix socket: without them a measured
+    container could never be proven gone, and the host would stay fenced."""
+    taken: list[object] = []
+    monkeypatch.setattr(cli, "_execution", lambda *args: taken.append(args))
+    result, requests, _ = _command(
+        tmp_path, monkeypatch, "--attempt-seconds", "600", engine=engine
+    )
+    assert result.exit_code == 2 and message in result.output
+    assert taken == [] and requests == []
+
+
+@pytest.mark.parametrize("case", ["output in before", "output in after", "missing before",
+                                  "after is a file", "malformed coverage"])
+def test_trees_an_output_inside_them_and_coverage_are_checked_before_the_host_is_taken(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    taken: list[object] = []
+    monkeypatch.setattr(cli, "_execution", lambda *args: taken.append(args))
+    options: list[str] = []
+    changes: dict[str, object] = {}
+    if case.startswith("output in"):
+        tree = tmp_path / case.removeprefix("output in ")
+        options = ["--output", str(tree / "pilot")]
+        message = "which it would change"
+    elif case == "missing before":
+        options = ["--before", str(tmp_path / "absent")]
+        message = "is not a directory"
+    elif case == "after is a file":
+        (tmp_path / "file").write_text("")
+        options = ["--after", str(tmp_path / "file")]
+        message = "is not a directory"
+    else:
+        changes = {"coverage": {"report_path": "cov.json", "timeout_seconds": 100}}
+        message = "for CoverageSettings"
+    result, requests, _ = _command(
+        tmp_path, monkeypatch, "--attempt-seconds", "600", *options, profile_changes=changes
+    )
+    assert result.exit_code == 2 and message in result.output
+    assert taken == [] and requests == []
+    assert not list(tmp_path.rglob("pilot"))
 
 
 def test_an_existing_output_is_never_reused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
