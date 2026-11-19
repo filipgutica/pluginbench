@@ -1196,6 +1196,7 @@ def _finish_evaluation(
         _adopt_measurement_revision(root, selection, revision)
         _save_selection(root, selection)
     if config.reviewer and selection["review_revision"] is None:
+        _refuse_temporary_inside(root)
         if progress:
             progress("Reviewing all submissions independently with fixed criteria")
         review_study(
@@ -1604,7 +1605,10 @@ def review_evaluation(
             )
         )
     identity = reviewer or config.reviewer
-    _review_preflight({"reviewer": identity.model_dump(mode="json")})
+    _refuse_temporary_inside(root)
+    # A resume with no call left only finishes the revision, so it needs no working reviewer.
+    if not resuming or resume_calls(root / "evidence", revision) > 0:
+        _review_preflight({"reviewer": identity.model_dump(mode="json")})
     override = None
     if resuming:
         # Attribution stays as recorded when the revision was created.
@@ -2167,6 +2171,16 @@ def _measurement_collection(root: Path, selection: dict[str, object]) -> dict[st
         "revision_receipt": study._reference(evidence, path),
         "history": history,
     }
+
+
+def _refuse_temporary_inside(root: Path) -> None:
+    """Refuse a review while temporary files would land in the run, where judge traces and
+    unscrubbed output must never be."""
+    if Path(tempfile.gettempdir()).resolve().is_relative_to(root.resolve()):
+        raise ValueError(
+            "the temporary directory is inside the run, so judge traces would name it; set "
+            "TMPDIR to a directory outside the run"
+        )
 
 
 def _record_override(

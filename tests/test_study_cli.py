@@ -7,6 +7,7 @@ import inspect
 import csv
 import dataclasses
 import io
+import tempfile
 import json
 import hashlib
 import os
@@ -2393,7 +2394,13 @@ def test_review_adds_a_selected_revision_with_the_frozen_reviewer(
     finished = path.read_text()
     path.write_text(json.dumps({**json.loads(finished), "status": "running"}))
     assert evaluation.plan_review(root, "r2")["review_calls"] == 0
-    path.write_text(finished)
+    with monkeypatch.context() as patched:
+        # Finishing with no call needs no working reviewer.
+        patched.setattr(isolation, "codex_code_mode_host", missing_host)
+        finish = CliRunner().invoke(cli.app, ["review", str(root), "--revision", "r2", "--yes"])
+    assert finish.exit_code == 0, finish.stderr + finish.stdout
+    assert json.loads(path.read_text())["status"] == "complete"
+    assert len(reviews) == reviewed + 9
     saved = evaluation._load_selection(root)
     measurements = saved["measurements"]
     assert isinstance(measurements, list)
@@ -2547,6 +2554,12 @@ def test_review_resumes_a_cut_off_revision_with_the_reviewer_that_started_it(
     overrides = evaluation._load_selection(root)["reviewer_overrides"]
     assert isinstance(overrides, dict) and overrides["second"]["model"] == "claude-opus-5-5"
     monkeypatch.setattr(codex, "invoke", reviewed)
+    # Temporary files inside the run, where judge output would land, are refused.
+    with monkeypatch.context() as patched:
+        (root / "tmp").mkdir()
+        patched.setattr(tempfile, "tempdir", str(root / "tmp"))
+        inside = CliRunner().invoke(cli.app, ["review", str(root), "--revision", "second", "--yes"])
+    assert inside.exit_code == 2 and "temporary directory is inside the run" in inside.stderr
     # Another reviewer is refused before any preflight or write.
     other = CliRunner().invoke(
         cli.app,

@@ -610,6 +610,7 @@ REVIEW_BOUNDARIES = (
     "creating",  # while the revision is being created, before any call
     "unscrubbed",  # the launcher could not scrub its artifacts; killed before the outcome
     "malformed",  # native output cut off mid-character; killed before the outcome
+    "malformed-type",  # a native event whose type is not a string; killed before the outcome
 )
 
 
@@ -628,7 +629,7 @@ def _review_boundary_child() -> None:
     def invoke(**kwargs: Any) -> dict[str, object]:
         execution = judged(**kwargs)
         artifacts = kwargs["area"] / "artifacts"
-        if boundary in {"after-stop", "after-error", "unscrubbed", "malformed"}:
+        if boundary in {"after-stop", "after-error", "unscrubbed", "malformed", "malformed-type"}:
             # Only a launcher that returned writes its success marker.
             (artifacts / "host-evidence.json").unlink()
         if boundary == "after-stop":
@@ -640,7 +641,11 @@ def _review_boundary_child() -> None:
             )
         if boundary == "malformed":
             (artifacts / "stdout.jsonl").write_bytes(b'{"type": "turn.completed"}\n\xe2\x82')
-        if boundary in {"after-output", "after-stop", "after-error", "unscrubbed", "malformed"}:
+        if boundary == "malformed-type":
+            (artifacts / "stdout.jsonl").write_text('{"type": []}\n')
+        if boundary in {
+            "after-output", "after-stop", "after-error", "unscrubbed", "malformed", "malformed-type"
+        }:
             kill()
         return execution
 
@@ -690,6 +695,8 @@ def _review_boundary_child() -> None:
         ("unscrubbed", "issues", 2, "unresolved"),
         # Malformed output cannot wedge recovery: the call fails and keeps its evidence.
         ("malformed", "issues", 1, "failed_transient"),
+        # A malformed event type cannot wedge recovery either: no stop, so the call retries.
+        ("malformed-type", "issues", 2, "unresolved"),
         # A revision cut off while being created was never published, and starts afresh.
         ("creating", "issues", 2, None),
         # A call that failed keeps its ending, and its failure signature, and is not called again.
@@ -774,6 +781,34 @@ def test_resume_refuses_a_saved_observation_that_differs_from_its_validated_resp
     with pytest.raises(ValueError, match="differs from its validated response"):
         study_review.review_study(root)
     assert calls == []
+
+
+def test_a_resumed_row_whose_slot_used_its_review_calls_ends_and_the_revision_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    calls = test_study_review._judge(monkeypatch, root, behavior="raised")
+    path = study_review.review_study(root)
+    state = json.loads(path.read_text())
+    row = state["records"][0]
+    slot = next(item["slot"] for item in _invocations(root) if item["attempt_id"] == row["id"])
+    ledger = Ledger.open(root / LEDGER_NAME)
+    try:  # Two more spent calls: the slot has used all three.
+        for inputs in ("other-1", "other-2"):
+            call = ledger.intent(slot=slot, stage="review", attempt_id=row["id"], inputs=inputs)
+            ledger.end(call, "failed_transient", f"error {inputs}")
+    finally:
+        ledger.close()
+    # As a crash cut off its last call: spent, and due to call again.
+    row["ending"] = {"state": "unresolved", "error": None}
+    path.write_text(json.dumps(state))
+    resumed = json.loads(study_review.review_study(root).read_text())
+    assert len(calls) == 2 and resumed["status"] == "incomplete"
+    ended = next(item for item in resumed["records"] if item["id"] == row["id"])
+    assert ended["status"] == "unavailable" and "used its 3 review invocations" in ended["reason"]
+    assert ended["superseded"][0]["ending"]["state"] == "unresolved"
+    # Nothing is left to call, so another resume changes nothing.
+    assert study_review.review_study(root) == path and len(calls) == 2
 
 
 def test_resume_refuses_other_settings_and_changed_review_code(

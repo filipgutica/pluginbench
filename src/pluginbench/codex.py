@@ -430,7 +430,8 @@ def invoke(
                 scrubbed = False
                 try:
                     scrub_artifacts(artifacts, secrets)
-                    scrubbed = True
+                    # A process group that may survive could still write after the scrub.
+                    scrubbed = cleanup_error is None
                 finally:
                     write_json(
                         artifacts / "execution.json",

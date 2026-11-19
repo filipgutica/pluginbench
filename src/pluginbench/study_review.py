@@ -691,8 +691,8 @@ def _saved_stop(artifacts: Path, harness: str) -> str | None:
         return None
     try:
         return provider_stops.saved_stop(artifacts, harness)
-    except (OSError, ValueError):
-        return None  # An unreadable trace records no stop.
+    except (OSError, ValueError, TypeError):
+        return None  # An unreadable or malformed trace records no stop.
 
 
 def _scrubbed(artifacts: Path) -> bool:
@@ -965,7 +965,7 @@ def review_study(
                 try:
                     execution = _captured_execution(artifacts, effort, harness)
                     capture_error = None
-                except (OSError, ValueError) as exc:
+                except (OSError, ValueError, TypeError) as exc:
                     # Malformed native output: the saved evidence stays, its usage unknown.
                     capture_error = f"{type(exc).__name__}: {exc}"
                     execution = codex.parse_events("", [], harness, requested_effort=effort)
@@ -1099,18 +1099,11 @@ def review_study(
                         reason="judge call cut off by a crash before its output was saved",
                     )
             calling = [index for index, row in enumerate(rows) if _calls_again(row)]
-            study._write(state_path, state)
-            _admit_review(
-                ledger,
-                {
-                    rows[index]["id"]: (slots[rows[index]["id"]], inputs[rows[index]["id"]])
-                    for index in calling
-                    if rows[index]["id"] in inputs
-                },
-            )
             mapping = json.loads((directory / "mapping.json").read_text())
-            for index in calling:
-                row = rows[index]
+
+            def supersede(row: dict[str, Any]) -> None:
+                """Keep the row's earlier call as superseded, and give it a fresh packet so no
+                earlier receipt or leftover is overwritten."""
                 if row.get("native_start") is not None:
                     row.setdefault("superseded", []).append(
                         {
@@ -1124,7 +1117,6 @@ def review_study(
                     )
                 for key in ("packet", "native_start", "reason", "ending"):
                     row.pop(key, None)
-                # A fresh packet, so no earlier call's receipts or leftovers are overwritten.
                 row.update(packet_id=uuid.uuid4().hex, status="pending", observation=None)
                 record = by_id[str(row["id"])]
                 mapping.append(
@@ -1135,6 +1127,31 @@ def review_study(
                         "implementation_model": record.model,
                     }
                 )
+
+            # A slot that used its review calls ends its row here, so the revision can finish.
+            for index in list(calling):
+                identity = str(rows[index]["id"])
+                refused = (
+                    ledger.refusal(slots[identity], "review", inputs[identity])
+                    if identity in inputs
+                    else None
+                )
+                if refused is not None:
+                    supersede(rows[index])
+                    rows[index].update(status="unavailable", reason=f"no judge call: {refused}")
+                    calling.remove(index)
+            study._write(directory / "mapping.json", mapping)
+            study._write(state_path, state)
+            _admit_review(
+                ledger,
+                {
+                    rows[index]["id"]: (slots[rows[index]["id"]], inputs[rows[index]["id"]])
+                    for index in calling
+                    if rows[index]["id"] in inputs
+                },
+            )
+            for index in calling:
+                supersede(rows[index])
             study._write(directory / "mapping.json", mapping)
             state["status"] = "running"
             study._write(state_path, state)

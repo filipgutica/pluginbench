@@ -355,6 +355,8 @@ def test_cleanup_failure_still_removes_auth_scrubs_evidence_and_preserves_origin
         assert any("Process-group cleanup failed" in note for note in failure.value.__notes__)
     receipt = json.loads((area / "artifacts/execution.json").read_text())
     assert receipt["cleanup_error"] == "cleanup probe"
+    # A process group that may survive could write after the scrub, so nothing is marked clean.
+    assert receipt["artifacts_scrubbed"] is False
     assert receipt["private_runtime_removed"] and not (area / "private").exists()
     assert auth.is_file()
     assert all(token not in path.read_text() for path in (area / "artifacts").iterdir())
