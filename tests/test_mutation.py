@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+import native_support
 from pluginbench import components, harbor_backend, isolation, mutation
 from pluginbench.assessment_metrics import (
     compare_evidence,
@@ -1759,3 +1760,38 @@ def test_discovery_past_the_attempt_limit_is_infrastructure_with_nothing_sampled
         return
     assert _object(report["infrastructure_failure"])["cause"] == "attempt_deadline"
     assert metrics["status"] == "incomplete" and metrics["killed"] is None
+
+
+def test_the_measurement_runtime_passes_the_runtime_check_of_a_saved_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Shaped as harbor_backend.runtime_identity saves it, enforcement fields included.
+    saved = native_support.runtime_identity()
+    saved["resources"] = {
+        "cpus": 1, "memory_mb": 1024, "cpu_enforcement": "limit", "memory_enforcement": "limit"
+    }
+    asked: list[tuple[int, int]] = []
+
+    def current(*, cpus: int, memory_mb: int, harness: str) -> dict[str, object]:
+        asked.append((cpus, memory_mb))
+        resources = {**saved["resources"], "cpus": cpus, "memory_mb": memory_mb}
+        return {**saved, "resources": resources}
+
+    monkeypatch.setattr(harbor_backend, "runtime_identity", current)
+    identity = {
+        "toolchain_identity": {"base_image_identity": {"reference": "base"}},
+        "image_identity": {"reference": "task"},
+        "isolation": saved,
+        "resources": saved["resources"],
+    }
+
+    measured = mutation.measurement_identity(identity)
+    harbor_backend.assert_runtime(measured["isolation"], launcher=False, harbor=False)
+
+    assert asked == [(mutation.MEASUREMENT_CPUS, mutation.MEASUREMENT_MEMORY_MB)]
+    assert measured["resources"] == measured["isolation"]["resources"] == {
+        "cpus": mutation.MEASUREMENT_CPUS,
+        "memory_mb": mutation.MEASUREMENT_MEMORY_MB,
+        "cpu_enforcement": "limit",
+        "memory_enforcement": "limit",
+    }
