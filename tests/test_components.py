@@ -130,7 +130,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # Optional provisioning runs previously unsupported profiles; existing runs stay v1.
             # v2: M = 20, four lanes in the base image, millisecond baseline, site and attempt
             # clocks, unconfirmed mutants; version 1 reports still decode.
-            "mutation.py": "e587f7892caf0e5d3020174aed7c7cdc72816934c9244c52817a00525f85dbbe",
+            "mutation.py": "a172458ebb8254e1649f199e3f63b692aada98cbbf8f3ef3605d8afa8b527fcd",
             "mutation_sites.mjs": (
                 "f7a602774f3e6f2415c1745127134862a9a6f42e8e9807b4c28368e7a3c27c88"
             ),
