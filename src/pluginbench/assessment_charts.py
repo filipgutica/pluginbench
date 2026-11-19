@@ -292,9 +292,14 @@ METRIC_GUIDE.update(
         ),
         "Mutation bug-catch rate %": (
             "Mutation bug-catch rate",
-            "% killed",
-            "Share of valid mutants on the agent's changed decision logic that its submitted test "
-            "suite fails on. Each arm mutates its own code, so populations differ.",
+            "% caught",
+            "Think of testing a smoke alarm by lighting a few small, safe fires and counting how "
+            "many it beeps for. Each fire is a mutant: one small deliberate bug placed in decision "
+            "logic the agent changed, up to 10 per attempt. The rate is the percentage of mutants "
+            "the agent's test suite (the tests it left in the repository) catches. It shows "
+            "whether the tests notice small logic bugs; a separate grade checks whether the code "
+            "itself is correct. Each agent is mutated in its own code, so two agents' mutants are "
+            "not the same bugs.",
         ),
         "Test-change kill share %": (
             "Test-change kill share",

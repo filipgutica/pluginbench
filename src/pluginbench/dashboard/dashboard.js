@@ -685,6 +685,11 @@ const RESULT_COLUMNS = [
   "Changed-line coverage",
   "Mutation bug-catch rate",
 ];
+// A one-line hint on a column header; the panel under the table explains it in full.
+const COLUMN_HINTS = {
+  "Mutation bug-catch rate":
+    "Percentage of small deliberate bugs placed in the agent's changed decision logic that its own tests catch.",
+};
 // Columns from Input tokens on hold numbers.
 const FIRST_NUMBER_COLUMN = RESULT_COLUMNS.indexOf("Input tokens");
 
@@ -784,12 +789,29 @@ function renderResults(data) {
           h(
             "tr",
             null,
-            RESULT_COLUMNS.map((label, index) => h("th", { scope: "col", class: index >= FIRST_NUMBER_COLUMN ? "num" : null }, label)),
+            RESULT_COLUMNS.map((label, index) =>
+              h("th", { scope: "col", class: index >= FIRST_NUMBER_COLUMN ? "num" : null, title: COLUMN_HINTS[label] }, label),
+            ),
           ),
         ),
         h("tbody", null, shown.map(resultRow)),
       ),
     ),
+    mutationHelp(),
+  );
+}
+
+// Readers who have never met mutation testing need it in plain words beside the numbers.
+function mutationHelp() {
+  return h(
+    "details",
+    { class: "column-help" },
+    h("summary", null, "What is the mutation bug-catch rate?"),
+    h("p", null, "Think of testing a smoke alarm by lighting a few small, safe fires and counting how many it beeps for."),
+    h("p", null, "Each fire is a mutant: one small deliberate bug placed in decision logic the agent changed, up to 10 per attempt."),
+    h("p", null, "The rate is the percentage of mutants the agent's test suite (the tests it left in the repository) catches. 7 caught out of 10 is 70%."),
+    h("p", null, "It shows whether the tests notice small logic bugs. It does not say whether the code is correct: the Correctness column covers that."),
+    h("p", null, "Each agent is mutated in its own code, so two agents' mutants are not the same bugs."),
   );
 }
 
