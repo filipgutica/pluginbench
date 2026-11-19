@@ -25,6 +25,7 @@ import importlib
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import socket
@@ -68,6 +69,8 @@ UNIT_POLL = 0.25
 MINIMUM_SYSTEMD = 255
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 LABEL_KEY = "pluginbench.invocation"
+# A local Docker socket: an absolute path, with no space or control character in it.
+_UNIX_SOCKET = re.compile(r"unix:///[^\x00-\x20\x7f]+")
 
 # The invocation whose handler this process runs, and the Docker runtime it recorded (None for
 # an operation that starts no container); set once by the entry point, in the scope.
@@ -123,6 +126,11 @@ class OperationFailed(ValueError):
         super().__init__(f"{type}: {message}" if type else message)
         self.type = type
         self.reason = message
+
+
+class EngineUnavailable(ValueError):
+    """The Docker engine an operation would record does not answer at its socket as itself,
+    so its containers' cleanup could never be proven. Nothing was recorded or started."""
 
 
 class OperationDeadlineExceeded(TimeoutError):
@@ -237,19 +245,41 @@ def container_invocation(runtime: dict[str, object] | None) -> str:
 
 
 def require_recoverable(runtime: object) -> None:
-    """Refuse a Docker runtime whose containers cleanup could not prove gone: `verify_labelled`
-    asks the recorded engine, by its ID, at a local Unix socket. Check it before an operation
-    on it is recorded, or a failed check fences the host."""
+    """Refuse a Docker runtime whose containers cleanup could not prove gone. `verify_labelled`
+    asks the recorded engine, by its ID, at a local Unix socket, so that engine must answer
+    there now, as itself. One bounded, read-only `docker info`, made as cleanup makes it.
+    `run_operation` checks it before an operation is recorded: once recorded, a cleanup that
+    cannot be verified fences the host."""
     engine = runtime.get("docker_engine") if isinstance(runtime, dict) else None
     engine_id = engine.get("id") if isinstance(engine, dict) else None
     endpoint = engine.get("endpoint") if isinstance(engine, dict) else None
     if not isinstance(engine_id, str) or not engine_id:
-        raise ValueError(
+        raise EngineUnavailable(
             "the Docker runtime records no engine ID, so cleanup could not prove its "
             "containers gone"
         )
-    if not isinstance(endpoint, str) or not endpoint.startswith("unix://"):
-        raise ValueError(f"the recorded Docker endpoint {endpoint!r} is not a local Unix socket")
+    if not isinstance(endpoint, str) or not _UNIX_SOCKET.fullmatch(endpoint):
+        raise EngineUnavailable(
+            f"the recorded Docker endpoint {endpoint!r} is not a local Unix socket path"
+        )
+    from pluginbench.control_store import CleanupUnknown
+
+    try:
+        cli = docker_cli_now(f"the Docker engine at {endpoint}")
+        output = _recovery_docker(
+            "info", "--format", "{{json .}}", cli=cli, endpoint=endpoint,
+            timeout=math.ceil(QUERY_SECONDS),
+        )
+    except (CleanupUnknown, OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise EngineUnavailable(f"Docker at {endpoint} could not be asked: {exc}") from exc
+    actual, _, problem = _engine_answer(output)
+    if actual is None:
+        raise EngineUnavailable(f"Docker at {endpoint} did not answer ({problem})")
+    if actual != engine_id:
+        raise EngineUnavailable(
+            f"another Docker engine, {actual}, answers at {endpoint} instead of {engine_id}, "
+            "which the runtime recorded: prepare again on this engine"
+        )
 
 
 def with_label(arguments: tuple[str, ...], invocation: str) -> tuple[str, ...]:
@@ -447,7 +477,8 @@ def run_operation(
     run; if it raises, nothing runs. `progress` gets each line the handler reports (`report`).
     The handler's own exception becomes OperationFailed; a handler past its deadline is killed
     and raises OperationDeadlineExceeded. Before anything spawns this raises only
-    HostUnavailable, ValueError, or CleanupBlocked once an earlier cleanup of this owner was not
+    HostUnavailable, ValueError (EngineUnavailable when the Docker engine it would record does
+    not answer as itself), or CleanupBlocked once an earlier cleanup of this owner was not
     verified. A cleanup that cannot be verified raises control_store.CleanupBlocked whatever the
     operation did, and keeps the owner unreleased. Any error raised once the scope's bootstrap
     started carries `launched`: the call is spent (`ledger.outcome`).
@@ -456,6 +487,8 @@ def run_operation(
     _refuse_after_failed_cleanup(lock)
     launcher = require_user_manager()
     spec = request.spec
+    if spec.docker is not None:
+        require_recoverable(spec.docker)
     directory = lock.state / "invocations" / spec.id
     directory.parent.mkdir(mode=0o700, exist_ok=True)
     directory.mkdir(mode=0o700)

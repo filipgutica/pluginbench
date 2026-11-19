@@ -247,6 +247,33 @@ def test_a_reference_measurement_runs_as_its_registered_operation_and_leaves_not
     assert _record(owned.state)["operations"] == []
 
 
+@pytest.mark.parametrize(
+    ("engine", "message"),
+    [("other", "another Docker engine, other, answers"),
+     ("", r"did not answer \(no engine ID\)")],
+    ids=["replaced engine", "no answer"],
+)
+def test_an_operation_on_an_engine_that_does_not_answer_as_itself_is_never_recorded(
+    fake_systemd: FakeSystemd,
+    owned: run_lock.ExecutionLock,
+    docker: _Docker,
+    tmp_path: Path,
+    engine: str,
+    message: str,
+) -> None:
+    """Its cleanup could never prove its containers gone, so it would fence the host for every
+    later operation. Refused before anything is recorded or started, the host stays usable."""
+    docker.engine = engine
+    marker = tmp_path / "ran"
+    request = _request("echo", _RUNTIME, value=1, marker=str(marker))
+    with pytest.raises(invocation_runtime.EngineUnavailable, match=message):
+        invocation_runtime.run_operation(request)
+    assert not marker.exists() and fake_systemd.units() == []
+    assert not (owned.state / "invocations" / request.spec.id).exists()
+    assert _record(owned.state)["operations"] == []
+    assert invocation_runtime.run_operation(_request("echo", value=2)) == 2
+
+
 def test_a_container_that_survives_removal_fences_the_host_until_a_later_check_removes_it(
     fake_systemd: FakeSystemd, docker: _Docker, tmp_path: Path, isolated_host_state: Path
 ) -> None:

@@ -292,14 +292,15 @@ def _command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *options: str, after: str = AFTER,
     ended: BaseException | None = None, engine: object = _RUNTIME["docker_engine"],
     profile_changes: dict[str, object] | None = None, behaviour: Any = None,
-    standalone: bool = True,
+    standalone: bool = True, answering: str = "daemon",
 ) -> tuple[Any, list[OperationRequest], dict[str, Any]]:
     """Run `reference-mutation` on a prepared profile, each container a fake run on a fake
     clock. Returns the result, the operations it ran and what the executor saw. `ended` is
     raised once the handler has returned, as the owner raises an unverified cleanup or a
     deadline that fires as the handler finishes. `engine` and `profile_changes` alter the
     prepared profile; a repeated option overrides the default before it. Without
-    `standalone`, a usage error is raised as itself rather than rendered for a terminal."""
+    `standalone`, a usage error is raised as itself rather than rendered for a terminal.
+    `answering` is the engine ID Docker gives at the profile's socket."""
     before = _tree(tmp_path / "before", {"src/grade.py": BEFORE})
     after_tree = _tree(tmp_path / "after", {"src/grade.py": after})
     behaviour = behaviour or _passing(lambda view: int(FIRST in view.source))
@@ -340,6 +341,10 @@ def _command(
         return fake
 
     monkeypatch.setattr(invocation_runtime, "run_operation", recording)
+    monkeypatch.setattr(
+        invocation_runtime, "_recovery_docker",
+        lambda *arguments, **kwargs: json.dumps({"ID": answering, "ServerErrors": None}),
+    )
     monkeypatch.setattr(mutation, "native_executor", executor)
     monkeypatch.setattr(mutation, "_check_capacity", lambda identity, lanes: None)
     # The engine's only clock reading: the fake's, so each run takes its fake duration.
@@ -502,6 +507,18 @@ def test_a_daemon_cleanup_could_not_check_is_refused_before_the_host_is_taken(
         tmp_path, monkeypatch, "--attempt-seconds", "600", engine=engine
     )
     assert result.exit_code == 2 and message in result.output
+    assert taken == [] and requests == []
+
+
+def test_a_profile_whose_engine_was_replaced_is_refused_before_the_host_is_taken(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    taken: list[object] = []
+    monkeypatch.setattr(cli, "_execution", lambda *args: taken.append(args))
+    result, requests, _ = _command(
+        tmp_path, monkeypatch, "--attempt-seconds", "600", answering="other"
+    )
+    assert result.exit_code == 2 and "another Docker engine, other, answers" in result.output
     assert taken == [] and requests == []
 
 
