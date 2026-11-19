@@ -676,13 +676,19 @@ def measurement_identity(identity: Mapping[str, object]) -> dict[str, object]:
             "mutation measures in the task's base image, and this task identity records no "
             "toolchain_identity.base_image_identity or isolation runtime"
         )
-    resources = {"cpus": MEASUREMENT_CPUS, "memory_mb": MEASUREMENT_MEMORY_MB}
     return {
         **identity,
         "image_identity": base,
-        "resources": resources,
-        "isolation": {**runtime, "resources": resources},
+        "resources": _measured(identity.get("resources")),
+        "isolation": {**runtime, "resources": _measured(runtime.get("resources"))},
     }
+
+
+def _measured(resources: object) -> dict[str, object]:
+    """Saved container resources at the measurement limits. Any other field, such as how
+    Docker enforces the limits, stays as saved, so the runtime check still compares it."""
+    saved = resources if isinstance(resources, dict) else {}
+    return {**saved, "cpus": MEASUREMENT_CPUS, "memory_mb": MEASUREMENT_MEMORY_MB}
 
 
 def _check_capacity(identity: Mapping[str, object], lanes: int) -> None:
@@ -1407,7 +1413,8 @@ class _Receipts:
         self.resources: dict[str, object] | None = None
         if version == VERSION:
             identity = measurement_identity(identity)
-            self.resources = _object(identity["resources"])
+            # The launcher records the resources of the runtime it checked, not the task's.
+            self.resources = _object(_object(identity["isolation"])["resources"])
         self.image = _object(identity["image_identity"])["image_id"]
         self.seen: set[str] = set()
 

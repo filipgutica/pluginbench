@@ -179,13 +179,15 @@ def _repeat(
             ),
             "runs": [_call(_object(run)) for run in _list(record["runs"])],
         })
+    runtime_resources = _object(_object(measured["isolation"])["resources"])
     return {
         "run_id": uuid4().hex,
         "report_sha256": digest,
         "before_digest": report["before_digest"],
         "after_digest": report["after_digest"],
         "image_id": _object(measured["image_identity"])["image_id"],
-        "resources": measured["resources"],
+        # The limits its containers ran at, as the launcher checked them.
+        "resources": {key: runtime_resources[key] for key in ("cpus", "memory_mb")},
         "timing_boundary": clocks["timing_boundary"],
         "candidate_count": len(_list(report["candidates"])),
         "selected": [f"{s.path}:{s.line}:{s.column}:{s.operator}" for s in selected],
