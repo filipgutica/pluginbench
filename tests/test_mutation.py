@@ -200,13 +200,19 @@ def _tree(path: Path, files: dict[str, str]) -> Path:
 # A prepared task: the installed coding image on top of its base image. Mutation measures in
 # the base image, at two CPUs and 2,048 MiB.
 BASE_IMAGE = {"image_id": "sha256:base", "workdir": "/app"}
+SAVED_RESOURCES = {
+    "cpus": 1, "memory_mb": 4096, "cpu_enforcement": "limit", "memory_enforcement": "limit"
+}
 IMAGE = {
     "image_identity": {"image_id": "sha256:installed"},
     "toolchain_identity": {"image_id": "sha256:installed", "base_image_identity": BASE_IMAGE},
-    "isolation": {"resources": {"cpus": 1, "memory_mb": 4096}},
-    "resources": {"cpus": 1, "memory_mb": 4096},
+    # Shaped as preparation saves them: the runtime records how Docker enforces its limits,
+    # and the task's own resources carry its setup timeout.
+    "isolation": {"resources": SAVED_RESOURCES},
+    "resources": {"cpus": 1, "memory_mb": 4096, "setup_timeout": 1800},
 }
-RESOURCES = {"cpus": 2, "memory_mb": 2048}
+# What the launcher records for each mutation container: the checked runtime's resources.
+RESOURCES = {"cpus": 2, "memory_mb": 2048, "cpu_enforcement": "limit", "memory_enforcement": "limit"}
 
 
 class Clock:

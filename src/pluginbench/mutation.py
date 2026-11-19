@@ -1413,7 +1413,8 @@ class _Receipts:
         self.resources: dict[str, object] | None = None
         if version == VERSION:
             identity = measurement_identity(identity)
-            self.resources = _object(identity["resources"])
+            # The launcher records the resources of the runtime it checked, not the task's.
+            self.resources = _object(_object(identity["isolation"])["resources"])
         self.image = _object(identity["image_identity"])["image_id"]
         self.seen: set[str] = set()
 

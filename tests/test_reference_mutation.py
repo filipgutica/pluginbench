@@ -15,7 +15,8 @@ import pytest
 import typer
 from pydantic import ValidationError
 from test_mutation import (
-    AFTER, BASE_IMAGE, BEFORE, FIRST, IMAGE, Fake, View, _config, _lines, _passing, _tree,
+    AFTER, BASE_IMAGE, BEFORE, FIRST, IMAGE, SAVED_RESOURCES, Fake, View, _config, _lines, _passing,
+    _tree,
 )
 from typer.testing import CliRunner
 
@@ -307,8 +308,7 @@ def _command(
     after_tree = _tree(tmp_path / "after", {"src/grade.py": after})
     behaviour = behaviour or _passing(lambda view: int(FIRST in view.source))
     fake = Fake(behaviour, before, after_tree)
-    isolation = {"resources": {"cpus": 1, "memory_mb": 4096}, "docker_cli": {},
-                 "docker_engine": engine}
+    isolation = {"resources": SAVED_RESOURCES, "docker_cli": {}, "docker_engine": engine}
     profile = tmp_path / "mutation.json"
     # As preparation saves it: the coverage settings whole (`CoverageSettings`).
     coverage = {"command": ["suite"], "report_path": "cov.json", "timeout_seconds": 100,
