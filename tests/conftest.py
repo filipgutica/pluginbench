@@ -14,6 +14,10 @@ from fake_systemd import HANDLERS, register_handlers
 from pluginbench import claude, control_store, invocation_runtime, run_lock
 from pluginbench.run_lock import ExecutionLock
 
+# Fixture trees hold other projects' sources and tests, which are data, not this suite's
+# tests; collecting one would also shadow a test module of the same name.
+collect_ignore = ["fixtures"]
+
 
 @pytest.fixture(autouse=True)
 def isolated_cache(
