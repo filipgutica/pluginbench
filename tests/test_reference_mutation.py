@@ -104,13 +104,13 @@ def test_a_repeat_the_attempt_limit_cuts_is_censored_for_both_rules(tmp_path: Pa
 
 def test_a_slow_reference_fails_only_the_time_rule(tmp_path: Path) -> None:
     mutation_receipt, time_receipt, _ = _reference(tmp_path)
-    # Baselines took 2 s; two of twenty mutants took one 2 s wave of four lanes. Five waves
-    # project 2 s + 5 x 2 s = 12 s, which needs 18 s at 150%: equality passes.
-    tight = TASK.model_copy(update={"mutation_timeout_seconds": 17})
+    # Baselines took 2 s; two of ten mutants took one 2 s wave of four lanes. Three waves
+    # project 2 s + 3 x 2 s = 8 s, which needs 12 s at 150%: equality passes.
+    tight = TASK.model_copy(update={"mutation_timeout_seconds": 11})
     assert suite_qualification._RULES["mutation"](mutation_receipt, tight).status == "pass"
     verdict = suite_qualification._RULES["mutation_time"](time_receipt, tight)
-    assert verdict.status == "fail" and "12000 ms" in str(verdict.reason)
-    loose = TASK.model_copy(update={"mutation_timeout_seconds": 18})
+    assert verdict.status == "fail" and "8000 ms" in str(verdict.reason)
+    loose = TASK.model_copy(update={"mutation_timeout_seconds": 12})
     assert suite_qualification._RULES["mutation_time"](time_receipt, loose).status == "pass"
 
 
@@ -379,7 +379,7 @@ def test_the_command_times_the_reference_in_one_operation_and_freeze_can_never_r
     # Its outer bound holds every repeat's whole attempt limit, then its cleanup.
     assert request.timeout == operations.reference_budget(600_000) > 3 * 600
     assert request.arguments["attempt_ms"] == 600_000
-    assert request.arguments["contract"] == {"headroom_percent": 150, "sample_size": 20, "lanes": 4}
+    assert request.arguments["contract"] == {"headroom_percent": 150, "sample_size": 10, "lanes": 4}
     assert "pins" not in request.arguments
     # Containers start on the daemon the profile froze, labelled with this invocation, while
     # the command holds the host.
@@ -421,7 +421,7 @@ def test_the_command_times_the_reference_in_one_operation_and_freeze_can_never_r
     assert [line.split(":")[0] for line in lines[:3]] == ["repeat 0", "repeat 1", "repeat 2"]
     assert all("baselines 1.0 s green, 1.0 s green;" in line for line in lines[:3])
     assert all(line.endswith("; complete") for line in lines[:3])
-    assert "M = 20, 4 lanes. No model calls." in result.output
+    assert "M = 10, 4 lanes. No model calls." in result.output
     assert "Not a qualification receipt." in result.output
 
 
