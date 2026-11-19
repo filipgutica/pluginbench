@@ -586,7 +586,9 @@ def check(
         _error(exc)
 
 
-# The timing pilot's published evidence, and what an unpublished one records instead.
+# The timing pilot's published directory and its manifest, and what a pilot that published
+# nothing records beside its staged repeats instead.
+PILOT_DIRECTORY = "pilot"
 PILOT_FILE = "pilot.json"
 PILOT_OUTCOME = "outcome.json"
 
@@ -631,7 +633,11 @@ def reference_mutation(
         # Everything is checked before the host is taken: a repeat can run for hours.
         destination = (output or _new_run_directory("reference-")).resolve()
         if destination.exists():
-            raise ValueError(f"{destination} already exists; give a new --output")
+            raise ValueError(
+                f"{destination} already exists; give a new --output. A pilot that published "
+                f"nothing says why in its {PILOT_OUTCOME}: to run it again there, first remove "
+                f"it with `rm -r {shlex.quote(str(destination))}`"
+            )
         trees = before.resolve(), after.resolve()
         for tree in trees:
             if not tree.is_dir():
@@ -660,21 +666,23 @@ def reference_mutation(
         invocation_runtime.require_recoverable(runtime)
         with _execution("preflight", profile, destination):
             destination.mkdir(parents=True)
+            published = destination / PILOT_DIRECTORY
             try:
                 # It returns only once the scope is gone and no labelled container is left.
                 facts = operations.run(
                     "reference", arguments,
                     timeout=operations.reference_budget(arguments.attempt_ms), docker=runtime,
                 )
-            except BaseException as exc:
-                _write_json(destination / PILOT_OUTCOME, _pilot_outcome(exc))
-                raise
-            staging.rename(destination / "repeats")
-            _write_json(destination / PILOT_FILE, {"kind": "reference-mutation-pilot",
+                # The manifest joins the repeats, and one rename publishes them together.
+                _write_json(staging / PILOT_FILE, {"kind": "reference-mutation-pilot",
                                                    "facts": facts})
+                staging.rename(published)
+            except BaseException as exc:
+                _record_unpublished(destination, exc)
+                raise
         for line in _reference_summary(facts):
             typer.echo(line)
-        typer.echo(f"Pilot timings: {destination / PILOT_FILE}. Not a qualification receipt.")
+        typer.echo(f"Pilot timings: {published / PILOT_FILE}. Not a qualification receipt.")
     except (
         OSError,
         ValueError,
@@ -685,12 +693,21 @@ def reference_mutation(
         _error(exc)
 
 
+def _record_unpublished(destination: Path, exc: BaseException) -> None:
+    """Record why a pilot published nothing beside its staged repeats, which stay for
+    inspection and prove nothing. If even that cannot be written, the error says so."""
+    try:
+        _write_json(destination / PILOT_OUTCOME, _pilot_outcome(exc))
+    except OSError as error:
+        exc.add_note(f"Why it published nothing could not be recorded in {destination}: {error}")
+
+
 def _pilot_outcome(exc: BaseException) -> dict[str, object]:
-    """Why a pilot published nothing. A deadline, an unverified cleanup or a launch failure is
-    infrastructure; the staged repeats stay for inspection and prove nothing."""
-    infrastructure = isinstance(exc, (
-        invocation_runtime.OperationDeadlineExceeded, control_store.CleanupBlocked,
-    )) or (isinstance(exc, invocation_runtime.OperationFailed) and not exc.type)
+    """Why a pilot published nothing. A deadline, an unverified cleanup, a launch failure or a
+    file it could not write is infrastructure."""
+    infrastructure = isinstance(exc, (OSError, control_store.CleanupBlocked)) or (
+        isinstance(exc, invocation_runtime.OperationFailed) and not exc.type
+    )
     return {
         "published": False,
         "infrastructure": infrastructure,

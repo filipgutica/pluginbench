@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import itertools
 import json
 import threading
@@ -378,12 +379,13 @@ def test_the_command_times_the_reference_in_one_operation_and_freeze_can_never_r
     assert seen["lock"] == "preflight"
     assert seen["identity"]["image_identity"] == BASE_IMAGE
     output = tmp_path / "reference"
-    published = json.loads((output / cli.PILOT_FILE).read_text())
+    published = json.loads((output / cli.PILOT_DIRECTORY / cli.PILOT_FILE).read_text())
     assert published["kind"] == "reference-mutation-pilot"
     assert len(published["facts"]["repeats"]) == 3
-    assert sorted(p.name for p in (output / "repeats").iterdir()) == [
-        "repeat-0", "repeat-1", "repeat-2",
+    assert sorted(p.name for p in (output / cli.PILOT_DIRECTORY).iterdir()) == [
+        cli.PILOT_FILE, "repeat-0", "repeat-1", "repeat-2",
     ]
+    assert sorted(p.name for p in output.iterdir()) == [cli.PILOT_DIRECTORY]
     # Pilot only: nothing it wrote is a receipt, so freeze has none of it to qualify on.
     assert not (output / "staging").exists() and not list(output.rglob("*.receipt.json"))
     for path in output.rglob("*.json"):
@@ -427,13 +429,40 @@ def test_repeats_that_ended_before_their_cleanup_was_proven_are_never_published(
     )
     assert result.exit_code == 2 and str(ended) in result.output
     output = tmp_path / "reference"
-    assert not (output / cli.PILOT_FILE).exists() and not (output / "repeats").exists()
+    assert not (output / cli.PILOT_DIRECTORY).exists()
     assert (output / "staging" / "repeat-2" / "report.json").is_file()
     outcome = json.loads((output / cli.PILOT_OUTCOME).read_text())
     assert outcome == {
         "published": False, "infrastructure": True,
         "error": f"{type(ended).__name__}: {ended}",
     }
+
+
+def test_a_publication_that_fails_records_why_and_its_output_names_the_cleanup_to_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The disk fills as the manifest is written: nothing is published, the staged repeats
+    stay, and outcome.json says why. Running again there is refused with the exact cleanup."""
+    write = cli._write_json
+
+    def full(path: Path, value: object) -> None:
+        if path.name == cli.PILOT_FILE:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        write(path, value)
+
+    monkeypatch.setattr(cli, "_write_json", full)
+    result, _, _ = _command(tmp_path, monkeypatch, "--attempt-seconds", "600")
+    assert result.exit_code == 2 and "No space left on device" in result.output
+    output = tmp_path / "reference"
+    assert not (output / cli.PILOT_DIRECTORY).exists()
+    assert (output / "staging" / "repeat-2" / "report.json").is_file()
+    outcome = json.loads((output / cli.PILOT_OUTCOME).read_text())
+    assert outcome["published"] is False and outcome["infrastructure"] is True
+    assert "No space left on device" in outcome["error"]
+    again, requests, _ = _command(tmp_path / "again", monkeypatch, "--attempt-seconds", "600",
+                                  "--output", str(output))
+    assert again.exit_code == 2 and requests == []
+    assert f"first remove it with `rm -r {output}`" in again.output
 
 
 def test_the_pilot_sets_m_lanes_and_the_limit_and_sees_a_censored_repeat(
@@ -522,7 +551,9 @@ def test_the_worker_gets_the_coverage_settings_with_the_defaults_they_were_valid
     sent = request.arguments["config"]["coverage"]
     assert sent["timeout_seconds"] == 600 and sent["format"] == "lcov"
     # The baseline cap the repeats ran under is that default.
-    published = json.loads((tmp_path / "reference" / cli.PILOT_FILE).read_text())
+    published = json.loads(
+        (tmp_path / "reference" / cli.PILOT_DIRECTORY / cli.PILOT_FILE).read_text()
+    )
     assert {r["baseline_ms"] for r in published["facts"]["repeats"]} == {600_000}
 
 
