@@ -1,0 +1,1 @@
+{"command": ["suite"], "image_id": "sha256:image", "before_digest": "sha256:c0e4677efbdb3ad46bf5689d13f958e8b21a1168b075a2b7e949f59259102952", "exit_code": 1, "timed_out": false, "stdout": "PB-SUITE-EXIT 1\n"}

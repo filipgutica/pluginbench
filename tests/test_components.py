@@ -126,11 +126,13 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
         },
     ),
     "mutation_observer": (
-        1,
+        2,
         {
             # Only report derivation changes; collection, sites, sampling and outcomes stay v1.
             # Optional provisioning runs previously unsupported profiles; existing runs stay v1.
-            "mutation.py": "a2b592ba8298be5eb4042b4c66e70d812de2ab4a3843f08294324789aeb6fa64",
+            # v2: M = 20, four lanes in the base image, millisecond baseline, site and attempt
+            # clocks, unconfirmed mutants; version 1 reports still decode.
+            "mutation.py": "1d25afc949d5921e99dcba406806047bc966a4ddc20191c58789bdf05aed4af1",
             "mutation_sites.mjs": (
                 "f7a602774f3e6f2415c1745127134862a9a6f42e8e9807b4c28368e7a3c27c88"
             ),

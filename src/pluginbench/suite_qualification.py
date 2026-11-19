@@ -14,11 +14,12 @@ later check (B3c); a frozen suite authorizes no paid call.
 
 from __future__ import annotations
 
+import json
 from collections import Counter
-from collections.abc import Callable, Iterable
-from typing import Any, Literal
+from collections.abc import Callable, Iterable, Sequence
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from pluginbench.benchmark import Count, Digest, Suite, SuiteTask
 
@@ -178,11 +179,427 @@ def _correctness(receipt: Receipt, task: SuiteTask) -> Verdict:
     return Verdict(status="pass")
 
 
+# --- Reference mutation -------------------------------------------------------------------
+#
+# The `mutation` and `mutation_time` receipts carry the same facts: the mutation part of the
+# common observer contract and three independent reference repeats, as
+# `reference_mutation.measure_reference` records them from validated mutation reports. The
+# rules re-derive every clock, outcome, count and the site partition from those raw readings;
+# they never read a verdict. The producer, not the rule, checks the sample against the
+# candidates, since sampling lives outside this module's import boundary.
+
+REFERENCE_REPEATS = 3
+# What B and every deadline time: the whole executor call (mutation.TIMING_BOUNDARY).
+TIMING_BOUNDARY = "executor_call"
+_Whole = Annotated[int, Field(strict=True, ge=0)]
+
+
+class _Call(_Value):
+    """One run: when it started, and, if it started, how it ended."""
+
+    started_ms: _Whole
+    dispatched: bool
+    elapsed_ms: _Whole | None = None
+    exit_code: int | None = None
+    timed_out: bool | None = None
+    suite_status: int | None = None
+
+    @model_validator(mode="after")
+    def _ended(self) -> _Call:
+        if self.dispatched != (self.elapsed_ms is not None and self.timed_out is not None):
+            raise ValueError("a run has a result exactly when it started")
+        if self.timed_out and (self.exit_code is not None or self.suite_status is not None):
+            raise ValueError("a run that timed out records an exit")
+        if self.suite_status is not None and self.exit_code is None:
+            raise ValueError("a run records a suite status with no exit code")
+        return self
+
+    @property
+    def ended_ms(self) -> int:
+        return self.started_ms + (self.elapsed_ms or 0)
+
+
+class _Check(_Call):
+    """A mutant's build or type check. `diagnostics` counts tsc errors in its output and
+    `new_diagnostics` those the unmutated tree does not have."""
+
+    kind: Literal["go", "tsc"]
+    diagnostics: _Whole | None = None
+    new_diagnostics: _Whole | None = None
+
+
+class _Site(_Value):
+    site: _Whole
+    dispatched_ms: _Whole
+    settled_ms: _Whole | None
+    check: _Check | None
+    runs: tuple[_Call, ...]
+
+
+class _Resources(_Value):
+    cpus: Count
+    memory_mb: Count
+
+
+class _MutationContract(_Value):
+    """The mutation part of the common observer contract, as the producer read it.
+
+    Binding these values to `observer_contract_sha256` is the manifest reader's job (B3b).
+    """
+
+    sample_size: Count
+    lanes: Count
+    resources: _Resources
+    baseline_factor: Count
+    site_factor: Count
+    first_run_factor: Count
+    # The mutation time limit must hold the projected reference time times this percentage.
+    headroom_percent: Count
+
+
+class _Repeat(_Value):
+    run_id: str = Field(min_length=1)
+    report_sha256: Digest
+    before_digest: str
+    after_digest: str
+    image_id: str = Field(min_length=1)
+    resources: _Resources
+    timing_boundary: str
+    candidate_count: _Whole
+    selected: tuple[str, ...]
+    baseline_ms: Count
+    attempt_ms: Count | None
+    baseline: tuple[_Call, ...]
+    check_baseline: _Check | None
+    sites: tuple[_Site, ...]
+    required_settled_ms: _Whole | None
+    infrastructure_failure: Literal["executor", "attempt_deadline"] | None
+    # Changed production files no finder parsed, and those in a language with no finder: either
+    # leaves the candidate population incomplete.
+    unparsed_files: tuple[str, ...]
+    unsupported_files: tuple[str, ...]
+
+
+class _MutationFacts(_Value):
+    contract: _MutationContract
+    repeats: tuple[_Repeat, ...]
+
+
+def _limit(
+    started: int, cap: int | None, deadline: int | None, attempt: int | None
+) -> tuple[str, int]:
+    """The clock that bounds a call, and the time it leaves; ties go to the attempt, then the
+    site, then the command (mutation.call_limit)."""
+    limits = [(name, value) for name, value in (
+        ("attempt", None if attempt is None else attempt - started),
+        ("site", None if deadline is None else deadline - started),
+        ("command", cap),
+    ) if value is not None]
+    least = min(value for _, value in limits)
+    return next(item for item in limits if item[1] == least)
+
+
+# A run's end: the clock that stopped it, left it no time or that it overran (None when it ran
+# to an exit within its time), and its suite status.
+_End = tuple[str | None, int | None]
+
+
+def _end(call: _Call, cap: int | None, deadline: int | None, attempt: int | None) -> _End:
+    """A run's end against the limits recomputed from its start (mutation._cut): a run that
+    returns after its limit is cut by that limit, whatever it exited with."""
+    bound, left = _limit(call.started_ms, cap, deadline, attempt)
+    if call.dispatched != (left > 0):
+        raise ValueError("a run's start contradicts the time it had left")
+    on_time = call.dispatched and not call.timed_out and (call.elapsed_ms or 0) <= left
+    return (None if on_time else bound), call.suite_status
+
+
+def _settle(ends: Sequence[_End]) -> str | None:
+    """A mutant's outcome from its runs' ends; None needs another run (mutation.site_outcome)."""
+    if not ends:
+        return None
+    (cut, status) = ends[0]
+    if cut is not None:
+        return {"command": "timeout_kill", "site": "unconfirmed"}.get(cut, "interrupted")
+    if status is None:
+        return "error"
+    if status == 0:
+        return "survived"
+    if len(ends) == 1:
+        return None
+    (cut, status) = ends[1]
+    if cut is not None:
+        return "interrupted" if cut == "attempt" else "unconfirmed"
+    if status is None:
+        return "error"
+    return "flaky" if status == 0 else "killed"
+
+
+def _ran(check: _Check, end: _End) -> bool:
+    """Whether a tsc baseline ran to a known result within its time (mutation._tsc_ran_v2)."""
+    code = check.exit_code
+    return (end[0] is None and code is not None
+            and code not in (126, 127) and (code == 0 or bool(check.diagnostics)))
+
+
+def _checked(check: _Check, end: _End) -> str:
+    """valid, invalid, error, unconfirmed or interrupted for a check (mutation._check_state_v2)."""
+    if end[0] is not None:
+        return "interrupted" if end[0] == "attempt" else "unconfirmed"
+    code = check.exit_code
+    if check.timed_out or code is None or code in (126, 127):
+        return "error"
+    if check.kind == "go":
+        return "valid" if code == 0 else "invalid"
+    if check.diagnostics is None or check.new_diagnostics is None:
+        raise ValueError("a tsc check records no diagnostic counts")
+    if code and not check.diagnostics:
+        return "error"
+    return "invalid" if check.new_diagnostics else "valid"
+
+
+def _site_outcome(site: _Site, slowest: int, attempt: int | None, contract: _MutationContract) -> str | None:
+    """A reference mutant's outcome, from its raw runs and clocks."""
+    deadline = site.dispatched_ms + contract.site_factor * slowest
+    state: str | None
+    if site.check is not None:
+        state = _checked(site.check, _end(site.check, None, deadline, attempt))
+        if state != "valid":
+            if site.runs:
+                raise ValueError("a mutant ran after its check settled it")
+            return state
+    ends = [
+        _end(call, contract.first_run_factor * slowest if position == 0 else None, deadline,
+             attempt)
+        for position, call in enumerate(site.runs)
+    ]
+    state = _settle(ends)
+    if any(_settle(ends[:count]) is not None for count in range(1, len(ends))):
+        raise ValueError("a mutant's runs go on after its outcome is known")
+    return state
+
+
+def _validate(repeat: _Repeat, contract: _MutationContract) -> None:
+    """Check one repeat's clock readings, shared by both reference rules.
+
+    The repeat timed executor calls and sampled no more sites than it found. Calls run in
+    order, each starts within its limits, a site is settled exactly when its calls give it an
+    outcome, no more sites run at once than the contract has lanes, and an uninterrupted repeat
+    keeps to its attempt limit. Raises ValueError on a contradiction.
+    """
+    if repeat.timing_boundary != TIMING_BOUNDARY:
+        raise ValueError(f"the repeat timed {repeat.timing_boundary}, not {TIMING_BOUNDARY}")
+    if len(repeat.selected) > repeat.candidate_count:
+        raise ValueError("the repeat selected more sites than it found")
+    if len(set(repeat.selected)) != len(repeat.selected):
+        raise ValueError("the repeat selected a site twice")
+    attempt = repeat.attempt_ms
+    serial = 0
+    for call in repeat.baseline:
+        if call.started_ms < serial:
+            raise ValueError("baseline runs overlap")
+        _end(call, repeat.baseline_ms, None, attempt)
+        serial = call.ended_ms
+    if repeat.check_baseline is not None:
+        if repeat.check_baseline.started_ms < serial:
+            raise ValueError("the tsc baseline overlaps the baselines")
+        _end(repeat.check_baseline, repeat.baseline_ms, None, attempt)
+        serial = repeat.check_baseline.ended_ms
+    ends = [_end(call, repeat.baseline_ms, None, attempt) for call in repeat.baseline]
+    green = len(ends) == 2 and all(cut is None and status == 0 for cut, status in ends)
+    slowest = max((call.elapsed_ms or 0 for call in repeat.baseline), default=0)
+    latest = serial
+    spans: list[tuple[int, int]] = []
+    for site in repeat.sites:
+        if site.dispatched_ms < serial:
+            raise ValueError(f"site {site.site} started before the baselines ended")
+        calls = ([site.check] if site.check is not None else []) + list(site.runs)
+        if not green and calls:
+            raise ValueError(f"site {site.site} ran without a green baseline")
+        moment = site.dispatched_ms
+        for call in calls:
+            if call.started_ms < moment:
+                raise ValueError(f"site {site.site}'s runs are out of order")
+            moment = call.ended_ms
+        if site.settled_ms is not None and site.settled_ms < moment:
+            raise ValueError(f"site {site.site} settled before its runs ended")
+        state = _site_outcome(site, slowest, attempt, contract)
+        if (site.settled_ms is not None) != (state not in (None, "interrupted")):
+            raise ValueError(f"site {site.site}'s settlement differs from its runs")
+        end = site.settled_ms if site.settled_ms is not None else moment
+        spans.append((site.dispatched_ms, end))
+        latest = max(latest, end)
+    # A lane dispatches its next site no earlier than its last one settled, so the sites
+    # running at any dispatch, ends excluded, are at most one per lane. A site that settles
+    # the millisecond it starts shares its lane only with sites that end or start then, so it
+    # needs a lane no site straddles.
+    for at, end in spans:
+        running = sum(
+            (start < at < stop) if at == end else (start <= at < stop) for start, stop in spans
+        )
+        if running + (at == end) > contract.lanes:
+            raise ValueError(f"more sites ran at once than the {contract.lanes} lanes hold")
+    if repeat.required_settled_ms is not None and repeat.required_settled_ms < latest:
+        raise ValueError("the required phase ended before its sites settled")
+    # A call its own cap or site bounds can still return after the attempt's limit.
+    returned = max(latest, repeat.required_settled_ms or 0)
+    if repeat.infrastructure_failure is None and attempt is not None:
+        cut = [end for end in ends if end[0] == "attempt"]
+        if cut or returned > attempt:
+            raise ValueError("an uninterrupted repeat overran its attempt limit")
+
+
+def _facts(receipt: Receipt) -> _MutationFacts | Verdict:
+    """The receipt's facts, or why they prove nothing: malformed, forged, reused, mixed,
+    contradicted by their own clocks, or over an incomplete candidate population."""
+    try:
+        facts = _MutationFacts.model_validate(receipt.facts)
+    except ValueError as error:
+        return Verdict(status="unavailable", reason=f"malformed reference mutation facts: {error}")
+    for repeat in facts.repeats:
+        try:
+            _validate(repeat, facts.contract)
+        except ValueError as error:
+            return Verdict(status="unavailable", reason=f"repeat {repeat.run_id}: {error}")
+        if repeat.unparsed_files or repeat.unsupported_files:
+            return Verdict(status="unavailable", reason=(
+                f"repeat {repeat.run_id}: the candidate population is incomplete"))
+    repeats = facts.repeats
+    if len(repeats) != REFERENCE_REPEATS:
+        return Verdict(status="unavailable", reason=(
+            f"{len(repeats)} reference repeats; expected {REFERENCE_REPEATS}"))
+    # Independent repeats can write identical reports, so only their run IDs tell them apart.
+    if len({r.run_id for r in repeats}) != len(repeats):
+        return Verdict(status="unavailable", reason="a reference repeat is reused")
+    if len({(r.before_digest, r.after_digest, r.image_id) for r in repeats}) != 1:
+        return Verdict(status="unavailable", reason="reference repeats measured different inputs")
+    if any(r.resources != facts.contract.resources for r in repeats):
+        return Verdict(status="unavailable", reason="a reference repeat ran with other resources")
+    return facts
+
+
+def _repeat_outcomes(repeat: _Repeat, contract: _MutationContract) -> tuple[str, ...] | Verdict:
+    """Every selected site's outcome in one complete repeat, or why the repeat proves nothing
+    (unavailable) or disproves the reference (fail)."""
+    if repeat.infrastructure_failure is not None:
+        return Verdict(status="unavailable", reason=(
+            f"repeat {repeat.run_id} was interrupted: {repeat.infrastructure_failure}"))
+    statuses = [
+        status if cut is None else None
+        for cut, status in (_end(c, repeat.baseline_ms, None, repeat.attempt_ms)
+                            for c in repeat.baseline)
+    ]
+    if len(statuses) != 2 or None in statuses:
+        return Verdict(status="unavailable", reason=f"repeat {repeat.run_id}: baseline has no status")
+    if any(status != 0 for status in statuses):
+        return Verdict(status="fail", reason=f"repeat {repeat.run_id}: reference baseline is red")
+    if not repeat.selected:
+        return Verdict(status="fail", reason="the reference change has no mutation site")
+    if len(repeat.selected) > contract.sample_size:
+        return Verdict(status="unavailable", reason=f"repeat {repeat.run_id}: sample exceeds M")
+    if [site.site for site in repeat.sites] != list(range(len(repeat.selected))):
+        return Verdict(status="unavailable", reason=(
+            f"repeat {repeat.run_id}: the sample is not accounted for"))
+    tsc = any(site.check is not None and site.check.kind == "tsc" for site in repeat.sites)
+    check = repeat.check_baseline
+    if tsc and (check is None or not _ran(
+            check, _end(check, repeat.baseline_ms, None, repeat.attempt_ms))):
+        return Verdict(status="unavailable", reason=(
+            f"repeat {repeat.run_id}: tsc did not run on the unmutated tree"))
+    slowest = max(call.elapsed_ms or 0 for call in repeat.baseline)
+    outcomes = []
+    for site in repeat.sites:
+        state = _site_outcome(site, slowest, repeat.attempt_ms, contract)
+        if state in (None, "interrupted", "error", "unconfirmed") or site.settled_ms is None:
+            return Verdict(status="unavailable", reason=(
+                f"repeat {repeat.run_id}: site {site.site} is {state or 'unsettled'}"))
+        assert state is not None
+        outcomes.append(state)
+    if repeat.required_settled_ms is None:
+        return Verdict(status="unavailable", reason=f"repeat {repeat.run_id}: required phase open")
+    return tuple(outcomes)
+
+
+def _mutation(receipt: Receipt, task: SuiteTask) -> Verdict:
+    """Three clean reference repeats, each with a green baseline, its whole sample settled and
+    a nonempty valid population, and the same outcome at every site in all three."""
+    facts = _facts(receipt)
+    if isinstance(facts, Verdict):
+        return facts
+    if len({r.selected for r in facts.repeats}) != 1:
+        return Verdict(status="fail", reason="reference repeats selected different sites")
+    results = []
+    for repeat in facts.repeats:
+        try:
+            result = _repeat_outcomes(repeat, facts.contract)
+        except ValueError as error:
+            return Verdict(status="unavailable", reason=f"repeat {repeat.run_id}: {error}")
+        results.append(result)
+    verdicts = [result for result in results if isinstance(result, Verdict)]
+    if verdicts:
+        return next((v for v in verdicts if v.status == "fail"), verdicts[0])
+    outcomes = [result for result in results if not isinstance(result, Verdict)]
+    if len(set(outcomes)) != 1:
+        return Verdict(status="fail", reason="reference repeats gave different outcomes")
+    valid = sum(state in ("killed", "timeout_kill", "survived") for state in outcomes[0])
+    if not valid:
+        return Verdict(status="fail", reason="the reference has no valid mutant")
+    return Verdict(status="pass")
+
+
+def projected_ms(*, setup_ms: int, settled_ms: int, ended_ms: int, sites: int,
+                 sample_size: int, lanes: int) -> int:
+    """A repeat's required time scaled to a full sample of M mutants in `lanes` lanes.
+
+    The site phase, from the first dispatch to the last settlement, runs in waves of `lanes`,
+    so it is scaled by `ceil(M / L) / ceil(n / L)`, rounded up. The setup before it and the
+    time from the last settlement to the end of the required work are fixed overhead. With
+    n = M it is the measured time.
+    """
+    waves = -(-sample_size // lanes)
+    measured = -(-sites // lanes)
+    return setup_ms + -(-(settled_ms - setup_ms) * waves // measured) + ended_ms - settled_ms
+
+
+def _mutation_time(receipt: Receipt, task: SuiteTask) -> Verdict:
+    """The slowest projected full-M reference time, times the contract's headroom, fits the
+    task's mutation time limit. Equality passes; a censored repeat proves nothing."""
+    facts = _facts(receipt)
+    if isinstance(facts, Verdict):
+        return facts
+    contract = facts.contract
+    projections = []
+    for repeat in facts.repeats:
+        if (repeat.infrastructure_failure is not None or repeat.required_settled_ms is None
+                or not repeat.sites
+                or [site.site for site in repeat.sites] != list(range(len(repeat.selected)))
+                or any(site.settled_ms is None for site in repeat.sites)):
+            return Verdict(status="unavailable", reason=(
+                f"repeat {repeat.run_id}: the reference timing is censored or missing"))
+        setup = min(site.dispatched_ms for site in repeat.sites)
+        settled = max(site.settled_ms or 0 for site in repeat.sites)
+        if settled < setup or repeat.required_settled_ms < settled:
+            return Verdict(status="unavailable", reason=(
+                f"repeat {repeat.run_id}: its clock readings are out of order"))
+        projections.append(projected_ms(
+            setup_ms=setup, settled_ms=settled, ended_ms=repeat.required_settled_ms,
+            sites=len(repeat.sites), sample_size=contract.sample_size, lanes=contract.lanes))
+    worst = max(projections)
+    limit_ms = 1000 * task.mutation_timeout_seconds
+    if worst * contract.headroom_percent > 100 * limit_ms:
+        return Verdict(status="fail", reason=(
+            f"projected reference time {worst} ms at {contract.headroom_percent}% exceeds the "
+            f"{task.mutation_timeout_seconds} s mutation limit"))
+    return Verdict(status="pass")
+
+
 # Each gate's rule. B4 and B5 replace the stubs as their producers land. Private and fixed:
 # a caller cannot hand freeze code to run.
 Rule = Callable[[Receipt, SuiteTask], Verdict]
 _RULES: dict[str, Rule] = {gate.name: _not_implemented for gate in GATES}
 _RULES["correctness"] = _correctness
+_RULES["mutation"] = _mutation
+_RULES["mutation_time"] = _mutation_time
 
 
 class Finding(_Value):
@@ -234,6 +651,11 @@ def freeze(suite: Suite, receipts: Iterable[Receipt], policy: Policy) -> Freeze:
             reasons = _gate_reasons(found.get((task_id, gate.name), []), gate, task, pins)
             bucket = blockers if gate.required else diagnostics
             bucket.extend(Finding(task=task_id, gate=gate.name, reason=reason) for reason in reasons)
+        paired = [found.get((task_id, gate), []) for gate in _SAME_REPEATS]
+        if all(len(receipts) == 1 for receipts in paired) and len(
+                {_canonical(receipts[0]) for receipts in paired}) != 1:
+            blockers.append(Finding(task=task_id, gate=_SAME_REPEATS[1], reason=(
+                f"unavailable: its facts differ from its {_SAME_REPEATS[0]} receipt's")))
     clusters = Counter(task.repository_cluster for task in suite.tasks)
     if len(suite.tasks) < policy.min_tasks:
         blockers.append(Finding(task=None, gate=None, reason=(
@@ -252,6 +674,16 @@ def freeze(suite: Suite, receipts: Iterable[Receipt], policy: Policy) -> Freeze:
         tasks=len(suite.tasks),
         repositories=len(clusters),
     )
+
+
+# Gates whose verdicts must rest on the same reference facts: the producer writes one set of
+# raw facts, contract included, to both, so the time verdict is about the very runs whose
+# outcomes qualified the task.
+_SAME_REPEATS = ("mutation", "mutation_time")
+
+
+def _canonical(receipt: Receipt) -> str:
+    return json.dumps(receipt.facts, sort_keys=True, separators=(",", ":"))
 
 
 def _gate_reasons(
