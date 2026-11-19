@@ -65,10 +65,11 @@ def guidance_above(path: Path) -> list[str]:
     for parent in path.parents:
         for name in GUIDANCE_NAMES:
             candidate = parent / name
-            if candidate.is_dir() and not candidate.is_symlink():
-                if next(candidate.iterdir(), None) is not None:
-                    found.append(str(candidate))
-            elif candidate.exists() or candidate.is_symlink():
+            try:
+                mode = candidate.lstat().st_mode
+            except FileNotFoundError:
+                continue  # Any other error, such as a denied lookup, stops the scan.
+            if not stat.S_ISDIR(mode) or next(candidate.iterdir(), None) is not None:
                 found.append(str(candidate))
     return sorted(found)
 

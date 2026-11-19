@@ -1234,6 +1234,20 @@ def test_check_refuses_guidance_above_the_temporary_directory(
     assert not checkable["calls"]
 
 
+def test_check_refuses_a_relative_temporary_directory(
+    checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tempfile, "tempdir", ".")
+
+    result = CliRunner().invoke(
+        cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"])]
+    )
+
+    assert result.exit_code != 0
+    assert "must be an absolute path, not ." in result.stderr
+    assert not checkable["calls"]
+
+
 def test_check_accepts_an_unverified_codex_version_and_warns_once(
     checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
 ) -> None:

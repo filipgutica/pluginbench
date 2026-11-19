@@ -92,31 +92,18 @@ GUIDANCE_CEILING = "PLUGINBENCH_TEST_GUIDANCE_CEILING"
 
 
 def bound_guidance(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Check a workspace's ancestors for guidance only up to GUIDANCE_CEILING, so guidance a
-    host keeps in /tmp or above cannot fail tests. Below it, the check is the real one."""
+    """Report guidance above a path only up to GUIDANCE_CEILING, so guidance a host keeps in
+    /tmp or above cannot fail tests. Below it, the scan is the real one."""
     if not (ceiling := os.environ.get(GUIDANCE_CEILING)):
         return
-    real, base = codex.reject_guidance, Path(ceiling)
+    real, base = codex.guidance_above, Path(ceiling)
 
-    def bounded(
-        workspace: Path, *, include_ancestors: bool = True, reject_git: bool = False
-    ) -> None:
-        root = workspace.resolve()
-        if not root.is_relative_to(base):
-            real(workspace, include_ancestors=include_ancestors, reject_git=reject_git)
-            return
-        real(workspace, include_ancestors=False, reject_git=reject_git)
-        found = sorted(
-            str(parent / name)
-            for parent in root.parents
-            if include_ancestors and parent.is_relative_to(base)
-            for name in codex.GUIDANCE_NAMES
-            if (parent / name).exists()
-        )
-        if found:
-            raise ValueError("custom guidance or unsupported fixture paths: " + ", ".join(found))
+    def bounded(path: Path) -> list[str]:
+        if not path.resolve().is_relative_to(base):
+            return real(path)
+        return [found for found in real(path) if Path(found).parent.is_relative_to(base)]
 
-    monkeypatch.setattr(codex, "reject_guidance", bounded)
+    monkeypatch.setattr(codex, "guidance_above", bounded)
 
 
 def install(

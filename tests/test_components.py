@@ -28,7 +28,7 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # process group stopped, so only those enter a run; no launch changes.
             # The parent-folder guidance scan skips empty folders, which hold no instructions;
             # it admits only attempts it refused before, so launches are unchanged.
-            "codex.py": "8965a7364b665f6aace0767bfec81bbd6746ff7ddec73902d430f145eb25c6f7",
+            "codex.py": "20d7e376138266a0ff17f1f9a58e59fb26e3250dd37e1c3c898427afdf0b9ff0",
             # The Claude launch contract; tests/test_codex_identity.py proves Codex launches equal.
             # Measurement and regrade skip launch-only runtime fields; coding checks are unchanged.
             # Audited command hooks keep native usage; with no audited_hooks every launch is
