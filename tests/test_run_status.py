@@ -254,6 +254,39 @@ def test_a_lower_bound_receipt_marks_the_arm_and_an_unknown_outcome_keeps_its_re
     assert "2.1k+" in run_status.format_status(status)
 
 
+def test_status_names_a_crashed_owner_of_this_run_that_blocks_the_next_command(
+    tmp_path: Path, isolated_host_state: Path
+) -> None:
+    root = _run(tmp_path / "run", states=STATES, ledger=True)
+    # A run killed before it released the host lock: schema 1 records always count as unreleased.
+    crashed = {"schema": 1, "pid": 7, "acquired_at": "earlier", "kind": "run",
+               "eval": str(root.resolve()), "root": str(root.resolve() / "evidence")}
+    (isolated_host_state / run_lock.EXECUTION_OWNER).write_text(json.dumps(crashed))
+
+    status = run_status.run_status(root)
+
+    host = status["host"]
+    assert host["error"] is None and host["execution"] is None and host["launches"] == []
+    assert host["blocked"] == [
+        {"name": "7-earlier", "kind": "run", "root": crashed["root"], "this_run": True}
+    ]
+    shown = run_status.format_status(status)
+    assert "Host: no coordinator; idle" in shown
+    assert "Blocked: crashed run for this run (7-earlier) must be verified first" in shown
+
+
+def test_status_names_the_execution_owner_running_this_run(
+    tmp_path: Path, host_execution: run_lock.ExecutionLock
+) -> None:
+    root = _run(tmp_path, states=STATES, ledger=True)
+
+    status = run_status.run_status(root)
+
+    assert status["host"]["blocked"] == []
+    assert status["host"]["execution"]["this_run"] is True
+    assert "; executing this run (run, process" in run_status.format_status(status)
+
+
 def test_a_failed_run_shows_its_error(tmp_path: Path) -> None:
     root = _run(tmp_path / "run", states=STATES, ledger=True)
     (root / "events.jsonl").write_text(
@@ -432,13 +465,14 @@ def test_a_killed_run_names_the_containers_it_left_running_until_a_resume_owns_i
     with run_lock.hold(root):
         assert run_status.run_status(root)["left_running"] is None
     assert not queries
-    # Observers that poll many runs skip Docker; the rest of the status is unchanged.
+    # Observers that poll many runs skip Docker and host state; the rest is unchanged.
     quiet = run_status.run_status(root, containers=False)
-    assert quiet["left_running"] is None
+    assert quiet["left_running"] is None and quiet["host"] is None
     assert not queries
     assert {**quiet, "left_running": None, "heartbeat": None} == {
         **status,
         "left_running": None,
+        "host": None,
         "heartbeat": None,
     }
 

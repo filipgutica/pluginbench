@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from pluginbench import grade, run_lock, trial_containers
+from pluginbench import control_store, coordinator, grade, run_lock, trial_containers
 from pluginbench.arms import normalize_arm_name
 from pluginbench.ledger import LEDGER_NAME, Ledger
 
@@ -381,6 +381,58 @@ def _phase(
     return "not_started" if run is None else "stopped"
 
 
+def _concerns(record: dict[str, Any], target: str) -> bool:
+    """Whether an execution owner record names this run: as its target, or by its evidence."""
+    return any(
+        isinstance(value, str) and Path(value).is_relative_to(target)
+        for value in (record.get("eval"), record.get("root"))
+    )
+
+
+def _host(root: Path) -> dict[str, Any]:
+    """What `app status` shows of the host, with what concerns this run: the coordinator, the
+    execution lock's owner, a reconciling reason, crashed owners the next command must verify,
+    and this run's background launches."""
+    try:
+        current = coordinator.status()
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        return {"error": str(exc)}
+    target = str(root.resolve())
+    execution = current["execution"]
+    owner = execution["owner"] or {}
+    return {
+        "error": None,
+        "coordinator": current["coordinator"],
+        "execution": {
+            "verified": execution["verified"],
+            "kind": owner.get("kind"),
+            "root": owner.get("root"),
+            "pid": owner.get("pid"),
+            "this_run": _concerns(owner, target),
+        }
+        if execution["held"]
+        else None,
+        "reconciling": current["reconciling"],
+        # A free lock whose last owner did not release it: every command waits on its checks.
+        "blocked": []
+        if execution["held"]
+        else [
+            {
+                "name": control_store.obligation_name(item),
+                "kind": item.get("kind"),
+                "root": item.get("root"),
+                "this_run": _concerns(item, target),
+            }
+            for item in run_lock.unreleased(execution["owner"])
+        ],
+        "launches": [
+            {key: launch[key] for key in ("launch_id", "kind", "status", "desired")}
+            for launch in current["launches"]
+            if launch["kind"] != "coordinator" and launch["target"] == target
+        ],
+    }
+
+
 def _left_running(evidence: Path) -> dict[str, Any]:
     """Containers of this run's trials still running with no live owner, or why none was read."""
     try:
@@ -404,8 +456,8 @@ def run_status(
 ) -> dict[str, Any]:
     """Everything `status` shows, as the documented JSON object; reads only.
 
-    With `containers=False` it runs no Docker command and `left_running` is null, for
-    observers that poll many runs.
+    With `containers=False` it runs no Docker command and reads no host state: `left_running`
+    and `host` are null, for observers that poll many runs.
     """
     root = root.expanduser().absolute()
     selection = _read(root / "evaluation.json")
@@ -593,6 +645,7 @@ def run_status(
         "log": str(log) if log.is_file() else None,
         # Only the run.lock holder stops them, so they are named while no process owns the run.
         "left_running": None if active or not containers else _left_running(evidence),
+        "host": _host(root) if containers else None,
         "attempts": attempts,
     }
 
@@ -626,6 +679,40 @@ def _result(row: dict[str, Any], active: bool) -> str:
     return str(row["outcome"] or _shown_state(row["state"], active))
 
 
+def _host_lines(host: dict[str, Any] | None) -> list[str]:
+    """The host's coordinator and execution owner in one line, then only what needs action."""
+    if host is None:
+        return []
+    if host["error"]:
+        return [f"Host: could not read its state: {host['error']}"]
+    found = host["coordinator"]
+    line = f"Host: coordinator process {found['pid']}" if found else "Host: no coordinator"
+    execution = host["execution"]
+    if execution is None:
+        line += "; idle"
+    elif not execution["verified"]:
+        line += "; executing for a process PluginBench cannot verify"
+    elif execution["this_run"]:
+        line += f"; executing this run ({execution['kind']}, process {execution['pid']})"
+    else:
+        line += f"; executing {execution['kind']} for {execution['root']}"
+    lines = [line]
+    if host["reconciling"]:
+        lines.append(f"Reconciling: {host['reconciling']}")
+    for item in host["blocked"]:
+        where = "this run" if item["this_run"] else item["root"]
+        lines.append(
+            f"Blocked: crashed {item['kind']} for {where} ({item['name']}) must be verified "
+            "first; run `pluginbench app cleanup`"
+        )
+    lines.extend(
+        f"Launch {launch['launch_id']}: {launch['kind']}, {launch['status']}, desired "
+        f"{launch['desired']}"
+        for launch in host["launches"]
+    )
+    return lines
+
+
 def format_status(status: dict[str, Any]) -> str:
     """The terminal view of run_status()."""
     lines = [f"Run: {status['run']}" + (f"  ({status['name']})" if status["name"] else "")]
@@ -643,6 +730,7 @@ def format_status(status: dict[str, Any]) -> str:
         lines.append(f"{alert['severity'].capitalize()}: {message}")
     if status["resume_command"]:
         lines.append(f"Resume: {status['resume_command']}")
+    lines.extend(_host_lines(status["host"]))
     left = status["left_running"]
     if left and not left["checked"]:
         lines.append(f"Containers: could not check for ones left running: {left['error']}")

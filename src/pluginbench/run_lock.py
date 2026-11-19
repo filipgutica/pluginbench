@@ -443,6 +443,12 @@ def _obligations(value: object) -> tuple[list[dict[str, Any]], list[str]]:
     return kept, problems
 
 
+def unreleased(record: object) -> list[dict[str, Any]]:
+    """The owners a free lock's last record says may have left work, which the next command
+    must verify before it runs: none for a host that never recorded an owner."""
+    return [] if record is None else _obligations(record)[0]
+
+
 def _obligation_problem(value: object) -> str | None:
     """Why `value` cannot be checked as an owner that may have left work running. Its pid and
     acquired_at are its identity, which a confirmation names; only the fence for an unreadable
