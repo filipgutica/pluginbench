@@ -505,13 +505,32 @@ def test_mutation_time_projects_the_full_sample_and_fits_it_with_headroom(
 
 
 def test_the_projection_scales_waves_of_lanes() -> None:
-    project = suite_qualification.projected_ms
-    assert project(setup_ms=2000, settled_ms=5000, sites=20, sample_size=20, lanes=4) == 5000
-    assert project(setup_ms=2000, settled_ms=5000, sites=2, sample_size=20, lanes=4) == 17000
+    def project(setup: int, settled: int, sites: int, ended: int | None = None) -> int:
+        return suite_qualification.projected_ms(
+            setup_ms=setup, settled_ms=settled, ended_ms=settled if ended is None else ended,
+            sites=sites, sample_size=20, lanes=4,
+        )
+
+    assert project(2000, 5000, 20) == 5000
+    assert project(2000, 5000, 2) == 17000
     # Ten sites are three waves of four; twenty are five.
-    assert project(setup_ms=2000, settled_ms=5000, sites=10, sample_size=20, lanes=4) == 7000
+    assert project(2000, 5000, 10) == 7000
     # Rounded up to the next whole millisecond.
-    assert project(setup_ms=0, settled_ms=1001, sites=12, sample_size=20, lanes=4) == 1669
+    assert project(0, 1001, 12) == 1669
+    # The time after the last settlement is fixed overhead, never scaled.
+    assert project(2000, 5000, 2, ended=5250) == 17250
+
+
+@pytest.mark.parametrize(("ended", "status"), [(6000, "pass"), (6001, "fail")])
+def test_the_time_after_the_last_site_settles_counts_toward_the_projection(
+    ended: int, status: str
+) -> None:
+    # The last site settles at 5,000 ms and the required work ends at `ended`: with M = n and
+    # 100% headroom, the projection is `ended` against a 6 s limit.
+    facts = _timed(5000, 5000, 5000, headroom=100)
+    for repeat in facts["repeats"]:
+        repeat["required_settled_ms"] = ended
+    assert _rule("mutation_time", facts, _limited(6)).status == status
 
 
 @pytest.mark.parametrize(

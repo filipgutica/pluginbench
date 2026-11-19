@@ -539,16 +539,18 @@ def _mutation(receipt: Receipt, task: SuiteTask) -> Verdict:
     return Verdict(status="pass")
 
 
-def projected_ms(*, setup_ms: int, settled_ms: int, sites: int, sample_size: int,
-                 lanes: int) -> int:
+def projected_ms(*, setup_ms: int, settled_ms: int, ended_ms: int, sites: int,
+                 sample_size: int, lanes: int) -> int:
     """A repeat's required time scaled to a full sample of M mutants in `lanes` lanes.
 
-    The site phase runs in waves of `lanes`, so it is scaled by `ceil(M / L) / ceil(n / L)`,
-    rounded up; with n = M it is the measured time.
+    The site phase, from the first dispatch to the last settlement, runs in waves of `lanes`,
+    so it is scaled by `ceil(M / L) / ceil(n / L)`, rounded up. The setup before it and the
+    time from the last settlement to the end of the required work are fixed overhead. With
+    n = M it is the measured time.
     """
     waves = -(-sample_size // lanes)
     measured = -(-sites // lanes)
-    return setup_ms + -(-(settled_ms - setup_ms) * waves // measured)
+    return setup_ms + -(-(settled_ms - setup_ms) * waves // measured) + ended_ms - settled_ms
 
 
 def _mutation_time(receipt: Receipt, task: SuiteTask) -> Verdict:
@@ -572,8 +574,8 @@ def _mutation_time(receipt: Receipt, task: SuiteTask) -> Verdict:
             return Verdict(status="unavailable", reason=(
                 f"repeat {repeat.run_id}: its clock readings are out of order"))
         projections.append(projected_ms(
-            setup_ms=setup, settled_ms=settled, sites=len(repeat.sites),
-            sample_size=contract.sample_size, lanes=contract.lanes))
+            setup_ms=setup, settled_ms=settled, ended_ms=repeat.required_settled_ms,
+            sites=len(repeat.sites), sample_size=contract.sample_size, lanes=contract.lanes))
     worst = max(projections)
     limit_ms = 1000 * task.mutation_timeout_seconds
     if worst * contract.headroom_percent > 100 * limit_ms:
