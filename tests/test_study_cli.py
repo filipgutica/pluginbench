@@ -59,6 +59,7 @@ from pluginbench.harbor_backend import assert_runtime as checked_runtime
 from pluginbench.ledger import Ledger
 from pluginbench.remeasure import propose_remeasurement
 from pluginbench.study_review import recover_review_citations
+from test_mutation import Clock
 from native_support import (
     task_entry,
     execution as native_execution,
@@ -2924,6 +2925,18 @@ def _mutation_run(
     return root, calls, reviews
 
 
+@pytest.fixture(autouse=True)
+def _mutation_clock(monkeypatch: pytest.MonkeyPatch) -> Iterator[Clock]:
+    """The clock mutation reads; each launcher run `_suite` fakes takes one second on it."""
+    global _CLOCK
+    _CLOCK = Clock()
+    monkeypatch.setattr(mutation, "time", SimpleNamespace(monotonic_ns=_CLOCK))
+    yield _CLOCK
+
+
+_CLOCK = Clock()
+
+
 def _suite(
     runs: list[tuple[str, int, str]],
     fail: Callable[[str, Path], BaseException | None] = lambda source, destination: None,
@@ -2931,9 +2944,11 @@ def _suite(
     """The coverage profile's suite as the launcher runs it, failing only on a `<=` mutant.
 
     `fail` names an error the launcher raises instead, after writing its receipt as it does.
+    Each run takes one second on the clock mutation reads.
     """
 
     def native(**kwargs: Any) -> dict[str, object]:
+        _CLOCK.advance(1000)
         destination = kwargs["destination"]
         destination.mkdir(parents=True, exist_ok=True)
         source = (kwargs["snapshot"] / "src/answer.py").read_text()
@@ -2945,6 +2960,8 @@ def _suite(
         receipt = {
             "command": kwargs["command"],
             "image_id": kwargs["task_identity"]["image_identity"]["image_id"],
+            # As the launcher records it: the limits its runtime check ran under.
+            "resources": kwargs["task_identity"]["isolation"]["resources"],
             "before_digest": inspect_snapshot(kwargs["snapshot"])["digest"],
             "exit_code": status,
             "timed_out": False,
@@ -3088,8 +3105,6 @@ def test_measure_adds_mutation_alone_and_carries_coverage_forward(
     assert not _observations(root, {"mutation"})
     suites: list[tuple[str, int, str]] = []
     monkeypatch.setattr(harbor_backend, "run_native_command", _suite(suites))
-    # Runs take no measured time, so each timeout is exactly the one-minute allowance.
-    monkeypatch.setattr(mutation, "time", SimpleNamespace(monotonic=lambda: 0.0))
 
     result = _measure_mutation(root)
 
@@ -3109,9 +3124,9 @@ def test_measure_adds_mutation_alone_and_carries_coverage_forward(
     assert decisions and {(row["status"], row["value"]) for row in decisions} == {("unknown", None)}
     provenance = [row["provenance"] for row in rates]
     assert [item["covered"] for item in provenance if isinstance(item, dict)] == [1] * len(rates)
-    # Every attempt submitted the same source, so it is measured once: the mutant and its
-    # confirming rerun, each with three times the slower baseline plus a minute.
-    assert [timeout for source, timeout, _ in suites if "flag <= 2" in source] == [60, 60]
+    # Every attempt submitted the same source, so it is measured once: the mutant's first run
+    # capped at 3B, B being one second, and its rerun at what is left of its 6B, in seconds.
+    assert [timeout for source, timeout, _ in suites if "flag <= 2" in source] == [3, 5]
     # Only mutation ran: coverage was neither probed nor collected again, and its evidence is
     # the earlier revision's, so the report reads the same coverage.
     assert all("/mutation/runs/" in destination for _, _, destination in suites)
