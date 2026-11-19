@@ -94,17 +94,17 @@ def descriptors(arguments: dict[str, Any]) -> Any:
 
 def _fake_reference(mode: str) -> None:
     """Run the real `reference` operation with its measurement stubbed, as PB_FAKE_REFERENCE
-    says: return no receipt, fail, or hang past its deadline. No container starts."""
+    says: return no repeat, fail, or hang past its deadline. No container starts."""
     from pluginbench import reference_mutation
 
-    def measure_reference(**arguments: Any) -> tuple[()]:
+    def measure_repeats(**arguments: Any) -> dict[str, object]:
         if mode == "fail":
             raise ValueError("the reference measurement failed")
         if mode == "hang":
             hang({"pid_file": str(arguments["destination"] / "escaped")})
-        return ()
+        return {}
 
-    setattr(reference_mutation, "measure_reference", measure_reference)
+    setattr(reference_mutation, "measure_repeats", measure_repeats)
 
 
 if mode := os.environ.get("PB_FAKE_REFERENCE"):

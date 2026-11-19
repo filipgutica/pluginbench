@@ -7,6 +7,9 @@ checked against its candidates here, because sampling lives outside the qualific
 import boundary. The raw facts and clock readings of all three repeats then go into one
 receipt per gate, pinning exactly the task's content, its observer profile and the common
 observer contract. `suite_qualification` re-derives every verdict from those facts.
+
+`measure_repeats` is the same measurement without receipts: the timing pilot's, which has no
+verified pins and so must never qualify a task.
 """
 
 from __future__ import annotations
@@ -68,14 +71,47 @@ def measure_reference(
 ) -> tuple[Receipt, Receipt]:
     """Measure the reference three times and write its `mutation` and `mutation_time` receipts.
 
+    `pins` must come from the task's verified manifest: a receipt is what `freeze` qualifies
+    the task on. The other arguments are `measure_repeats`'.
+    """
+    if sorted(pins) != sorted(PINS):
+        raise ValueError(f"reference mutation receipts pin exactly {', '.join(PINS)}")
+    facts = measure_repeats(
+        before=before, after=after, config=config, contract=contract, destination=destination,
+        baseline_ms=baseline_ms, attempt_ms=attempt_ms, execute=execute, clock=clock,
+    )
+    receipts = tuple(
+        Receipt(
+            task=pins["content_sha256"], gate=gate, pins=dict(pins), producer=PRODUCER,
+            facts=facts,
+        )
+        for gate in GATES
+    )
+    for receipt in receipts:
+        (destination / f"{receipt.gate}.receipt.json").write_text(receipt.model_dump_json())
+    return receipts[0], receipts[1]
+
+
+def measure_repeats(
+    *,
+    before: Path,
+    after: Path,
+    config: dict[str, object],
+    contract: Contract,
+    destination: Path,
+    baseline_ms: int | None = None,
+    attempt_ms: int | None = None,
+    execute: mutation.Executor | None = None,
+    clock: mutation.Clock | None = None,
+) -> dict[str, object]:
+    """The raw facts of three reference repeats, each repeat's evidence under `destination`.
+
     `before` is the task's frozen starting tree and `after` that tree with the verified oracle
     change. `baseline_ms` is the calibration ceiling for each baseline run (the profile's
     coverage timeout when None), and `attempt_ms` bounds each repeat. A repeat that hits
     infrastructure, including its own limit, is recorded as censored; an integrity violation
-    raises.
+    raises. No receipt: the facts qualify nothing until `measure_reference` binds them to pins.
     """
-    if sorted(pins) != sorted(PINS):
-        raise ValueError(f"reference mutation receipts pin exactly {', '.join(PINS)}")
     limits = mutation.Limits(
         sample_size=contract.sample_size, lanes=contract.lanes, baseline_ms=baseline_ms,
         attempt_ms=attempt_ms,
@@ -103,17 +139,7 @@ def measure_reference(
             unsupported_files=sorted(str(path) for path in _list(metrics["unsupported_files"])),
         )
         repeats.append(repeat)
-    facts = {"contract": contract.facts(), "repeats": repeats}
-    receipts = tuple(
-        Receipt(
-            task=pins["content_sha256"], gate=gate, pins=dict(pins), producer=PRODUCER,
-            facts=facts,
-        )
-        for gate in GATES
-    )
-    for receipt in receipts:
-        (destination / f"{receipt.gate}.receipt.json").write_text(receipt.model_dump_json())
-    return receipts[0], receipts[1]
+    return {"contract": contract.facts(), "repeats": repeats}
 
 
 def _check_sample(report: dict[str, object], contract: Contract) -> None:

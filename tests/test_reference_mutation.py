@@ -11,6 +11,7 @@ from typing import Any
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 from test_mutation import (
     AFTER, BASE_IMAGE, BEFORE, FIRST, IMAGE, Fake, View, _config, _lines, _passing, _tree,
 )
@@ -18,6 +19,7 @@ from typer.testing import CliRunner
 
 from pluginbench import (
     cli,
+    control_store,
     harbor_backend,
     invocation_runtime,
     mutation,
@@ -286,10 +288,13 @@ _RUNTIME: dict[str, object] = {
 
 
 def _command(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *options: str, after: str = AFTER
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *options: str, after: str = AFTER,
+    ended: BaseException | None = None,
 ) -> tuple[Any, list[OperationRequest], dict[str, Any]]:
     """Run `reference-mutation` on a prepared profile, each container a fake run on a fake
-    clock. Returns the result, the operations it ran and what the executor saw."""
+    clock. Returns the result, the operations it ran and what the executor saw. `ended` is
+    raised once the handler has returned, as the owner raises an unverified cleanup or a
+    deadline that fires as the handler finishes."""
     before = _tree(tmp_path / "before", {"src/grade.py": BEFORE})
     after_tree = _tree(tmp_path / "after", {"src/grade.py": after})
     fake = Fake(_passing(lambda view: int(FIRST in view.source)), before, after_tree)
@@ -302,7 +307,10 @@ def _command(
 
     def recording(request: OperationRequest, **kwargs: Any) -> Any:
         requests.append(request)
-        return in_place(request, **kwargs)
+        value = in_place(request, **kwargs)
+        if ended is not None:
+            raise ended
+        return value
 
     def executor(identity: dict[str, object], *args: Any, **kwargs: Any) -> Fake:
         lock = run_lock.held_execution()
@@ -325,15 +333,12 @@ def _command(
     monkeypatch.setattr(mutation, "time", SimpleNamespace(monotonic_ns=fake.clock))
     result = CliRunner().invoke(cli.app, [
         "reference-mutation", str(profile), "--before", str(before), "--after", str(after_tree),
-        "--content-sha256", PINS["content_sha256"],
-        "--observer-profile-sha256", PINS["observer_profile_sha256"],
-        "--observer-contract-sha256", PINS["observer_contract_sha256"],
         "--headroom-percent", "150", "--output", str(tmp_path / "reference"), *options,
     ])
     return result, requests, seen
 
 
-def test_the_command_measures_the_reference_in_one_operation_whose_receipts_freeze_reads(
+def test_the_command_times_the_reference_in_one_operation_and_freeze_can_never_read_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     result, requests, seen = _command(tmp_path, monkeypatch, "--attempt-seconds", "600")
@@ -344,6 +349,7 @@ def test_the_command_measures_the_reference_in_one_operation_whose_receipts_free
     assert request.timeout == operations.reference_budget(600_000) > 3 * 600
     assert request.arguments["attempt_ms"] == 600_000
     assert request.arguments["contract"] == {"headroom_percent": 150, "sample_size": 20, "lanes": 4}
+    assert "pins" not in request.arguments
     # Containers start on the daemon the profile froze, labelled with this invocation, while
     # the command holds the host.
     assert request.spec.docker == _RUNTIME
@@ -353,14 +359,20 @@ def test_the_command_measures_the_reference_in_one_operation_whose_receipts_free
     )
     assert seen["lock"] == "preflight"
     assert seen["identity"]["image_identity"] == BASE_IMAGE
-    # Freeze reads the receipts as written: their pins match the task, so both rules run.
-    saved = [
-        Receipt.model_validate_json((tmp_path / "reference" / f"{gate}.receipt.json").read_text())
-        for gate in reference_mutation.GATES
+    output = tmp_path / "reference"
+    published = json.loads((output / cli.PILOT_FILE).read_text())
+    assert published["kind"] == "reference-mutation-pilot"
+    assert len(published["facts"]["repeats"]) == 3
+    assert sorted(p.name for p in (output / "repeats").iterdir()) == [
+        "repeat-0", "repeat-1", "repeat-2",
     ]
-    task = TASK.model_copy(update={"mutation_timeout_seconds": 600})
+    # Pilot only: nothing it wrote is a receipt, so freeze has none of it to qualify on.
+    assert not (output / "staging").exists() and not list(output.rglob("*.receipt.json"))
+    for path in output.rglob("*.json"):
+        with pytest.raises(ValidationError):
+            Receipt.model_validate_json(path.read_text())
     suite = Suite(
-        tasks=(task,), attempts=3, seed=1,
+        tasks=(TASK,), attempts=3, seed=1,
         observer_contract_sha256=PINS["observer_contract_sha256"],
         reviewers=(ReviewerRule(
             coding_harness="claude", reviewer_harness="codex", reviewer_model_id="model",
@@ -368,14 +380,41 @@ def test_the_command_measures_the_reference_in_one_operation_whose_receipts_free
         ),),
     )
     frozen = suite_qualification.freeze(
-        suite, saved, Policy(min_tasks=1, min_repositories=1, max_tasks_per_repository=1)
+        suite, [], Policy(min_tasks=1, min_repositories=1, max_tasks_per_repository=1)
     )
-    assert not [f for f in frozen.blockers if f.gate in reference_mutation.GATES]
-    assert [f.gate for f in frozen.blockers if f.gate == "correctness"] == ["correctness"]
+    assert {(f.gate, f.reason) for f in frozen.blockers if f.gate in reference_mutation.GATES} == {
+        ("mutation", "no receipt"), ("mutation_time", "no receipt"),
+    }
     lines = result.output.splitlines()
     assert [line.split(":")[0] for line in lines[:3]] == ["repeat 0", "repeat 1", "repeat 2"]
     assert all(line.endswith("clean") for line in lines[:3])
     assert "M = 20, 4 lanes. No model calls." in result.output
+    assert "Not a qualification receipt." in result.output
+
+
+@pytest.mark.parametrize(
+    "ended",
+    [control_store.CleanupBlocked("cleanup of invocation x was not verified"),
+     invocation_runtime.OperationDeadlineExceeded("operation reference did not return")],
+    ids=["cleanup unverified", "deadline"],
+)
+def test_repeats_that_ended_before_their_cleanup_was_proven_are_never_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ended: BaseException
+) -> None:
+    """The handler finished every repeat, then its operation failed: the staged evidence
+    stays unpublished, and the output says why, durably."""
+    result, _, _ = _command(
+        tmp_path, monkeypatch, "--attempt-seconds", "600", ended=ended
+    )
+    assert result.exit_code == 2 and str(ended) in result.output
+    output = tmp_path / "reference"
+    assert not (output / cli.PILOT_FILE).exists() and not (output / "repeats").exists()
+    assert (output / "staging" / "repeat-2" / "report.json").is_file()
+    outcome = json.loads((output / cli.PILOT_OUTCOME).read_text())
+    assert outcome == {
+        "published": False, "infrastructure": True,
+        "error": f"{type(ended).__name__}: {ended}",
+    }
 
 
 def test_the_pilot_sets_m_lanes_and_the_limit_and_sees_a_censored_repeat(
@@ -400,8 +439,7 @@ def test_the_pilot_sets_m_lanes_and_the_limit_and_sees_a_censored_repeat(
 
 @pytest.mark.parametrize(
     ("option", "value", "message"),
-    [("--attempt-seconds", "0", "--attempt-seconds"), ("--lanes", "0", "--lanes"),
-     ("--content-sha256", "nothex", "content_sha256")],
+    [("--attempt-seconds", "0", "--attempt-seconds"), ("--lanes", "0", "--lanes")],
 )
 def test_an_invalid_input_is_refused_before_the_host_is_taken(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, option: str, value: str, message: str

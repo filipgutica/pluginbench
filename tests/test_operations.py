@@ -25,7 +25,7 @@ from pluginbench import (
 from pluginbench.collectors import Collector
 from pluginbench.measurement_profiles import CoverageSettings, MeasurementSettings
 from pluginbench.reference_mutation import Contract
-from pluginbench.suite_qualification import REFERENCE_REPEATS, Receipt
+from pluginbench.suite_qualification import REFERENCE_REPEATS
 
 
 _RUNNERS = {
@@ -59,11 +59,6 @@ _MODELS: dict[str, type[BaseModel]] = {
     "collect": operations.Collect,
     "reference": operations.Reference,
 }
-_PINS = {
-    "content_sha256": "a" * 64,
-    "observer_profile_sha256": "b" * 64,
-    "observer_contract_sha256": "c" * 64,
-}
 
 
 def _cases(tmp_path: Path) -> dict[str, tuple[Any, str, dict[str, Any]]]:
@@ -91,20 +86,12 @@ def _cases(tmp_path: Path) -> dict[str, tuple[Any, str, dict[str, Any]]]:
              "destination": tmp_path / "coverage", "baseline": None},
         ),
         "reference": (
-            reference_mutation, "measure_reference",
+            reference_mutation, "measure_repeats",
             {"before": tmp_path / "before", "after": tmp_path / "after",
              "config": {"native_task_identity": {}}, "contract": Contract(headroom_percent=150),
-             "pins": _PINS, "destination": tmp_path / "reference", "attempt_ms": 60_000},
+             "destination": tmp_path / "reference", "attempt_ms": 60_000},
         ),
     }
-
-
-def _receipts() -> tuple[Receipt, Receipt]:
-    mutation, time = (
-        Receipt(task="a" * 64, gate=gate, pins=_PINS, producer="test", facts={})
-        for gate in ("mutation", "mutation_time")
-    )
-    return mutation, time
 
 
 def test_the_handler_table_names_the_six_operations_and_each_resolves() -> None:
@@ -125,7 +112,7 @@ def test_each_handler_passes_its_validated_arguments_to_its_implementation(
 
     returned: dict[str, Any] = {
         "collect": (({"report": 1}, "1.0", "tool"), [{"report": 1}, "1.0", "tool"]),
-        "reference": (_receipts(), [r.model_dump(mode="json") for r in _receipts()]),
+        "reference": ({"repeats": []}, {"repeats": []}),
     }
     result, expected = returned.get(operation, ({"done": True}, {"done": True}))
 
@@ -252,7 +239,9 @@ _ROUTED = {
     "run_reference_agents": {("evaluation", "_reference_agents")},
     # `run_evaluation` is a test helper that no production code calls.
     "prepare_evaluation": {("evaluation", "run_evaluation")},
+    # Its receipts need a verified manifest's pins; no production caller has them yet.
     "measure_reference": set(),
+    "measure_repeats": {("reference_mutation", "measure_reference")},
 }
 
 
@@ -306,6 +295,7 @@ def _measurement_call_overhead() -> int:
         if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "_DOCKER_TIMEOUT"
         and isinstance(node.value, ast.Constant)
     ]
+    assert isinstance(default, int)
 
     def cap(call: ast.Call, function: ast.FunctionDef) -> int:
         value = next((k.value for k in call.keywords if k.arg in ("timeout", "limit")), None)

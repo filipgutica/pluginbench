@@ -586,6 +586,11 @@ def check(
         _error(exc)
 
 
+# The timing pilot's published evidence, and what an unpublished one records instead.
+PILOT_FILE = "pilot.json"
+PILOT_OUTCOME = "outcome.json"
+
+
 @app.command("reference-mutation")
 def reference_mutation(
     profile: Path = typer.Argument(
@@ -602,13 +607,6 @@ def reference_mutation(
         ..., "--headroom-percent", min=1,
         help="How far the mutation limit must exceed the projected reference time; 150 = 1.5x.",
     ),
-    content_sha256: str = typer.Option(..., "--content-sha256", help="The task's content pin."),
-    observer_profile_sha256: str = typer.Option(
-        ..., "--observer-profile-sha256", help="The task's observer profile pin."
-    ),
-    observer_contract_sha256: str = typer.Option(
-        ..., "--observer-contract-sha256", help="The common observer contract's pin."
-    ),
     sample_size: int = typer.Option(
         mutation.SAMPLE_SIZE, "--sample-size", min=1, help="M, the mutants each repeat measures."
     ),
@@ -616,11 +614,14 @@ def reference_mutation(
         mutation.LANES, "--lanes", min=1, help="Mutant containers each repeat runs at once."
     ),
     output: Path | None = typer.Option(
-        None, "--output", help="New directory for the three repeats and the two receipts."
+        None, "--output", help="New directory for the pilot's repeats and timings."
     ),
 ) -> None:
-    """Measure a task's reference mutation three times and write its `mutation` and
-    `mutation_time` qualification receipts. No model calls."""
+    """Time a task's reference mutation for the timing pilot: three repeats, no model calls.
+
+    Pilot only. It writes no qualification receipt and takes no pins, so `freeze` can never
+    read what it measures. The receipts come from pins a verified suite manifest supplies.
+    """
     from pluginbench import operations
     from pluginbench.reference_mutation import Contract
 
@@ -632,31 +633,36 @@ def reference_mutation(
         identity = config.get("native_task_identity") if isinstance(config, dict) else None
         if not isinstance(identity, dict):
             raise ValueError(f"{profile} is not a prepared mutation profile")
-        # Everything is checked before the host is taken: a repeat can run for hours.
+        # Everything is checked before the host is taken: a repeat can run for hours. The
+        # repeats run in a staging directory, published only once cleanup is verified.
+        staging = destination / "staging"
         arguments = operations.Reference(
             before=before.resolve(), after=after.resolve(), config=config,
             contract=Contract(
                 headroom_percent=headroom_percent, sample_size=sample_size, lanes=lanes
             ),
-            pins={
-                "content_sha256": content_sha256,
-                "observer_profile_sha256": observer_profile_sha256,
-                "observer_contract_sha256": observer_contract_sha256,
-            },
-            destination=destination, attempt_ms=1000 * attempt_seconds,
+            destination=staging, attempt_ms=1000 * attempt_seconds,
         )
         # The frozen runtime the profile saved: its containers start on that daemon only.
         runtime = mutation.measurement_identity(identity)["isolation"]
         assert isinstance(runtime, dict)  # `measurement_identity` requires one.
         with _execution("preflight", profile, destination):
-            receipts = operations.run(
-                "reference", arguments,
-                timeout=operations.reference_budget(arguments.attempt_ms), docker=runtime,
-            )
-        for line in _reference_summary(receipts[0]["facts"]):
+            destination.mkdir(parents=True)
+            try:
+                # It returns only once the scope is gone and no labelled container is left.
+                facts = operations.run(
+                    "reference", arguments,
+                    timeout=operations.reference_budget(arguments.attempt_ms), docker=runtime,
+                )
+            except BaseException as exc:
+                _write_json(destination / PILOT_OUTCOME, _pilot_outcome(exc))
+                raise
+            staging.rename(destination / "repeats")
+            _write_json(destination / PILOT_FILE, {"kind": "reference-mutation-pilot",
+                                                   "facts": facts})
+        for line in _reference_summary(facts):
             typer.echo(line)
-        typer.echo(f"Receipts: {destination / 'mutation.receipt.json'}, "
-                   f"{destination / 'mutation_time.receipt.json'}")
+        typer.echo(f"Pilot timings: {destination / PILOT_FILE}. Not a qualification receipt.")
     except (
         OSError,
         ValueError,
@@ -665,6 +671,26 @@ def reference_mutation(
         control_store.CleanupBlocked,
     ) as exc:
         _error(exc)
+
+
+def _pilot_outcome(exc: BaseException) -> dict[str, object]:
+    """Why a pilot published nothing. A deadline, an unverified cleanup or a launch failure is
+    infrastructure; the staged repeats stay for inspection and prove nothing."""
+    infrastructure = isinstance(exc, (
+        invocation_runtime.OperationDeadlineExceeded, control_store.CleanupBlocked,
+    )) or (isinstance(exc, invocation_runtime.OperationFailed) and not exc.type)
+    return {
+        "published": False,
+        "infrastructure": infrastructure,
+        "error": f"{type(exc).__name__}: {exc}",
+    }
+
+
+def _write_json(path: Path, value: object) -> None:
+    """Write `value` whole or not at all: readers never see half a file."""
+    partial = path.with_name(f".{path.name}.partial")
+    partial.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    os.replace(partial, path)
 
 
 def _reference_summary(facts: dict[str, Any]) -> list[str]:

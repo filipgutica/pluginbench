@@ -208,12 +208,12 @@ def test_a_reference_measurement_runs_as_its_registered_operation_and_leaves_not
     outcome: str,
 ) -> None:
     """However the measurement ends, its scope and its labelled containers are gone after it.
-    A hung one is killed at its budget: each repeat's attempt limit, here with no grace."""
+    A hung one is killed at its budget: each repeat's attempt limit and rounding second, here
+    with no launcher overhead."""
     from pluginbench import operations
     from pluginbench.reference_mutation import Contract
 
     monkeypatch.setenv("PB_FAKE_REFERENCE", outcome)
-    monkeypatch.setattr(operations, "AROUND_COLLECTOR", 0)
     monkeypatch.setattr(invocation_runtime, "KILL_GRACE", 0.5)
     invocation = uuid4().hex
     destination = tmp_path / "reference"
@@ -222,11 +222,10 @@ def test_a_reference_measurement_runs_as_its_registered_operation_and_leaves_not
     arguments = operations.Reference(
         before=tmp_path / "before", after=tmp_path / "after", config={},
         contract=Contract(headroom_percent=150), destination=destination, attempt_ms=1000,
-        pins={name: "a" * 64 for name in ("content_sha256", "observer_profile_sha256",
-                                           "observer_contract_sha256")},
     )
+    monkeypatch.setattr(operations, "MEASUREMENT_CALL_OVERHEAD", 0)
     budget = operations.reference_budget(arguments.attempt_ms)
-    assert budget == 3
+    assert budget == 6
 
     def measure() -> Any:
         return operations.run(
@@ -234,12 +233,12 @@ def test_a_reference_measurement_runs_as_its_registered_operation_and_leaves_not
         )
 
     if outcome == "return":
-        assert measure() == []
+        assert measure() == {}
     elif outcome == "fail":
         with pytest.raises(ValueError, match="reference measurement failed"):
             measure()
     else:
-        with pytest.raises(OperationDeadlineExceeded, match="within 3 seconds"):
+        with pytest.raises(OperationDeadlineExceeded, match="within 6 seconds"):
             measure()
         assert _gone(_pid(destination / "escaped"), within=1)
     assert f"pb-inv-{invocation}.scope" in (fake_systemd.root / "log").read_text()

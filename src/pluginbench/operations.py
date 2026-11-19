@@ -22,7 +22,7 @@ from uuid import uuid4
 from pydantic import AfterValidator, BaseModel, ConfigDict
 
 from pluginbench import invocation_runtime
-from pluginbench.benchmark import Count, Digest
+from pluginbench.benchmark import Count
 from pluginbench.collectors import Collector
 from pluginbench.evaluation import Evaluation
 from pluginbench.reference_mutation import Contract
@@ -142,16 +142,16 @@ class Requalify(_Arguments):
 
 
 class Reference(_Arguments):
-    """`reference_mutation.measure_reference`: a task's reference measured three times into
-    its `mutation` and `mutation_time` receipts. `config` is the task's prepared mutation
-    profile, whose frozen Docker runtime the operation records. Unlike a submission's collect,
-    each repeat needs a declared limit: the operation's budget derives from it."""
+    """`reference_mutation.measure_repeats`: a task's reference measured three times, for the
+    timing pilot. It takes no pins and writes no receipt, so nothing it produces can qualify a
+    task. `config` is the task's prepared mutation profile, whose frozen Docker runtime the
+    operation records. Unlike a submission's collect, each repeat needs a declared limit: the
+    operation's budget derives from it."""
 
     before: AbsolutePath
     after: AbsolutePath
     config: dict[str, Any]
     contract: Contract
-    pins: dict[str, Digest]
     destination: AbsolutePath
     attempt_ms: Count
 
@@ -305,12 +305,11 @@ def collect(arguments: dict[str, Any]) -> list[object]:
     return list(collectors._run_collector(**dict(Collect.model_validate(arguments))))
 
 
-def reference(arguments: dict[str, Any]) -> list[dict[str, Any]]:
-    """The `mutation` and `mutation_time` receipts, as JSON, once both are written."""
+def reference(arguments: dict[str, Any]) -> dict[str, object]:
+    """The three repeats' raw facts. The caller publishes them once cleanup is verified."""
     from pluginbench import reference_mutation
 
-    receipts = reference_mutation.measure_reference(**dict(Reference.model_validate(arguments)))
-    return [receipt.model_dump(mode="json") for receipt in receipts]
+    return reference_mutation.measure_repeats(**dict(Reference.model_validate(arguments)))
 
 
 def preflight(arguments: dict[str, Any]) -> object:
