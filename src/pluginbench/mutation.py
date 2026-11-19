@@ -2035,7 +2035,7 @@ def _source_only_v2(
         source["baseline"], measured.command, _tree_digest(files),
         lambda _: (baseline_ms, None, attempt_ms),
     )
-    cut = {"status": "incomplete", "reason": "the source-only diagnostic was cut"}
+    cut: dict[str, object] = {"status": "incomplete", "reason": "the source-only diagnostic was cut"}
 
     def kept_limit(calls: list[dict[str, object]], readings: list[object]) -> None:
         if attempt_ms is not None and _last_return(calls, readings) > attempt_ms:
