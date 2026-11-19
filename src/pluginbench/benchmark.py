@@ -17,13 +17,36 @@ import hashlib
 import json
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PositiveInt, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
-# The hash envelope's version. Changing what a kind's digest binds, or how it is encoded,
-# must bump it, so an existing ID is never silently redefined.
-HASH_VERSION = 1
+# Each kind's hash version. Changing what a kind's digest binds, or how it is encoded, bumps
+# that kind only, so an existing ID is never silently redefined and a change to one kind
+# (say, review) keeps every other kind's IDs, and the evidence they key.
+HASH_VERSIONS = {
+    "entrant": 1,
+    "configuration": 1,
+    "coding-task": 1,
+    "review-contract": 1,
+    "observer-contract": 1,
+    "coding-population": 1,
+    "observer-revision": 1,
+    "measurement-revision": 1,
+    "suite": 1,
+    "coding-slot": 1,
+    "measurement": 1,
+    "cell": 1,
+}
 
-Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+def _bare_digest(value: object) -> object:
+    """A `sha256:`-prefixed digest, as task catalogs record them, is the same digest."""
+    return value.removeprefix("sha256:") if isinstance(value, str) else value
+
+
+Digest = Annotated[str, BeforeValidator(_bare_digest), Field(pattern=r"^[0-9a-f]{64}$")]
+# Counts and indices refuse booleans, strings and floats, so a mistyped YAML value can never
+# silently prescribe a different population.
+Count = Annotated[int, Field(strict=True, gt=0)]
 GitObject = Annotated[str, Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")]
 Harness = Literal["codex", "claude"]
 Effort = Literal["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
@@ -33,7 +56,7 @@ Name = Annotated[str, Field(min_length=1)]
 def _identity(kind: str, fields: dict[str, Any]) -> str:
     """The SHA-256 of `fields` under `kind`, in canonical JSON: keys sorted, no whitespace,
     ASCII only. Callers sort set-like lists; order-bearing lists keep their order."""
-    envelope = {"kind": kind, "v": HASH_VERSION, "fields": fields}
+    envelope = {"kind": kind, "v": HASH_VERSIONS[kind], "fields": fields}
     encoded = json.dumps(envelope, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(encoded.encode()).hexdigest()
 
@@ -96,7 +119,11 @@ class Configuration(_Value):
 
     @property
     def revision(self) -> str:
-        return _identity("configuration", self.model_dump())
+        return _identity(
+            "configuration",
+            {"harness": self.harness, "model_id": self.model_id, "effort": self.effort,
+             "cli_version": self.cli_version, "launch_sha256": self.launch_sha256},
+        )
 
 
 class SuiteTask(_Value):
@@ -112,7 +139,7 @@ class SuiteTask(_Value):
     repository_cluster: Name
     coding_contract_sha256: Digest
     observer_profile_sha256: Digest
-    mutation_timeout_seconds: PositiveInt
+    mutation_timeout_seconds: Count
 
     @property
     def coding_id(self) -> str:
@@ -138,9 +165,22 @@ class ReviewerRule(_Value):
     reviewer_cli_version: Name
     protocol_sha256: Digest
 
+    @model_validator(mode="after")
+    def _other_family(self) -> ReviewerRule:
+        if self.reviewer_harness == self.coding_harness:
+            raise ValueError(f"{self.coding_harness} attempts need a reviewer from the other family")
+        return self
+
     @property
     def contract(self) -> str:
-        return _identity("review-contract", self.model_dump())
+        return _identity(
+            "review-contract",
+            {"coding_harness": self.coding_harness, "reviewer_harness": self.reviewer_harness,
+             "reviewer_model_id": self.reviewer_model_id,
+             "reviewer_effort": self.reviewer_effort,
+             "reviewer_cli_version": self.reviewer_cli_version,
+             "protocol_sha256": self.protocol_sha256},
+        )
 
 
 class Suite(_Value):
@@ -152,14 +192,14 @@ class Suite(_Value):
     """
 
     tasks: tuple[SuiteTask, ...] = Field(min_length=1)
-    attempts: PositiveInt
-    seed: int
+    attempts: Count
+    seed: Annotated[int, Field(strict=True)]
     observer_contract_sha256: Digest
     reviewers: tuple[ReviewerRule, ...]
 
     @model_validator(mode="after")
     def _unique(self) -> Suite:
-        if len({task.coding_id for task in self.tasks}) != len(self.tasks):
+        if len({task.content_sha256 for task in self.tasks}) != len(self.tasks):
             raise ValueError("the suite lists one task twice")
         if len({rule.coding_harness for rule in self.reviewers}) != len(self.reviewers):
             raise ValueError("the suite has two reviewer rules for one coding harness")
@@ -189,16 +229,26 @@ class Suite(_Value):
 
     @property
     def observer_revision(self) -> str:
-        rows = sorted([task.coding_id, self.observer_contract(task)] for task in self.tasks)
+        """How every task is measured, independent of how it is coded."""
+        rows = sorted([task.content_sha256, self.observer_contract(task)] for task in self.tasks)
         return _identity("observer-revision", {"tasks": rows})
 
     @property
-    def id(self) -> str:
+    def measurement_revision(self) -> str:
+        """What the leaderboard names: the observer revision and every reviewer rule. Changing
+        it re-measures or re-reviews saved submissions and never recodes them."""
         reviews = sorted([rule.coding_harness, rule.contract] for rule in self.reviewers)
+        return _identity(
+            "measurement-revision",
+            {"observer_revision": self.observer_revision, "reviews": reviews},
+        )
+
+    @property
+    def id(self) -> str:
         return _identity(
             "suite",
             {"coding_population_id": self.coding_population_id,
-             "observer_revision": self.observer_revision, "reviews": reviews},
+             "measurement_revision": self.measurement_revision},
         )
 
 
@@ -208,7 +258,7 @@ class Slot(_Value):
     coding_task_id: Digest
     entrant_id: Digest
     configuration_revision: Digest
-    attempt_index: PositiveInt
+    attempt_index: Count
     observer_contract: Digest
     review_contract: Digest
 

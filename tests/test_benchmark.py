@@ -78,22 +78,34 @@ def _with(model: Any, field: str) -> Any:
 
 
 @pytest.mark.parametrize(
-    ("model", "identity"),
+    ("model", "fields", "identity"),
     [
-        (PACKAGE, lambda value: value.id),
-        (CLAUDE, lambda value: value.revision),
-        (CLAUDE_REVIEWER, lambda value: value.contract),
+        (PACKAGE, ["source_commit", "source_tree"], lambda value: value.id),
+        (CLAUDE, ["harness", "model_id", "effort", "cli_version", "launch_sha256"],
+         lambda value: value.revision),
+        (CLAUDE_REVIEWER, ["reviewer_model_id", "reviewer_effort", "reviewer_cli_version",
+                           "protocol_sha256"], lambda value: value.contract),
     ],
     ids=["package", "configuration", "reviewer"],
 )
-def test_every_field_of_an_entrant_configuration_or_reviewer_is_identity(
-    model: Any, identity: Any
+def test_each_execution_input_of_an_entrant_configuration_or_reviewer_is_identity(
+    model: Any, fields: list[str], identity: Any
 ) -> None:
-    # A field added later without entering the digest fails here.
-    for field in type(model).model_fields:
-        if field == "kind":
-            continue
+    for field in fields:
         assert identity(_with(model, field)) != identity(model), field
+
+
+def test_a_reviewer_rule_binds_both_harnesses_and_never_its_own_family() -> None:
+    swapped = CLAUDE_REVIEWER.model_copy(
+        update={"coding_harness": "codex", "reviewer_harness": "claude"}
+    )
+    assert swapped.contract != CLAUDE_REVIEWER.contract
+
+    with pytest.raises(ValidationError, match="reviewer from the other family"):
+        Suite.model_validate(
+            {**SUITE.model_dump(),
+             "reviewers": [{**CLAUDE_REVIEWER.model_dump(), "reviewer_harness": "claude"}]}
+        )
 
 
 @pytest.mark.parametrize("field", list(SuiteTask.model_fields))
@@ -107,6 +119,9 @@ def test_every_task_field_changes_the_cell_and_only_its_own_contract(field: str)
     measured = field in {"observer_profile_sha256", "mutation_timeout_seconds"}
     # A cluster names the comparison population, not the work: no slot changes.
     assert ({s.id for s in after} != {s.id for s in before}) is coded
+    # How a task is coded never changes how it is measured.
+    if field == "coding_contract_sha256":
+        assert changed.measurement_revision == SUITE.measurement_revision
     if measured:
         assert [s.id for s in after] == [s.id for s in before]
         assert [s.review_measurement_id for s in after] == [s.review_measurement_id for s in before]
@@ -174,6 +189,16 @@ def test_a_new_reviewer_reviews_again_and_never_recodes_or_remeasures() -> None:
     assert all(
         b.review_measurement_id != a.review_measurement_id for b, a in zip(before, after, strict=True)
     )
+    assert cell.id != CELL.id
+    assert cell.suite.measurement_revision != SUITE.measurement_revision
+    assert cell.suite.coding_population_id == SUITE.coding_population_id
+
+
+def test_the_two_measurement_kinds_never_share_an_id() -> None:
+    slot = CELL.slots()[0]
+    same = slot.model_copy(update={"review_contract": slot.observer_contract})
+
+    assert same.observer_measurement_id != same.review_measurement_id
 
 
 def test_a_cell_binds_only_its_own_harness_reviewer() -> None:
@@ -203,11 +228,13 @@ def test_a_release_label_binds_one_entrant() -> None:
 
 
 def test_ids_are_pinned() -> None:
-    # Changing these redefines every stored identity: bump benchmark.HASH_VERSION instead.
+    # Changing these redefines stored identities: bump that kind in benchmark.HASH_VERSIONS.
     assert Vanilla().id == "95d1e55f4a7cd2abcefb516b563b21824302721cdd7a22e3c8423f391b963601"
     assert PACKAGE.id == "cafcce55c350ae2bc4a26a1e7cf9fefc2075c1b45d535473d1ef701ab9adc051"
     assert CLAUDE.revision == "cafa581673918d8ec66796571c0f389adc605afbccf2df1856c8232e6cd53efb"
     assert CELL.slots()[0].id == "79ae6b3baf0d6503a6ae5649224357e612c9f916c4e0115ee2806f6b619d28eb"
+    # Non-ASCII text is escaped, so the bytes hashed never depend on an encoder's default.
+    assert benchmark._identity("entrant", {"name": "caf\u00e9"}) == "329d46bc4aed735336c0c52c8ceb2c7d7485e66bc6b67e7ca91966f73474ed88"
 
 
 def test_a_cell_survives_a_json_round_trip() -> None:
@@ -222,16 +249,29 @@ def test_a_cell_survives_a_json_round_trip() -> None:
     [
         {"tasks": ()},
         {"tasks": (_task("a"), _task("a"))},
+        {"tasks": (_task("a"), _task("a").model_copy(update={"coding_contract_sha256": "f" * 64}))},
         {"attempts": 0},
+        {"attempts": True},
+        {"attempts": "3"},
+        {"attempts": 3.0},
+        {"seed": "7"},
         {"reviewers": (CLAUDE_REVIEWER, CLAUDE_REVIEWER)},
-        {"observer_contract_sha256": "sha256:" + _digest("observers")},
         {"unknown": 1},
     ],
-    ids=["no-tasks", "duplicate-task", "no-attempts", "duplicate-reviewer", "prefixed", "extra"],
+    ids=["no-tasks", "duplicate-task", "same-content", "no-attempts", "bool-attempts",
+         "string-attempts", "float-attempts", "string-seed", "duplicate-reviewer", "extra"],
 )
 def test_an_invalid_suite_is_refused(change: dict[str, Any]) -> None:
     with pytest.raises(ValidationError):
         Suite.model_validate({**SUITE.model_dump(), **change})
+
+
+def test_a_prefixed_digest_is_the_same_digest() -> None:
+    prefixed = Suite.model_validate(
+        {**SUITE.model_dump(), "observer_contract_sha256": "sha256:" + _digest("observers")}
+    )
+
+    assert prefixed.id == SUITE.id
 
 
 def test_a_cell_needs_a_reviewer_for_its_harness_and_a_full_commit() -> None:
