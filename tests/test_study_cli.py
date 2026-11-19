@@ -7,6 +7,7 @@ import inspect
 import csv
 import dataclasses
 import io
+import tempfile
 import json
 import hashlib
 import os
@@ -822,7 +823,7 @@ def test_integrated_evaluation_and_report_regeneration(
         criteria.write_bytes(original_criteria)
         existing_review = root / "evidence/review-revisions/review"
         existing_review.mkdir(parents=True)
-        with pytest.raises(ValueError, match="model calls cannot be replayed"):
+        with pytest.raises(ValueError, match="has no saved state, so it cannot resume"):
             evaluation.plan_resume(root)
         existing_review.rmdir()
         rejected = CliRunner().invoke(cli.app, ["run", str(root), "--output", "other"])
@@ -2386,7 +2387,19 @@ def test_review_adds_a_selected_revision_with_the_frozen_reviewer(
     assert status["last_event"]["event"] == "finished"
 
     again = CliRunner().invoke(cli.app, ["review", str(root), "--revision", "r2", "--yes"])
-    assert again.exit_code == 2 and "choose a new --revision name" in again.stderr
+    assert again.exit_code == 2 and "no review left to call" in again.stderr
+    assert len(reviews) == reviewed + 9
+    # A revision whose pass a crash cut off after its last call still resumes, with no call.
+    path = root / "evidence/review-revisions/r2/review-state.json"
+    finished = path.read_text()
+    path.write_text(json.dumps({**json.loads(finished), "status": "running"}))
+    assert evaluation.plan_review(root, "r2")["review_calls"] == 0
+    with monkeypatch.context() as patched:
+        # Finishing with no call needs no working reviewer.
+        patched.setattr(isolation, "codex_code_mode_host", missing_host)
+        finish = CliRunner().invoke(cli.app, ["review", str(root), "--revision", "r2", "--yes"])
+    assert finish.exit_code == 0, finish.stderr + finish.stdout
+    assert json.loads(path.read_text())["status"] == "complete"
     assert len(reviews) == reviewed + 9
     saved = evaluation._load_selection(root)
     measurements = saved["measurements"]
@@ -2479,6 +2492,96 @@ def test_a_grade_pass_that_migrates_a_version_1_ledger_saves_the_evaluation_ceil
     finally:
         connection.close()
     assert ceiling == 3 * (9 + 9)
+
+
+def test_run_resumes_a_first_review_a_stop_cut_off(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _measured_and_reviewed(config, tmp_path, monkeypatch)
+    calls: list[str] = []
+    reviews: list[str] = []
+    backend = _coding_and_review_backend(
+        calls, reviews, timeout=config.timeout_seconds, interrupt_at=None
+    )
+    judged: list[str] = []
+
+    def stopped(**kwargs: Any) -> dict[str, Any]:
+        if kwargs.get("output_schema") is not None:
+            judged.append(str(kwargs["area"]))
+            if len(judged) == 2:
+                raise KeyboardInterrupt("operator stop")
+        return backend(**kwargs)
+
+    monkeypatch.setattr(codex, "invoke", stopped)
+    monkeypatch.setattr(harbor_backend, "invoke_native", backend)
+    root = tmp_path / "run"
+    with pytest.raises(KeyboardInterrupt, match="operator stop"):
+        evaluation.run_evaluation(config, root)
+    coded, finished = len(calls), len(reviews)
+    assert finished == 1
+    monkeypatch.setattr(codex, "invoke", backend)
+
+    result = CliRunner().invoke(cli.app, ["run", str(root), "--yes", "--foreground"])
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    # Coding is not repeated, and the finished review is kept: only the rest are called.
+    assert len(calls) == coded
+    state = json.loads((root / "evidence/review-revisions/review/review-state.json").read_text())
+    assert state["status"] == "complete" and len(reviews) == state["assigned"]
+    assert evaluation._load_selection(root)["review_revision"] == "review"
+
+
+def test_review_resumes_a_cut_off_revision_with_the_reviewer_that_started_it(
+    config: evaluation.Evaluation, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, reviews = _reviewed_run(config, tmp_path, monkeypatch)
+    monkeypatch.setenv(claude.TOKEN_ENV, "token")
+    monkeypatch.setattr(claude, "preflight", lambda: {"harness_version": "2.1.0 (Claude Code)"})
+    reviewed, started = codex.invoke, []
+
+    def stopped(**kwargs: Any) -> dict[str, Any]:
+        started.append(kwargs)
+        if len(started) == 4:
+            raise KeyboardInterrupt("operator stop")
+        return reviewed(**kwargs)
+
+    monkeypatch.setattr(codex, "invoke", stopped)
+    claude_reviewer = evaluation.Runner.model_validate(
+        {"harness": "claude", "model": "claude-opus-5-5", "reasoning": "high"}
+    )
+    with pytest.raises(KeyboardInterrupt, match="operator stop"):
+        evaluation.review_evaluation(root, "second", reviewer=claude_reviewer)
+    overrides = evaluation._load_selection(root)["reviewer_overrides"]
+    assert isinstance(overrides, dict) and overrides["second"]["model"] == "claude-opus-5-5"
+    monkeypatch.setattr(codex, "invoke", reviewed)
+    # Temporary files inside the run, where judge output would land, are refused.
+    with monkeypatch.context() as patched:
+        (root / "tmp").mkdir()
+        patched.setattr(tempfile, "tempdir", str(root / "tmp"))
+        inside = CliRunner().invoke(cli.app, ["review", str(root), "--revision", "second", "--yes"])
+    assert inside.exit_code == 2 and "temporary directory is inside the run" in inside.stderr
+    # Another reviewer is refused before any preflight or write.
+    other = CliRunner().invoke(
+        cli.app,
+        ["review", str(root), "--revision", "second", "--yes", "--reviewer-harness", "codex"]
+        + ["--reviewer-model", "gpt-6-luna", "--reviewer-effort", "high"],
+    )
+    assert other.exit_code == 2 and "was started by claude claude-opus-5-5 high" in other.stderr
+    assert evaluation._load_selection(root)["reviewer_overrides"] == overrides
+
+    # No reviewer options: the revision resumes with the Claude reviewer it was started with.
+    result = CliRunner().invoke(cli.app, ["review", str(root), "--revision", "second", "--yes"])
+
+    assert result.exit_code == 0, result.stderr + result.stdout
+    assert "review calls as review revision second." in result.stdout
+    assert len(reviews) == 18  # Every submission reviewed once in each revision.
+    second = root / "evidence/review-revisions/second"
+    assert json.loads((second / "review-state.json").read_text())["status"] == "complete"
+    protocol = json.loads((second / "protocol.json").read_text())
+    assert (protocol["harness"], protocol["model"]) == ("claude", "claude-opus-5-5")
+    assert evaluation._load_selection(root)["reviewer_overrides"] == overrides
+    again = CliRunner().invoke(cli.app, ["review", str(root), "--revision", "second", "--yes"])
+    assert again.exit_code == 2 and "no review left to call" in again.stderr
 
 
 def test_review_with_another_reviewer_records_and_reports_that_reviewer(

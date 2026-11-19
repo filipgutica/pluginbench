@@ -177,8 +177,10 @@ def _codex_retries(events: list[dict[str, Any]]) -> list[str]:
     messages: list[str] = []
     for event in events:
         item = event.get("item")
+        kind = event.get("type")
         if (
-            event.get("type") in {"item.started", "item.updated", "item.completed"}
+            isinstance(kind, str)
+            and kind in {"item.started", "item.updated", "item.completed"}
             and isinstance(item, dict)
             and item.get("type") != "error"
         ):

@@ -91,6 +91,7 @@ from pluginbench.study_review import (
     _fixed_criteria,
     _review_directory,
     recover_review_citations,
+    resume_calls,
     review_study,
     validate_review_revision,
 )
@@ -1195,6 +1196,7 @@ def _finish_evaluation(
         _adopt_measurement_revision(root, selection, revision)
         _save_selection(root, selection)
     if config.reviewer and selection["review_revision"] is None:
+        _refuse_temporary_inside(root)
         if progress:
             progress("Reviewing all submissions independently with fixed criteria")
         review_study(
@@ -1418,10 +1420,13 @@ def _resume_inputs(
         if selection["review_revision"] is not None:
             validate_review_revision(evidence, str(selection["review_revision"]))
         else:
-            if (evidence / "review-revisions/review").exists():
-                raise ValueError("review evidence already exists; model calls cannot be replayed")
             guidance = _frozen_review_guidance(root, selection, config.reviewer)
-            calls = sum(record.stages[-1].snapshot is not None for record in manifest.records)
+            # A first review that a crash or Stop cut off resumes; it is not started again.
+            calls = (
+                resume_calls(evidence, "review")
+                if (evidence / "review-revisions/review").exists()
+                else sum(record.stages[-1].snapshot is not None for record in manifest.records)
+            )
     return selection, profiles, guidance, calls
 
 
@@ -1535,15 +1540,24 @@ def plan_review(root: Path, revision: str) -> dict[str, object]:
         raise ValueError(
             f"this run has not finished its first review; finish it with `pluginbench run {root}`"
         )
-    if _review_directory(root / "evidence", revision).exists():
-        raise ValueError(f"review revision {revision} already exists; choose a new --revision name")
     _frozen_review_guidance(root, selection, config.reviewer)
-    _, manifest, _ = _native_state(root / "evidence")
-    return {
-        "name": selection["name"],
-        "revision": revision,
-        "review_calls": sum(record.stages[-1].snapshot is not None for record in manifest.records),
-    }
+    if _review_directory(root / "evidence", revision).exists():
+        # A revision a crash or Stop cut off resumes with the reviewer it was started with.
+        calls = resume_calls(root / "evidence", revision)
+        state = json.loads(
+            (_review_directory(root / "evidence", revision) / "review-state.json").read_text()
+        )
+        selected = selection["review_revision"] in {revision, f"{revision}-citations"}
+        # A revision still unfinished, or not yet selected, finishes with no review call.
+        if calls == 0 and selected and state["status"] in {"complete", "incomplete"}:
+            raise ValueError(
+                f"review revision {revision} has no review left to call; choose a new "
+                "--revision name"
+            )
+    else:
+        _, manifest, _ = _native_state(root / "evidence")
+        calls = sum(record.stages[-1].snapshot is not None for record in manifest.records)
+    return {"name": selection["name"], "revision": revision, "review_calls": calls}
 
 
 def review_evaluation(
@@ -1568,10 +1582,38 @@ def review_evaluation(
     if config.reviewer is None:
         raise ValueError("this run has no reviewer, so it has no review to repeat")
     guidance = _frozen_review_guidance(root, selection, config.reviewer)
+    recorded = _object(selection.get("reviewer_overrides", {})).get(revision)
+    directory = _review_directory(root / "evidence", revision)
+    resuming = directory.exists()
+    if resuming:
+        # A revision resumes with the reviewer frozen in its protocol, checked before any
+        # preflight or write.
+        state = json.loads((directory / "review-state.json").read_text())
+        protocol = study._bound_document(root / "evidence", state["protocol"])
+        frozen = (protocol.get("harness", "codex"), protocol["model"], protocol["effort"])
+        if reviewer is not None and (reviewer.harness, reviewer.model, reviewer.reasoning) != frozen:
+            raise ValueError(
+                f"review revision {revision} was started by {' '.join(frozen)}; resume it with "
+                "that reviewer, or without the --reviewer options"
+            )
+        configured = (config.reviewer.harness, config.reviewer.model, config.reviewer.reasoning)
+        reviewer = (
+            None
+            if frozen == configured
+            else Runner.model_validate(
+                {"harness": frozen[0], "model": frozen[1], "reasoning": frozen[2]}
+            )
+        )
     identity = reviewer or config.reviewer
-    _review_preflight({"reviewer": identity.model_dump(mode="json")})
+    _refuse_temporary_inside(root)
+    # A resume with no call left only finishes the revision, so it needs no working reviewer.
+    if not resuming or resume_calls(root / "evidence", revision) > 0:
+        _review_preflight({"reviewer": identity.model_dump(mode="json")})
     override = None
-    if reviewer is not None:
+    if resuming:
+        # Attribution stays as recorded when the revision was created.
+        override = _object(recorded) if recorded else None
+    elif reviewer is not None:
         override = {
             **reviewer.model_dump(mode="json", include={"harness", "model", "reasoning"}),
             "harness_version": _harness_version(reviewer.harness),
@@ -2131,6 +2173,16 @@ def _measurement_collection(root: Path, selection: dict[str, object]) -> dict[st
     }
 
 
+def _refuse_temporary_inside(root: Path) -> None:
+    """Refuse a review while temporary files would land in the run, where judge traces and
+    unscrubbed output must never be."""
+    if Path(tempfile.gettempdir()).resolve().is_relative_to(root.resolve()):
+        raise ValueError(
+            "the temporary directory is inside the run, so judge traces would name it; set "
+            "TMPDIR to a directory outside the run"
+        )
+
+
 def _record_override(
     root: Path, selection: dict[str, object], revision: str, override: dict[str, object]
 ) -> None:
@@ -2192,10 +2244,11 @@ def regenerate_report(root: Path, *, review_revision: str | None = None) -> Path
         if previous_path is not None:
             states.add(previous_path)
         starts = {
-            study._bound_path(evidence, row["native_start"]).resolve()
+            study._bound_path(evidence, call["native_start"]).resolve()
             for path in states
             for row in study._bound_document(evidence, study._reference(evidence, path))["records"]
-            if row.get("native_start") is not None
+            for call in [row, *row.get("superseded", [])]
+            if call.get("native_start") is not None
         }
         config["review_projection"] = {
             "original_revision": original_revision,

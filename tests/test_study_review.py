@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 from typing import TypedDict, Unpack
 
@@ -277,7 +278,9 @@ def _judge(
             (artifacts / "host-trace-0.jsonl").write_text(
                 "\n".join(json.dumps(event) for event in startup) + "\n"
             )
-        (artifacts / "execution.json").write_text(json.dumps({"elapsed_seconds": 2.5}))
+        (artifacts / "execution.json").write_text(
+            json.dumps({"elapsed_seconds": 2.5, "artifacts_scrubbed": True})
+        )
         (artifacts / "host-evidence.json").write_text(json.dumps(execution))
         if behavior == "raised":
             raise RuntimeError("judge transport failed after usage capture")
@@ -346,9 +349,13 @@ def test_failed_review_stays_unknown_keeps_usage_and_is_not_paid_again(
     )
     observation = study._bound_document(root, state["records"][0]["observation"])
     assert observation["execution"]["usage"] == {"input_tokens": 30, "output_tokens": 7}
-    with pytest.raises(ValueError, match="already|replayed"):
-        study_review.review_study(root)
+    # Every row ended, so reviewing the revision again calls nothing and changes nothing.
+    saved = (root / "review-revisions/review/review-state.json").read_bytes()
+    study_review.review_study(root)
     assert len(calls) == 2
+    assert json.loads((root / "review-revisions/review/review-state.json").read_bytes()) == (
+        json.loads(saved)
+    )
 
 
 def test_missing_handoffs_keep_all_assignments_without_judge_calls(
@@ -496,9 +503,84 @@ def test_interrupted_judge_binds_reportable_usage_and_pending_assignments(
         and attempt["stages"][0]["work"]["usage_validation"]["recorded_usage"]["input_tokens"] == 10
         for attempt in report["attempts"]
     )
-    with pytest.raises(ValueError, match="already|replayed"):
+    # Resuming keeps the finished reviews and calls the judge only for the rows still open.
+    kept = {row["id"]: row for row in state["records"] if row["status"] == "reviewed"}
+    resumed = json.loads(study_review.review_study(root).read_text())
+    assert len(calls) == interrupted_call + (2 - interrupted_call) + 1
+    assert resumed["status"] == "complete" and resumed["native_invocations"] == 3
+    assert all(row == kept[row["id"]] for row in resumed["records"] if row["id"] in kept)
+    [retried] = [row for row in resumed["records"] if row.get("superseded")]
+    assert retried["superseded"][0]["status"] == "interrupted"
+    assert study_review.validate_review_revision(root, "review")
+    # The interrupted call's spend stays in the report beside the accepted review.
+    report = json.loads(study.report_study(root, review_revision="review").read_text())
+    [replaced] = [item for item in report["independent_review"]["records"] if item["superseded"]]
+    assert replaced["status"] == "reviewed"
+    assert replaced["superseded"][0]["work"]["elapsed_seconds"] == 2.5
+    assert report["independent_review"]["native_invocation_requests"] == 3
+    # A start bound twice would count one call twice.
+    path = root / "review-revisions/review/review-state.json"
+    state = json.loads(path.read_text())
+    retried = next(row for row in state["records"] if row.get("superseded"))
+    retried["superseded"].append(retried["superseded"][0])
+    state["native_invocations"] += 1
+    path.write_text(json.dumps(state))
+    with pytest.raises(ValueError, match="bound more than once"):
+        study_review.validate_review_revision(root, "review")
+
+
+def test_artifacts_the_launcher_did_not_scrub_never_enter_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _existing_study(tmp_path, monkeypatch)
+    _judge(monkeypatch, root)
+    native = codex.invoke
+
+    def unscrubbed(*, area: Path, **kwargs: Unpack[NativeInvocationKwargs]) -> dict[str, object]:
+        native(area=area, **kwargs)
+        receipt = area / "artifacts/execution.json"
+        receipt.write_text(json.dumps({**json.loads(receipt.read_text()), "artifacts_scrubbed": False}))
+        raise RuntimeError("scrubbing failed")
+
+    monkeypatch.setattr(codex, "invoke", unscrubbed)
+    state = json.loads(study_review.review_study(root).read_text())
+    assert {row["reason"] for row in state["records"]} == {
+        "the judge call's artifacts were not scrubbed, so they are not kept"
+    }
+    assert not list((root / "review-revisions/review/observations").glob("*/artifacts"))
+
+
+def test_a_temporary_directory_inside_the_run_is_refused_before_any_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _existing_study(tmp_path, monkeypatch)
+    calls = _judge(monkeypatch, root)
+    inside = root / "tmp"
+    inside.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(inside))
+    with pytest.raises(ValueError, match="temporary directory is inside the run"):
         study_review.review_study(root)
-    assert len(calls) == interrupted_call
+    assert calls == [] and not (root / "review-revisions").exists()
+
+
+def test_a_crashed_call_s_area_is_trusted_only_when_its_packet_copy_names_the_call(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "run"
+    root.mkdir()
+
+    def area(parent: Path, name: str, packet_id: str) -> str:
+        (parent / name / "workspace").mkdir(parents=True)
+        (parent / name / "workspace/packet.json").write_text(json.dumps({"packet_id": packet_id}))
+        return str(parent / name)
+
+    owned = area(tmp_path, "pluginbench-judge-a", "p1")
+    assert study_review._owned_area(root, owned, "p1") == Path(owned)
+    # Another call's area, an unexpected name, a path inside the run, or a relative path.
+    assert study_review._owned_area(root, owned, "p2") is None
+    assert study_review._owned_area(root, area(tmp_path, "other-b", "p1"), "p1") is None
+    assert study_review._owned_area(root, area(root, "pluginbench-judge-c", "p1"), "p1") is None
+    assert study_review._owned_area(root, "pluginbench-judge-a", "p1") is None
 
 
 def test_interruption_before_judge_call_binds_all_pending_review_rows(
@@ -562,8 +644,12 @@ def test_fixed_review_preserves_source_and_uses_identical_guidance(
     for row in state["records"]:
         observation = study._bound_document(root, row["observation"])
         assert observation["response"]["issues"][0]["severity"] == "P2"
-    with pytest.raises(ValueError, match="already exists"):
-        study_review.review_study(root, revision="fixed-v1", guidance=[guidance])
+    # A complete revision resumes as a no-op; other guidance cannot resume it.
+    assert study_review.review_study(root, revision="fixed-v1", guidance=[guidance]) == state_path
+    other = guidance.with_name("other-guidance.md")
+    other.write_text("Different criteria\n")
+    with pytest.raises(ValueError, match="frozen with other criteria_sha256"):
+        study_review.review_study(root, revision="fixed-v1", guidance=[other])
     assert len(calls) == 2
 
 
@@ -899,6 +985,7 @@ def test_parallel_judge_interrupt_keeps_active_observations_costs_and_unstarted_
                 json.dumps(
                     {
                         "usage": {"input_tokens": 30, "output_tokens": 7},
+                        "artifacts_scrubbed": True,
                     }
                 )
             )

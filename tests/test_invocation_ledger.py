@@ -589,10 +589,266 @@ def test_a_judge_call_killed_as_it_starts_still_counts_toward_the_ceiling(
     )
     assert child.returncode == -signal.SIGKILL, child.stderr
     calls = test_study_review._judge(monkeypatch, root)
+    # Another revision would mark the cut-off call unresolved before its revision can adopt it.
+    with pytest.raises(ValueError, match="cut off by a crash"):
+        study_review.review_study(root, revision="second")
     # The killed call is the fifth paid invocation, so two more reviews would make seven.
     with pytest.raises(CeilingReached):
-        study_review.review_study(root, revision="second")
+        study_review.review_study(root)
     assert calls == [] and _states(root, "review") == ["unresolved"]
+
+
+# Where a review child SIGKILLs itself, around its first judge call.
+REVIEW_BOUNDARIES = (
+    "before-receipt",  # after the ledger intent, before the start receipt
+    "before-receipt-bound",  # after the start receipt, before the state that binds it
+    "after-output",  # after the launcher finished, before acceptance
+    "before-state",  # after the observation, before the state that binds it
+    "before-ledger-end",  # after the final state, before the ledger records the ending
+    "after-stop",  # the launcher saved a provider stop and raised; killed before the outcome
+    "after-error",  # the launcher raised with no stop; killed before the outcome
+    "creating",  # while the revision is being created, before any call
+    "unscrubbed",  # the launcher could not scrub its artifacts; killed before the outcome
+    "malformed",  # native output cut off mid-character; killed before the outcome
+    "malformed-type",  # a native event whose type is not a string; killed before the outcome
+)
+
+
+def _review_boundary_child() -> None:
+    """argv: run, boundary, behavior. Reviews the run and SIGKILLs itself at the boundary."""
+    root, boundary, behavior = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+    patch = pytest.MonkeyPatch()
+    operation_support.in_place(patch)
+    patch.setattr(submissions, "reviewed_contract", synthetic_contract)
+    test_study_review._judge(patch, root, behavior=behavior)
+    judged, write, end = codex.invoke, study._write, Ledger.end
+
+    def kill() -> None:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+    def invoke(**kwargs: Any) -> dict[str, object]:
+        execution = judged(**kwargs)
+        artifacts = kwargs["area"] / "artifacts"
+        if boundary in {"after-stop", "after-error", "unscrubbed", "malformed", "malformed-type"}:
+            # Only a launcher that returned writes its success marker.
+            (artifacts / "host-evidence.json").unlink()
+        if boundary == "after-stop":
+            (artifacts / "host-trace-0.jsonl").write_text(codex_rollout("usage_limit_exceeded"))
+        if boundary == "unscrubbed":
+            receipt = json.loads((artifacts / "execution.json").read_text())
+            (artifacts / "execution.json").write_text(
+                json.dumps({**receipt, "artifacts_scrubbed": False})
+            )
+        if boundary == "malformed":
+            (artifacts / "stdout.jsonl").write_bytes(b'{"type": "turn.completed"}\n\xe2\x82')
+        if boundary == "malformed-type":
+            (artifacts / "stdout.jsonl").write_text('{"type": []}\n')
+        if boundary in {
+            "after-output", "after-stop", "after-error", "unscrubbed", "malformed", "malformed-type"
+        }:
+            kill()
+        return execution
+
+    def written(path: Path, value: object) -> None:
+        if boundary == "before-receipt" and path.name == "native-start.json":
+            kill()
+        if boundary == "creating" and path.name == "mapping.json":
+            kill()
+        bound = path.name == "review-state.json"
+        if bound and boundary == "before-receipt-bound" and any(
+            path.parent.glob("observations/*/native-start.json")
+        ):
+            kill()
+        if bound and boundary == "before-state" and any(
+            path.parent.glob("observations/*/observation.json")
+        ):
+            kill()
+        write(path, value)
+
+    def ended(self: Ledger, invocation: str, state: str, error: str | None = None) -> None:
+        if boundary == "before-ledger-end":
+            kill()
+        end(self, invocation, state, error)
+
+    patch.setattr(codex, "invoke", invoke)
+    patch.setattr(study, "_write", written)
+    patch.setattr(Ledger, "end", ended)
+    study_review.review_study(root)
+    raise SystemExit(f"the review finished without reaching {boundary}")
+
+
+@pytest.mark.parametrize(
+    "boundary,behavior,calls_again,first",
+    [
+        # Nothing durable was saved: the judge is called again within the slot's cap.
+        ("before-receipt", "issues", 2, "unresolved"),
+        ("before-receipt-bound", "issues", 2, "unresolved"),
+        # A finished call is adopted from its saved output and never called again.
+        ("after-output", "issues", 1, "finished"),
+        ("before-state", "issues", 1, "finished"),
+        ("before-ledger-end", "issues", 1, "finished"),
+        # A saved provider stop is given back to the slot even without the success marker.
+        ("after-stop", "issues", 2, "halted_provider"),
+        # A launcher error the crash lost: the call counts, keeps its usage, and calls again.
+        ("after-error", "issues", 2, "unresolved"),
+        # Artifacts the launcher did not scrub never enter the run; the call counts and retries.
+        ("unscrubbed", "issues", 2, "unresolved"),
+        # Malformed output cannot wedge recovery: the call fails and keeps its evidence.
+        ("malformed", "issues", 1, "failed_transient"),
+        # A malformed event type cannot wedge recovery either: no stop, so the call retries.
+        ("malformed-type", "issues", 2, "unresolved"),
+        # A revision cut off while being created was never published, and starts afresh.
+        ("creating", "issues", 2, None),
+        # A call that failed keeps its ending, and its failure signature, and is not called again.
+        ("before-state", "bad_json", 1, "failed_transient"),
+        ("before-ledger-end", "bad_json", 1, "failed_transient"),
+    ],
+)
+def test_a_review_killed_at_each_boundary_resumes_without_repeating_a_finished_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str, behavior: str,
+    calls_again: int, first: str | None,
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    temporary = tmp_path / "child-tmp"
+    temporary.mkdir()
+    child = subprocess.run(
+        [
+            sys.executable, "-c", "import test_invocation_ledger as t; t._review_boundary_child()",
+            str(root), boundary, behavior,
+        ],
+        env={**os.environ, "PYTHONPATH": _PATH, "TMPDIR": str(temporary)},
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert child.returncode == -signal.SIGKILL, child.stderr
+    calls = test_study_review._judge(monkeypatch, root)
+    path = study_review.review_study(root)
+    assert len(calls) == calls_again
+    assert sorted(_states(root, "review")) == sorted(
+        [*([first] if first else []), *["finished"] * calls_again]
+    )
+    state = json.loads(path.read_text())
+    # A call killed before its start receipt counts in the ledger but started nothing.
+    started = calls_again + (boundary not in {"before-receipt", "creating"})
+    assert state["native_invocations"] == started
+    assert study_review.validate_review_revision(root, "review") == path
+    starts = study_review.review_starts(root)
+    assert len(starts) == state["native_invocations"] and all(ended for _, ended in starts)
+    expected = "incomplete" if first == "failed_transient" else "complete"
+    assert state["status"] == expected
+    # A crashed call's area, which can hold a credential copy, is removed once its receipt names
+    # it. Before the receipt, nothing has launched, so the area holds only a packet copy.
+    left = list(temporary.glob("pluginbench-judge-*"))
+    assert len(left) == (boundary == "before-receipt")
+    # A revision a crash left in staging is never listed or counted.
+    names = sorted(path.name for path in (root / "review-revisions").iterdir())
+    assert names[-1] == "review" and len(names) == 1 + (boundary == "creating")
+    assert all(name.startswith(".staging-review-") for name in names[:-1])
+    if boundary == "unscrubbed":
+        [replaced] = [row for row in state["records"] if row.get("superseded")]
+        packet = replaced["superseded"][0]["packet_id"]
+        assert not (root / "review-revisions/review/observations" / packet / "artifacts").exists()
+    if first == "unresolved" and boundary == "after-error":
+        [replaced] = [row for row in state["records"] if row.get("superseded")]
+        kept = study._bound_document(root, replaced["superseded"][0]["observation"])
+        # The scrubbed artifacts the call saved stay in evidence.
+        assert kept["ending"] == {"state": "unresolved", "error": None}
+        assert kept["execution"]["elapsed_seconds"] == 2.5
+    assert all(not (area / "private").exists() for area in left)
+
+
+def test_resume_refuses_a_saved_observation_that_differs_from_its_validated_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    child = subprocess.run(
+        [
+            sys.executable, "-c", "import test_invocation_ledger as t; t._review_boundary_child()",
+            str(root), "before-state", "issues",
+        ],
+        env={**os.environ, "PYTHONPATH": _PATH, "TMPDIR": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert child.returncode == -signal.SIGKILL, child.stderr
+    [saved] = (root / "review-revisions/review/observations").glob("*/observation.json")
+    observation = json.loads(saved.read_text())
+    observation["response"]["issues"] = []  # Findings no saved trace supports.
+    saved.write_text(json.dumps(observation))
+    calls = test_study_review._judge(monkeypatch, root)
+    with pytest.raises(ValueError, match="differs from its validated response"):
+        study_review.review_study(root)
+    assert calls == []
+
+
+def test_a_resumed_row_whose_slot_used_its_review_calls_ends_and_the_revision_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    calls = test_study_review._judge(monkeypatch, root, behavior="raised")
+    path = study_review.review_study(root)
+    state = json.loads(path.read_text())
+    row = state["records"][0]
+    slot = next(item["slot"] for item in _invocations(root) if item["attempt_id"] == row["id"])
+    ledger = Ledger.open(root / LEDGER_NAME)
+    try:  # Two more spent calls: the slot has used all three.
+        for inputs in ("other-1", "other-2"):
+            call = ledger.intent(slot=slot, stage="review", attempt_id=row["id"], inputs=inputs)
+            ledger.end(call, "failed_transient", f"error {inputs}")
+    finally:
+        ledger.close()
+    # As a crash cut off its last call: spent, and due to call again.
+    row["ending"] = {"state": "unresolved", "error": None}
+    path.write_text(json.dumps(state))
+    resumed = json.loads(study_review.review_study(root).read_text())
+    assert len(calls) == 2 and resumed["status"] == "incomplete"
+    ended = next(item for item in resumed["records"] if item["id"] == row["id"])
+    assert ended["status"] == "unavailable" and "used its 3 review invocations" in ended["reason"]
+    assert ended["superseded"][0]["ending"]["state"] == "unresolved"
+    # Nothing is left to call, so another resume changes nothing.
+    assert study_review.review_study(root) == path and len(calls) == 2
+
+
+def test_resume_refuses_other_settings_and_changed_review_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = test_study_review._existing_study(tmp_path, monkeypatch)
+    calls = test_study_review._judge(monkeypatch, root, behavior="raised")
+    study_review.review_study(root)
+    for settings, refused in (
+        ({"model": "gpt-6-luna"}, "frozen with other model"),
+        ({"effort": "medium"}, "frozen with other effort"),
+        ({"seed": 7}, "frozen with other seed"),
+        ({"jobs": 2}, "frozen with other jobs"),
+    ):
+        with pytest.raises(ValueError, match=refused):
+            study_review.review_study(root, **settings)
+    state_path = root / "review-revisions/review/review-state.json"
+    saved = state_path.read_text()
+    citations = root / "review-revisions/review-citations"
+    citations.mkdir()
+    # With nothing left to do, a revision a citation recovery binds stays as saved.
+    assert study_review.review_study(root) == state_path and state_path.read_text() == saved
+    # With a refunded call to make again, resuming would change the state it binds.
+    refunded = json.loads(saved)
+    refunded["records"][0]["ending"] = {"state": "halted_provider", "error": None}
+    state_path.write_text(json.dumps(refunded))
+    with pytest.raises(ValueError, match="review-citations binds this revision"):
+        study_review.review_study(root)
+    citations.rmdir()
+    state_path.write_text(saved)
+    state_path.write_text(json.dumps({**json.loads(saved), "schema_version": 1}))
+    with pytest.raises(ValueError, match="predates resumable reviews"):
+        study_review.review_study(root)
+    state_path.write_text(saved)
+    changed = tmp_path / "study_review.py"
+    changed.write_text(Path(study_review.__file__).read_text() + "# changed\n")
+    monkeypatch.setattr(study_review, "__file__", str(changed))
+    with pytest.raises(ValueError, match="other PluginBench code"):
+        study_review.review_study(root)
+    assert len(calls) == 2
 
 
 def test_coding_resumed_after_a_review_counts_the_review_s_calls(
@@ -670,6 +926,11 @@ def test_a_provider_halt_in_review_gives_the_call_back_and_stops_the_pass(
         assert ledger.paid_room() == 6 - 2 - 1  # Two coding calls and the halt.
     finally:
         ledger.close()
+    # Once the provider recovers, resuming calls the halted row again and the one never called.
+    monkeypatch.setattr(codex, "invoke", judged)
+    state = json.loads(study_review.review_study(root).read_text())
+    assert len(calls) == 3 and state["status"] == "complete"
+    assert sorted(_states(root, "review")) == ["finished", "finished", "halted_provider"]
 
 
 def test_a_slot_that_failed_twice_for_one_reviewer_is_still_reviewed_by_another(

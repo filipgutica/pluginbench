@@ -184,6 +184,8 @@ def _measures(report: dict[str, Any] | None) -> tuple[dict[str, dict[str, Any]],
 def _revisions(directory: Path, state_name: str, selected: object) -> list[dict[str, Any]]:
     rows = []
     for path in sorted(directory.glob(f"*/{state_name}")):
+        if path.parent.name.startswith("."):
+            continue  # A revision a crash left in staging, never published.
         state = _read(path) or {}
         row: dict[str, Any] = {
             "revision": path.parent.name,
