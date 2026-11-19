@@ -11,6 +11,7 @@ from typing import Any
 from types import SimpleNamespace
 
 import pytest
+import typer
 from pydantic import ValidationError
 from test_mutation import (
     AFTER, BASE_IMAGE, BEFORE, FIRST, IMAGE, Fake, View, _config, _lines, _passing, _tree,
@@ -291,12 +292,14 @@ def _command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *options: str, after: str = AFTER,
     ended: BaseException | None = None, engine: object = _RUNTIME["docker_engine"],
     profile_changes: dict[str, object] | None = None, behaviour: Any = None,
+    standalone: bool = True,
 ) -> tuple[Any, list[OperationRequest], dict[str, Any]]:
     """Run `reference-mutation` on a prepared profile, each container a fake run on a fake
     clock. Returns the result, the operations it ran and what the executor saw. `ended` is
     raised once the handler has returned, as the owner raises an unverified cleanup or a
     deadline that fires as the handler finishes. `engine` and `profile_changes` alter the
-    prepared profile; a repeated option overrides the default before it."""
+    prepared profile; a repeated option overrides the default before it. Without
+    `standalone`, a usage error is raised as itself rather than rendered for a terminal."""
     before = _tree(tmp_path / "before", {"src/grade.py": BEFORE})
     after_tree = _tree(tmp_path / "after", {"src/grade.py": after})
     behaviour = behaviour or _passing(lambda view: int(FIRST in view.source))
@@ -344,7 +347,7 @@ def _command(
     result = CliRunner().invoke(cli.app, [
         "reference-mutation", str(profile), "--before", str(before), "--after", str(after_tree),
         "--headroom-percent", "150", "--output", str(tmp_path / "reference"), *options,
-    ])
+    ], standalone_mode=standalone)
     return result, requests, seen
 
 
@@ -463,18 +466,21 @@ def test_a_red_baseline_is_shown_and_its_repeat_is_incomplete_never_complete(
 
 
 @pytest.mark.parametrize(
-    ("option", "value", "message"),
-    [("--attempt-seconds", "0", "--attempt-seconds"), ("--lanes", "0", "--lanes")],
+    ("option", "value"), [("--attempt-seconds", "0"), ("--lanes", "0"), ("--lanes", "5")]
 )
-def test_an_invalid_input_is_refused_before_the_host_is_taken(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, option: str, value: str, message: str
+def test_an_out_of_range_option_is_refused_before_the_host_is_taken(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, option: str, value: str
 ) -> None:
+    """Above four lanes the contract's measurement capacity no longer holds. The usage error
+    is checked as raised: rendered, its wording depends on the terminal's width and colour."""
     taken: list[object] = []
     monkeypatch.setattr(cli, "_execution", lambda *args: taken.append(args))
     result, requests, _ = _command(
-        tmp_path, monkeypatch, "--attempt-seconds", "600", option, value
+        tmp_path, monkeypatch, "--attempt-seconds", "600", option, value, standalone=False
     )
-    assert result.exit_code == 2 and message in result.output
+    refused = result.exception
+    assert isinstance(refused, typer.BadParameter) and refused.param is not None
+    assert option in refused.param.opts
     assert taken == [] and requests == []
 
 
