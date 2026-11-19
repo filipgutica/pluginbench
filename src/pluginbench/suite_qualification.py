@@ -627,9 +627,9 @@ def freeze(suite: Suite, receipts: Iterable[Receipt], policy: Policy) -> Freeze:
             bucket.extend(Finding(task=task_id, gate=gate.name, reason=reason) for reason in reasons)
         paired = [found.get((task_id, gate), []) for gate in _SAME_REPEATS]
         if all(len(receipts) == 1 for receipts in paired) and len(
-                {_cited(receipts[0]) for receipts in paired}) != 1:
+                {_canonical(receipts[0]) for receipts in paired}) != 1:
             blockers.append(Finding(task=task_id, gate=_SAME_REPEATS[1], reason=(
-                f"unavailable: cites other reference repeats than its {_SAME_REPEATS[0]} receipt")))
+                f"unavailable: its facts differ from its {_SAME_REPEATS[0]} receipt's")))
     clusters = Counter(task.repository_cluster for task in suite.tasks)
     if len(suite.tasks) < policy.min_tasks:
         blockers.append(Finding(task=None, gate=None, reason=(
@@ -650,17 +650,14 @@ def freeze(suite: Suite, receipts: Iterable[Receipt], policy: Policy) -> Freeze:
     )
 
 
-# Gates whose verdicts must rest on one batch of reference repeats: the time verdict is about the
-# same runs whose outcomes qualified the task.
+# Gates whose verdicts must rest on the same reference facts: the producer writes one set of
+# raw facts, contract included, to both, so the time verdict is about the very runs whose
+# outcomes qualified the task.
 _SAME_REPEATS = ("mutation", "mutation_time")
 
 
-def _cited(receipt: Receipt) -> str:
-    """The repeat evidence a reference mutation receipt cites: its run IDs and report digests."""
-    repeats = receipt.facts.get("repeats")
-    rows = repeats if isinstance(repeats, list) else []
-    return json.dumps([[row.get("run_id"), row.get("report_sha256")] if isinstance(row, dict)
-                       else None for row in rows], sort_keys=True)
+def _canonical(receipt: Receipt) -> str:
+    return json.dumps(receipt.facts, sort_keys=True, separators=(",", ":"))
 
 
 def _gate_reasons(

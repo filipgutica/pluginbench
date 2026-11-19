@@ -629,19 +629,40 @@ def test_a_late_exit_is_cut_by_the_limit_it_overran() -> None:
     assert _both(baseline) == ("unavailable", "unavailable")
 
 
-def test_freeze_refuses_time_and_outcome_verdicts_from_different_repeats(
-    passing: dict[str, Any],
+def _faster(facts: dict[str, Any]) -> dict[str, Any]:
+    """The same repeats, run IDs and report digests, with the last site's run 1 ms shorter."""
+    faster = json.loads(json.dumps(facts))
+    for repeat in faster["repeats"]:
+        repeat["sites"][1]["runs"][0]["elapsed_ms"] -= 1
+    return faster
+
+
+@pytest.mark.parametrize(
+    "time_facts",
+    [
+        lambda batch: _mutation_facts(*[_repeat(f"other-{i}") for i in range(3)]),
+        _faster,
+        lambda batch: {**batch, "contract": _contract(headroom_percent=100)},
+    ],
+    ids=["other-repeats", "same-ids-faster-calls", "other-contract"],
+)
+def test_freeze_refuses_time_and_outcome_verdicts_from_different_facts(
+    passing: dict[str, Any], time_facts: Any
 ) -> None:
     task = SUITE.tasks[0]
     batch = _mutation_facts()
-    other = _mutation_facts(*[_repeat(f"other-{i}") for i in range(3)])
     receipts = [r for r in _all() if not (r.task == task.content_sha256 and r.gate in {
         "mutation", "mutation_time"})]
     same = [_receipt(task, "mutation", **batch), _receipt(task, "mutation_time", **batch)]
     assert freeze(SUITE, receipts + same, POLICY).suite == SUITE
+    other = time_facts(batch)
+    # The time facts pass the real rule on their own (`passing` stubs `_RULES`); only the
+    # pairing refuses them.
+    alone = _receipt(task, "mutation_time", **other)
+    assert suite_qualification._mutation_time(alone, _limited(1000)).status == "pass"
     mixed = [_receipt(task, "mutation", **batch), _receipt(task, "mutation_time", **other)]
     result = freeze(SUITE, receipts + mixed, POLICY)
     assert result.suite is None
     assert [(b.gate, b.reason) for b in result.blockers] == [
-        ("mutation_time", "unavailable: cites other reference repeats than its mutation receipt")
+        ("mutation_time", "unavailable: its facts differ from its mutation receipt's")
     ]
