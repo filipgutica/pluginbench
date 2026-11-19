@@ -1,4 +1,4 @@
-"""The handler table: the five operations a scope may run, and the arguments each accepts."""
+"""The handler table: the six operations a scope may run, and the arguments each accepts."""
 
 from __future__ import annotations
 
@@ -20,9 +20,12 @@ from pluginbench import (
     harbor_backend,
     invocation_runtime,
     operations,
+    reference_mutation,
 )
 from pluginbench.collectors import Collector
 from pluginbench.measurement_profiles import CoverageSettings, MeasurementSettings
+from pluginbench.reference_mutation import Contract
+from pluginbench.suite_qualification import REFERENCE_REPEATS, Receipt
 
 
 _RUNNERS = {
@@ -54,6 +57,12 @@ _MODELS: dict[str, type[BaseModel]] = {
     "grading": operations.Grading,
     "review": operations.Review,
     "collect": operations.Collect,
+    "reference": operations.Reference,
+}
+_PINS = {
+    "content_sha256": "a" * 64,
+    "observer_profile_sha256": "b" * 64,
+    "observer_contract_sha256": "c" * 64,
 }
 
 
@@ -81,34 +90,54 @@ def _cases(tmp_path: Path) -> dict[str, tuple[Any, str, dict[str, Any]]]:
             {"root": tmp_path / "source", "collector": _collector(tmp_path),
              "destination": tmp_path / "coverage", "baseline": None},
         ),
+        "reference": (
+            reference_mutation, "measure_reference",
+            {"before": tmp_path / "before", "after": tmp_path / "after",
+             "config": {"native_task_identity": {}}, "contract": Contract(headroom_percent=150),
+             "pins": _PINS, "destination": tmp_path / "reference", "attempt_ms": 60_000},
+        ),
     }
 
 
-def test_the_handler_table_names_the_five_operations_and_each_resolves() -> None:
+def _receipts() -> tuple[Receipt, Receipt]:
+    mutation, time = (
+        Receipt(task="a" * 64, gate=gate, pins=_PINS, producer="test", facts={})
+        for gate in ("mutation", "mutation_time")
+    )
+    return mutation, time
+
+
+def test_the_handler_table_names_the_six_operations_and_each_resolves() -> None:
     assert sorted(invocation_runtime.HANDLERS) == [
-        "coding", "collect", "grading", "preflight", "review",
+        "coding", "collect", "grading", "preflight", "reference", "review",
     ]
     for target in invocation_runtime.HANDLERS.values():
         module, name = target.split(":")
         assert callable(getattr(importlib.import_module(module), name))
 
 
-@pytest.mark.parametrize("operation", ["coding", "grading", "review", "collect"])
+@pytest.mark.parametrize("operation", ["coding", "grading", "review", "collect", "reference"])
 def test_each_handler_passes_its_validated_arguments_to_its_implementation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
     owner, name, arguments = _cases(tmp_path)[operation]
     seen: dict[str, Any] = {}
 
+    returned: dict[str, Any] = {
+        "collect": (({"report": 1}, "1.0", "tool"), [{"report": 1}, "1.0", "tool"]),
+        "reference": (_receipts(), [r.model_dump(mode="json") for r in _receipts()]),
+    }
+    result, expected = returned.get(operation, ({"done": True}, {"done": True}))
+
     def implementation(*args: Any, **kwargs: Any) -> Any:
         seen.update(kwargs)
-        return ({"report": 1}, "1.0", "tool") if operation == "collect" else {"done": True}
+        return result
 
     monkeypatch.setattr(owner, name, implementation)
     # As a caller sends it: the model dumped to JSON.
     value = getattr(operations, operation)(_MODELS[operation](**arguments).model_dump(mode="json"))
     assert seen == arguments
-    assert value == ([{"report": 1}, "1.0", "tool"] if operation == "collect" else {"done": True})
+    assert value == expected
 
 
 @pytest.mark.parametrize("harness", ["codex", "claude"])
@@ -144,7 +173,7 @@ def test_preflight_runs_the_check_or_the_preparation_on_the_same_evaluation(
 @pytest.mark.parametrize(
     ("operation", "field"),
     [("coding", "area"), ("grading", "directory"), ("review", "output_schema"),
-     ("collect", "root"), ("collect", "collector")],
+     ("collect", "root"), ("collect", "collector"), ("reference", "destination")],
 )
 def test_a_relative_path_is_refused_since_the_handler_runs_elsewhere(
     tmp_path: Path, operation: str, field: str
@@ -223,6 +252,7 @@ _ROUTED = {
     "run_reference_agents": {("evaluation", "_reference_agents")},
     # `run_evaluation` is a test helper that no production code calls.
     "prepare_evaluation": {("evaluation", "run_evaluation")},
+    "measure_reference": set(),
 }
 
 
@@ -280,6 +310,12 @@ def test_each_operation_budget_outlasts_its_implementations_own_timeouts(
     assert operations.coding_budget(task, 900) > worker(task_dir=task, agent_seconds=900)
     assert operations.grading_budget(task) > worker(task_dir=task)
     assert operations.review_budget(600) > 600
+    # Every repeat at its whole attempt limit, rounded up, then its last containers' setup and
+    # export, as a collect allows around its command.
+    attempts = REFERENCE_REPEATS * 1801
+    assert operations.reference_budget(1_800_500) - attempts >= (
+        REFERENCE_REPEATS * operations.AROUND_COLLECTOR
+    )
     assert operations.collect_budget(_collector(tmp_path)) > _collector(tmp_path).timeout_seconds
     mutation = tmp_path / "mutation.json"
     mutation.write_text(json.dumps({"coverage": {"timeout_seconds": 100}}))

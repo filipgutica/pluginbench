@@ -198,6 +198,56 @@ def test_the_entry_point_creates_containers_only_on_the_daemon_its_operation_rec
     )
 
 
+@pytest.mark.parametrize("outcome", ["return", "fail", "hang"])
+def test_a_reference_measurement_runs_as_its_registered_operation_and_leaves_nothing(
+    fake_systemd: FakeSystemd,
+    owned: run_lock.ExecutionLock,
+    docker: _Docker,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    """However the measurement ends, its scope and its labelled containers are gone after it.
+    A hung one is killed at its budget: each repeat's attempt limit, here with no grace."""
+    from pluginbench import operations
+    from pluginbench.reference_mutation import Contract
+
+    monkeypatch.setenv("PB_FAKE_REFERENCE", outcome)
+    monkeypatch.setattr(operations, "AROUND_COLLECTOR", 0)
+    monkeypatch.setattr(invocation_runtime, "KILL_GRACE", 0.5)
+    invocation = uuid4().hex
+    destination = tmp_path / "reference"
+    destination.mkdir()
+    docker.containers = {"mine": invocation, "other": uuid4().hex}
+    arguments = operations.Reference(
+        before=tmp_path / "before", after=tmp_path / "after", config={},
+        contract=Contract(headroom_percent=150), destination=destination, attempt_ms=1000,
+        pins={name: "a" * 64 for name in ("content_sha256", "observer_profile_sha256",
+                                           "observer_contract_sha256")},
+    )
+    budget = operations.reference_budget(arguments.attempt_ms)
+    assert budget == 3
+
+    def measure() -> Any:
+        return operations.run(
+            "reference", arguments, timeout=budget, docker=_RUNTIME, invocation=invocation
+        )
+
+    if outcome == "return":
+        assert measure() == []
+    elif outcome == "fail":
+        with pytest.raises(ValueError, match="reference measurement failed"):
+            measure()
+    else:
+        with pytest.raises(OperationDeadlineExceeded, match="within 3 seconds"):
+            measure()
+        assert _gone(_pid(destination / "escaped"), within=1)
+    assert f"pb-inv-{invocation}.scope" in (fake_systemd.root / "log").read_text()
+    assert docker.containers.keys() == {"other"}
+    assert ("rm", "--force", "--volumes", "mine") in docker.calls
+    assert _record(owned.state)["operations"] == []
+
+
 def test_a_container_that_survives_removal_fences_the_host_until_a_later_check_removes_it(
     fake_systemd: FakeSystemd, docker: _Docker, tmp_path: Path, isolated_host_state: Path
 ) -> None:

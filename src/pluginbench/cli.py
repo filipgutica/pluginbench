@@ -1,5 +1,5 @@
-"""The pluginbench command line: init, check, run, status, dashboard, stop, compare, report,
-review, measure, judge."""
+"""The pluginbench command line: init, check, reference-mutation, run, status, dashboard, stop,
+compare, report, review, measure, judge."""
 
 from __future__ import annotations
 
@@ -23,7 +23,14 @@ import typer
 import yaml
 from typer.core import TyperGroup
 
-from pluginbench import __version__, control_store, coordinator, invocation_runtime, run_lock
+from pluginbench import (
+    __version__,
+    control_store,
+    coordinator,
+    invocation_runtime,
+    mutation,
+    run_lock,
+)
 from pluginbench.isolation import RuntimeDriftError
 from pluginbench.evaluation import (
     CheckFailed,
@@ -577,6 +584,127 @@ def check(
         control_store.CleanupBlocked,
     ) as exc:
         _error(exc)
+
+
+@app.command("reference-mutation")
+def reference_mutation(
+    profile: Path = typer.Argument(
+        ..., help="The task's prepared mutation profile, mutation.json, with its frozen runtime."
+    ),
+    before: Path = typer.Option(..., "--before", help="The task's frozen starting tree."),
+    after: Path = typer.Option(
+        ..., "--after", help="The starting tree with the verified oracle change applied."
+    ),
+    attempt_seconds: int = typer.Option(
+        ..., "--attempt-seconds", min=1, help="Each repeat's whole attempt limit."
+    ),
+    headroom_percent: int = typer.Option(
+        ..., "--headroom-percent", min=1,
+        help="How far the mutation limit must exceed the projected reference time; 150 = 1.5x.",
+    ),
+    content_sha256: str = typer.Option(..., "--content-sha256", help="The task's content pin."),
+    observer_profile_sha256: str = typer.Option(
+        ..., "--observer-profile-sha256", help="The task's observer profile pin."
+    ),
+    observer_contract_sha256: str = typer.Option(
+        ..., "--observer-contract-sha256", help="The common observer contract's pin."
+    ),
+    sample_size: int = typer.Option(
+        mutation.SAMPLE_SIZE, "--sample-size", min=1, help="M, the mutants each repeat measures."
+    ),
+    lanes: int = typer.Option(
+        mutation.LANES, "--lanes", min=1, help="Mutant containers each repeat runs at once."
+    ),
+    output: Path | None = typer.Option(
+        None, "--output", help="New directory for the three repeats and the two receipts."
+    ),
+) -> None:
+    """Measure a task's reference mutation three times and write its `mutation` and
+    `mutation_time` qualification receipts. No model calls."""
+    from pluginbench import operations
+    from pluginbench.reference_mutation import Contract
+
+    try:
+        destination = (output or _new_run_directory("reference-")).resolve()
+        if destination.exists():
+            raise ValueError(f"{destination} already exists; give a new --output")
+        config = json.loads(profile.read_text())
+        identity = config.get("native_task_identity") if isinstance(config, dict) else None
+        if not isinstance(identity, dict):
+            raise ValueError(f"{profile} is not a prepared mutation profile")
+        # Everything is checked before the host is taken: a repeat can run for hours.
+        arguments = operations.Reference(
+            before=before.resolve(), after=after.resolve(), config=config,
+            contract=Contract(
+                headroom_percent=headroom_percent, sample_size=sample_size, lanes=lanes
+            ),
+            pins={
+                "content_sha256": content_sha256,
+                "observer_profile_sha256": observer_profile_sha256,
+                "observer_contract_sha256": observer_contract_sha256,
+            },
+            destination=destination, attempt_ms=1000 * attempt_seconds,
+        )
+        # The frozen runtime the profile saved: its containers start on that daemon only.
+        runtime = mutation.measurement_identity(identity)["isolation"]
+        assert isinstance(runtime, dict)  # `measurement_identity` requires one.
+        with _execution("preflight", profile, destination):
+            receipts = operations.run(
+                "reference", arguments,
+                timeout=operations.reference_budget(arguments.attempt_ms), docker=runtime,
+            )
+        for line in _reference_summary(receipts[0]["facts"]):
+            typer.echo(line)
+        typer.echo(f"Receipts: {destination / 'mutation.receipt.json'}, "
+                   f"{destination / 'mutation_time.receipt.json'}")
+    except (
+        OSError,
+        ValueError,
+        subprocess.SubprocessError,
+        RuntimeDriftError,
+        control_store.CleanupBlocked,
+    ) as exc:
+        _error(exc)
+
+
+def _reference_summary(facts: dict[str, Any]) -> list[str]:
+    """One line per reference repeat, in seconds from its start: baselines, first dispatch,
+    when the M = 10 prefix and the whole sample settled, and whether a limit censored it."""
+    sample = int(facts["contract"]["sample_size"])
+
+    def seconds(ms: int | None) -> str:
+        return "unsettled" if ms is None else f"{ms / 1000:.1f} s"
+
+    def settled(sites: list[dict[str, Any]], count: int) -> int | None:
+        chosen = [site for site in sites if site["site"] < count]
+        if len(chosen) < count or any(site["settled_ms"] is None for site in chosen):
+            return None
+        return max((site["settled_ms"] for site in chosen), default=0)
+
+    lines = []
+    for index, repeat in enumerate(facts["repeats"]):
+        sites, selected = repeat["sites"], len(repeat["selected"])
+        baselines = ", ".join(
+            seconds(run["elapsed_ms"]) if run["dispatched"] else "not run"
+            for run in repeat["baseline"]
+        )
+        parts = [
+            f"repeat {index}: {selected} of {repeat['candidate_count']} candidates",
+            f"baselines {baselines or 'none'}",
+            f"first mutant {seconds(min((s['dispatched_ms'] for s in sites), default=None))}",
+        ]
+        if selected > mutation.V1_SAMPLE_SIZE:
+            parts.append(
+                f"first {mutation.V1_SAMPLE_SIZE} settled "
+                f"{seconds(settled(sites, mutation.V1_SAMPLE_SIZE))}"
+            )
+        parts.append(f"all settled {seconds(settled(sites, selected))}")
+        parts.append(f"required work {seconds(repeat['required_settled_ms'])}")
+        failure = repeat["infrastructure_failure"]
+        parts.append("clean" if failure is None else f"censored ({failure})")
+        lines.append("; ".join(parts))
+    lines.append(f"M = {sample}, {facts['contract']['lanes']} lanes. No model calls.")
+    return lines
 
 
 @app.command("status")

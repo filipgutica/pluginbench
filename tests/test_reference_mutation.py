@@ -8,13 +8,28 @@ import threading
 from pathlib import Path
 from typing import Any
 
-import pytest
-from test_mutation import AFTER, BEFORE, FIRST, Fake, View, _config, _lines, _passing, _tree
+from types import SimpleNamespace
 
-from pluginbench import harbor_backend, mutation, reference_mutation, suite_qualification
-from pluginbench.benchmark import SuiteTask
+import pytest
+from test_mutation import (
+    AFTER, BASE_IMAGE, BEFORE, FIRST, IMAGE, Fake, View, _config, _lines, _passing, _tree,
+)
+from typer.testing import CliRunner
+
+from pluginbench import (
+    cli,
+    harbor_backend,
+    invocation_runtime,
+    mutation,
+    operations,
+    reference_mutation,
+    run_lock,
+    suite_qualification,
+)
+from pluginbench.benchmark import ReviewerRule, Suite, SuiteTask
+from pluginbench.invocation_runtime import OperationRequest
 from pluginbench.reference_mutation import Contract, measure_reference
-from pluginbench.suite_qualification import Receipt
+from pluginbench.suite_qualification import Policy, Receipt
 
 PINS = {
     "content_sha256": "a" * 64,
@@ -261,3 +276,138 @@ def test_a_tsc_baseline_the_attempt_limit_left_no_time_keeps_its_repeat(
     ] * 3
     for receipt in (mutation_receipt, time_receipt):
         assert suite_qualification._RULES[receipt.gate](receipt, TASK).status == "unavailable"
+
+
+# --- The command: one registered operation on the profile's frozen daemon --------------------
+
+_RUNTIME: dict[str, object] = {
+    "docker_cli": {}, "docker_engine": {"id": "daemon", "endpoint": "unix:///fake.sock"},
+}
+
+
+def _command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *options: str, after: str = AFTER
+) -> tuple[Any, list[OperationRequest], dict[str, Any]]:
+    """Run `reference-mutation` on a prepared profile, each container a fake run on a fake
+    clock. Returns the result, the operations it ran and what the executor saw."""
+    before = _tree(tmp_path / "before", {"src/grade.py": BEFORE})
+    after_tree = _tree(tmp_path / "after", {"src/grade.py": after})
+    fake = Fake(_passing(lambda view: int(FIRST in view.source)), before, after_tree)
+    identity = {**IMAGE, "isolation": {"resources": {"cpus": 1, "memory_mb": 4096}, **_RUNTIME}}
+    profile = tmp_path / "mutation.json"
+    profile.write_text(json.dumps(_config(native_task_identity=identity)))
+    requests: list[OperationRequest] = []
+    seen: dict[str, Any] = {}
+    in_place = invocation_runtime.run_operation  # `operation_support.run_in_place`
+
+    def recording(request: OperationRequest, **kwargs: Any) -> Any:
+        requests.append(request)
+        return in_place(request, **kwargs)
+
+    def executor(identity: dict[str, object], *args: Any, **kwargs: Any) -> Fake:
+        lock = run_lock.held_execution()
+        seen.update(
+            invocation=invocation_runtime.current(), identity=identity,
+            lock=None if lock is None else lock.record["kind"],
+        )
+        return fake
+
+    monkeypatch.setattr(invocation_runtime, "run_operation", recording)
+    monkeypatch.setattr(mutation, "native_executor", executor)
+    monkeypatch.setattr(mutation, "_check_capacity", lambda identity, lanes: None)
+    # The engine's only clock reading: the fake's, so each run takes its fake duration.
+    monkeypatch.setattr(mutation, "time", SimpleNamespace(monotonic_ns=fake.clock))
+    result = CliRunner().invoke(cli.app, [
+        "reference-mutation", str(profile), "--before", str(before), "--after", str(after_tree),
+        "--content-sha256", PINS["content_sha256"],
+        "--observer-profile-sha256", PINS["observer_profile_sha256"],
+        "--observer-contract-sha256", PINS["observer_contract_sha256"],
+        "--headroom-percent", "150", "--output", str(tmp_path / "reference"), *options,
+    ])
+    return result, requests, seen
+
+
+def test_the_command_measures_the_reference_in_one_operation_whose_receipts_freeze_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, requests, seen = _command(tmp_path, monkeypatch, "--attempt-seconds", "600")
+    assert result.exit_code == 0, result.output
+    [request] = requests
+    assert request.operation == "reference"
+    # Its outer bound holds every repeat's whole attempt limit, then its cleanup.
+    assert request.timeout == operations.reference_budget(600_000) > 3 * 600
+    assert request.arguments["attempt_ms"] == 600_000
+    assert request.arguments["contract"] == {"headroom_percent": 150, "sample_size": 20, "lanes": 4}
+    # Containers start on the daemon the profile froze, labelled with this invocation, while
+    # the command holds the host.
+    assert request.spec.docker == _RUNTIME
+    assert seen["invocation"] == request.spec.id
+    assert seen["lock"] == "preflight"
+    assert seen["identity"]["image_identity"] == BASE_IMAGE
+    # Freeze reads the receipts as written: their pins match the task, so both rules run.
+    saved = [
+        Receipt.model_validate_json((tmp_path / "reference" / f"{gate}.receipt.json").read_text())
+        for gate in reference_mutation.GATES
+    ]
+    task = TASK.model_copy(update={"mutation_timeout_seconds": 600})
+    suite = Suite(
+        tasks=(task,), attempts=3, seed=1,
+        observer_contract_sha256=PINS["observer_contract_sha256"],
+        reviewers=(ReviewerRule(
+            coding_harness="claude", reviewer_harness="codex", reviewer_model_id="model",
+            reviewer_effort="high", reviewer_cli_version="1", protocol_sha256="e" * 64,
+        ),),
+    )
+    frozen = suite_qualification.freeze(
+        suite, saved, Policy(min_tasks=1, min_repositories=1, max_tasks_per_repository=1)
+    )
+    assert not [f for f in frozen.blockers if f.gate in reference_mutation.GATES]
+    assert [f.gate for f in frozen.blockers if f.gate == "correctness"] == ["correctness"]
+    lines = result.output.splitlines()
+    assert [line.split(":")[0] for line in lines[:3]] == ["repeat 0", "repeat 1", "repeat 2"]
+    assert all(line.endswith("clean") for line in lines[:3])
+    assert "M = 20, 4 lanes. No model calls." in result.output
+
+
+def test_the_pilot_sets_m_lanes_and_the_limit_and_sees_a_censored_repeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Twelve sites at M = 12 and one lane: one second per run, so the 13 s limit cuts every
+    # repeat before its last mutants settle.
+    result, [request], _ = _command(
+        tmp_path, monkeypatch, "--attempt-seconds", "13", "--sample-size", "12", "--lanes", "1",
+        after=_lines(12),
+    )
+    assert result.exit_code == 0, result.output
+    assert request.arguments["contract"] == {"headroom_percent": 150, "sample_size": 12, "lanes": 1}
+    assert request.timeout == operations.reference_budget(13_000)
+    first = result.output.splitlines()[0]
+    assert first.startswith("repeat 0: 12 of ")
+    assert "baselines 1.0 s, 1.0 s" in first and "first mutant 2.0 s" in first
+    # The M = 10 prefix is reported apart from the whole sample.
+    assert "first 10 settled 12.0 s" in first
+    assert "all settled unsettled" in first and first.endswith("censored (attempt_deadline)")
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    [("--attempt-seconds", "0", "--attempt-seconds"), ("--lanes", "0", "--lanes"),
+     ("--content-sha256", "nothex", "content_sha256")],
+)
+def test_an_invalid_input_is_refused_before_the_host_is_taken(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, option: str, value: str, message: str
+) -> None:
+    taken: list[object] = []
+    monkeypatch.setattr(cli, "_execution", lambda *args: taken.append(args))
+    result, requests, _ = _command(
+        tmp_path, monkeypatch, "--attempt-seconds", "600", option, value
+    )
+    assert result.exit_code == 2 and message in result.output
+    assert taken == [] and requests == []
+
+
+def test_an_existing_output_is_never_reused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "reference").mkdir()
+    result, requests, _ = _command(tmp_path, monkeypatch, "--attempt-seconds", "600")
+    assert result.exit_code == 2 and "already exists" in result.output
+    assert requests == []

@@ -13,6 +13,7 @@ finite budget that leaves its implementation's own timeouts room to end it first
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -21,8 +22,10 @@ from uuid import uuid4
 from pydantic import AfterValidator, BaseModel, ConfigDict
 
 from pluginbench import invocation_runtime
+from pluginbench.benchmark import Count, Digest
 from pluginbench.collectors import Collector
 from pluginbench.evaluation import Evaluation
+from pluginbench.reference_mutation import Contract
 
 # What an operation has beyond the timeout its implementation applies to its main command:
 # after a Harbor worker, its export and cleanup; after a reviewer, its trace and receipts;
@@ -132,6 +135,21 @@ class Requalify(_Arguments):
     destination: AbsolutePath
 
 
+class Reference(_Arguments):
+    """`reference_mutation.measure_reference`: a task's reference measured three times into
+    its `mutation` and `mutation_time` receipts. `config` is the task's prepared mutation
+    profile, whose frozen Docker runtime the operation records. Unlike a submission's collect,
+    each repeat needs a declared limit: the operation's budget derives from it."""
+
+    before: AbsolutePath
+    after: AbsolutePath
+    config: dict[str, Any]
+    contract: Contract
+    pins: dict[str, Digest]
+    destination: AbsolutePath
+    attempt_ms: Count
+
+
 def run(
     operation: str,
     arguments: _Arguments,
@@ -180,6 +198,15 @@ def requalify_budget(task_dir: Path) -> int:
     from pluginbench import harbor_backend
 
     return REFERENCE_AGENTS * coding_budget(task_dir, harbor_backend._REFERENCE_AGENT_TIMEOUT)
+
+
+def reference_budget(attempt_ms: int) -> int:
+    """A reference measurement's whole budget: each repeat's attempt limit, then its
+    containers' setup and export. The lanes' last calls overshoot the limit together, so one
+    allowance per repeat holds them."""
+    from pluginbench.suite_qualification import REFERENCE_REPEATS
+
+    return REFERENCE_REPEATS * (math.ceil(attempt_ms / 1000) + AROUND_COLLECTOR)
 
 
 def review_budget(timeout: int) -> int:
@@ -270,6 +297,14 @@ def collect(arguments: dict[str, Any]) -> list[object]:
     from pluginbench import collectors
 
     return list(collectors._run_collector(**dict(Collect.model_validate(arguments))))
+
+
+def reference(arguments: dict[str, Any]) -> list[dict[str, Any]]:
+    """The `mutation` and `mutation_time` receipts, as JSON, once both are written."""
+    from pluginbench import reference_mutation
+
+    receipts = reference_mutation.measure_reference(**dict(Reference.model_validate(arguments)))
+    return [receipt.model_dump(mode="json") for receipt in receipts]
 
 
 def preflight(arguments: dict[str, Any]) -> object:

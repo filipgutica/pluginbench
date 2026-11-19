@@ -47,7 +47,7 @@ from pluginbench import run_lock
 # in a scope: an unknown name is refused before anything spawns, and again by the entry point.
 HANDLERS: dict[str, str] = {
     name: f"pluginbench.operations:{name}"
-    for name in ("coding", "grading", "review", "collect", "preflight")
+    for name in ("coding", "grading", "review", "collect", "preflight", "reference")
 }
 
 # Each startup gate's bound: the bootstrap's wait for its permit, and the entry point's
