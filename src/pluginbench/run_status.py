@@ -381,16 +381,31 @@ def _phase(
     return "not_started" if run is None else "stopped"
 
 
+def _control_problem(exc: sqlite3.Error) -> str:
+    """Why the host control database could not be read, and what to do about it."""
+    name = getattr(exc, "sqlite_errorname", "")
+    if name == "SQLITE_READONLY_ROLLBACK":
+        return f"{exc}: a killed command left a write unfinished; `pluginbench app status` rolls it back"
+    if name.startswith(("SQLITE_BUSY", "SQLITE_LOCKED")):
+        return f"{exc}: a command is writing it; try again"
+    return str(exc)
+
+
 def _host(root: Path) -> dict[str, Any]:
     """What `app status` shows of the host, with what concerns this run: the coordinator, the
     verified execution lock owner, a reconciling reason, what the next command must verify
     first, and this run's background launches. Unlike `app status`, it never rolls back a write
     a killed command left in the control database."""
     try:
+        # Read first, under the shared probe: a command that takes the host afterwards shows
+        # as executing, never its own record as a crash.
+        carried = run_lock.unreleased()
         current = coordinator.status(recover=False)
-        blocked = [] if current["execution"]["held"] else run_lock.unreleased()
-    except (OSError, ValueError, sqlite3.Error) as exc:
-        return {"error": f"{exc}; `pluginbench app status` reads and repairs it"}
+    except sqlite3.Error as exc:
+        return {"error": _control_problem(exc)}
+    except (OSError, ValueError) as exc:
+        return {"error": str(exc)}
+    blocked = [] if carried is None or current["execution"]["held"] else carried
     target = str(root.resolve())
     execution = current["execution"]
     # Only a verified holder's record says who executes; a stale one names a past owner.
@@ -697,8 +712,8 @@ def _host_lines(host: dict[str, Any] | None) -> list[str]:
         if item["problem"]:
             lines.append(
                 f"Blocked: the host's owner record cannot be trusted: {item['problem']}. Check "
-                "that nothing PluginBench started still runs, then run `pluginbench app cleanup "
-                f"--confirm-stopped {item['root']}`"
+                "that nothing PluginBench started still runs, then run "
+                f"`{shlex.join(['pluginbench', 'app', 'cleanup', '--confirm-stopped', item['root']])}`"
             )
             continue
         where = "this run" if item["this_run"] else item["root"]

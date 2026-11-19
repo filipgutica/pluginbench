@@ -290,6 +290,20 @@ def test_status_names_the_execution_owner_running_this_run(
     assert status["host"]["blocked"] == []
     assert status["host"]["execution"]["this_run"] is True
     assert "; executing this run (run, process" in run_status.format_status(status)
+    assert run_lock.unreleased() is None  # Never the holder's own record, as a crash.
+
+
+def test_a_released_record_never_names_the_holder(
+    tmp_path: Path, isolated_host_state: Path, host_execution: run_lock.ExecutionLock
+) -> None:
+    # Between taking the lock and publishing its new record, a holder's lock descriptor can
+    # match the record it released earlier.
+    path = isolated_host_state / run_lock.EXECUTION_OWNER
+    path.write_text(json.dumps({**json.loads(path.read_text()), "state": "released"}))
+
+    snapshot = run_lock.execution_owner()
+
+    assert snapshot.held and not snapshot.verified
 
 
 def test_status_names_the_fence_an_unreadable_owner_record_leaves(
@@ -351,7 +365,7 @@ def test_status_leaves_a_killed_control_write_for_app_status_to_roll_back(
     status = run_status.run_status(root)
 
     assert (database.read_bytes(), journal.read_bytes()) == before
-    assert "`pluginbench app status` reads and repairs it" in status["host"]["error"]
+    assert "`pluginbench app status` rolls it back" in status["host"]["error"]
     assert status["phase"] == "stopped"  # The run's own status still reads.
 
 
