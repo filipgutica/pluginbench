@@ -496,3 +496,32 @@ def test_the_owner_check_never_sees_a_record_another_thread_is_still_adopting(
             stop.set()
             checker.join()
     assert lost == []
+
+
+def test_an_observer_reading_the_owner_record_never_delays_an_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    with run_lock.hold_execution(_owner("run", tmp_path / "old"), state=state):
+        pass  # The lock file now exists and is free.
+    opened = run_lock._open_record
+    started: list[str] = []
+
+    def slow_reader(path: Path) -> Any:
+        read = opened(path)
+
+        def read_while_an_owner_starts() -> Any:
+            # An observer stalled in its read must not hold the probe the owner waits out.
+            with run_lock.hold_execution(_owner("run", tmp_path / "new"), state=state):
+                started.append("new")
+            return read()
+
+        return read_while_an_owner_starts
+
+    monkeypatch.setattr(run_lock, "_open_record", slow_reader)
+    snapshot, carried = run_lock.observe_execution(state)
+
+    assert started == ["new"]
+    # The observation is the record as it was opened: the old owner's clean release.
+    assert not snapshot.held and carried == []

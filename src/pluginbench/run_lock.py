@@ -382,7 +382,12 @@ class LockSnapshot:
 def _read_record(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     """The owner record at `path`, or None and why it cannot be trusted. A missing record has
     no reason; an unreadable or invalid one is unknown, never an empty record."""
-    value, problem = _load_record(path)
+    return _validated(_load_record(path))
+
+
+def _validated(loaded: tuple[Any, str | None]) -> tuple[dict[str, Any] | None, str | None]:
+    """_read_record of what _load_record returned."""
+    value, problem = loaded
     if value is _MISSING:
         return None, None
     problem = problem or _record_problem(value)
@@ -402,6 +407,27 @@ def _load_record(path: Path) -> tuple[Any, str | None]:
         return _MISSING, None
     except (OSError, ValueError) as exc:
         return None, f"it cannot be read: {exc}"
+
+
+def _open_record(path: Path) -> Callable[[], tuple[Any, str | None]]:
+    """Open the record at `path` now and return what reads it, as _load_record does, later.
+    Records are replaced atomically, so the read finds the version current when it was opened."""
+    try:
+        stream = path.open("rb")
+    except FileNotFoundError:
+        return lambda: (_MISSING, None)
+    except OSError as exc:
+        problem = f"it cannot be read: {exc}"
+        return lambda: (None, problem)
+
+    def read() -> tuple[Any, str | None]:
+        with stream:
+            try:
+                return json.loads(stream.read()), None
+            except (OSError, ValueError) as exc:
+                return None, f"it cannot be read: {exc}"
+
+    return read
 
 
 def _record_problem(value: object) -> str | None:
@@ -551,20 +577,20 @@ def observe_execution(
     A free lock's record is read under a brief shared flock, which no owner can take the lock
     through, so the two always agree."""
     state = state or state_root()
-    path = state / EXECUTION_LOCK
+    path, owner = state / EXECUTION_LOCK, state / EXECUTION_OWNER
     while True:
         try:
             fd = os.open(path, os.O_RDONLY)
         except FileNotFoundError:
-            record, carried = _read_record(state / EXECUTION_OWNER)[0], _carried(state)
+            loaded = _load_record(owner)
             if path.exists():
                 continue  # An owner created the lock during the read: observe it instead.
-            return LockSnapshot(path, held=False, record=record, verified=False), carried
+            break
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
             except BlockingIOError:
-                record = _read_record(state / EXECUTION_OWNER)[0]
+                record = _read_record(owner)[0]
                 # A released record names a past owner, even when its process holds the lock
                 # again.
                 verified = (
@@ -573,10 +599,15 @@ def observe_execution(
                     and holds(record, os.fstat(fd))
                 )
                 return LockSnapshot(path, held=True, record=record, verified=verified), None
-            record = _read_record(state / EXECUTION_OWNER)[0]
-            return LockSnapshot(path, held=False, record=record, verified=False), _carried(state)
+            # Only the open happens under the shared flock, which delays any owner taking the
+            # lock: the read and validation come after it is released.
+            read = _open_record(owner)
         finally:
             os.close(fd)
+        loaded = read()
+        break
+    record = _validated(loaded)[0]
+    return LockSnapshot(path, held=False, record=record, verified=False), _carried(state, loaded)
 
 
 def write_atomic(path: Path, value: dict[str, object]) -> None:
@@ -818,13 +849,15 @@ def note_runtime(runtime: dict[str, object]) -> None:
         _execution.note_runtime(runtime)
 
 
-def _carried(state: Path) -> list[dict[str, Any]]:
+def _carried(
+    state: Path, loaded: tuple[Any, str | None] | None = None
+) -> list[dict[str, Any]]:
     """The obligations the last owner left: those it carried, and itself unless it recorded a
     clean release (see _obligations). Whatever part of the record cannot be read or fails
     validation adds one more obligation, a fence whose root is the state directory. Every
     obligation that validates on its own is kept with its own root and checks, so repairing
-    the fence never clears them."""
-    value, problem = _load_record(state / EXECUTION_OWNER)
+    the fence never clears them. `loaded` is the record as _load_record read it, if it was."""
+    value, problem = loaded or _load_record(state / EXECUTION_OWNER)
     if value is _MISSING:
         return []
     kept, problems = ([], [problem]) if problem else _obligations(value)
