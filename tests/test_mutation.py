@@ -142,7 +142,7 @@ def test_sample_takes_one_mutant_per_line_round_robin_over_operators() -> None:
 
 def test_sample_stops_at_m_and_takes_every_line_when_fewer() -> None:
     many = [_site("a.py", line, "relational_boundary") for line in range(1, 30)]
-    assert len(mutation.sample(many, "sha256:x")) == mutation.SAMPLE_SIZE == 20
+    assert len(mutation.sample(many, "sha256:x")) == mutation.SAMPLE_SIZE == 10
     few = [_site("a.py", 1, "relational_boundary"), _site("a.py", 2, "boolean_connective", 3)]
     assert sorted(site.line for site in mutation.sample(few, "sha256:x")) == [1, 2]
 
@@ -1479,7 +1479,8 @@ def test_four_lanes_never_become_five(tmp_path: Path) -> None:
         return 0, False, ""
 
     report, fake, destination = _measure(
-        tmp_path, behaviour, after={"src/grade.py": _lines(12)}, limits=mutation.Limits(lanes=4)
+        tmp_path, behaviour, after={"src/grade.py": _lines(12)},
+        limits=mutation.Limits(lanes=4, sample_size=12),
     )
     assert fake.most_active == 4 and report["lanes"] == 4
     metrics = _metrics(report, destination)
