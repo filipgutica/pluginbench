@@ -742,6 +742,7 @@ def _check(config: Evaluation, output: Path, progress: Callable[[str], None] | N
         raise ValueError(f"output must be a new directory: {root}")
     caches = _caches(root)
     harbor_backend.preflight(jobs=config.jobs, harness=config.runner.harness, **limits)
+    _refuse_guidance_above_attempts()
     harness_versions: dict[str, str] = {
         config.runner.harness: _harness_version(
             config.runner.harness, config.runner.cli_version, coding=True
@@ -2175,6 +2176,18 @@ def _measurement_collection(root: Path, selection: dict[str, object]) -> dict[st
         "revision_receipt": study._reference(evidence, path),
         "history": history,
     }
+
+
+def _refuse_guidance_above_attempts() -> None:
+    """Refuse what would stop every coding attempt: each starts in a new folder in the
+    temporary directory, and `codex.reject_guidance` refuses instructions above it. Found
+    here, it stops the check, not the paid run."""
+    if found := codex.guidance_above(Path(tempfile.gettempdir()).resolve() / "attempt"):
+        raise ValueError(
+            "instruction files or folders above the temporary directory would stop every "
+            f"coding attempt: {', '.join(found)}. Remove them, or set TMPDIR to a directory "
+            "without them above it"
+        )
 
 
 def _refuse_temporary_inside(root: Path) -> None:

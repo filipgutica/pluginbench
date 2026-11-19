@@ -48,16 +48,29 @@ def reject_guidance(
         elif path.name in GUIDANCE_NAMES or (reject_git and path.name == ".git"):
             contaminants.append(str(path))
     if include_ancestors:
-        contaminants.extend(
-            str(parent / name)
-            for parent in root.parents
-            for name in GUIDANCE_NAMES
-            if (parent / name).exists()
-        )
+        contaminants.extend(guidance_above(root))
     if contaminants:
         raise ValueError(
             "custom guidance or unsupported fixture paths: " + ", ".join(sorted(contaminants))
         )
+
+
+def guidance_above(path: Path) -> list[str]:
+    """Instruction files and nonempty instruction folders in the parent folders of `path`.
+
+    An empty folder is left out: it holds no instructions, and sandboxes create empty
+    `.codex` and `.agents` folders in the directories they protect, such as /tmp.
+    """
+    found = []
+    for parent in path.parents:
+        for name in GUIDANCE_NAMES:
+            candidate = parent / name
+            if candidate.is_dir() and not candidate.is_symlink():
+                if next(candidate.iterdir(), None) is not None:
+                    found.append(str(candidate))
+            elif candidate.exists() or candidate.is_symlink():
+                found.append(str(candidate))
+    return sorted(found)
 
 
 def preflight() -> dict[str, Any]:
