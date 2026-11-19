@@ -96,12 +96,15 @@ def bound_guidance(monkeypatch: pytest.MonkeyPatch) -> None:
     /tmp or above cannot fail tests. Below it, the scan is the real one."""
     if not (ceiling := os.environ.get(GUIDANCE_CEILING)):
         return
-    real, base = codex.guidance_above, Path(ceiling)
+    real, folder, base = codex.guidance_above, codex.guidance_in, Path(ceiling)
 
     def bounded(path: Path) -> list[str]:
         if not path.resolve().is_relative_to(base):
             return real(path)
-        return [found for found in real(path) if Path(found).parent.is_relative_to(base)]
+        return sorted(
+            found for parent in path.parents if parent.is_relative_to(base)
+            for found in folder(parent)
+        )
 
     monkeypatch.setattr(codex, "guidance_above", bounded)
 

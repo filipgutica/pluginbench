@@ -56,22 +56,26 @@ def reject_guidance(
 
 
 def guidance_above(path: Path) -> list[str]:
-    """Instruction files and nonempty instruction folders in the parent folders of `path`.
+    """Instruction files and nonempty instruction folders in the parent folders of `path`."""
+    return sorted(found for parent in path.parents for found in guidance_in(parent))
+
+
+def guidance_in(folder: Path) -> list[str]:
+    """Instruction files and nonempty instruction folders directly in `folder`.
 
     An empty folder is left out: it holds no instructions, and sandboxes create empty
     `.codex` and `.agents` folders in the directories they protect, such as /tmp.
     """
     found = []
-    for parent in path.parents:
-        for name in GUIDANCE_NAMES:
-            candidate = parent / name
-            try:
-                mode = candidate.lstat().st_mode
-            except FileNotFoundError:
-                continue  # Any other error, such as a denied lookup, stops the scan.
-            if not stat.S_ISDIR(mode) or next(candidate.iterdir(), None) is not None:
-                found.append(str(candidate))
-    return sorted(found)
+    for name in GUIDANCE_NAMES:
+        candidate = folder / name
+        try:
+            mode = candidate.lstat().st_mode
+        except FileNotFoundError:
+            continue  # Any other error, such as a denied lookup, stops the scan.
+        if not stat.S_ISDIR(mode) or next(candidate.iterdir(), None) is not None:
+            found.append(str(candidate))
+    return found
 
 
 def preflight() -> dict[str, Any]:

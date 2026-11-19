@@ -1237,14 +1237,15 @@ def test_check_refuses_guidance_above_the_temporary_directory(
 def test_check_refuses_a_relative_temporary_directory(
     checkable: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(tempfile, "tempdir", ".")
+    # Python makes a relative TMPDIR absolute from the working directory, before check sees it.
+    monkeypatch.setenv("TMPDIR", "scratch")
 
     result = CliRunner().invoke(
         cli.app, ["check", str(checkable["path"]), "--output", str(checkable["output"])]
     )
 
     assert result.exit_code != 0
-    assert "must be an absolute path, not ." in result.stderr
+    assert "must be absolute paths: TMPDIR=scratch" in result.stderr
     assert not checkable["calls"]
 
 

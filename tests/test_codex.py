@@ -204,6 +204,19 @@ def test_ancestor_guard_stops_on_a_folder_it_cannot_read(tmp_path: Path) -> None
         (tmp_path / ".codex").chmod(0o700)
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root looks up any path")
+def test_ancestor_guard_stops_on_a_folder_it_cannot_look_into(tmp_path: Path) -> None:
+    # Without search permission no entry's metadata can be read; that is not "absent".
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o600)
+    try:
+        with pytest.raises(PermissionError):
+            codex.guidance_above(locked / "attempt" / "workspace")
+    finally:
+        locked.chmod(0o700)
+
+
 def test_preflight_checks_help_without_model_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     required = (
         "--ignore-user-config --ignore-rules --json --model --config "

@@ -2182,11 +2182,12 @@ def _refuse_guidance_above_attempts() -> None:
     """Refuse what would stop every coding attempt: each starts in a new folder in the
     temporary directory, and `codex.reject_guidance` refuses instructions above it. Found
     here, it stops the check, not the paid run."""
-    temporary = Path(tempfile.gettempdir())
-    if not temporary.is_absolute():
-        # Attempts would resolve it from another working directory than this check does.
-        raise ValueError(f"the temporary directory must be an absolute path, not {temporary}")
-    if found := codex.guidance_above(temporary.resolve() / "attempt"):
+    # Python resolves a relative one from each process's own working directory, so attempts
+    # could start somewhere other than where this check looks.
+    if relative := [f"{name}={value}" for name in ("TMPDIR", "TEMP", "TMP")
+                    if (value := os.environ.get(name)) and not Path(value).is_absolute()]:
+        raise ValueError(f"temporary directory variables must be absolute paths: {', '.join(relative)}")
+    if found := codex.guidance_above(Path(tempfile.gettempdir()).resolve() / "attempt"):
         raise ValueError(
             "instruction files or folders above the temporary directory would stop every "
             f"coding attempt: {', '.join(found)}. Remove them, or set TMPDIR to a directory "
