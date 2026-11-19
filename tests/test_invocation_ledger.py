@@ -1019,8 +1019,9 @@ def _through_run_operation(
 ) -> None:
     """Run the study's operations through the owner's real `run_operation`: it records each
     operation and verifies its cleanup. `launch` stands in for the scope, `cleanup` for the
-    verification."""
+    verification, and the recorded Docker engine answers as itself."""
     monkeypatch.setattr(invocation_runtime, "run_operation", _RUN_OPERATION)
+    monkeypatch.setattr(invocation_runtime, "require_recoverable", lambda runtime: None)
     monkeypatch.setattr(invocation_runtime, "_launch", launch)
     monkeypatch.setattr(invocation_runtime, "verify_cleanup", cleanup)
 
