@@ -24,7 +24,9 @@ PINNED: dict[str, tuple[int, dict[str, str]]] = {
             # no launch changes.
             # The reviewer's failed cleanup is told to the host lock owner; launches are
             # unchanged.
-            "codex.py": "9017df04931b2817beeb281f6153d3820d3461e3fa5ed17563fdd274ef390ff6",
+            # The reviewer's execution.json records whether its artifacts were scrubbed, so only
+            # scrubbed ones enter a run; no launch changes.
+            "codex.py": "54aa8f71097817af192eb0bf32c3697f2665746132238dc1f5dc7c7cadce05df",
             # The Claude launch contract; tests/test_codex_identity.py proves Codex launches equal.
             # Measurement and regrade skip launch-only runtime fields; coding checks are unchanged.
             # Audited command hooks keep native usage; with no audited_hooks every launch is

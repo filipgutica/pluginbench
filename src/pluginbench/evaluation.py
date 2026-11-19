@@ -1543,7 +1543,12 @@ def plan_review(root: Path, revision: str) -> dict[str, object]:
     if _review_directory(root / "evidence", revision).exists():
         # A revision a crash or Stop cut off resumes with the reviewer it was started with.
         calls = resume_calls(root / "evidence", revision)
-        if calls == 0:
+        state = json.loads(
+            (_review_directory(root / "evidence", revision) / "review-state.json").read_text()
+        )
+        selected = selection["review_revision"] in {revision, f"{revision}-citations"}
+        # A revision still unfinished, or not yet selected, finishes with no review call.
+        if calls == 0 and selected and state["status"] in {"complete", "incomplete"}:
             raise ValueError(
                 f"review revision {revision} has no review left to call; choose a new "
                 "--revision name"
@@ -1577,17 +1582,33 @@ def review_evaluation(
         raise ValueError("this run has no reviewer, so it has no review to repeat")
     guidance = _frozen_review_guidance(root, selection, config.reviewer)
     recorded = _object(selection.get("reviewer_overrides", {})).get(revision)
-    resuming = _review_directory(root / "evidence", revision).exists()
-    if resuming and recorded and reviewer is None:
-        # Resumed with the reviewer that started it; review_study refuses any other.
-        reviewer = Runner.model_validate(
-            {key: _object(recorded)[key] for key in ("harness", "model", "reasoning")}
+    directory = _review_directory(root / "evidence", revision)
+    resuming = directory.exists()
+    if resuming:
+        # A revision resumes with the reviewer frozen in its protocol, checked before any
+        # preflight or write.
+        state = json.loads((directory / "review-state.json").read_text())
+        protocol = study._bound_document(root / "evidence", state["protocol"])
+        frozen = (protocol.get("harness", "codex"), protocol["model"], protocol["effort"])
+        if reviewer is not None and (reviewer.harness, reviewer.model, reviewer.reasoning) != frozen:
+            raise ValueError(
+                f"review revision {revision} was started by {' '.join(frozen)}; resume it with "
+                "that reviewer, or without the --reviewer options"
+            )
+        configured = (config.reviewer.harness, config.reviewer.model, config.reviewer.reasoning)
+        reviewer = (
+            None
+            if frozen == configured
+            else Runner.model_validate(
+                {"harness": frozen[0], "model": frozen[1], "reasoning": frozen[2]}
+            )
         )
     identity = reviewer or config.reviewer
     _review_preflight({"reviewer": identity.model_dump(mode="json")})
     override = None
-    if resuming and recorded:
-        override = _object(recorded)  # Its attribution stays as recorded when it started.
+    if resuming:
+        # Attribution stays as recorded when the revision was created.
+        override = _object(recorded) if recorded else None
     elif reviewer is not None:
         override = {
             **reviewer.model_dump(mode="json", include={"harness", "model", "reasoning"}),

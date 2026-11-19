@@ -608,6 +608,8 @@ REVIEW_BOUNDARIES = (
     "after-stop",  # the launcher saved a provider stop and raised; killed before the outcome
     "after-error",  # the launcher raised with no stop; killed before the outcome
     "creating",  # while the revision is being created, before any call
+    "unscrubbed",  # the launcher could not scrub its artifacts; killed before the outcome
+    "malformed",  # native output cut off mid-character; killed before the outcome
 )
 
 
@@ -626,12 +628,19 @@ def _review_boundary_child() -> None:
     def invoke(**kwargs: Any) -> dict[str, object]:
         execution = judged(**kwargs)
         artifacts = kwargs["area"] / "artifacts"
-        if boundary in {"after-stop", "after-error"}:
+        if boundary in {"after-stop", "after-error", "unscrubbed", "malformed"}:
             # Only a launcher that returned writes its success marker.
             (artifacts / "host-evidence.json").unlink()
         if boundary == "after-stop":
             (artifacts / "host-trace-0.jsonl").write_text(codex_rollout("usage_limit_exceeded"))
-        if boundary in {"after-output", "after-stop", "after-error"}:
+        if boundary == "unscrubbed":
+            receipt = json.loads((artifacts / "execution.json").read_text())
+            (artifacts / "execution.json").write_text(
+                json.dumps({**receipt, "artifacts_scrubbed": False})
+            )
+        if boundary == "malformed":
+            (artifacts / "stdout.jsonl").write_bytes(b'{"type": "turn.completed"}\n\xe2\x82')
+        if boundary in {"after-output", "after-stop", "after-error", "unscrubbed", "malformed"}:
             kill()
         return execution
 
@@ -677,6 +686,10 @@ def _review_boundary_child() -> None:
         ("after-stop", "issues", 2, "halted_provider"),
         # A launcher error the crash lost: the call counts, keeps its usage, and calls again.
         ("after-error", "issues", 2, "unresolved"),
+        # Artifacts the launcher did not scrub never enter the run; the call counts and retries.
+        ("unscrubbed", "issues", 2, "unresolved"),
+        # Malformed output cannot wedge recovery: the call fails and keeps its evidence.
+        ("malformed", "issues", 1, "failed_transient"),
         # A revision cut off while being created was never published, and starts afresh.
         ("creating", "issues", 2, None),
         # A call that failed keeps its ending, and its failure signature, and is not called again.
@@ -725,6 +738,10 @@ def test_a_review_killed_at_each_boundary_resumes_without_repeating_a_finished_c
     names = sorted(path.name for path in (root / "review-revisions").iterdir())
     assert names[-1] == "review" and len(names) == 1 + (boundary == "creating")
     assert all(name.startswith(".staging-review-") for name in names[:-1])
+    if boundary == "unscrubbed":
+        [replaced] = [row for row in state["records"] if row.get("superseded")]
+        packet = replaced["superseded"][0]["packet_id"]
+        assert not (root / "review-revisions/review/observations" / packet / "artifacts").exists()
     if first == "unresolved" and boundary == "after-error":
         [replaced] = [row for row in state["records"] if row.get("superseded")]
         kept = study._bound_document(root, replaced["superseded"][0]["observation"])
@@ -773,13 +790,20 @@ def test_resume_refuses_other_settings_and_changed_review_code(
     ):
         with pytest.raises(ValueError, match=refused):
             study_review.review_study(root, **settings)
+    state_path = root / "review-revisions/review/review-state.json"
+    saved = state_path.read_text()
     citations = root / "review-revisions/review-citations"
     citations.mkdir()
+    # With nothing left to do, a revision a citation recovery binds stays as saved.
+    assert study_review.review_study(root) == state_path and state_path.read_text() == saved
+    # With a refunded call to make again, resuming would change the state it binds.
+    refunded = json.loads(saved)
+    refunded["records"][0]["ending"] = {"state": "halted_provider", "error": None}
+    state_path.write_text(json.dumps(refunded))
     with pytest.raises(ValueError, match="review-citations binds this revision"):
         study_review.review_study(root)
     citations.rmdir()
-    state_path = root / "review-revisions/review/review-state.json"
-    saved = state_path.read_text()
+    state_path.write_text(saved)
     state_path.write_text(json.dumps({**json.loads(saved), "schema_version": 1}))
     with pytest.raises(ValueError, match="predates resumable reviews"):
         study_review.review_study(root)

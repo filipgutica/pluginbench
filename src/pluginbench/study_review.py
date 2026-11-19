@@ -612,8 +612,6 @@ def _resumable_state(
         )
     if state.get("recovery"):
         raise ValueError("a citation recovery revision cannot resume; resume its original")
-    if (directory.parent / f"{revision}-citations").exists():
-        raise ValueError(f"review revision {revision}-citations binds this revision, so it cannot resume")
     adapter = state["adapter"]
     assert isinstance(adapter, dict)
     if adapter.get("sha256") != study._digest(Path(__file__)):
@@ -691,7 +689,19 @@ def _saved_stop(artifacts: Path, harness: str) -> str | None:
         codex.validate_artifacts(artifacts)
     except (OSError, ValueError):
         return None
-    return provider_stops.saved_stop(artifacts, harness)
+    try:
+        return provider_stops.saved_stop(artifacts, harness)
+    except (OSError, ValueError):
+        return None  # An unreadable trace records no stop.
+
+
+def _scrubbed(artifacts: Path) -> bool:
+    """Whether the launcher scrubbed a call's artifacts, which alone may enter the run."""
+    try:
+        receipt = json.loads((artifacts / "execution.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(receipt, dict) and receipt.get("artifacts_scrubbed") is True
 
 
 def _accept(
@@ -756,6 +766,11 @@ def review_study(
         raise ValueError("review requires a complete or interrupted study, not an active run")
     directory = _review_directory(root, revision)
     resuming = directory.exists()
+    if Path(tempfile.gettempdir()).resolve().is_relative_to(root):
+        raise ValueError(
+            "the temporary directory is inside the run, so judge traces would name it; set "
+            "TMPDIR to a directory outside the run"
+        )
     study._bound_document(root, original_run["assessment_input"])
     _, records = _load_manifest(root / original_run["assessment_input"]["path"])
     if not model.strip() or not effort.strip() or timeout <= 0:
@@ -933,7 +948,7 @@ def review_study(
                 return ending  # type: ignore[no-any-return]
             area = _owned_area(root, start.get("area"), packet_id)
             # The launcher writes `execution.json` last in its cleanup, after it scrubs.
-            if area is None or not (area / "artifacts/execution.json").is_file():
+            if area is None or not _scrubbed(area / "artifacts"):
                 return None
             artifacts = observed / "artifacts"
             if artifacts.is_dir() and not artifacts.is_symlink():
@@ -947,10 +962,21 @@ def review_study(
                 execution.update(successful_native_completion=False, error=error)
                 status, reason, ending_ = "unknown", error, ("failed_transient", error)
             else:
-                execution = _captured_execution(artifacts, effort, harness)
+                try:
+                    execution = _captured_execution(artifacts, effort, harness)
+                    capture_error = None
+                except (OSError, ValueError) as exc:
+                    # Malformed native output: the saved evidence stays, its usage unknown.
+                    capture_error = f"{type(exc).__name__}: {exc}"
+                    execution = codex.parse_events("", [], harness, requested_effort=effort)
+                    execution.update(successful_native_completion=False, error=capture_error)
                 if (stopped := provider_stop(artifacts)) is not None:
                     status, reason = "unknown", f"judge review failed: ProviderStopped: {stopped}"
                     ending_ = ("halted_provider", None)
+                elif capture_error is not None:
+                    status = "unknown"
+                    reason = f"judge review failed: {capture_error}"
+                    ending_ = ("failed_transient", capture_error)
                 elif not (artifacts / "host-evidence.json").is_file():
                     # The launcher raised, and the crash lost what it raised. Its usage stays.
                     status = "unknown"
@@ -1005,12 +1031,16 @@ def review_study(
             state = _resumable_state(root, directory, revision, frozen)
             protocol_ref = state["protocol"]
             rows = state["records"]
+            calls = {row["id"]: row for row in ledger.invocations() if row["stage"] == "review"}
             open_calls = {
-                row["id"]: row
-                for row in ledger.invocations()
-                if row["stage"] == "review" and row["state"] in invocation_ledger.OPEN_STATES
+                call: row
+                for call, row in calls.items()
+                if row["state"] in invocation_ledger.OPEN_STATES
             }
             crashed: list[tuple[dict[str, object], str]] = []
+            # Whether the saved state lags what the run holds: a receipt it does not bind yet,
+            # or a call an earlier recovery ended before this state was saved.
+            lagging = False
             for row in rows:
                 packet_id = str(row["packet_id"])
                 # A crash between a call's start receipt and the state that binds it.
@@ -1023,15 +1053,31 @@ def review_study(
                         status="running",
                     )
                     state["native_invocations"] = int(state["native_invocations"]) + 1
+                    lagging = True
                 if row.get("native_start") is None:
                     continue
                 start = study._bound_document(root, row["native_start"])
                 call = start.get("invocation")
                 if call not in open_calls:
+                    if row["status"] == "running" and call in calls:
+                        row.update(
+                            status="unknown",
+                            ending={"state": calls[call]["state"], "error": calls[call]["error"]},
+                            reason="judge call ended by an earlier recovery before its state "
+                            "was saved",
+                        )
+                        lagging = True
                     continue
                 if open_calls[call]["attempt_id"] != row["id"] or call not in cleaned:
                     raise ValueError(f"judge call {call} cannot be matched to its review row")
                 crashed.append((row, call))
+            pending = crashed or lagging or any(_calls_again(row) for row in rows)
+            if pending and (directory.parent / f"{revision}-citations").exists():
+                raise ValueError(
+                    f"review revision {revision}-citations binds this revision, so it cannot resume"
+                )
+            if not pending and state["status"] in {"complete", "incomplete"}:
+                return state_path  # Nothing to recover or call: the revision stays as saved.
             for row, call in crashed:
                 start = study._bound_document(root, row["native_start"])
                 ending = row.get("ending")
@@ -1382,8 +1428,12 @@ def review_study(
                             call_interrupted = exc
                     finally:
                         artifact_error = None
-                        if artifacts.exists() or artifacts.is_symlink():
+                        if _scrubbed(artifacts):
                             artifact_error = codex.copy_artifacts(artifacts, observed / "artifacts")
+                        elif artifacts.exists() or artifacts.is_symlink():
+                            artifact_error = (
+                                "the judge call's artifacts were not scrubbed, so they are not kept"
+                            )
                         if artifact_error:
                             row.update(status="unknown", reason=artifact_error)
                             response = None

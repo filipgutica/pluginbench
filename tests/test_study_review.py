@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 from typing import TypedDict, Unpack
 
@@ -277,7 +278,9 @@ def _judge(
             (artifacts / "host-trace-0.jsonl").write_text(
                 "\n".join(json.dumps(event) for event in startup) + "\n"
             )
-        (artifacts / "execution.json").write_text(json.dumps({"elapsed_seconds": 2.5}))
+        (artifacts / "execution.json").write_text(
+            json.dumps({"elapsed_seconds": 2.5, "artifacts_scrubbed": True})
+        )
         (artifacts / "host-evidence.json").write_text(json.dumps(execution))
         if behavior == "raised":
             raise RuntimeError("judge transport failed after usage capture")
@@ -524,6 +527,40 @@ def test_interrupted_judge_binds_reportable_usage_and_pending_assignments(
     path.write_text(json.dumps(state))
     with pytest.raises(ValueError, match="bound more than once"):
         study_review.validate_review_revision(root, "review")
+
+
+def test_artifacts_the_launcher_did_not_scrub_never_enter_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _existing_study(tmp_path, monkeypatch)
+    _judge(monkeypatch, root)
+    native = codex.invoke
+
+    def unscrubbed(*, area: Path, **kwargs: Unpack[NativeInvocationKwargs]) -> dict[str, object]:
+        native(area=area, **kwargs)
+        receipt = area / "artifacts/execution.json"
+        receipt.write_text(json.dumps({**json.loads(receipt.read_text()), "artifacts_scrubbed": False}))
+        raise RuntimeError("scrubbing failed")
+
+    monkeypatch.setattr(codex, "invoke", unscrubbed)
+    state = json.loads(study_review.review_study(root).read_text())
+    assert {row["reason"] for row in state["records"]} == {
+        "the judge call's artifacts were not scrubbed, so they are not kept"
+    }
+    assert not list((root / "review-revisions/review/observations").glob("*/artifacts"))
+
+
+def test_a_temporary_directory_inside_the_run_is_refused_before_any_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _existing_study(tmp_path, monkeypatch)
+    calls = _judge(monkeypatch, root)
+    inside = root / "tmp"
+    inside.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(inside))
+    with pytest.raises(ValueError, match="temporary directory is inside the run"):
+        study_review.review_study(root)
+    assert calls == [] and not (root / "review-revisions").exists()
 
 
 def test_a_crashed_call_s_area_is_trusted_only_when_its_packet_copy_names_the_call(
@@ -948,6 +985,7 @@ def test_parallel_judge_interrupt_keeps_active_observations_costs_and_unstarted_
                 json.dumps(
                     {
                         "usage": {"input_tokens": 30, "output_tokens": 7},
+                        "artifacts_scrubbed": True,
                     }
                 )
             )

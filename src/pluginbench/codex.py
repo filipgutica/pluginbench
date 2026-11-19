@@ -427,12 +427,16 @@ def invoke(
                 elif private.exists():
                     shutil.rmtree(private)
             finally:
+                scrubbed = False
                 try:
                     scrub_artifacts(artifacts, secrets)
+                    scrubbed = True
                 finally:
                     write_json(
                         artifacts / "execution.json",
                         {
+                            # Only scrubbed artifacts may leave the call's private area.
+                            "artifacts_scrubbed": scrubbed,
                             "exit_code": proc.returncode if proc is not None else None,
                             "timed_out": timed_out,
                             "elapsed_seconds": time.monotonic() - started,

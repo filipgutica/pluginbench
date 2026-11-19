@@ -2388,6 +2388,12 @@ def test_review_adds_a_selected_revision_with_the_frozen_reviewer(
     again = CliRunner().invoke(cli.app, ["review", str(root), "--revision", "r2", "--yes"])
     assert again.exit_code == 2 and "no review left to call" in again.stderr
     assert len(reviews) == reviewed + 9
+    # A revision whose pass a crash cut off after its last call still resumes, with no call.
+    path = root / "evidence/review-revisions/r2/review-state.json"
+    finished = path.read_text()
+    path.write_text(json.dumps({**json.loads(finished), "status": "running"}))
+    assert evaluation.plan_review(root, "r2")["review_calls"] == 0
+    path.write_text(finished)
     saved = evaluation._load_selection(root)
     measurements = saved["measurements"]
     assert isinstance(measurements, list)
@@ -2541,6 +2547,14 @@ def test_review_resumes_a_cut_off_revision_with_the_reviewer_that_started_it(
     overrides = evaluation._load_selection(root)["reviewer_overrides"]
     assert isinstance(overrides, dict) and overrides["second"]["model"] == "claude-opus-5-5"
     monkeypatch.setattr(codex, "invoke", reviewed)
+    # Another reviewer is refused before any preflight or write.
+    other = CliRunner().invoke(
+        cli.app,
+        ["review", str(root), "--revision", "second", "--yes", "--reviewer-harness", "codex"]
+        + ["--reviewer-model", "gpt-6-luna", "--reviewer-effort", "high"],
+    )
+    assert other.exit_code == 2 and "was started by claude claude-opus-5-5 high" in other.stderr
+    assert evaluation._load_selection(root)["reviewer_overrides"] == overrides
 
     # No reviewer options: the revision resumes with the Claude reviewer it was started with.
     result = CliRunner().invoke(cli.app, ["review", str(root), "--revision", "second", "--yes"])
