@@ -35,10 +35,12 @@ class Contract:
     """The mutation part of the common observer contract.
 
     `headroom_percent` is how much the task's mutation time limit must exceed the projected
-    full-M reference time: 150 means one and a half times.
+    full-M reference time: 200 means twice. The pilot pinned 200: a submission whose tests kill
+    every mutant takes up to 1.73 times its reference, and one cut off by the limit would never
+    finish, so packages that test more would lose their slots.
     """
 
-    headroom_percent: int
+    headroom_percent: int = mutation.HEADROOM_PERCENT
     sample_size: int = mutation.SAMPLE_SIZE
     lanes: int = mutation.LANES
 

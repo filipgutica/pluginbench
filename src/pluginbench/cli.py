@@ -613,8 +613,8 @@ def reference_mutation(
         ..., "--attempt-seconds", min=1, help="Each repeat's whole attempt limit."
     ),
     headroom_percent: int = typer.Option(
-        ..., "--headroom-percent", min=1,
-        help="How far the mutation limit must exceed the projected reference time; 150 = 1.5x.",
+        mutation.HEADROOM_PERCENT, "--headroom-percent", min=1,
+        help="How far the mutation limit must exceed the projected reference time; 200 = 2x.",
     ),
     sample_size: int = typer.Option(
         mutation.SAMPLE_SIZE, "--sample-size", min=1, help="M, the mutants each repeat measures."

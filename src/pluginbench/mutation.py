@@ -67,10 +67,13 @@ OPERATORS = (
     "boolean_connective",
     "condition_negation",
 )
-# M, the most mutants one attempt measures. A timing pilot pins it; its first ten sites are the
-# version 1 sample, so M = 10 and M = 20 measure the same first ten mutants.
-SAMPLE_SIZE = 20
+# M, the most mutants one attempt measures, pinned at 10 by the 2026-11-19 timing pilot: at 20 the
+# first fill's mutation alone would take 14 to 44 hours. The first ten sites of any larger sample
+# are this sample, so a later M = 20 measures these ten mutants too.
+SAMPLE_SIZE = 10
 V1_SAMPLE_SIZE = 10
+# How far a task's mutation time limit exceeds its projected reference time, in percent.
+HEADROOM_PERCENT = 200
 # Mutants run in up to this many lanes at once, one container each, where the caller runs one
 # measurement at a time. Every other caller keeps one lane (`Limits.lanes`).
 LANES = 4
