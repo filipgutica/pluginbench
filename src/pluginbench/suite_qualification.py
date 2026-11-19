@@ -153,11 +153,12 @@ def _reference(agent: str, row: object, expected: bool) -> Verdict:
     passed = grade.get("passed")
     if type(passed) is not bool or "fail_reason" not in grade or grade["fail_reason"] is not None:
         return Verdict(status="unavailable", reason=f"{agent}: source-only grade is not a test result")
-    # The grade is of this trial's reconstructed patch, not another submission's.
-    if (grade.get("export_digest") != row.get("export_digest")
-            or grade.get("native_patch_sha256") != reconstruction.get("patch_sha256")
-            or not isinstance(row.get("export_digest"), str)
-            or not isinstance(reconstruction.get("patch_sha256"), str)):
+    # The grade is of this trial's reconstructed patch. Two trials over the same source share
+    # both digests, so the trial ID tells them apart.
+    bindings = (("trial", row.get("trial")), ("export_digest", row.get("export_digest")),
+                ("native_patch_sha256", reconstruction.get("patch_sha256")))
+    if any(not isinstance(value, str) or not value or grade.get(key) != value
+           for key, value in bindings):
         return Verdict(status="unavailable", reason=f"{agent}: source-only grade is of another submission")
     for source, value in (("verifier reward", reward), ("source-only grade", passed)):
         if value is not expected:
