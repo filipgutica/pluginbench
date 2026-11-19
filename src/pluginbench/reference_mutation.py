@@ -135,9 +135,9 @@ def _repeat(
     clocks = _object(report["clocks"])
     selected = mutation._sites(report["selected"])
     check_baseline = report["check_baseline"]
-    tsc_stdout = (
-        _stdout(directory, _object(check_baseline)) if check_baseline is not None else None
-    )
+    # Only a tsc baseline that started has output: the attempt's limit can leave it no time.
+    tsc_ran = check_baseline is not None and _object(check_baseline)["dispatched"] is True
+    tsc_stdout = _stdout(directory, _object(check_baseline)) if tsc_ran else None
     failure = report["infrastructure_failure"]
     sites = []
     for item in _list(report["mutants"]):
@@ -169,7 +169,8 @@ def _repeat(
         "check_baseline": None if check_baseline is None else {
             **_call(_object(check_baseline)),
             "kind": "tsc",
-            "diagnostics": sum(mutation.tsc_errors(tsc_stdout or "").values()),
+            **({"diagnostics": sum(mutation.tsc_errors(tsc_stdout).values())}
+               if tsc_stdout is not None else {}),
         },
         "sites": sites,
         "required_settled_ms": report["required_settled_ms"],

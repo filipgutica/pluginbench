@@ -245,3 +245,19 @@ def test_four_lanes_of_eight_sites_pass_both_rules(tmp_path: Path) -> None:
     }})
     verdict = suite_qualification._RULES["mutation"](three, TASK)
     assert verdict.status == "unavailable" and "3 lanes hold" in str(verdict.reason)
+
+
+def test_a_tsc_baseline_the_attempt_limit_left_no_time_keeps_its_repeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The second baseline ends exactly at the 2,000 ms limit, on time: the tsc baseline that
+    # follows has no time left, so it never starts and has no output to read.
+    monkeypatch.setattr(mutation, "_check_command", lambda path: mutation.TSC_CHECK)
+    mutation_receipt, time_receipt, _ = _reference(tmp_path, attempt_ms=2000)
+    repeats = mutation_receipt.facts["repeats"]
+    assert [r["infrastructure_failure"] for r in repeats] == ["attempt_deadline"] * 3
+    assert [r["check_baseline"] for r in repeats] == [
+        {"started_ms": 2000, "dispatched": False, "kind": "tsc"}
+    ] * 3
+    for receipt in (mutation_receipt, time_receipt):
+        assert suite_qualification._RULES[receipt.gate](receipt, TASK).status == "unavailable"
