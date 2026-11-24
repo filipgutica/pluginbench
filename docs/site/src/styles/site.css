@@ -33,7 +33,7 @@
 .doc-content li + li { margin-top: var(--space-2); }
 .doc-content .fg-code-block { min-width: 0; }
 /* Copy appears once scripts run; reserving its height keeps the page from shifting then. */
-.doc-content .fg-code-block[data-variant="default"] .fg-code-block__actions { min-height: var(--control-lg); }
+.doc-content .fg-code-block[data-variant="default"] .fg-code-block__actions { min-height: var(--control-touch); }
 /* A line that continues a command after a trailing backslash gets no prompt.
  * The library's command plate prompts every line, so this belongs upstream. */
 .fg-code-block[data-command="true"] .fg-code-block__line[data-continuation]::before { content: '  ' / ''; }
