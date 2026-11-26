@@ -2,7 +2,7 @@
 import { UiSiteHeader, UiSiteNav } from '@filipgutica/ui/site';
 import type { UiSiteNavGroup } from '@filipgutica/ui/site';
 
-defineProps<{ groups: UiSiteNavGroup[] }>();
+defineProps<{ groups: UiSiteNavGroup[]; contents?: UiSiteNavGroup[] }>();
 const headerLinks = [
   { label: 'GitHub', href: 'https://github.com/filipgutica/pluginbench' },
   { label: 'Releases', href: 'https://github.com/filipgutica/pluginbench/releases' },
@@ -13,7 +13,7 @@ const headerLinks = [
   <a class="fg-site-skip" href="#main">Skip to content</a>
   <div class="fg-site-docs">
     <UiSiteHeader project="pluginbench" :links="headerLinks" />
-    <UiSiteNav label="Documentation" :groups="groups" />
+    <UiSiteNav label="Documentation" :groups="groups" :contents="contents" />
     <main id="main" class="fg-site-prose doc-content">
       <slot />
     </main>

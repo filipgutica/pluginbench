@@ -18,8 +18,19 @@ for (const width of [320, 390, 720, 801, 1280]) {
     await trigger.click();
     await expect(page.getByRole('navigation', { name: 'Projects', exact: true }).getByRole('link')).toHaveCount(8);
     await trigger.click();
-    if (width <= 800) await page.locator('.fg-site-rail__menu > summary').click();
-    await page.getByRole('navigation', { name: 'Documentation', exact: true }).getByRole('group', { name: 'On this page', exact: true }).getByRole('link', { name: 'Requirements', exact: true }).click();
+    const railMenu = page.locator('.fg-site-rail__menu');
+    const contentsMenu = page.locator('.fg-site-contents__menu');
+    const contentsSummary = contentsMenu.locator('summary');
+    if (width <= 800) {
+      await expect(page.locator('.fg-site-rail + .fg-site-contents')).toHaveCount(1);
+      await expect(railMenu).toHaveJSProperty('open', false);
+      await expect(contentsMenu).toHaveJSProperty('open', false);
+    }
+    if (await contentsSummary.isVisible()) await contentsSummary.click();
+    const contents = page.getByRole('navigation', { name: 'On this page', exact: true });
+    await expect(contents.getByRole('link')).toHaveCount(await page.locator('main h2').count());
+    await contents.getByRole('link', { name: 'Requirements', exact: true }).click();
+    await expect(page).toHaveURL(/#requirements$/);
     await expect(page.locator('#requirements')).toBeInViewport();
   });
 }

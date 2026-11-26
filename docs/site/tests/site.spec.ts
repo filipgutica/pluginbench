@@ -22,12 +22,17 @@ for (const width of [320, 390, 720, 801, 1280]) {
   test(`all pages and navigation work at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 900 });
     await page.goto('/pluginbench/');
+    const contents = page.getByRole('navigation', { name: 'On this page', exact: true });
+    const contentsSummary = page.locator('.fg-site-contents__menu > summary');
     for (const route of routes) {
       await expect(page.locator('.fg-site-rail')).toHaveAttribute('data-enhanced', 'true');
       if (width <= 800) await page.locator('.fg-site-rail__toggle').click();
       const nav = page.getByRole('navigation', { name: 'Documentation', exact: true });
-      await expect(nav.locator('.fg-site-rail__group').first().getByRole('link')).toHaveText(routes.map(({ label }) => label));
-      await expect(nav.getByRole('group', { name: 'On this page', exact: true })).toHaveCount(await page.locator('main h2').count() ? 1 : 0);
+      await expect(nav.getByRole('link')).toHaveText(routes.map(({ label }) => label));
+      if (await contentsSummary.isVisible()) await contentsSummary.click();
+      const sectionCount = await page.locator('main h2').count();
+      await expect(contents).toHaveCount(sectionCount ? 1 : 0);
+      await expect(contents.getByRole('link')).toHaveCount(sectionCount);
       await nav.getByRole('link', { name: route.label, exact: true }).click();
       await expect(page).toHaveURL(route.path);
       await expect(page).toHaveTitle(`${route.label} · PluginBench`);
@@ -61,13 +66,23 @@ for (const width of [320, 390, 720, 801, 1280]) {
       }
     }
     await expect(page.locator('.fg-site-rail')).toHaveAttribute('data-enhanced', 'true');
-    if (width <= 800) await page.locator('.fg-site-rail__toggle').click();
+    if (width <= 800) {
+      await page.locator('.fg-site-rail__toggle').click();
+      const drawerNavs = page.getByRole('dialog').getByRole('navigation');
+      await expect(drawerNavs).toHaveCount(2);
+      await expect(drawerNavs.first()).toHaveAccessibleName('On this page');
+      await expect(drawerNavs.last()).toHaveAccessibleName('Documentation');
+    } else if (await contentsSummary.isVisible()) {
+      await contentsSummary.click();
+    }
     const nav = page.getByRole('navigation', { name: 'Documentation', exact: true });
     await expect(nav.locator('[aria-current="page"]')).toHaveText('Measurement specification');
-    await nav.getByRole('group', { name: 'On this page', exact: true }).getByRole('link', { name: 'Requirements', exact: true }).click();
+    await contents.getByRole('link', { name: 'Requirements', exact: true }).click();
     await expect(page).toHaveURL(/#requirements$/);
     await expect(page.locator('#requirements')).toBeInViewport();
     if (width <= 800) await expect(page.getByRole('dialog')).toHaveCount(0);
+    // On phones the list leaves with the drawer, and reopening it scrolls back to the trigger.
+    else await expect(contents.locator('[aria-current="location"]')).toHaveText('Requirements');
   });
 }
 
