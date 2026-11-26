@@ -18,8 +18,10 @@ const { slug, title, description, headings } = Astro.props;
 const sections = headings.filter(({ depth }) => depth === 2);
 const groups = [
   { items: pages.map((page) => ({ label: page.title, href: pageHref(page.slug), current: page.slug === slug })) },
-  ...(sections.length ? [{ label: 'On this page', items: sections.map(({ text, slug }) => ({ label: text, href: `#${slug}` })) }] : []),
 ];
+const contents = sections.length
+  ? [{ items: sections.map(({ text, slug }) => ({ label: text, href: `#${slug}` })) }]
+  : undefined;
 const canonical = new URL(pageHref(slug), Astro.site);
 // Keep the library roles and page branding consistent without the theme boot script.
 const darkTokens = [libraryThemeCss, sitePaletteCss, projectThemeCss].map((css) => {
@@ -47,7 +49,7 @@ const noScriptDarkCss = `@media (prefers-color-scheme: dark) { :root:not(.dark) 
     <noscript><style is:global set:html={noScriptDarkCss}></style></noscript>
   </head>
   <body>
-    <SiteFrame groups={groups} client:load>
+    <SiteFrame groups={groups} contents={contents} client:load>
       <slot />
     </SiteFrame>
     <script>
