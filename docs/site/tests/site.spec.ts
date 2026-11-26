@@ -81,6 +81,8 @@ for (const width of [320, 390, 720, 801, 1280]) {
     await expect(page).toHaveURL(/#requirements$/);
     await expect(page.locator('#requirements')).toBeInViewport();
     if (width <= 800) await expect(page.getByRole('dialog')).toHaveCount(0);
+    // On phones the list leaves with the drawer, and reopening it scrolls back to the trigger.
+    else await expect(contents.locator('[aria-current="location"]')).toHaveText('Requirements');
   });
 }
 
