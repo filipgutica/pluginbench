@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.11.0](https://github.com/filipgutica/pluginbench/compare/v0.10.0...v0.11.0) (2026-11-28)
+
+
+### Features
+
+* bound reference mutation and qualify it with the mutation and mutation_time rules ([#154](https://github.com/filipgutica/pluginbench/issues/154)) ([910c938](https://github.com/filipgutica/pluginbench/commit/910c9385c48204901b511442811473c85d89cf4f))
+* derive benchmark identities for entrants, configurations, suites, cells and slots ([#150](https://github.com/filipgutica/pluginbench/issues/150)) ([03b2052](https://github.com/filipgutica/pluginbench/commit/03b20525ccf0aeed436020c924dc98572607945b))
+* freeze a suite only when every required qualification gate passes ([#151](https://github.com/filipgutica/pluginbench/issues/151)) ([ef6cfea](https://github.com/filipgutica/pluginbench/commit/ef6cfea1f2b329bd8ff502f5203a6df2b406eef1))
+* measure a task's reference mutation as one contained operation from the CLI ([#155](https://github.com/filipgutica/pluginbench/issues/155)) ([3f36dbf](https://github.com/filipgutica/pluginbench/commit/3f36dbfd66fa016de644287d83d6d8b49f96ccf4))
+* pin mutation at ten mutants per attempt with a 200% time limit margin ([#157](https://github.com/filipgutica/pluginbench/issues/157)) ([955ebe9](https://github.com/filipgutica/pluginbench/commit/955ebe922ccf0d7e9f6b26e9fe65b3df115d172b))
+* read the Claude subscription token from a secrets file when the environment has none ([#146](https://github.com/filipgutica/pluginbench/issues/146)) ([750e783](https://github.com/filipgutica/pluginbench/commit/750e783d29c9a416c32ec1e2b6a21eb340ae46e3))
+* resume a review revision and adopt a judge call a crash cut off ([#148](https://github.com/filipgutica/pluginbench/issues/148)) ([2d3f2e3](https://github.com/filipgutica/pluginbench/commit/2d3f2e3b4e3545350034d498856d6d9579ea1604))
+* show the host coordinator, execution owner and blocking crash in status RUN ([#149](https://github.com/filipgutica/pluginbench/issues/149)) ([6189d5a](https://github.com/filipgutica/pluginbench/commit/6189d5a259501d36509a6f59bb0c3eaef6540820))
+* **site:** show page sections in the contents list beside main ([#162](https://github.com/filipgutica/pluginbench/issues/162)) ([321d4bf](https://github.com/filipgutica/pluginbench/commit/321d4bf401a0a6f9e97e84e47b6eca67accc3bc0))
+
+
+### Bug Fixes
+
+* ignore empty instruction folders above an attempt and refuse the rest in check ([#153](https://github.com/filipgutica/pluginbench/issues/153)) ([e2ff803](https://github.com/filipgutica/pluginbench/commit/e2ff80370eb0f9169c844c26fe7b7ad1bd91552a))
+* leave Claude's ignored limits out of every evaluation dump so preflight reads it back ([#152](https://github.com/filipgutica/pluginbench/issues/152)) ([e68f316](https://github.com/filipgutica/pluginbench/commit/e68f316a4b9306cf943724a494edbd42823a5223))
+* measure mutation at the saved runtime's resources and check its receipts against them ([#156](https://github.com/filipgutica/pluginbench/issues/156)) ([7b2c644](https://github.com/filipgutica/pluginbench/commit/7b2c64408eb63f493ee0f80008d6a3c88c32cb99))
+
+
+### Documentation
+
+* add an agent runbook for working the exam-set and dashboard issues ([#181](https://github.com/filipgutica/pluginbench/issues/181)) ([ae8cc42](https://github.com/filipgutica/pluginbench/commit/ae8cc4214dd3bc942e9ce6094a8b598b6f523c9c))
+* explain the mutation bug-catch rate in plain words wherever results are read ([#158](https://github.com/filipgutica/pluginbench/issues/158)) ([2dc3372](https://github.com/filipgutica/pluginbench/commit/2dc3372c06d37fbf63a1f79deada6d06025e60bd))
+
 ## [0.10.0](https://github.com/filipgutica/pluginbench/compare/v0.9.0...v0.10.0) (2026-11-18)
 
 
